@@ -62,6 +62,11 @@ extraResources:
     to: icon.png
   - from: node_modules/@kangentic/branding/resources/desktop/icon.ico
     to: icon.ico
+  # extraResources keeps legal files outside asar and readable from process.resourcesPath.
+  - from: LICENSE
+    to: LICENSE
+  - from: FORK-NOTICE.md
+    to: FORK-NOTICE.md
 
 # We rebuild better-sqlite3 manually; node-pty uses NAPI prebuilts
 npmRebuild: false
@@ -71,8 +76,8 @@ afterSign: build/afterSign.js
 win:
   target: nsis
   icon: node_modules/@kangentic/branding/resources/desktop/icon.ico
-  signtoolOptions:
-    sign: build/windowsSign.js
+  signExts:
+    - "!.exe"
 
 nsis:
   oneClick: true
@@ -126,8 +131,4 @@ rpm:
     - libdrm
     - libXShmfence
 
-publish:
-  provider: github
-  owner: Kangentic
-  repo: kangentic
-  releaseType: draft
+publish: null
