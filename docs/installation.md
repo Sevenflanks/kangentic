@@ -1,179 +1,77 @@
-# Installation
+# 安裝
 
-## Prerequisites
+## 此 fork 的使用方式
 
-- **Claude Code CLI** -- installed and on your PATH. [Get Claude Code](https://docs.anthropic.com/en/docs/claude-code).
-- **Git 2.25+** -- required for worktree support. Run `git --version` to check.
-
-## Quick Install (Recommended)
+`Sevenflanks/kangentic` 只支援兩種使用方式：從來源執行，以及由維護者在自己的 Windows 電腦建立本機 installer。`sevenflanks-main` 是 fork 的個人整合主線，也是預設工作基底。
 
 ```bash
-npx kangentic
-```
-
-This downloads the pre-built binary for your platform, installs it, and launches the app. After the first run, auto-updates handle everything (Windows and macOS). Linux users re-run `npx kangentic` to update.
-
-To open a specific project:
-
-```bash
-npx kangentic /path/to/your/project
-```
-
-To install a specific version:
-
-```bash
-npx kangentic@0.2.0
-```
-
-## Manual Download
-
-Download the latest release for your platform from [GitHub Releases](https://github.com/Kangentic/kangentic/releases/latest).
-
-| Platform | File | Notes |
-|----------|------|-------|
-| Windows | `Kangentic Setup X.Y.Z.exe` | NSIS installer. Auto-updates. |
-| macOS | `Kangentic-X.Y.Z.dmg` | Drag to Applications. See [Gatekeeper note](#macos-gatekeeper). |
-| Linux (Debian/Ubuntu) | `kangentic_X.Y.Z_amd64.deb` | `sudo dpkg -i kangentic_*.deb` |
-| Linux (Fedora/RHEL) | `kangentic-X.Y.Z-1.x86_64.rpm` | `sudo rpm -i kangentic-*.rpm` |
-
-### Windows
-
-1. Download the `.exe` installer.
-2. Run it -- the NSIS installer handles installation and creates a Start Menu shortcut.
-3. If Windows SmartScreen warns about an unrecognized app, click **More info** then **Run anyway**. This happens because the app is not yet code-signed.
-4. Auto-updates are built in. New versions install silently on restart.
-
-### macOS
-
-1. Download the `.dmg` file.
-2. Open it and drag Kangentic to your Applications folder.
-3. On first launch, macOS Gatekeeper may block the app. See [Gatekeeper bypass](#macos-gatekeeper) below.
-
-#### macOS Gatekeeper
-
-Since the app is not yet notarized, macOS will block it on first launch:
-
-1. Open **System Settings > Privacy & Security**.
-2. Scroll to the bottom -- you'll see a message about Kangentic being blocked.
-3. Click **Open Anyway**.
-4. Alternatively, right-click the app in Finder, select **Open**, then click **Open** in the dialog.
-
-### Linux
-
-Install with your package manager:
-
-```bash
-# Debian/Ubuntu
-sudo dpkg -i kangentic_X.Y.Z_amd64.deb
-
-# Fedora/RHEL
-sudo rpm -i kangentic-X.Y.Z-1.x86_64.rpm
-```
-
-Linux does not have built-in auto-updates. Download new releases manually from GitHub.
-
-### WSL Note
-
-Kangentic is a GUI desktop application. If you use WSL, install the **Windows** version -- it runs as a native Windows app and can use WSL shells for agent sessions. Do not attempt to install the Linux version inside WSL.
-
-## From Source
-
-For contributors or users who want to run from source:
-
-```bash
-git clone https://github.com/Kangentic/kangentic.git
+git clone https://github.com/Sevenflanks/kangentic.git
 cd kangentic
-npm install
+git checkout sevenflanks-main
+npm ci
 npm run dev
 ```
 
-Requires:
+## 建立本機 Windows Installer
+
+在 Windows 上執行：
+
+```bash
+npm run make:win
+```
+
+這是唯一的 fork 封裝入口。script 內建 electron-builder 的 `--publish never`，輸出為 `out/Kangentic-Setup-X.Y.Z.exe`。installer 未簽署、僅供本機使用，包含 `LICENSE` 與 `FORK-NOTICE.md`，而且沒有 auto-update feed。
+
+1. 在自己的電腦上執行 `npm run make:win`。
+2. 執行本機產生的 `out/Kangentic-Setup-X.Y.Z.exe`。
+3. installer 未簽署，Windows 可能顯示 SmartScreen 警告。只在已確認本機來源與版本後，依系統提示繼續。
+4. 更新時從已驗證來源重新建置並執行新的本機 installer。
+
+## 先決條件
+
 - Node.js 22+
-- C++ build tools for native modules (better-sqlite3, node-pty)
-  - **Windows:** `npm install -g windows-build-tools` or install Visual Studio Build Tools
-  - **macOS:** Xcode Command Line Tools (`xcode-select --install`)
-  - **Linux:** `build-essential` package (`sudo apt install build-essential`)
+- Git 2.25+
+- C++ 建置工具，供 `better-sqlite3` 與 `node-pty` 等原生模組使用
+- 至少一個已安裝並登入的支援 agent CLI
 
-## Troubleshooting
+原生模組建置工具依平台而異：
 
-### Claude Code CLI not found
+- Windows：安裝 Visual Studio Build Tools 與 Python 3。
+- macOS：執行 `xcode-select --install` 安裝 Xcode Command Line Tools。
+- Linux：安裝發行版提供的 C/C++ 建置套件，例如 Debian 或 Ubuntu 的 `build-essential`。
 
-Kangentic requires the Claude Code CLI (`claude`) on your PATH. Verify it's installed:
+## 上游發行版：`npx kangentic`
+
+`npx kangentic` 是 upstream 發行管道。它會下載 `Kangentic/kangentic` 的 release，不會下載或安裝此 fork。需要 upstream 發行版時，請依 upstream 的文件使用該命令；需要此 fork 時，請使用前述來源執行或本機 Windows installer 方式。
+
+## 疑難排解
+
+### Agent CLI 找不到
+
+確認選用的 agent CLI 已在 `PATH`，並依該 agent 的官方說明完成登入。例如：
 
 ```bash
 claude --version
 ```
 
-If not installed, follow the [Claude Code setup guide](https://docs.anthropic.com/en/docs/claude-code).
+### 原生模組建置失敗
 
-### Linux arm64
+- 確認已安裝對應平台的 C++ 建置工具。
+- Windows 也需要 Python 3 供 `node-gyp` 使用。
+- 重新執行 `npm ci`，讓 lockfile 指定的相依套件重新安裝。
 
-Pre-built arm64 Linux binaries are not available in v1. arm64 Linux users should [build from source](#from-source).
-
-### Windows SmartScreen warning
-
-The app is not yet code-signed. Click **More info** then **Run anyway** to proceed. Once code signing certificates are configured, this warning will no longer appear.
-
-### macOS "app is damaged" error
-
-If you see "app is damaged and can't be opened", the quarantine attribute needs to be removed:
-
-```bash
-xattr -cr /Applications/Kangentic.app
-```
-
-### Native module build failures
-
-If `npm install` fails on native modules:
-
-- Ensure you have C++ build tools installed (see [From Source](#from-source) above).
-- On Windows, ensure Python 3.x is available (required by node-gyp).
-- Try clearing the npm cache: `npm cache clean --force` then `npm install` again.
-
-## Uninstall
+## 移除
 
 ### Windows
 
-1. Open **Settings > Apps > Installed apps**.
-2. Find "Kangentic" and click **Uninstall**.
-3. Or run from command line: `%LOCALAPPDATA%\Kangentic\Update.exe --uninstall`
-4. To remove all data: delete `%APPDATA%\kangentic\`
+1. 開啟 **Settings > Apps > Installed apps**。
+2. 找到 Kangentic 並選擇 **Uninstall**。
+3. 如需刪除資料，再移除 `%APPDATA%\kangentic\`。
 
-### macOS
+## 自訂資料目錄
 
-1. Drag Kangentic from Applications to the Trash.
-2. To remove all data: delete `~/Library/Application Support/kangentic/`
-
-### Linux
+設定 `KANGENTIC_DATA_DIR` 可讓來源建置與已安裝版本使用不同資料目錄。
 
 ```bash
-# Debian/Ubuntu
-sudo dpkg -r kangentic
-
-# Fedora/RHEL
-sudo rpm -e kangentic
+KANGENTIC_DATA_DIR=/path/to/data npm run dev
 ```
-
-To remove all data: delete `~/.config/kangentic/`
-
-## Custom Data Directory
-
-By default, Kangentic stores its global database and project data in:
-
-| Platform | Default path |
-|----------|-------------|
-| Windows | `%APPDATA%\kangentic\` |
-| macOS | `~/Library/Application Support/kangentic/` |
-| Linux | `~/.config/kangentic/` |
-
-To use a custom location, pass `--data-dir` or set the `KANGENTIC_DATA_DIR` environment variable:
-
-```bash
-# Using the flag
-npx kangentic --data-dir=/path/to/data
-
-# Using the environment variable
-KANGENTIC_DATA_DIR=/path/to/data npx kangentic
-```
-
-If both are set, the environment variable takes priority. This is useful for running separate dev and production instances side by side.
