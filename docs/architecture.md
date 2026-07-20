@@ -16,9 +16,10 @@ Context isolation is enabled -- the renderer has no direct access to Node.js API
 User drags task between columns
   → BoardStore.moveTask() -- optimistic UI update
   → IPC task:move
-  → Main: update DB positions
-  → Main: check priority rules (To Do? Done? Active session? No session?)
-  → Main: TransitionEngine executes action chain (create_worktree → spawn_agent)
+  -> Main: Phase 1 task lock moves DB state and applies priority rules
+  -> Main: Phase 2 prepares slow git/worktree work outside the task lock
+  -> Main: Phase 3 task lock CAS-checks then calls spawnAgent() when needed
+  -> Main: TransitionEngine executes the action chain through the resolved AgentAdapter
   → SessionManager spawns PTY (or queues it)
   → PTY streams output → 16ms batched flush → IPC session:data → xterm render
   → Bridge scripts write status/activity/events files → fs.watch → IPC → Zustand stores
@@ -448,8 +449,8 @@ Created on project open. Stored in the global config directory (not inside the p
 - **task_attachments** -- File attachments (images, etc.) stored on disk, metadata in DB
 - **backlog_tasks** -- Staging area tasks (Backlog View). Pre-board tasks with priority, labels, and optional external source tracking.
 - **backlog_attachments** -- File attachments for backlog tasks, mirroring `task_attachments`. Copied to `task_attachments` on promote.
-- **session_transcripts** -- ANSI-stripped PTY output per session. Written by `TranscriptWriter` with a 30s debounced flush (early-flushed at 256KB pending). Used for cross-agent handoff context. No FK; cascade via DELETE trigger on sessions.
-- **handoffs** -- Cross-agent handoff records. Tracks from/to agents and sessions, stores serialized `ContextPacket` (transcript excluded). FK on task_id with CASCADE delete.
+- **session_transcripts** -- ANSI-stripped PTY persistence for each session. Written by `TranscriptWriter` with a 30s debounced flush (early-flushed at 256KB pending) and used for transcript viewing and search. No FK; cascade via DELETE trigger on sessions.
+- **handoffs** -- Cross-agent handoff audit records. Stores source and target agent/session metadata plus a nullable `session_history_path` to the source adapter's native history file. `packet_json` is legacy schema data; current repository queries neither read nor write it. FK on task_id with CASCADE delete.
 - **usage_history** -- Append-only ledger of finalized session usage (cost, tokens, duration, tool count, git stats, model, agent). No FK to `tasks` or `sessions`, so rows survive task deletion, bulk-archive cleanup, and revert-to-backlog. Backs the usage dashboard's period totals, cost-per-day series, and by-model / by-agent breakdowns (Live/Today/Week/Month/All Time) via `usage:getDashboardStats` and the `kangentic_get_usage_stats` MCP tool. Written by `captureSessionMetrics` (UPSERT on `session_record_id`) and `captureGitChurn` (`src/main/ipc/handlers/git-stats-capture.ts`, fired on every session finalization - suspend, move, handoff, respawn, natural exit - not just move-to-Done; writes to exactly one record per task lineage via `setTaskGitStats` to avoid double-counting branch-cumulative churn across `--resume` records). The dashboard's SESSIONS KPI and Live view additionally merge in-flight sessions from the live `SessionManager` (deduped by `session_record_id` against the ledger) so running sessions are not undercounted before they finalize.
 
 Repositories follow a simple pattern -- one class per table, all queries are synchronous (better-sqlite3). Transactions used for position shifts (task move, swimlane reorder).
@@ -473,19 +474,31 @@ This function is used by task-move (to detect cross-agent handoff), session-reco
 
 When a task moves between swimlanes, the IPC handler checks priorities in order:
 
-1. **Target is To Do** → Kill session, preserve worktree
+1. **Target is To Do** → Kill session, delete session history and worktree, and delete the branch when `git.autoCleanup` is enabled
 2. **Target is Done** → Suspend session (resumable), archive task
 3. **Target has auto_spawn=false** → Suspend session
-4. **Task has active session** → A permission-mode delta (destination's effective mode differs from the session record's spawn-time mode) suspends and respawns so the new `--permission-mode` / `--model` / `--effort` land as CLI flags. Otherwise live-inject model/effort/auto_command when the adapter supports it, respawn on a concrete model/effort delta without live-swap, or keep the session alive. See [Transition Engine](transition-engine.md) Priority 3 for the full sub-case order.
+4. **Task has active session** → A permission-only lane change keeps the live session running. A model change restarts the session. An effort change is live-swapped when the adapter supports it, otherwise a concrete effort change restarts the session. Agent, session-track, and force-fresh changes also follow the spawn path. See [Transition Engine](transition-engine.md) Priority 3 for the full sub-case order.
 5. **Task has no session** → Create worktree (if enabled), execute transition action chain. For resumed sessions, `auto_command` is preloaded as the resume prompt. For fresh spawns, it is injected via `TerminalSubmitScheduler.scheduleKeystrokes`.
 
 Transitions only fire for case 5. The action chain runs in `execution_order`: typically `create_worktree` → `spawn_agent`.
+
+### Split-Lock Move Flow
+
+`task:move` uses `withTaskLock` as a per-task FIFO lock. Different tasks remain concurrent. Phase 1 holds the lock for the database move, priority decisions, and fast session lifecycle dispatch. Phase 2 releases it for cancellable, slow git and worktree I/O, which is separately serialized per project. Phase 3 takes the task lock again, re-reads the task, and uses its swimlane and `session_id` as compare-and-swap guards before calling `spawnAgent()`.
+
+Cancellation happens before queueing on the lock so the current move can observe its `AbortSignal`. Failure or cancellation cleanup re-enters the task lock, removes any partial session, and only rolls the card back if it still occupies this move's destination lane.
+
+### Task-Agent Spawn Chokepoints
+
+Board-driven task-agent spawns route through `spawnAgent()` in `src/main/ipc/helpers/agent-spawn.ts`. Startup recovery and reconciliation route through `prepareAgentSpawn()` in `src/main/transition-engine/session-startup/prepare-spawn.ts`. Both call `runSpawnPreamble()` to lock first-spawn overrides before resolving the target agent.
+
+The transition engine uses the resolved `AgentAdapter` contract to `detect` the CLI, `ensureTrust`, `buildCommand`, and optionally `buildEnv`. Raw PTY spawning is reserved for explicit non-task-agent paths such as transient terminals, renderer-supplied raw session spawn, and the `run_script` action.
 
 ### Action Types
 
 | Type | What it does |
 |------|-------------|
-| `spawn_agent` | Build Claude CLI command, spawn PTY. Resumes if suspended session exists. |
+| `spawn_agent` | Resolve the selected adapter, build its command and environment, and spawn a PTY. Resumes a compatible suspended session when available. |
 | `send_command` | Write interpolated text to running PTY stdin |
 | `run_script` | Spawn one-off shell command (no persistence) |
 | `kill_session` | Suspend session, clear task.session_id |
@@ -687,7 +700,7 @@ On project open (`src/main/transition-engine/session-startup/`):
 
 `src/main/boards/`
 
-Provides external issue import (and future write-back / discovery) for board providers. Mirrors the per-agent adapter layout under `src/main/agent/adapters/`. Each provider lives in its own folder with isolated auth, fetch, and mapping logic; the central registry dispatches by `ExternalSource` id, so IPC handlers contain zero provider-specific branching.
+Provides external issue import (and future write-back / discovery) for board providers. Mirrors the per-agent adapter layout under `src/main/agent/adapters/`. Each provider lives in its own folder with isolated auth, fetch, and mapping logic. Generic import handlers dispatch through the central registry, with Asana credential IPC kept as the current adapter-local exception.
 
 ### Layout
 
@@ -718,13 +731,13 @@ src/main/boards/
 
 ### Interface
 
-`BoardAdapter` (in `shared/types.ts`) declares:
+`BoardAdapter` (in `src/main/boards/shared/types.ts`) declares:
 - Required metadata: `id` (matches `ExternalSource`), `displayName`, `icon`, `status` (`'stable' | 'stub'`).
 - Required setup methods: `checkPrerequisites()` (structured CLI + auth check), `checkCli()` (legacy wrapper for back-compat).
 - Required import methods: `fetch()`, `downloadImages()`. Optional `downloadFileAttachments()` for providers with explicit attachment relations (Azure DevOps).
 - Optional future methods: `authenticate()`, `listProjects()`, `listIssues()`, `pushUpdates()`. Reserved for live discovery and write-back. No provider implements these yet.
 
-Stub adapters (`jira`, `linear`, `trello`) implement the required surface with method bodies that throw `Error('<Provider> adapter is not yet implemented')`. The IPC handler short-circuits stubs by checking `adapter.status === 'stub'` before dispatch, returning a structured error to the renderer.
+The registry contains seven providers. GitHub Issues, GitHub Projects, Azure DevOps, and Asana are stable. Jira, Linear, and Trello are stubs. `requireStable()` rejects a stub before fetch or execute reaches its adapter methods.
 
 ### Adding a new provider
 
@@ -733,13 +746,13 @@ Stub adapters (`jira`, `linear`, `trello`) implement the required surface with m
 3. Register the adapter in `src/main/boards/board-registry.ts`.
 4. (Optional) Register a URL parser via `registerSourceUrlParser()` so user-pasted URLs route to the right adapter.
 
-No edits to IPC handlers or the renderer are required - dispatch is registry-driven. The contract is locked in by `tests/unit/board-registry.test.ts`, which fails if a provider is added to the union but not registered.
+Generic import dispatch needs no IPC edits because it is registry-driven. A provider with its own credential flow may still own adapter-local IPC, as Asana does. The contract is locked in by `tests/unit/board-registry.test.ts`, which fails if a provider is added to the union but not registered.
 
 ### IPC channels
 
-Backlog Import group (6 channels): `backlog:importCheckCli`, `backlog:importFetch`, `backlog:importExecute`, `backlog:importSourcesList`, `backlog:importSourcesAdd`, `backlog:importSourcesRemove`. All dispatch through `boardRegistry.getOrThrow(source)` in `src/main/ipc/handlers/backlog.ts`.
+Backlog Import group (6 channels): `backlog:importCheckCli`, `backlog:importFetch`, `backlog:importExecute`, `backlog:importSourcesList`, `backlog:importSourcesAdd`, `backlog:importSourcesRemove`. Check and source-label operations use `boardRegistry.get(source)`, allowing unavailable sources to be reported or skipped. Fetch and execute use `boardRegistry.requireStable(source)`, which rejects a stub before dispatch.
 
-Asana ships an additional `boards:asana:*` group (3 channels: `authStatus`, `setPat`, `clearCredential`) for its Personal Access Token lifecycle. Handlers live in `src/main/boards/adapters/asana/ipc-handlers.ts` and are registered by `registerAsanaIpcHandlers()` from the backlog handler. Keeping the surface adapter-local means Asana specifics never leak into the generic backlog handler.
+Asana ships an additional `boards:asana:*` group (3 channels: `authStatus`, `setPat`, `clearCredential`) for its Personal Access Token lifecycle. Handlers live in `src/main/boards/adapters/asana/ipc-handlers.ts` and are registered by `registerAsanaIpcHandlers()` from the backlog handler. This is the current provider-specific exception to otherwise generic import handlers.
 
 ## Mobile Bridge
 
