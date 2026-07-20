@@ -1,30 +1,30 @@
 <p align="center">
-  <a href="https://www.kangentic.com"><img src="https://raw.githubusercontent.com/Kangentic/branding/main/resources/web/logo.png" alt="Kangentic Logo" width="128" /></a>
+  <img src="https://raw.githubusercontent.com/Kangentic/branding/main/resources/web/logo.png" alt="Kangentic Logo" width="128" />
 </p>
 
-<h1 align="center"><a href="https://www.kangentic.com">Kangentic</a></h1>
+<h1 align="center"><a href="https://github.com/Sevenflanks/kangentic">Kangentic</a></h1>
+
+> **Fork notice**
+>
+> 此 repository 是 [Kangentic/kangentic](https://github.com/Kangentic/kangentic) 的修改版 fork，由 [Sevenflanks/kangentic](https://github.com/Sevenflanks/kangentic) 維護。它未獲 upstream 背書，與 upstream 沒有關聯，也不是官方發行版。Kangentic 名稱與既有品牌素材暫時保留，等待後續品牌決策。
 
 <p align="center">
   <strong>Drag a card. An agent starts.</strong>
 </p>
 
 <p align="center">
-  <a href="https://www.npmjs.com/package/kangentic"><img src="https://img.shields.io/npm/v/kangentic?style=flat-square" alt="npm version" /></a>
-  <a href="https://github.com/Kangentic/kangentic/releases/latest"><img src="https://img.shields.io/github/v/release/Kangentic/kangentic?style=flat-square" alt="GitHub release" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-blue.svg?style=flat-square" alt="AGPL-3.0 License" /></a>
   <img src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-brightgreen.svg?style=flat-square" alt="Platform" />
-  <a href="https://www.kangentic.com"><img src="https://img.shields.io/badge/website-kangentic.com-purple.svg?style=flat-square" alt="Website" /></a>
-  <a href="https://github.com/Kangentic/kangentic/stargazers"><img src="https://img.shields.io/github/stars/Kangentic/kangentic?style=social" alt="GitHub Stars" /></a>
 </p>
 
 ---
 
-<p align="center">A Kanban board for AI coding agents. Spawn, suspend, and resume eleven coding-agent CLIs from one board, with your own backlog. Local, free, open source.</p>
+<p align="center">A Kanban board for AI coding agents. Spawn, suspend, and resume sessions through twelve supported agent adapters from one board, with your own backlog. Local, free, open source.</p>
 
 <p align="center">AI coding agents can build features, fix bugs, and refactor entire modules autonomously. With git worktrees you can run many of them in parallel, but now the bottleneck is <strong>you</strong>: juggling terminals across projects to track which agents are stuck, finished, or waiting for approval. Kangentic replaces that with a Kanban command center. One board shows every agent's status, output, and progress. Respond when needed; let them work autonomously the rest of the time.</p>
 
 <p align="center">
-  <a href="https://www.kangentic.com"><img src="https://raw.githubusercontent.com/Kangentic/branding/main/resources/social/og-image.png" alt="Kangentic: Kanban board for AI coding agents" width="800" /></a>
+  <img src="https://raw.githubusercontent.com/Kangentic/branding/main/resources/social/og-image.png" alt="Kangentic: Kanban board for AI coding agents" width="800" />
 </p>
 
 ## Features
@@ -35,24 +35,24 @@
 - **Agent-to-board tools** - agents that self-organize. Every running session has MCP tools to create tasks, move cards, search prior sessions, and queue follow-up work, so a planning agent can hand a backlog to an executing agent without you touching the board.
 - **Git worktrees & review** - each agent runs in its own git worktree for parallel development without branch conflicts. When work is ready, the built-in Changes panel opens a split or inline diff viewer with file tree, a commit graph, and a Markdown preview, one click from the task card.
 - **Session persistence** - sessions survive restarts and crashes. Orphaned sessions are detected on startup and resumable. Suspend to Done, resume later with full context, nothing is lost.
-- **Handoff context** - hand work between agents without losing context. When a card moves from a Claude plan column to a Codex execute column, the next agent starts with the full history of what came before. Supported in both directions for Claude, Codex, Gemini, Qwen, Kimi, and OpenCode.
+- **Handoff context** - opt in to a native-history reference when work moves between agents. A handoff needs an agent change, an existing session, and the destination column's `handoff_context` option. The target's initial prompt receives a reference to the source adapter's resolved native history when available. Kangentic does not inline full history or synthesize transcript, git, or metrics context, and the target agent may not read the reference.
 - **Terminal & activity log** - a built-in terminal for every session, plus a structured activity log that shows what each agent is doing without the noise.
 - **Usage & cost analytics** - track tokens, cost, and burn rate across every project, agent, model, and effort level. Filter by any time range, watch spend by week or cumulatively, and drill into a per-project ledger with cost share, dollars per million tokens, and top agent.
 - **Embedded browser** - point a sandboxed Chromium pane at any URL inside the task dialog, draw annotations, pick DOM elements, and submit the rendered frame plus context to the active agent as a multi-modal prompt, all without leaving the task.
 - **Search & memory** - one overlay (Ctrl+Shift+F) searches everything on your machine: tasks, backlog, session events, projects, and every past agent conversation, by keyword or on-device semantic memory. Land on the exact turn where you solved something before, no API key required, and your agents can recall it too through the board's MCP tools.
 - **Voice dictation** - hold a key, talk, release: local push-to-talk speech-to-text drops your words into the agent's terminal, transcribed on-device with a streaming preview and a refinement pass. Punctuation, language, and auto-submit are all configurable.
 - **Model & effort routing** - use Opus for Planning, Sonnet for Code Review, change efforts for the harder steps. Kangentic live-applies changes as cards cross columns: no restart, no manual /model commands.
-- **Your CLIs, your machine** - runs entirely on your desktop (Windows, macOS, Linux, and WSL) with no cloud service and no data leaving your machine. No OAuth, no wrappers, no API proxies: Kangentic launches the native Claude Code, Codex, Gemini, Qwen Code, Kimi Code, OpenCode, Droid, Cursor, Copilot, Aider, and Warp CLIs you already have, with your own logins and subscriptions. Just the real CLIs, the way each vendor intended.
+- **Your tools, your machine** - runs entirely on your desktop (Windows, macOS, Linux, and WSL) with no cloud service and no data leaving your machine. Kangentic launches native agent CLIs where they apply, plus Ollama for local LLM chat, using your own logins and subscriptions.
 
 ## How It Works
 
 1. **Create a task** - add a card with a title and prompt. Paste screenshots, choose a source branch, and toggle worktree isolation, all from the create dialog.
-2. **Drag to run** - drag the card to any active column. Kangentic creates a worktree, picks the permission mode, and spawns your chosen agent automatically. Columns ship preconfigured, To Do through Done; reshape the pipeline, agents, and permissions per column anytime.
+2. **Drag to run** - drag the card to any active column. Kangentic resolves an adapter through task, column, project, and global precedence, then uses the shared spawn pipeline to create a worktree, apply settings, and start the session. Columns ship preconfigured, To Do through Done; reshape the pipeline, adapters, and permissions per column anytime.
 3. **Watch it code** - your agent starts writing immediately. Follow along in the live terminal: see diffs, test results, and tool calls as they happen. Drag between columns to steer, or drag to Done to pause and pick up later.
 
 ## Supported Agents
 
-Eleven coding-agent CLIs, all first-class, on one Kanban board. Mix agents per column and hand off context between them:
+Twelve supported agent adapters on one Kanban board. Mix adapters per column and opt in to native-history references when handing off work:
 
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (Anthropic)
 - [Codex CLI](https://developers.openai.com/codex/cli) (OpenAI)
@@ -65,6 +65,7 @@ Eleven coding-agent CLIs, all first-class, on one Kanban board. Mix agents per c
 - [GitHub Copilot CLI](https://docs.github.com/en/copilot/how-tos/copilot-cli/cli-getting-started)
 - [Aider](https://aider.chat/)
 - [Oz CLI](https://docs.warp.dev/reference/cli/cli) (Warp)
+- [Ollama](https://ollama.com/)
 
 ## Supported Boards
 
@@ -84,50 +85,50 @@ Bring your own backlog. Pull tasks in from the tools your team already uses, inc
 
 ## Prerequisites
 
-- [Node.js](https://nodejs.org/) 20+ (for npx)
+- [Node.js](https://nodejs.org/) 22+
 - [Git 2.25+](https://git-scm.com/)
-- At least one supported agent CLI (see [Supported Agents](#supported-agents))
+- At least one supported agent adapter (see [Supported Agents](#supported-agents))
 
-## Setup
+## 從來源建置
 
 ```bash
-npx kangentic
+git clone https://github.com/Sevenflanks/kangentic.git
+cd kangentic
+git checkout sevenflanks-main
+npm ci
+npm run dev
 ```
 
-One command to download, install, and launch. After the first run, auto-updates handle everything.
+此 fork 的使用路徑只有從來源執行，以及在自己的 Windows 電腦建立本機 installer：
 
-For more details, see the [Installation & Setup guide](https://www.kangentic.com/getting-started/).
+```bash
+npm run make:win
+```
 
-## Documentation
+此指令產生未簽署的 `out/Kangentic-Setup-X.Y.Z.exe`，不發布產物，也沒有 auto-update feed。封裝檔包含 `LICENSE` 與 `FORK-NOTICE.md`。完整步驟請見[安裝指南](docs/installation.md)。
 
-Get started at [kangentic.com/getting-started](https://www.kangentic.com/getting-started/).
+`npx kangentic` 是 upstream 的安裝管道，不會下載或安裝此 fork。
+
+## 文件
+
+請從[本機文件索引](docs/README.md)開始，或直接閱讀[安裝指南](docs/installation.md)。
 
 ## Development
 
-Building from source requires Node.js 22+ (the npx floor above is for end users running the
-launcher).
-
-```bash
-git clone https://github.com/Kangentic/kangentic.git
-cd kangentic
-npm install
-npm start
-```
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for project structure, testing, and conventions.
+開發環境與來源建置使用相同的 Node.js 22+、fork checkout 與 `npm ci` 步驟。請參閱 [CONTRIBUTING.md](CONTRIBUTING.md) 取得專案結構、測試範圍與慣例。
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines. All contributors must sign a [CLA](CLA.md) before their first PR can be merged.
+請參閱 [CONTRIBUTING.md](CONTRIBUTING.md)。本 fork 的貢獻只以 `AGPL-3.0-only` 接受，不收集 upstream CLA。
 
 ## Support
 
-- [GitHub Discussions](https://github.com/Kangentic/kangentic/discussions) for questions and feature requests
-- [GitHub Issues](https://github.com/Kangentic/kangentic/issues) for bug reports
+- [GitHub Discussions](https://github.com/Sevenflanks/kangentic/discussions) 用於問題與功能建議
+- [GitHub Issues](https://github.com/Sevenflanks/kangentic/issues) 用於錯誤回報
 
 ## License
 
-[AGPL-3.0](LICENSE). If AGPL doesn't work for you, drop us a line at licensing@kangentic.com.
+此 fork 以 [AGPL-3.0-only](LICENSE) 授權，詳見 [FORK-NOTICE.md](FORK-NOTICE.md)。不提供商業或替代授權。
 
 ---
 
@@ -145,5 +146,5 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines. All contributors must sig
 </p>
 
 <p align="center">
-  <a href="https://www.kangentic.com"><img src="https://raw.githubusercontent.com/Kangentic/branding/main/resources/web/brandmark-small.svg" alt="Kangentic app icon" width="26" height="26" /></a>
+  <img src="https://raw.githubusercontent.com/Kangentic/branding/main/resources/web/brandmark-small.svg" alt="Kangentic app icon" width="26" height="26" />
 </p>
