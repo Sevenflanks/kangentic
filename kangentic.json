@@ -1,5 +1,6 @@
 {
   "version": 1,
+  "defaultBaseBranch": "sevenflanks-main",
   "columns": [
     {
       "id": "e6350e8a-77fa-43a2-815b-6447820adf40",
