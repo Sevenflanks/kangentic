@@ -4,31 +4,41 @@
 
 The transition engine executes action chains when tasks move between swimlanes. It handles the logic that makes Kanban columns "active" -- spawning agents, sending commands, managing worktrees, and more.
 
+## Split-Lock Task Move
+
+`task:move` uses a three-phase flow for moves that need worktree preparation or an agent spawn. `withTaskLock(taskId, ...)` is a per-task FIFO lock, so operations on one task are serialized while different tasks can proceed concurrently.
+
+1. **Phase 1, locked and short.** Move the task in the database, capture the source and destination state, and make the priority decision. Fast session lifecycle dispatch, including suspend or kill, stays here. Moves fully handled by To Do, Done, `auto_spawn=false`, or a live-session no-op end in this phase.
+2. **Phase 2, unlocked and slow.** Create or prepare the worktree and check out a branch. This git I/O is serialized per project by `WorktreeManager.projectQueues`, not by the task lock. The move's `AbortSignal` reaches this work, so a newer move or explicit cancellation can stop stale work.
+3. **Phase 3, locked and short.** Re-read the task and compare its current swimlane and `session_id` with the Phase 1 plan. A deleted task, changed destination, or existing session is a compare-and-swap mismatch, so the handler skips spawning. Otherwise it calls `spawnAgent()`.
+
+Cancellation is requested before queueing on the task lock, allowing an in-flight holder to observe the signal and finish. If Phase 2 or Phase 3 fails or is cancelled, rollback and partial-session cleanup re-enter the task lock. The rollback only restores the original position when the task is still in this move's destination lane, so a newer move remains authoritative.
+
 ## Priority Rules on Task Move
 
 When a task moves from one column to another, the IPC handler (`task:move`) checks these conditions in order. The first match wins:
 
 | Priority | Condition | Action |
 |----------|-----------|--------|
-| 1 | Target is **To Do** (role=`todo`) | Kill session, preserve worktree |
+| 1 | Target is **To Do** (role=`todo`) | Kill session, delete session history and worktree, and delete the branch when `git.autoCleanup` is enabled |
 | 2 | Target is **Done** (role=`done`) | Suspend session (resumable), archive task |
 | 2.5 | Target has `auto_spawn=false` (non-todo, non-done) | Suspend session |
-| 3 | Task has **active session** | Permission-mode delta suspends and respawns with the destination's CLI flags. Live injection plan injects into the running session. Model/effort delta without live-swap suspends and respawns. Otherwise keep alive. |
+| 3 | Task has **active session** | Agent, model, session-track, or force-fresh changes can suspend and respawn. An adapter may live-swap an effort change. A permission-only change never restarts a live session. |
 | 4 | Task has **no session** | Resume suspended session (with `auto_command` preloaded as resume prompt) OR create worktree (if enabled) + execute transition action chain |
 
 ### Priority 3: Active Session Handling
 
 Priority 3 has five sub-cases, checked in order:
 
-**a) Agent change (handoff):** If `resolveTargetAgent()` returns a different agent than the current session's agent, the session is suspended and the engine falls through to the `spawnAgent` path. The `agentOverride` parameter is set on the spawn request to prevent the new session from resuming the old agent's session. **Side effect:** per-task `model_override` and `effort_override` are cleared on handoff because override values are model-name-specific and don't carry across agents (Claude's `claude-sonnet-4-6` is meaningless to Codex). This clear is skipped when `task.agent_override` is set, since the user locked the agent at creation and the overrides remain valid for that agent. If the target column has `handoff_context` enabled, prior work context (transcript, git diff, metrics) is packaged and delivered to the new agent. If disabled (the default), the new agent starts fresh with just the task title/description. See [Cross-Agent Handoff](#cross-agent-handoff) below.
+**a) Agent change (handoff):** If `resolveTargetAgent()` returns a different agent than the current session's agent, the session is suspended and the engine falls through to the `spawnAgent` path. The `agentOverride` parameter prevents the target session from resuming the old agent's session. Per-task `model_override` and `effort_override` are cleared on handoff because their values are agent-specific; this clear is skipped when `task.agent_override` locks the agent. Native-history handoff behavior additionally requires a prior session, project context, and enabled destination `handoff_context`. It then attempts to locate the source adapter's native history file and gives the target prompt an optional path reference. Without those conditions, the agent change still spawns normally with no history reference or handoff audit row. See [Cross-Agent Handoff](#cross-agent-handoff) below.
 
-**b) Same agent + permission-mode delta:** If the destination column's EFFECTIVE permission mode (`lane.permission_mode ?? config.agent.permissionMode`) differs from the mode the live session was spawned with (the session record's `permission_mode`, not the source lane), the session is suspended and respawned. No adapter exposes a non-interactive permission-mode switch for a live session (Claude's only mechanism is interactive shift+tab cycling), so this is checked before live injection. The respawn resumes the same agent session id, and the destination's `--permission-mode` / `--model` / `--effort` land as CLI flags. Legacy session records with a null `permission_mode` never trigger this case. A plan-exit auto-move additionally passes a continuation prompt ("Your plan was approved. Proceed with the implementation.") delivered as the resumed session's first message when the destination column has no `auto_command` (the `auto_command` wins when present).
+**b) Same agent + model change:** A model change is the restart marker. The handler suspends the session and continues through Phases 2 and 3, where the resumed spawn applies the destination model, effort, and permission as adapter-built command options. It does not try a live model swap.
 
-**c) Same agent + live injection plan:** If the destination adapter returns a non-null plan from `prepareInjectionPlan` (model/effort slash commands like `/model X` + optional auto_command), the writes are scheduled directly into the running session via `TerminalSubmitScheduler.scheduleKeystrokes`. No suspend/resume cycle occurs. The delta is computed against the session's *recorded running value* (`applied_model` / `applied_effort` on the session record), not the leaving column, so a column whose value the session already has injects nothing. After scheduling, when `plan.appliedSettings` is present the handler persists it via `sessionRepo.updateAppliedSettings`, keeping the recorded value current so the next move diffs against the truth.
+**c) Same agent + effort change:** The adapter decides whether it can apply a concrete effort change live. A live-swap plan is scheduled through `TerminalSubmitScheduler.scheduleKeystrokes`, then its applied settings are persisted on the session record. Without a live-swap capability, a concrete effort delta suspends and respawns so the new setting reaches the adapter command. Deltas compare the session record's `applied_effort`, not the source lane. Entering a default-effort lane does not respawn because resume preserves the existing agent setting.
 
-**d) Same agent + concrete model/effort delta (no live-swap):** If the adapter has no live-swap slash for the target value AND the destination column overrides model or effort to a non-null value the session is not already running at (the delta is computed against the session record's `applied_model` / `applied_effort`, not the source lane), the session is suspended and respawned so the new flags land on the command line. The respawn is skipped when the target value is null (entering a "Default" column) because adapters have no `/model <agent-default>` slash and `--resume <id>` preserves the saved model regardless - the suspend/resume would just churn the PTY without changing anything. Matches the recovery contract in `task-runtime-override.ts`.
+**d) Same agent + permission-only delta:** The live session remains running. A changed lane permission does not restart it, including the Planning to Executing path where the user already approved the plan in the same session. The spawn-time permission record is not a restart signal.
 
-**e) Same agent, no delta or no concrete target:** The session stays alive with no interruption.
+**e) Same agent, no restart condition:** The session stays alive. An adapter may still schedule a configured `auto_command` through its injection plan.
 
 Transition action chains (priority 4) only fire when a task has no active session.
 
@@ -59,7 +69,7 @@ Each action is a record in the `actions` table with a `type` and `config_json`.
 
 ### `spawn_agent`
 
-Builds a Claude CLI command and spawns a PTY session. If a suspended session exists for the task, resumes it instead.
+Resolves the selected `AgentAdapter`, then detects its CLI, ensures trust, builds the command and optional environment, and starts a PTY session. If a compatible suspended session exists for the task, the adapter resumes it instead.
 
 Config:
 | Field | Type | Description |
@@ -164,6 +174,14 @@ The transition engine threads an `AbortSignal` through the execution chain:
 
 If the signal is aborted, the method throws an `AbortError` which the caller catches and ignores (the newer transition takes over). This prevents orphaned PTY processes from accumulating.
 
+## Task-Agent Spawn Chokepoints
+
+Board-driven task-agent entry points, including task move, create into a spawning column, backlog promotion, MCP task creation, and unarchive, call `spawnAgent()` in `src/main/ipc/helpers/agent-spawn.ts`. Startup recovery and reconciliation call `prepareAgentSpawn()` in `src/main/transition-engine/session-startup/prepare-spawn.ts`.
+
+Both chokepoints call `runSpawnPreamble()` in `src/main/transition-engine/spawn-preamble.ts`. The preamble first locks inherited Advanced overrides on the task's first spawn, then resolves the target agent. This keeps first-spawn override behavior and agent selection identical across board-driven and startup paths.
+
+The transition engine receives that resolved agent and uses its `AgentAdapter` contract: `detect`, `ensureTrust`, `buildCommand`, and optional `buildEnv`. It does not build a Claude-specific command outside the adapter. Raw PTY spawns remain only for explicitly non-task-agent paths, including transient command terminals, the renderer-supplied raw session spawn, and the `run_script` transition action.
+
 ## Command Injection
 
 When a task moves to a column with `auto_command` set, the command delivery depends on how the session was started:
@@ -189,7 +207,7 @@ Two special roles affect behavior:
 
 | Role | Behavior |
 |------|----------|
-| `todo` | Task moves here → session killed (not suspended), worktree preserved |
+| `todo` | Task moves here → session killed (not suspended), session history and worktree deleted; branch deleted when `git.autoCleanup` is enabled |
 | `done` | Task moves here → session suspended (resumable), task archived |
 
 All other columns (including Planning, Running, Code Review, etc.) are custom columns with no special role. Their behavior is controlled by `auto_spawn`, `auto_command`, `permission_mode`, and `plan_exit_target_id`.
@@ -218,18 +236,16 @@ New projects get:
 
 ## Cross-Agent Handoff
 
-When a task moves to a column with a different agent (detected by `resolveTargetAgent()` in `src/main/transition-engine/agent-resolver.ts`), a cross-agent handoff occurs:
+An agent change is necessary but not sufficient for native-history handoff. `spawnAgent()` takes the native-history path only when all of these conditions hold: the resolved target agent differs, a prior session record exists, project context is available, and the destination lane enables `handoff_context`. A task-level `agent_override` takes precedence over the lane and therefore prevents a column-driven agent change.
 
-1. **Agent resolution** detects agent change: `resolveTargetAgent()` checks `task.agent_override` first (highest priority - the user's create-time lock), then column `agent_override`, then project `default_agent`, then global fallback (`'claude'`). If the resolved agent differs from the current session's agent, a handoff is triggered. Tasks with a non-null `task.agent_override` never trigger a handoff on column moves - the locked agent supersedes column settings.
-2. **Task-move Priority 3** suspends the current session.
-3. **spawnAgent handoff path** - the `agentOverride` parameter is passed to `executeSpawnAgent()`, which prevents resume of the wrong agent's session.
-4. **HandoffOrchestrator** packages context from the previous session: transcript (from `session_transcripts`), git diff, and session metrics.
-5. **Transition engine** spawns the new agent with a `handoffPromptPrefix` that summarizes the handoff context.
-6. **Post-spawn** - a `handoff-context.md` file is written to the session directory for the new agent to reference.
+1. **Suspend and resolve.** Task Move suspends the source session, and `spawnAgent()` resolves the target adapter.
+2. **Locate native history.** The source adapter attempts to locate its native history file from the prior agent session ID and CWD. The result may be null.
+3. **Prepare the prompt and audit record.** `buildSessionHistoryReference()` supplies the target agent's initial prompt with an optional XML path reference. When the path is unavailable, the reference falls back to git-log guidance. A handoff audit row stores source and target metadata plus the nullable `session_history_path`.
+4. **Spawn and link.** The transition engine starts the target adapter. After a successful spawn, the audit row is linked to the target session record.
 
-Spawn progress phases during handoff: `packaging-handoff` (while context is being assembled), `detecting-agent` (while the target agent CLI is detected), then `starting-agent`.
+There is no synthesized context package, transcript, git diff, metrics package, or generated handoff file. The runtime still emits `packaging-handoff` while preparing this path, followed by `detecting-agent` and `starting-agent`.
 
-Because create-into-spawn-column and unarchive route through the same `spawnAgent` chokepoint as task moves, handoff semantics apply on those paths too: unarchiving a task into a column whose resolved agent differs from `task.agent` packages handoff context when the column's `handoff_context` toggle is enabled, and spawns the new agent fresh (no context) when it is disabled. The full entry-point table lives in [Session Lifecycle](session-lifecycle.md#spawn-entry-points).
+When `handoff_context` is disabled, or another eligibility condition is absent, the agent change follows the normal spawn path with no history reference and no handoff audit row. Create into a spawning column and unarchive share the same `spawnAgent()` eligibility and native-history reference semantics as task moves. The full entry-point table lives in [Session Lifecycle](session-lifecycle.md#spawn-entry-points).
 
 ## See Also
 
