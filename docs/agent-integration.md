@@ -326,7 +326,7 @@ When `nonInteractive` is set, `--print` is added. The agent runs, prints output,
 
 ### Settings Merge
 
-For every session, a merged settings file is built at `.kangentic/sessions/<claudeSessionId>/settings.json` and passed via `--settings`:
+For every Claude Code session, a merged settings file is built at `.kangentic/sessions/<ptySessionId>/settings.json` and passed via `--settings`. `ptySessionId` is the Kangentic `sessions.id` value, distinct from the adapter-native `agent_session_id`:
 
 1. Read `.claude/settings.json` from project root (committed, shared)
 2. Deep-merge `.claude/settings.local.json` from project root (gitignored, personal)
