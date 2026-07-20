@@ -4,7 +4,10 @@
   "version": "0.30.0",
   "description": "Cross-platform desktop Kanban for Claude Code agents",
   "main": ".vite/build/index.js",
-  "repository": "https://github.com/Kangentic/kangentic",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Sevenflanks/kangentic.git"
+  },
   "private": true,
   "workspaces": [
     "packages/launcher",
@@ -14,10 +17,9 @@
     "start": "node scripts/dev.js",
     "package": "npm run rebuild && npm run build && electron-builder --dir",
     "make": "npm run rebuild && npm run build && electron-builder",
-    "make:win": "npm run rebuild && npm run build && electron-builder --win",
+    "make:win": "npm run rebuild && npm run build && electron-builder --win --publish never",
     "make:mac": "npm run rebuild && npm run build && electron-builder --mac",
     "make:linux": "npm run rebuild && npm run build && electron-builder --linux",
-    "publish": "npm run rebuild && npm run build && electron-builder --publish always",
     "postinstall": "node scripts/rebuild-native.js",
     "rebuild": "node scripts/rebuild-native.js",
     "lint": "eslint src/ packages/protocol/src/ --max-warnings 0",
