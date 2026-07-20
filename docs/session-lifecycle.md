@@ -69,7 +69,7 @@ shared spawn preamble `runSpawnPreamble` (`src/main/transition-engine/spawn-prea
 the Advanced overrides on a first-ever spawn (`lockAdvancedOverridesOnFirstSpawn`), then resolve
 the target agent (`resolveTargetAgent`), in that order. Permission mode is resolved by the same
 module's `resolveEffectivePermissionMode` (a lane forcing `plan` always wins, else task -> lane
--> global). Enforced by `.claude/rules/spawn-entry-point-parity.md` +
+-> global). Guarded by root `CLAUDE.md` and
 `tests/unit/spawn-entry-point-parity.test.ts`.
 
 | Entry point | Trigger | Route |
@@ -98,8 +98,8 @@ sessions bypass all of this (not task agents).
    - Pre-populate `~/.claude.json` trust for worktree paths
    - Check for previous suspended session (can resume?)
    - If resuming: use existing `agent_session_id` with `--resume`, no prompt
-   - If fresh: generate new UUID for `agent_session_id`, use `--session-id`, include prompt
-   - Create session directory at `.kangentic/sessions/<agentSessionId>/`
+    - If fresh: generate an adapter-native `agent_session_id` only when the adapter accepts caller-supplied IDs, then include the prompt
+    - Generate a Kangentic PTY session ID and create `.kangentic/sessions/<ptySessionId>/`; this is also the `sessions.id` primary key and is distinct from `agent_session_id`
    - Build agent CLI command via `CommandBuilder`
    - Call `SessionManager.spawn()`
 3. `SessionManager.spawn()`:
@@ -124,7 +124,7 @@ sessions bypass all of this (not task agents).
 
 Session teardown varies by target column:
 
-- **To Do** (role=`todo`) -- full cleanup via `cleanupTaskSession()`: kills the PTY (via `SessionManager.remove()`), deletes session files from disk, deletes all session DB records for the task. The worktree and branch are preserved so code is not lost. Moving back to an active column spawns a fresh session.
+- **To Do** (role=`todo`) -- full cleanup via `cleanupTaskResources()`: kills the PTY, deletes session files and DB records, and removes the worktree. When `git.autoCleanup` is enabled, it also deletes the task branch. Moving back to an active column starts a fresh session and creates a new worktree and branch as needed.
 - **Done** (role=`done`) -- suspends session (preserves for resume via `SessionManager.suspend()`), archives task. The DB record is marked `suspended` so the session can be resumed if the task is later unarchived.
 - **Any column with `auto_spawn=false`** -- suspends session (same as Done, but without archiving).
 
@@ -275,19 +275,17 @@ PTY output is captured for two purposes: terminal display (via the scrollback bu
 
 `TranscriptWriter` (`src/main/pty/buffer/transcript-writer.ts`) receives raw PTY data, strips ANSI escape sequences, and debounces writes to the `session_transcripts` table every 30 seconds, flushing early if a session's pending buffer exceeds 256KB. This provides a clean, searchable text transcript of the session without terminal formatting noise.
 
-The transcript is used during cross-agent handoff: when a task moves to a column with a different agent, the `HandoffOrchestrator` reads the transcript from the database, combines it with git diff and session metrics, and packages it as handoff context for the new agent.
+The PTY transcript is a persistent, searchable terminal record. It is separate from adapter-native conversation history and is not assembled with git or metrics into handoff input.
 
 ## Cross-Agent Handoff
 
-When a task moves to a column where `resolveTargetAgent()` returns a different agent than the current session:
+When a task changes agents, a handoff runs only if a prior session exists and the destination lane enables `handoff_context`. The source adapter then attempts to locate native history from that session's adapter-native `agent_session_id` and CWD. Native history stays in adapter-specific user or project storage, which can be a file, project-level history, or database depending on the adapter and CLI version.
 
-1. The current session is suspended (Priority 3a in the [Transition Engine](transition-engine.md))
-2. The `HandoffOrchestrator` packages context: session transcript (from `session_transcripts`), git diff (changed files), and session metrics (tokens, cost, duration)
-3. A new session is spawned with the target agent, receiving a `handoffPromptPrefix` summarizing the previous agent's work
-4. A `handoff-context.md` file is written to the new session directory for reference
-5. A `handoffs` record is inserted in the database tracking the from/to agents, sessions, and the full context packet
+1. Kangentic inserts a `handoffs` audit record with source and target metadata plus a nullable `session_history_path`.
+2. The target starts a new PTY session. Its initial prompt receives XML instructions with the optional native-history path, not a synthesized transcript, git diff, metrics packet, or `handoff-context.md` file.
+3. After a successful spawn, Kangentic records the target PTY session ID in the audit row.
 
-The handoff is transparent to the user - the task card shows spawn progress phases (`packaging-handoff`, `detecting-agent`, `starting-agent`) and the shimmer overlay lifts when the new agent's TUI is ready.
+The target agent is not required to read the reference. If lookup finds no path, the audit record still exists with a null path and the prompt advises the target to inspect `git log` for prior changes. Parsed structured transcripts and `session_transcripts` remain separate retrieval sources.
 
 ## Output Streaming
 
