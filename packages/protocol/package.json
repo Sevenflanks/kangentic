@@ -2,6 +2,7 @@
   "name": "@kangentic/protocol",
   "version": "0.5.0",
   "description": "Kangentic mobile bridge wire protocol: framing, Noise-based pairing and session handshakes, signed device roster, and capability verbs shared between desktop and mobile.",
+  "private": true,
   "main": "dist/index.cjs",
   "module": "dist/index.mjs",
   "types": "dist/index.d.ts",
@@ -14,7 +15,8 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Kangentic/kangentic.git"
+    "url": "git+https://github.com/Sevenflanks/kangentic.git",
+    "directory": "packages/protocol"
   },
   "keywords": [
     "kangentic",
@@ -34,6 +36,7 @@
   "files": [
     "dist/",
     "LICENSE",
+    "FORK-NOTICE.md",
     "README.md"
   ],
   "scripts": {
