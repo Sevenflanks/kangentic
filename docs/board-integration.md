@@ -83,6 +83,7 @@ class BoardRegistry {
   register(adapter: BoardAdapter): void;
   get(id: ExternalSource): BoardAdapter | undefined;
   getOrThrow(id: ExternalSource): BoardAdapter;
+  requireStable(id: ExternalSource): BoardAdapter;
   has(id: ExternalSource): boolean;
   list(): BoardAdapter[];
 }
@@ -92,7 +93,7 @@ boardRegistry.register(new GitHubIssuesAdapter());
 // ... 6 more
 ```
 
-The registry is a singleton populated at module import time. Adapters self-register their URL parsers via `registerSourceUrlParser()` so user-pasted URLs route to the right provider. Status check (`adapter.status === 'stub'`) is the single gate that prevents stub providers from reaching their throwing method bodies.
+The registry is a singleton populated at module import time. Adapters self-register their URL parsers via `registerSourceUrlParser()` so user-pasted URLs route to the right provider. `boardRegistry.get()` is used for checks and source-label enrichment, where an unknown adapter can be reported or skipped. `requireStable()` is used for fetch and execute, rejecting a stub before its throwing method body is reached.
 
 ## Adding a New Provider
 
@@ -100,7 +101,7 @@ The registry is a singleton populated at module import time. Adapters self-regis
 2. **Union.** Extend `ExternalSource` in `src/shared/types.ts`. Use snake_case for back-compat with existing DB rows, plain lowercase for new providers.
 3. **Register.** Import the new adapter in `src/main/boards/board-registry.ts` and call `boardRegistry.register(new <Provider>Adapter())`.
 4. **URL parser** (optional). If the provider has user-pasted URLs, call `registerSourceUrlParser('<provider>', { parse, buildLabel })` at module load time so the import-source store knows how to handle them.
-5. **No IPC changes.** Dispatch goes through `boardRegistry.getOrThrow(source)` in `src/main/ipc/handlers/backlog.ts`. Adding a provider does not touch this file.
+5. **Generic import dispatch.** Checks and source-label enrichment use `boardRegistry.get(source)`. Fetch and execute use `boardRegistry.requireStable(source)`. Adding a provider does not change `src/main/ipc/handlers/backlog.ts` unless it needs provider-specific IPC, such as Asana credential management.
 
 The contract is locked in by `tests/unit/board-registry.test.ts`, which fails if a new provider is added to the union but not registered, or if any adapter is missing a required field.
 
@@ -116,7 +117,11 @@ The contract is locked in by `tests/unit/board-registry.test.ts`, which fails if
 | Linear | stub | - | Tracked in #482. |
 | Trello | stub | - | Tracked in #483. |
 
-The registry enumerates all 7 providers. Stable providers dispatch normally; stub providers (`jira`, `linear`, `trello`) are rendered as "coming soon" in the settings UI, and IPC handlers short-circuit them before any throwing method runs.
+The registry enumerates all 7 providers. GitHub Issues, GitHub Projects, Azure DevOps, and Asana are stable. Jira, Linear, and Trello are stubs and are rendered as "coming soon" in the settings UI. Fetch and execute reject stubs through `requireStable()` before any throwing method runs.
+
+## Asana Credential IPC Exception
+
+Import checks, fetches, execution, and source management are generic backlog handlers. Asana is the current provider-specific exception because its Personal Access Token lifecycle has adapter-local IPC in `src/main/boards/adapters/asana/ipc-handlers.ts`. `registerBacklogHandlers()` registers its `boards:asana:authStatus`, `boards:asana:setPat`, and `boards:asana:clearCredential` channels. The adapter validates a token against Asana and stores or clears the credential; these operations are not part of the generic import handler surface.
 
 ## See Also
 
