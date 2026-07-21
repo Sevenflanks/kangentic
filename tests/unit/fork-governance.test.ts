@@ -5,6 +5,8 @@ import { z } from 'zod';
 
 const REPO_ROOT = path.resolve(__dirname, '../..');
 const GOVERNANCE_DOCUMENT_PATH = path.join(REPO_ROOT, 'docs', 'fork-governance.md');
+const OVERVIEW_DOCUMENT_PATH = path.join(REPO_ROOT, 'docs', 'overview.md');
+const WORKTREE_STRATEGY_DOCUMENT_PATH = path.join(REPO_ROOT, 'docs', 'worktree-strategy.md');
 const BOARD_CONFIG_PATH = path.join(REPO_ROOT, 'kangentic.json');
 const PACKAGE_MANIFEST_PATH = path.join(REPO_ROOT, 'package.json');
 const LICENSE_PATH = path.join(REPO_ROOT, 'LICENSE');
@@ -180,6 +182,21 @@ describe('fork governance contract', () => {
     });
     expect(release.macosPackaging).toBe('retained-upstream-development-only-unapproved');
     expect(release.linuxPackaging).toBe('retained-upstream-development-only-unapproved');
+  });
+
+  it('keeps distribution and live-session transition documentation within the fork contract', () => {
+    // Given the overview and worktree lifecycle documentation
+    const overview = readRequiredFile(OVERVIEW_DOCUMENT_PATH);
+    const worktreeStrategy = readRequiredFile(WORKTREE_STRATEGY_DOCUMENT_PATH);
+
+    // When distribution and same-session active-column transitions are described
+    // Then the fork approval boundary and live injection behavior remain explicit
+    expect(overview).not.toContain('Native installers for Windows (NSIS), macOS (DMG), and Linux (deb/rpm).');
+    expect(overview).toContain('Only approved fork distribution: local unsigned Windows `npm run make:win`.');
+    expect(worktreeStrategy).not.toContain('suspend and resume with command as prompt');
+    expect(worktreeStrategy).toMatch(
+      /same-track, same-agent, same-model live session stays live and injects\s+supported auto_command and effort changes/,
+    );
   });
 
   it('keeps repository-local .claude absent while supporting content in external user projects', () => {

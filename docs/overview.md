@@ -64,7 +64,7 @@ Attach actions to any column transition: spawn agents, send commands, run shell 
 
 ### Cross-Platform
 
-Native installers for Windows (NSIS), macOS (DMG), and Linux (deb/rpm). Kangentic adapts to the local shell environment - PowerShell, bash, zsh, fish, nushell, WSL, and cmd are all supported.
+Kangentic runs across Windows, macOS, and Linux and adapts to the local shell environment - PowerShell, bash, zsh, fish, nushell, WSL, and cmd are all supported. Only approved fork distribution: local unsigned Windows `npm run make:win`; retained macOS DMG and Linux deb/rpm targets are unsupported, unverified, and unapproved upstream development tooling.
 
 ### Real-Time Terminal
 
