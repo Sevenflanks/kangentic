@@ -78,6 +78,8 @@ export interface CommandOptions {
 /** Agent-agnostic spawn options - renames `cliPath` to `agentPath`. */
 export type SpawnCommandOptions = Omit<CommandOptions, 'cliPath'> & { agentPath: string };
 
+export type InitialPromptDelivery = 'command-argument' | 'terminal-submit';
+
 /** Interface that every agent adapter must implement. */
 export interface AgentAdapter {
   /** Unique identifier for this agent type (e.g. 'claude', 'codex', 'aider'). */
@@ -138,6 +140,8 @@ export interface AgentAdapter {
 
   /** Build the shell command string to spawn the agent. */
   buildCommand(options: SpawnCommandOptions): string;
+
+  readonly initialPromptDelivery?: InitialPromptDelivery;
 
   /**
    * Build adapter-specific environment variables to inject into the PTY

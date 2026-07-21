@@ -1,4 +1,4 @@
-import { quoteArg, isUnixLikeShell } from '../../../../shared/paths';
+import { quoteArg } from '../../../../shared/paths';
 import { interpolateTemplate } from '../../shared/template-utils';
 import { buildHooks } from './hook-manager';
 import type { PermissionMode } from '../../../../shared/types';
@@ -27,19 +27,13 @@ export interface OpenCodeCommandOptions {
  * Build the shell command string that spawns OpenCode in interactive
  * TUI mode. CLI surface (verified against /anomalyco/opencode docs):
  *
- *   opencode [--session <id>] [--prompt <text>] [--model <provider/model>]
+ *   opencode [--session <id>] [--model <provider/model>]
  *
  * Important shape constraints:
  *
- * - The TUI's positional argument is a PROJECT DIRECTORY, not a prompt.
- *   Initial prompts must go through `--prompt <text>`, otherwise
- *   OpenCode tries to chdir into the prompt text. The PTY layer already
- *   sets the shell cwd, so we never emit a positional/`--dir` value.
- *
  * - Resume uses `--session <id>` (alias `-s`). The flag is part of the
  *   TUI command (the docs list it under "TUI - Terminal User
- *   Interface"), not the `run` subcommand. We omit `--prompt` when
- *   resuming so the user can continue the prior conversation.
+ *   Interface"), not the `run` subcommand.
  *
  * - There is no `--dangerously-skip-permissions` flag in TUI mode.
  *   That flag is only documented for `opencode run` (non-interactive).
@@ -96,16 +90,6 @@ export class OpenCodeCommandBuilder {
     // Per-column model override (format: provider/model, e.g., anthropic/claude-sonnet)
     if (options.model && options.model.trim().length > 0) {
       parts.push('--model', quoteArg(options.model.trim(), shell));
-    }
-
-    if (options.prompt) {
-      const needsDoubleQuoteReplacement = shell
-        ? !isUnixLikeShell(shell)
-        : process.platform === 'win32';
-      const safePrompt = needsDoubleQuoteReplacement
-        ? options.prompt.replace(/"/g, "'")
-        : options.prompt;
-      parts.push('--prompt', quoteArg(safePrompt, shell, { multiline: true }));
     }
 
     return parts.join(' ');

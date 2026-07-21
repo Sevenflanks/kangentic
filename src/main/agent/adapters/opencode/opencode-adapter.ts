@@ -84,6 +84,7 @@ export class OpenCodeAdapter implements AgentAdapter {
   readonly displayName = 'OpenCode';
   readonly sessionType = 'opencode_agent';
   readonly supportsCallerSessionId = false;
+  readonly initialPromptDelivery = 'terminal-submit' as const;
   // OpenCode's autonomy is expressed through "agents" (Build, Plan,
   // and any custom agents the user defines in opencode.json), cycled
   // at runtime via Tab. We expose those native concepts directly

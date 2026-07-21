@@ -52,7 +52,6 @@ vi.mock('../../src/main/agent/shared/bridge-utils', () => ({
 
 import { CodexCommandBuilder } from '../../src/main/agent/adapters/codex';
 import { AiderAdapter } from '../../src/main/agent/adapters/aider';
-import { OpenCodeCommandBuilder } from '../../src/main/agent/adapters/opencode';
 import { KimiCommandBuilder } from '../../src/main/agent/adapters/kimi';
 import { DroidCommandBuilder } from '../../src/main/agent/adapters/droid';
 import { WarpAdapter } from '../../src/main/agent/adapters/warp';
@@ -95,19 +94,6 @@ describe('Adapter multiline prompt - regression guard for { multiline: true }', 
     const adapter = new AiderAdapter();
     const command = adapter.buildCommand({
       agentPath: '/usr/bin/aider',
-      taskId: 'task-1',
-      cwd: '/project',
-      permissionMode: 'default',
-      shell: 'bash',
-      prompt: MULTILINE_XML,
-    });
-    expect(command).toContain(EXPECTED_FRAGMENT);
-  });
-
-  it('OpenCodeCommandBuilder preserves newlines in prompt under bash', () => {
-    const builder = new OpenCodeCommandBuilder();
-    const command = builder.buildOpenCodeCommand({
-      opencodePath: '/usr/bin/opencode',
       taskId: 'task-1',
       cwd: '/project',
       permissionMode: 'default',
