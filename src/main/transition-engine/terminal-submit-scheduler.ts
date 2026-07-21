@@ -113,6 +113,7 @@ export class TerminalSubmitScheduler {
     const session = this.sessionManager.getSession(sessionId);
     if (!session) return;
 
+    this.cancel(taskId);
     const status: SessionStatus = session.status;
     let isQueued: boolean;
     switch (status) {
@@ -131,7 +132,6 @@ export class TerminalSubmitScheduler {
       }
     }
 
-    this.cancel(taskId);
     const entry: PendingContent = {
       controller: new AbortController(),
       cleanup: () => undefined,

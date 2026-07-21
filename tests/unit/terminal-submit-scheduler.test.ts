@@ -478,6 +478,52 @@ describe('TerminalSubmitScheduler', () => {
       expect(terminalSubmit.calls).toHaveLength(0);
     });
 
+    it.each([
+      'exited',
+      'suspended',
+    ] satisfies readonly SessionStatus[])('cancels pending content and its follower when the same task reruns against %s status', async (status) => {
+      sessionManager.registry.set('running-session', { status: 'running' });
+      sessionManager.registry.set('inactive-session', { status });
+
+      scheduler.scheduleContent('task-1', 'running-session', 'old content');
+      scheduler.scheduleKeystrokes('task-1', 'running-session', ['/old-follower']);
+
+      scheduler.scheduleContent('task-1', 'inactive-session', 'inactive rerun');
+      sessionManager.emitFirstOutput('running-session');
+      await tick();
+      terminalSubmit.finishContentLatest();
+      await tick();
+
+      expect(terminalSubmit.contentCalls).toHaveLength(0);
+      expect(terminalSubmit.calls).toHaveLength(0);
+      expect(sessionManager.eventNames()).toEqual([]);
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it.each([
+      'exited',
+      'suspended',
+    ] satisfies readonly SessionStatus[])('aborts in-flight content and drops its follower when the same task reruns against %s status', async (status) => {
+      sessionManager.registry.set('running-session', { status: 'running' });
+      sessionManager.registry.set('inactive-session', { status });
+
+      scheduler.scheduleContent('task-1', 'running-session', 'old content');
+      sessionManager.emitFirstOutput('running-session');
+      await tick();
+      scheduler.scheduleKeystrokes('task-1', 'running-session', ['/old-follower']);
+      const oldContent = terminalSubmit.contentCalls[0];
+
+      scheduler.scheduleContent('task-1', 'inactive-session', 'inactive rerun');
+      terminalSubmit.finishContentLatest();
+      await tick();
+
+      expect(oldContent.aborted).toBe(true);
+      expect(terminalSubmit.contentCalls).toHaveLength(1);
+      expect(terminalSubmit.calls).toHaveLength(0);
+      expect(sessionManager.eventNames()).toEqual([]);
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
     it('drops the follower and cleans task state when submitContent fails', async () => {
       vi.spyOn(console, 'error').mockImplementation(() => undefined);
       sessionManager.registry.set('s1', { status: 'running' });
