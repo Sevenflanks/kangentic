@@ -76,7 +76,7 @@ export function createTransitionEngine(
   projectPath: string | null,
 ): TransitionEngine {
   return new TransitionEngine(
-    context.sessionManager, context.terminalSubmit, actions, tasks,
+    context.sessionManager, context.terminalSubmit, context.terminalSubmitScheduler, actions, tasks,
     () => {
       const config = context.configManager.getEffectiveConfig(projectPath || undefined);
       const gitConfig = { ...config.git };

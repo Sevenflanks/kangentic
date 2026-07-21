@@ -77,11 +77,12 @@ function makeEngine(options: { autoCleanup?: boolean } = {}) {
   const engine = new TransitionEngine(
     sessionManager as unknown as EngineArgs[0],
     { submitKeystrokes: vi.fn() } as unknown as EngineArgs[1],
-    actionRepo as unknown as EngineArgs[2],
-    taskRepo as unknown as EngineArgs[3],
-    getConfig as unknown as EngineArgs[4],
-    { getLatestForTask: vi.fn(() => null) } as unknown as EngineArgs[5],
-    { getPathsForTask: vi.fn(() => []) } as unknown as EngineArgs[6],
+    { scheduleContent: vi.fn() } as unknown as EngineArgs[2],
+    actionRepo as unknown as EngineArgs[3],
+    taskRepo as unknown as EngineArgs[4],
+    getConfig as unknown as EngineArgs[5],
+    { getLatestForTask: vi.fn(() => null) } as unknown as EngineArgs[6],
+    { getPathsForTask: vi.fn(() => []) } as unknown as EngineArgs[7],
   );
 
   return { engine, taskRepo, sessionManager };
