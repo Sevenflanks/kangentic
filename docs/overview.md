@@ -2,7 +2,7 @@
 
 ## What is Kangentic?
 
-Kangentic is a cross-platform desktop Kanban application purpose-built for orchestrating AI coding agents. It supports Claude Code, Codex CLI, Gemini CLI, Cursor CLI, GitHub Copilot CLI, Aider, and Oz CLI (Warp). Dragging a task card between columns can spawn, suspend, resume, or terminate agent sessions - turning a familiar Kanban workflow into a powerful multi-agent control plane.
+Kangentic is a cross-platform desktop Kanban application purpose-built for orchestrating AI coding agents. It supports twelve agent adapters: Claude Code, Codex CLI, Gemini CLI, Aider, Cursor CLI, Oz CLI, GitHub Copilot CLI, OpenCode, Qwen Code, Kimi Code, Droid, and Ollama. Dragging a task card between columns can spawn, suspend, resume, or terminate sessions, turning a familiar Kanban workflow into a powerful multi-agent control plane.
 
 ## The Problem
 
@@ -10,21 +10,21 @@ Working with multiple AI coding agent sessions simultaneously is difficult. Deve
 
 ## The Solution
 
-Kangentic replaces terminal tab chaos with a drag-and-drop board. Each task card represents a unit of work. Moving a card into a column triggers configurable actions - spawning an agent, sending it a command, suspending it, or tearing it down. Different columns can use different agents, and context is automatically handed off when a task moves between agents. The board becomes the single interface for seeing what every agent is doing and controlling what happens next.
+Kangentic replaces terminal tab chaos with a drag-and-drop board. Each task card represents a unit of work. Moving a card into a column triggers configurable actions: spawning an adapter-resolved session, sending it a command, suspending it, or tearing it down. Board-driven spawn resolves an adapter through task, column, project, and global precedence, then uses the shared spawn pipeline. Different columns can use different adapters. The board becomes the single interface for seeing what every session is doing and controlling what happens next.
 
 ## Key Features
 
 ### Multi-Agent Support
 
-Orchestrate Claude Code, Codex CLI, Gemini CLI, Cursor CLI, GitHub Copilot CLI, Aider, and Oz CLI (Warp) from a single board. Set a default agent per project, or override it per column. When a task moves between columns with different agents, Kangentic automatically packages the outgoing agent's context (transcript, git changes, metrics) and hands it off to the incoming agent. No manual copy-paste between tools.
+Orchestrate Claude Code, Codex CLI, Gemini CLI, Aider, Cursor CLI, Oz CLI, GitHub Copilot CLI, OpenCode, Qwen Code, Kimi Code, Droid, and Ollama from a single board. Set a default adapter per project, or override it per column. Cross-agent history passthrough needs an agent change, an existing session, and the destination column's `handoff_context` option. When those conditions hold, the target's initial prompt includes a reference to the source adapter's resolved native history when available. Kangentic does not inline full history or synthesize transcript, git, or metrics context, and the target agent may not read the reference.
 
 ### Visual Agent Orchestration
 
-Drag a task card into an active column to spawn an agent. Drag it to Done to terminate the session. Drag it back to To Do to suspend. Every column transition is an orchestration event.
+Drag a task card into an active column to spawn a session through the resolved adapter. Drag it to Done to suspend and archive its resumable session state while deleting the worktree and preserving the branch. Drag it back to To Do for a full reset that deletes the session history and worktree; the branch is also deleted when `git.autoCleanup` is enabled. Every column transition is an orchestration event.
 
 ### Backlog & Import
 
-Stage tasks in a backlog before promoting them to the board. Import issues from GitHub Issues, GitHub Projects, and Azure DevOps with full metadata (descriptions, labels, attachments, comments). Multi-select items for bulk operations, drag to reorder, and right-click for context menus. See the [User Guide](user-guide.md#backlog) for details.
+Stage tasks in a backlog before promoting them to the board. Import issues from GitHub Issues, GitHub Projects, Azure DevOps, and Asana with full metadata (descriptions, labels, attachments, comments). Multi-select items for bulk operations, drag to reorder, and right-click for context menus. See the [User Guide](user-guide.md#backlog) for details.
 
 ### Board Filtering
 
@@ -64,7 +64,7 @@ Attach actions to any column transition: spawn agents, send commands, run shell 
 
 ### Cross-Platform
 
-Native installers for Windows (NSIS), macOS (DMG), and Linux (deb/rpm). Kangentic adapts to the local shell environment - PowerShell, bash, zsh, fish, nushell, WSL, and cmd are all supported.
+Kangentic runs across Windows, macOS, and Linux and adapts to the local shell environment - PowerShell, bash, zsh, fish, nushell, WSL, and cmd are all supported. Only approved fork distribution: local unsigned Windows `npm run make:win`; retained macOS DMG and Linux deb/rpm targets are unsupported, unverified, and unapproved upstream development tooling.
 
 ### Real-Time Terminal
 
@@ -89,16 +89,16 @@ Ten built-in themes: Dark, Light, Moon, Forest, Ocean, Ember, Sand, Mint, Sky, a
 ## How It Works
 
 1. **Create a board** with columns representing your workflow stages (To Do, In Progress, Review, Done, or any custom stages).
-2. **Add task cards** describing units of work - features, bugs, refactors. Create them directly on the board, stage them in the backlog, or import them from GitHub Issues, GitHub Projects, or Azure DevOps.
-3. **Drag a card** into an active column. Kangentic spawns a Claude Code CLI session, passes it the task description as a prompt, and begins streaming terminal output.
+2. **Add task cards** describing units of work: features, bugs, refactors. Create them directly on the board, stage them in the backlog, or import them from GitHub Issues, GitHub Projects, Azure DevOps, or Asana.
+3. **Drag a card** into an active column. Kangentic resolves the selected adapter and starts it through the shared spawn pipeline, passing the task description as its prompt and streaming terminal output.
 4. **Monitor progress** via the embedded terminal, activity indicators, and board-level status at a glance. Filter by priority or label to focus on what matters.
 5. **Drag the card forward** through your workflow. Each transition can trigger additional actions - commands, scripts, webhooks.
-6. **Drag to Done** to complete and terminate the session, or back to To Do to suspend it for later.
+6. **Drag to Done** to suspend and archive resumable session state while deleting the worktree and preserving the branch, or back to To Do for a full reset that deletes session history and the worktree, plus the branch when `git.autoCleanup` is enabled.
 
 ## What Kangentic Is Not
 
 - **Not a task tracker.** It is not Jira, Linear, or Trello. There are no sprints, story points, or grooming features. The board exists to control agents, not to manage project management metadata.
-- **Not a CI system.** It does not run pipelines, deploy artifacts, or manage environments. It orchestrates interactive Claude Code sessions on your local machine.
+- **Not a CI system.** It does not run pipelines, deploy artifacts, or manage environments. It orchestrates interactive adapter-driven sessions on your local machine.
 - **Not a wrapper around a web API.** Kangentic works with agent CLIs directly. It spawns real terminal sessions with full PTY support.
 
 Kangentic is an **agent orchestration desktop app** - a visual control surface for running multiple AI coding agents in parallel.
@@ -112,7 +112,7 @@ Kangentic is an **agent orchestration desktop app** - a visual control surface f
 | Backend      | better-sqlite3, node-pty, simple-git             |
 | Build        | Vite (renderer), esbuild (main), electron-builder |
 | Testing      | Playwright (E2E + UI), Vitest (unit)              |
-| Distribution | NSIS (Windows), DMG (macOS), deb/rpm (Linux)      |
+| Distribution | Only approved fork distribution: local unsigned Windows `npm run make:win`. Retained macOS DMG and Linux deb/rpm targets are unsupported, unverified, and unapproved upstream development tooling. |
 
 ## Target Audience
 

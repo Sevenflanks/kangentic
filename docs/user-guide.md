@@ -16,13 +16,13 @@ New projects start with seven columns:
 
 | Column | Role | Behavior |
 |--------|------|----------|
-| **To Do** | todo | Holding area. No agent runs here. Moving a task here kills its session. |
-| **Planning** | (plan mode) | Spawns Claude in plan mode. Agent creates a plan, then task auto-moves to Executing. |
-| **Executing** | (auto) | Spawns Claude in default permission mode. Agent works on the task. |
+| **To Do** | todo | Holding area. No agent runs here. Moving a task here deletes its session history and worktree; the branch is also deleted when **git.autoCleanup** is enabled. |
+| **Planning** | (plan mode) | Spawns the resolved adapter in plan mode. The adapter creates a plan, then the task auto-moves to Executing. |
+| **Executing** | (auto) | Spawns the resolved adapter in its default permission mode. The adapter works on the task. |
 | **Code Review** | (auto) | Agent keeps running. Can attach an auto-command for review prompts. |
 | **Tests** | (auto) | Agent keeps running. Can attach an auto-command (e.g. open a PR and drive its checks green). |
 | **Ship It** | (auto) | Agent keeps running. Can attach an auto-command (e.g. merge a verified PR and pull back). |
-| **Done** | done | Suspends the session (preserving context) and archives the task. |
+| **Done** | done | Suspends and archives the session's resumable state while deleting the worktree. |
 
 ## Task Lifecycle
 
@@ -40,7 +40,7 @@ Click **Advanced** in the New Task dialog (or in the task detail edit form for a
 
 | Field | Description |
 |-------|-------------|
-| **Agent** | Pick a specific agent CLI (Claude, Codex, etc.) for this task. Defaults to the destination column's agent override, then the project default. Hidden when only one agent is detected on the machine. |
+| **Agent** | Pick a specific supported agent adapter (Claude, Codex, Ollama, etc.) for this task. Defaults to the destination column's adapter override, then the project default. Hidden when only one adapter is detected on the machine. |
 | **Model** | Adapter-specific model identifier (e.g. `opus`, `sonnet`, `claude-opus-4-8`). The dropdown is fed by the shared model cache. For Claude, the list is populated both by scanning past session transcripts and by harvesting the CLI's own `/model` picker through a hidden background probe, so newly shipped models surface without first being used in a session. |
 | **Effort** | Adapter-specific reasoning tier (Claude: `low`, `medium`, `high`, `xhigh`, `max`). Only shown when the agent reports effort levels. |
 
@@ -48,14 +48,14 @@ A per-task pick **stays with the task across column moves** - column settings ar
 
 Before the first spawn, the task detail dialog also shows a slim **pre-spawn context bar** with the same Model and Effort pills. Set them there to avoid the spawn -> cancel -> restart loop: the picker writes the override to the DB, and `prepare-spawn` picks it up on the next agent launch.
 
-When an agent is already running, the same Model / Effort pills appear in the live context bar below the terminal. Picking a value there delivers the change to the running session via the adapter's slash-command injection sequence when it supports live model changes (Claude's `/model`), or suspends and respawns when it does not.
+When an agent is already running, the same Model / Effort pills appear in the live context bar below the terminal. A concrete Model selection suspends and respawns the session with the resolved launch flag. Effort applies live only when the adapter supports it; an unsupported concrete effort selection suspends and respawns.
 
 ### Spawn an Agent
 
 Drag a task from To Do to any active column (Planning, Executing, etc.). Kangentic will:
 
 1. Create a git worktree for the task (if worktrees are enabled)
-2. Spawn a Claude Code CLI session with the task title and description as the prompt
+2. Resolve an adapter through task, column, project, and global precedence, then start it through the shared spawn pipeline with the task title and description as the prompt
 3. The task card shows a spinner while the agent is thinking
 
 ### Monitor Progress
@@ -73,11 +73,11 @@ Drag a task from To Do to any active column (Planning, Executing, etc.). Kangent
 
 ### Move Between Active Columns
 
-Dragging between active columns (e.g., Executing to Code Review) keeps the session alive when the target has no `auto_command`. If the target column has an `auto_command` configured (e.g., `/code-review`), the session is suspended and resumed with the command as the resume prompt. Permission mode differences alone do not cause a suspend/resume cycle.
+Dragging between active columns (e.g., Executing to Code Review) normally keeps the same live agent session alive and injects the target column's `auto_command` (e.g., `/code-review`) directly into it. A move can require a respawn when the session track changes, the target requires a fresh session, or the agent or model changes. An adapter that cannot live-apply a concrete effort value may also respawn to apply it at launch. Permission mode differences alone do not restart the session, and a move with no applicable setting or command change keeps it alive.
 
 ### Complete a Task
 
-Drag to Done. The worktree directory is removed to reclaim disk, the session is suspended (not destroyed), the task is archived, and the conversation ID is preserved. The branch is deleted too when **git.autoCleanup** is on (the default) and kept when it is off. A clean move happens silently; a confirmation dialog appears only when the move would destroy real work - uncommitted files, or commits that exist only on the local branch about to be deleted - and it spells out exactly what is at risk (worktree deleted, branch kept or deleted, session history kept). If you later unarchive the task and drag it to an active column, Kangentic recreates the worktree and the agent resumes with full conversation context.
+Drag to Done. The worktree directory is removed to reclaim disk, the session is suspended rather than destroyed, the task is archived, and its resumable state and branch are preserved. A clean move happens silently; a confirmation dialog appears only when the move would destroy real work, and it spells out exactly what is at risk. If you later unarchive the task and drag it to an active column, Kangentic recreates the worktree and resumes the agent from its preserved session state.
 
 Clicking a completed task opens a session summary showing: duration, model, cost, token usage, tool call count, files changed, and lines added/removed. A collapsible "By tool" section breaks the count down per tool name (calls, total duration, average duration, plus a Failed column when any tool was interrupted). Cost / input / output columns appear only for adapters that emit per-tool telemetry. The Done column also supports searching completed tasks by title and sorting by date, cost, tokens, or duration.
 
@@ -93,7 +93,7 @@ Right-click any task card on the board to open a context menu with:
 
 ### Return to To Do
 
-Drag to To Do to reset the task to "not started": the session is killed and its history wiped, and the worktree is removed (the branch too, when **git.autoCleanup** is on). When the reset would destroy pending changes, a confirmation dialog warns that the worktree and session history will be lost before anything happens. If you drag back to an active column, a fresh session starts in a fresh worktree.
+Drag to To Do to reset the task to "not started": the session is killed, its history is wiped, and the worktree is removed. When **git.autoCleanup** is enabled, the task branch is removed too; otherwise the Git branch remains but the task no longer tracks it. A confirmation dialog appears before pending work would be destroyed. If you drag back to an active column, Kangentic creates a fresh session, worktree, and branch as needed.
 
 ## Terminal Panel
 
@@ -243,6 +243,7 @@ Click **Import** in the backlog toolbar to pull tasks from external project mana
 - **GitHub Issues** - import issues from any GitHub repository
 - **GitHub Projects** - import items from a GitHub Project board
 - **Azure DevOps Work Items** - import work items from Azure DevOps boards, sprints, or backlogs
+- **Asana** - import tasks from Asana projects
 
 **Prerequisites:**
 - **GitHub:** The `gh` CLI must be installed and authenticated. For GitHub Projects, the `project` scope is required (`gh auth refresh -s project`).
@@ -250,7 +251,7 @@ Click **Import** in the backlog toolbar to pull tasks from external project mana
 
 **Adding a source:**
 1. Click **Import** > **Add Source**
-2. Choose a provider (GitHub or Azure DevOps) and source type
+2. Choose a provider (GitHub, Azure DevOps, or Asana) and source type
 3. Paste the full URL (e.g., `https://github.com/owner/repo`, `https://github.com/orgs/owner/projects/1`, or `https://dev.azure.com/org/project`)
 4. Click **Connect** - Kangentic verifies CLI authentication and saves the source
 5. For Azure DevOps sprint URLs, items are automatically scoped to that sprint's iteration path
@@ -313,7 +314,7 @@ Click the column header's settings icon. You can configure:
 | **Auto Command** | Command injected into running sessions when tasks arrive |
 | **Plan Exit Target** | For plan-mode columns: where tasks move when planning completes |
 
-When a column's agent override differs from the current session's agent, moving a task into that column triggers a cross-agent handoff. The outgoing agent's context (transcript, git changes, metrics) is automatically packaged and delivered to the incoming agent.
+When a column's adapter override differs from the current session's adapter, a cross-agent history passthrough requires that agent change, an existing session, and the destination column's `handoff_context` option. When enabled, the target's initial prompt receives a reference to adapter-resolved native history when available. Kangentic does not inline full history or synthesize transcript, git, or metrics context, and the target agent may not read the reference.
 
 ### Reorder Columns
 
@@ -385,12 +386,12 @@ The context bar is a status line displayed below the terminal showing session me
 
 | Setting | Description |
 |---------|-------------|
-| Default Agent | Which agent CLI to use for new sessions in this project. Supported agents: Claude Code, Codex CLI, Gemini CLI, Qwen Code, Kimi Code, OpenCode, Droid (Factory), Cursor CLI, GitHub Copilot CLI, Aider, Oz CLI (Warp). Per-project setting. |
+| Default Agent | Which supported agent adapter to use for new sessions in this project. Supported adapters: Claude Code, Codex CLI, Gemini CLI, Aider, Cursor CLI, Oz CLI, GitHub Copilot CLI, OpenCode, Qwen Code, Kimi Code, Droid, Ollama. Per-project setting. |
 | CLI Path | Path to agent CLI binary (auto-detected if empty) |
 | Idle Timeout (minutes) | Auto-suspend sessions after N minutes idle; 0 to disable |
 | Permissions | Default permission mode for all sessions. Options vary by agent (e.g., Claude Code has Plan, Don't Ask, Default, Accept Edits, Auto, and Bypass; Aider has Interactive and Auto-Approve) |
 
-All permission modes are available in both the global App Settings dropdown and the per-column Edit Column dialog. The dropdown shows only the modes supported by the active agent. Each column can override the project default agent via the Edit Column dialog. When a task moves between columns with different agents, a context handoff occurs automatically - see [Column Management](#column-management) above.
+All permission modes are available in both the global App Settings dropdown and the per-column Edit Column dialog. The dropdown shows only the modes supported by the active adapter. Each column can override the project default adapter via the Edit Column dialog. Cross-agent history passthrough is opt in and follows the conditions described in [Column Management](#column-management).
 
 ### Git Settings
 
@@ -398,7 +399,7 @@ All permission modes are available in both the global App Settings dropdown and 
 |---------|-------------|
 | Worktrees Enabled | Create isolated branches per task |
 | Auto Cleanup | Delete branches when worktrees are removed |
-| Default Base Branch | Branch to create worktrees from (default: main) |
+| Default Base Branch | Branch to create worktrees from. Product fallback is `main`; a repository `kangentic.json` may override it. |
 | Copy Files | Files to copy from repo root into worktrees |
 | Post-Worktree Script | Shell script run in each new worktree after creation (e.g. `npm install`). A non-zero exit or timeout fails worktree creation |
 | Link node_modules | Symlink the root `node_modules` into each worktree to skip a fresh install (on by default). Turn off to let the Post-Worktree Script install the worktree's own dependencies |
@@ -490,6 +491,8 @@ Priority order:
 3. `kangentic.json` `defaultBaseBranch` (team-shared, overridable via `kangentic.local.json`)
 4. Per-user `git.defaultBaseBranch` (default: `main`)
 
+產品在沒有 repository override 時以 `main` 作為 fallback。本 fork 的 `kangentic.json` 明確將 `defaultBaseBranch` 設為 `sevenflanks-main`，因此在此 repository 建立一般 task worktree 時會使用 `sevenflanks-main`。這不改變其他專案的 `main` fallback。
+
 ## Session Queue
 
 When the max concurrent sessions limit is reached, new sessions are queued automatically. Queued tasks show a "Queued" indicator on their card. When a running session exits or is suspended, the next queued session promotes automatically (FIFO order).
@@ -534,7 +537,7 @@ The Developer tab exposes power-user diagnostics for the activity-detection subs
 |---------|-------------|
 | Activity Engine Debug Overlay | Show a floating overlay with live activity-engine state for every running session: current `ActivityReason`, raw counters (pending tools, subagent depth, background shells), and a ring buffer of recent state transitions. Toggle from anywhere with Ctrl+Shift+D. Polls every 2 seconds while open; lazy-disables the IPC when closed. |
 
-## CLI
+## Upstream CLI
 
 Open a project directly from the terminal:
 
@@ -543,7 +546,7 @@ npx kangentic /path/to   # Open a specific project path
 npx kangentic            # No path: reopen your last project
 ```
 
-If the project doesn't exist yet, it's created automatically. Without a path, Kangentic reopens the project you last had active (or shows the welcome screen on a first run).
+這些 `npx kangentic` 指令是 upstream 發行版行為，會取得 `Kangentic/kangentic`，不會安裝或啟動此 fork。需要此 fork 時，請從來源執行，或自行建置本機 Windows installer。upstream 版本中，若 project 不存在會自動建立；未提供 path 時，會重開上次使用的 project，首次執行則顯示 welcome screen。
 
 ## Session Persistence
 

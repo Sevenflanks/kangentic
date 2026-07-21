@@ -203,7 +203,7 @@ IPC channels for shortcuts are in the Board Config group: `boardConfig:getShortc
 | `contextBar.showProgressBar` | boolean | `true` | Show the context window progress bar |
 | `contextBar.showRateLimits` | boolean | `true` | Show adapter-reported plan-usage quota bars. Each window is self-described by the agent adapter (e.g. Claude reports a 5-hour session and 7-day weekly window). Hidden for adapters that do not report rate limits. |
 
-The model and effort pills are intentionally NOT toggleable. They double as in-place picker triggers (clicking them opens a popover that lets the user switch models/effort without restarting the session), so a "hide" toggle would silently disable that feature. They render whenever a session reports a model.
+The model and effort pills are intentionally NOT toggleable. They double as in-place picker triggers: selecting a model can suspend and respawn the session, while selecting effort is live only when the adapter supports that concrete effort change. A "hide" toggle would silently disable those controls. They render whenever a session reports a model.
 
 All context bar settings are global-only and cannot be overridden per-project.
 
@@ -335,7 +335,7 @@ Each swimlane has its own overrides (stored in the per-project DB):
 | `auto_command` | string \| null | null | Command injected into running session on task arrival |
 | `plan_exit_target_id` | string \| null | null | Target column when plan-mode agent exits |
 | `agent_override` | string \| null | null | Agent CLI override for sessions spawned in this column |
-| `model_override` | string \| null | null | Adapter-specific model identifier passed at spawn time (e.g. Claude `--model opus`). Live-applied via `/model` slash on column transition when supported. |
+| `model_override` | string \| null | null | Adapter-specific model identifier passed at spawn time (e.g. Claude `--model opus`). A concrete model change on an automated path suspends and respawns the active session with the resolved model flag; it is never live-applied via `/model`. |
 | `effort_override` | string \| null | null | Adapter-specific effort/reasoning level passed at spawn time (e.g. Claude `--effort xhigh`). Live-applied via `/effort` slash on column transition when supported. |
 | `handoff_context` | boolean | false | When enabled, cross-agent transitions package prior session context for the target agent |
 | `session_target` | `'main'` \| `'isolated'` | `'main'` | Which session track a task runs on in this column. `main` = the task's shared main conversation; `isolated` = this column's own context-isolated session (keyed by the swimlane id). See `SessionTarget` in `src/shared/types.ts`. |

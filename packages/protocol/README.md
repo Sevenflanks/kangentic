@@ -12,8 +12,9 @@ This package is the single source of truth for the desktop (`src/main/mobile-bri
 runs on Node (Electron main) and React Native (via the same pure-JS primitives), with no native
 module coupling.
 
-See `docs/mobile-bridge.md` in the main repository for the pairing ceremony, roster/revocation
-model, and the honest relay-metadata statement.
+See [`docs/mobile-bridge.md`](https://github.com/Sevenflanks/kangentic/blob/sevenflanks-main/docs/mobile-bridge.md)
+in the fork repository for the pairing ceremony, roster/revocation model, and the honest
+relay-metadata statement. This fork is not endorsed by or affiliated with the upstream project.
 
 ## Security
 
@@ -25,3 +26,7 @@ model, and the honest relay-metadata statement.
 
 This package has not undergone a third-party security audit. Report suspected vulnerabilities
 per the repository's security policy rather than filing a public issue.
+
+## License
+
+[AGPL-3.0-only](https://github.com/Sevenflanks/kangentic/blob/sevenflanks-main/LICENSE)

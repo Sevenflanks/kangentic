@@ -429,18 +429,16 @@ export async function handleTaskMove(
       }
 
       // --- Priority 3: TASK HAS ACTIVE SESSION ---
-      // Five sub-cases (in evaluation order):
-      //   a) Agent change (handoff): suspend + fall through to spawnAgent
-      //   b) Same agent + permission-mode delta (destination's effective mode
-      //      differs from the session record's spawn-time mode): suspend and
-      //      respawn so --permission-mode / --model / --effort land as CLI
-      //      flags (no adapter can switch permission mode on a live session)
-      //   c) Same agent + adapter has live-swap plan: inject command(s)
-      //      directly into running session (model/effort/auto_command)
-      //   d) Same agent + no live-swap plan + model/effort delta: suspend
-      //      and respawn so the new flags land via command-line args
-      //   e) Same agent + no delta and no live-swap: keep session alive
-      //      (no-op; preserves auto_command-less moves between custom columns)
+      // Evaluation order:
+      //   a) Session-track change or always_spawn_new: suspend and route to a
+      //      target spawn/resume.
+      //   b) Agent change: suspend and hand off to spawnAgent.
+      //   c) Model change: suspend and respawn so the new launch flags apply.
+      //   d) Supported effort or auto_command change: live-inject into the
+      //      running session.
+      //   e) Unsupported concrete effort change: suspend and respawn to apply
+      //      the effort as a launch flag.
+      //   f) Permission-only change or no delta: keep the live session alive.
       if (task.session_id) {
         context.terminalSubmitScheduler.cancel(task.id);
 

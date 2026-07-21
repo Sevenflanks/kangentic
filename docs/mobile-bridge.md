@@ -62,22 +62,22 @@ src/main/mobile-bridge/       # desktop implementation, consumes @kangentic/prot
   mobile-bridge-service.ts    # top-level service: identity, roster, pairing, sessions, attachContext()
 ```
 
-The desktop service is constructed in `src/main/ipc/register-all.ts` and torn down synchronously in `src/main/index.ts`'s `clearPendingTimers` (see [Synchronous Shutdown](../.claude/rules/synchronous-shutdown.md)). It is wired to the renderer through the full 7-layer IPC bridge - channels in `src/shared/ipc-channels.ts` (`MOBILE_*`, see [Architecture > Mobile Bridge](architecture.md#mobile-bridge-10-channels)), types in `src/shared/types.ts` ("Mobile Bridge" section), the `mobile:` namespace in `src/preload/preload.ts`, the handler in `src/main/ipc/handlers/mobile-bridge.ts`, the `useMobileStore` renderer store, and the Mobile Devices settings tab.
+桌面服務在 `src/main/ipc/register-all.ts` 建立，並在 `src/main/index.ts` 的 `clearPendingTimers` 同步關閉，遵循根目錄 `CLAUDE.md` 的同步 shutdown 邊界。它透過完整的七層 IPC bridge 連接 renderer，包含 `src/shared/ipc-channels.ts` 的 channel (`MOBILE_*`，見 [Architecture > Mobile Bridge](architecture.md#mobile-bridge-10-channels))、`src/shared/types.ts` 的型別、`src/preload/preload.ts` 的 `mobile:` namespace、`src/main/ipc/handlers/mobile-bridge.ts` 的 handler、`useMobileStore` renderer store 與 Mobile Devices 設定分頁。
 
 ## Why a separate package
 
-`@kangentic/protocol` is a local npm workspace (`packages/protocol/`), built independently (`npm run build -w packages/protocol`) and published as its own npm package. It is dependency-free of anything Electron- or Node-specific in its public surface (only `@noble/ciphers`, `@noble/curves`, `@noble/hashes` - pure JS, portable to React Native), so the same wire schema, Noise implementation, and capability-verb list are shared verbatim between the desktop and the future mobile app, with no risk of the two drifting.
+`@kangentic/protocol` 是本機 npm workspace (`packages/protocol/`)，在 `packages/protocol/package.json` 保有自己的版本與獨立建置指令 `npm run build -w packages/protocol`。它的 public surface 沒有 Electron 或 Node 專屬相依套件，僅使用 `@noble/ciphers`、`@noble/curves` 與 `@noble/hashes`，讓 desktop 與 mobile 共用同一份 wire schema、Noise implementation 與 capability-verb list，避免彼此漂移。
 
-Its version and release cadence are **deliberately decoupled from Kangentic's own** - `packages/protocol/package.json` carries its own semver line, bumped and tagged (`protocol-vX.Y.Z`, a separate namespace from Kangentic's `vX.Y.Z` release tags) by the `/release-protocol` skill, published by its own workflow (`.github/workflows/publish-protocol.yml`), independent of the `kangentic` launcher's publish step in `release.yml`. This lets the protocol package ship on its own schedule while the mobile bridge feature is still being built out, without requiring or triggering a full Kangentic desktop release. In-repo, the desktop still consumes the package's TypeScript source directly via the `@kangentic/protocol` alias (see Layout above) - only the external, published npm artifact follows the separate versioning.
+獨立版本用來識別 workspace 與建置產物。`@kangentic/protocol` 是 private workspace，不會發布至 npm。desktop 透過 `@kangentic/protocol` alias 取用本 repository 的 TypeScript source。需要驗證封裝內容時，僅在本機執行 `npm run build --workspace packages/protocol` 與 `npm pack --dry-run --workspace packages/protocol`，不會建立 `.tgz`、上傳 artifact 或發布 registry package。
 
 ### Iterating on the protocol across repos (without publishing every change)
 
-`@kangentic/protocol` is consumed by three repos: this monorepo (the desktop, in-repo workspace), `kangentic-mobile`, and `kangentic-relay`. Publishing to npm on every protocol tweak is a slow path, so while the wire is still firming up:
+`@kangentic/protocol` 由此 monorepo 以 in-repo workspace 形式取用，其 wire contract 也與 `kangentic-mobile` 和 `kangentic-relay` 共用。wire 仍在變更時：
 
-- **This monorepo's `main` is the protocol's source of truth.** Protocol changes land on `main` via PR, decoupled from npm publishing; publish (`/release-protocol`) only at a release milestone or when a consumer's cloud build needs the pinned version resolvable from npm.
-- **The desktop** rebuilds the workspace after editing protocol source (`npm run build --workspace packages/protocol`) and **restarts** - the mobile-bridge runs in the Electron main process, which does not hot-reload, so an in-place protocol edit is not picked up until a restart.
-- **The mobile app and the relay** pin `@kangentic/protocol` to a published `^x.y.z` in their committed `package.json`, but for local dev their tooling links the freshly built sibling `packages/protocol` into `node_modules` (kangentic-mobile's dev rig does this automatically via `ensureLocalProtocol`; see that repo's `docs/developer-guide.md`). The committed manifest is never rewritten to a local path - only `node_modules` is linked - so a fresh clone or CI still resolves the published version.
-- **Wire compatibility:** additive, backward-compatible changes keep `PROTOCOL_VERSION` the same so mixed-version peers interoperate; a breaking wire change bumps `PROTOCOL_VERSION` (bound into the Noise prologue) and requires all peers to upgrade together.
+- **本 fork** 在 `sevenflanks-main` 整合已核准的 protocol work。source-first 流程只在本機建置與執行 `npm pack --dry-run` 驗證，不會發布到 npm。
+- **desktop** 在編輯 protocol source 後重建 workspace (`npm run build --workspace packages/protocol`) 並重新啟動，因為 mobile bridge 位於 Electron main process，無法 hot-reload。
+- **mobile app 與 relay** 可能在各自既有的 upstream 或 external setup 取用 registry package。這種取用與本 fork 的政策分開，不代表本 fork 是 publisher。其 local development tooling 可以把剛建置的相鄰 `packages/protocol` 連結到 `node_modules`，committed manifest 仍各自負責其 dependency source。
+- **Wire compatibility：** additive 且 backward-compatible 的變更會維持 `PROTOCOL_VERSION`，讓不同版本 peer 可互通。breaking wire change 會提高 `PROTOCOL_VERSION`，它會綁定在 Noise prologue，並要求所有 peer 一起升級。
 
 ## Pairing Ceremony
 

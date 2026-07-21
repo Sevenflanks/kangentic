@@ -45,7 +45,7 @@ Claude Code agent calls MCP tool (e.g. kangentic_create_task)
 
 Claude Code supports a `--mcp-config` flag that accepts a path to a JSON file containing MCP server definitions. Kangentic uses this to deliver its MCP server config without modifying `.mcp.json` (which may be tracked in git). When Kangentic spawns a session:
 
-1. `CommandBuilder.createMergedSettings()` writes the kangentic MCP server config to `.kangentic/sessions/<sessionId>/mcp.json`. The entry is an HTTP MCP server pointing at the per-launch URL `http://127.0.0.1:<port>/mcp/<projectId>` with the `X-Kangentic-Token` header containing the per-launch token. In the same gated block it also appends `mcp__kangentic` to the merged settings' `permissions.allow` (append-if-absent) so the spawned agent does not prompt for kangentic tools in default mode (see Permissions).
+1. `CommandBuilder.createMergedSettings()` writes the kangentic MCP server config to `.kangentic/sessions/<ptySessionId>/mcp.json`, where `ptySessionId` is `sessions.id`. The entry is an HTTP MCP server pointing at the per-launch URL `http://127.0.0.1:<port>/mcp/<projectId>` with the `X-Kangentic-Token` header containing the per-launch token. In the same gated block it also appends `mcp__kangentic` to the merged settings' `permissions.allow` (append-if-absent) so the spawned agent does not prompt for kangentic tools in default mode (see Permissions).
 2. `CommandBuilder.buildClaudeCommand()` adds `--mcp-config <path>` to the CLI command
 3. `ensureMcpServerTrust()` adds "kangentic" to `enabledMcpjsonServers` in `~/.claude.json`
 4. Claude Code starts, reads both `.mcp.json` (user servers) and the `--mcp-config` file (kangentic), and connects to the in-process HTTP MCP server over loopback. No child process is spawned for kangentic itself.
@@ -225,7 +225,7 @@ List all session records for a task with metadata: start/end times, exit codes, 
 
 ### kangentic_get_session_history
 
-Read the agent's native session history file for a task. Returns the raw file content (Claude JSONL, Codex rollout JSONL, or Gemini chat JSON) from the most recent session. Large files are truncated to the most recent portion.
+Attempt to read the most recent session's adapter-native history. Support depends on the adapter and its CLI version. Native history may be a file, project-level history, or database, and the tool reports unavailable history when the adapter cannot locate a readable source. Large file-backed histories are truncated to the most recent portion.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -452,7 +452,7 @@ Structured-format support by agent:
 
 ### kangentic_get_session_files
 
-Get the absolute paths to every per-session file: `events.jsonl` (activity log), `status.json` (usage/metrics), `settings.json`, `commands.jsonl` (MCP queue), `mcp.json`, the `responses/` directory, and the agent's native session history file (Claude JSONL, Codex JSONL, or Gemini JSON). Session directories are keyed by Kangentic PTY session id under `.kangentic/sessions/<id>/`. Each file entry includes an `exists` flag. Provide either `taskId` or `sessionId`.
+Get paths for Kangentic's per-PTY-session directory and the adapter-native history location when it can be found. The directory is `.kangentic/sessions/<ptySessionId>/`, where `ptySessionId` is `sessions.id`, not `agent_session_id`. It may contain `events.jsonl` and `status.json`, with `settings.json`, `commands.jsonl`, `mcp.json`, and `responses/` present only when the adapter or enabled feature creates them. Native history stays in adapter-specific user or project storage and is not copied into the session directory. Each returned entry includes an `exists` flag. Provide either `taskId` or `sessionId`.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -583,7 +583,7 @@ Config key: `mcpServer.enabled` (boolean, default `true`)
 
 Agents Kangentic spawns never see a permission prompt for Kangentic's own tools. Three layers cover the axes (which mode, which project):
 
-1. **Auto-allow injection (all projects, default / acceptEdits mode).** Whenever the MCP server is attached, `CommandBuilder.createMergedSettings()` appends `mcp__kangentic` to `permissions.allow` in the per-session merged `settings.json` (`.kangentic/sessions/<sessionId>/settings.json`). This is gated on the same condition as the session `mcp.json` write and is append-if-absent, so a committed project rule or a Claude "always allow" grant is not duplicated. It lives only in the regenerated per-session settings, never written back to the user's own settings files, and an explicit user `deny` of `mcp__kangentic` still wins (deny outranks allow). So the no-prompt behavior holds for every project, not just ones that committed a rule.
+1. **Auto-allow injection (all projects, default / acceptEdits mode).** Whenever the MCP server is attached, `CommandBuilder.createMergedSettings()` appends `mcp__kangentic` to `permissions.allow` in the per-session merged `settings.json` (`.kangentic/sessions/<ptySessionId>/settings.json`, where `ptySessionId` is `sessions.id`). This is gated on the same condition as the session `mcp.json` write and is append-if-absent, so a committed project rule or a Claude "always allow" grant is not duplicated. It lives only in the regenerated per-session settings, never written back to the user's own settings files, and an explicit user `deny` of `mcp__kangentic` still wins (deny outranks allow). So the no-prompt behavior holds for every project, not just ones that committed a rule.
 2. **Read-only annotations (all projects, plan mode).** Allow rules do not punch through plan mode. Plan-mode auto-approval comes from the tools' `readOnlyHint` annotations (see the Tool annotations note under Available Tools): read-only tools run without a prompt while planning; mutating tools still prompt, by design.
 3. **Auto-mode classifier allow rule (all projects, auto mode).** `--permission-mode auto` runs its OWN natural-language classifier that does not honor `permissions.allow`, so the same `createMergedSettings()` also appends a plain-language rule (`KANGENTIC_AUTO_MODE_ALLOW_RULE`) to `autoMode.allow`, seeding the array with `$defaults` when absent so the classifier's built-in rules are preserved. Without it a headless, board-driven auto-mode session (e.g. a Code Review column) could soft-deny Kangentic's own board/session tools even though they are allowed by default. Append-if-absent, per-session only, and the built-in `$defaults` stay in effect.
 
@@ -616,7 +616,7 @@ Dependencies (`@modelcontextprotocol/sdk`, `zod`) are bundled into the main proc
 
 ### MCP tools not showing up
 
-1. Check the session's MCP config: `.kangentic/sessions/<sessionId>/mcp.json` should contain a `kangentic` entry under `mcpServers` with a `type: "http"`, a `url` pointing at `http://127.0.0.1:<port>/mcp/<projectId>`, and an `X-Kangentic-Token` header.
+1. Check the session's MCP config: `.kangentic/sessions/<ptySessionId>/mcp.json` should contain a `kangentic` entry under `mcpServers` with a `type: "http"`, a `url` pointing at `http://127.0.0.1:<port>/mcp/<projectId>`, and an `X-Kangentic-Token` header. `ptySessionId` is the `sessions.id` value.
 2. Check the CLI command includes `--mcp-config` pointing to the session's `mcp.json`.
 3. Check `~/.claude.json`: the project path should have `"kangentic"` in `enabledMcpjsonServers`.
 4. Verify the in-process server is listening: look for `[mcp-http] Listening on http://127.0.0.1:<port>/mcp` in the Electron main console at launch.

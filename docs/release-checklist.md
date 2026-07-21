@@ -1,31 +1,79 @@
-# Release Smoke Checklist
+# Local Windows Installer QA
 
-Manual validation against real, authenticated agent CLIs before publishing a draft release. Automated tests use mock fixtures (`tests/fixtures/mock-*.{js,cmd}`) which exercise spawn, capture, and resume mechanics but do not exercise real model latency, real tool calls, or conversation continuity across resume. This checklist closes that gap.
+本清單驗證維護者在自己的 Windows 電腦建立的本機 installer。它不是 release checklist，不會建立 tag、GitHub Release、draft、npm publication、public artifact 或 auto-update feed。
 
-Run from a packaged build (`npm run make`) on the platform you primarily ship from, against a project that has the agent CLI installed and authenticated. Use a throwaway project directory so file writes do not pollute real work.
+## 建置前確認
 
-If any step fails, do not publish the draft release. File a bug, fix forward, cut a new tag.
+- 來源位於預定使用的 commit，且 `git status --short` 已人工確認。
+- `package.json` 的 `make:win` 為 `npm run rebuild && npm run build && electron-builder --win --publish never`。
+- `electron-builder.yml` 的 top-level `publish` 為 `null`。
+- 根目錄有 `LICENSE` 與 `FORK-NOTICE.md`。
 
-## OpenCode
+## 建立產物
 
-Prerequisites:
+在 Windows 上執行：
 
-- `opencode --version` resolves on PATH
-- OpenCode is authenticated (logged in to a provider, model selected)
-- A scratch project opened in Kangentic with the default swimlanes (`To Do`, `Planning`, `Executing`, `Code Review`, `Tests`, `Ship It`, `Done`) and OpenCode set as the project default agent
-- The scratch project contains a file with non-trivial prose (e.g. a real `README.md`) so the prompt in step 1 has something to summarize
+```powershell
+npm run make:win
+```
 
-Steps:
+確認只產生一個符合版本的 installer：
 
-1. **Create a task** in `To Do` with a title and a description that asks OpenCode to read a known file in the project (e.g. "Read README.md and summarize the first paragraph").
-2. **Drag the task to `Planning`.** Verify:
-   - A PTY session spawns and the OpenCode TUI renders in the bottom panel
-   - The shimmer overlay clears within a few seconds (cursor-hide marker observed)
-   - A session ID is captured (visible in the task detail dialog header)
-3. **Verify the model responds.** Wait for OpenCode to produce a real assistant turn (not the mock's static greeting). Confirm the response references the prompt content.
-4. **Verify a real tool call.** Confirm OpenCode invokes its file-read tool against the file named in the prompt and that the response paraphrases the actual file contents.
-5. **Drag the task to `Done`.** Verify the session is suspended and the terminal panel detaches cleanly. Check Task Manager (Windows: look for `opencode.exe`) or `ps` (macOS/Linux: look for `opencode`) to confirm no orphaned process remains.
-6. **Unarchive the task** (drag back out of `Done`, or use the unarchive control). Verify the session resumes:
-   - The same session ID is reused (no new ID emitted)
-   - The TUI reattaches with the prior conversation visible in scrollback
-7. **Verify conversation continuity.** Send a second prompt that depends purely on the prior assistant turn (e.g. "Repeat the summary you just gave back to me verbatim" or "What did you just tell me?"). Confirm OpenCode answers using the prior context, proving the resume is real and not a fresh session.
+```powershell
+$installers = @(Get-ChildItem out\Kangentic-Setup-*.exe)
+if ($installers.Count -ne 1) { throw "Expected exactly one Windows installer." }
+$installers.FullName
+```
+
+顯示的唯一路徑就是本次 installer。installer 必須是未簽署產物：
+
+```powershell
+Get-AuthenticodeSignature -LiteralPath $installers[0].FullName | Select-Object Status
+```
+
+預期 `Status` 是 `NotSigned`。
+
+## 更新與 legal resources
+
+確認未產生更新 manifest：
+
+```powershell
+Test-Path out\win-unpacked\resources\app-update.yml
+```
+
+預期 `False`。沒有 `app-update.yml` 時，既有 updater guard 會停用 auto-update，且不應阻止 app 啟動。
+
+確認 packaged legal resources 存在，並與根目錄計算相同 SHA-256：
+
+```powershell
+Get-FileHash LICENSE -Algorithm SHA256
+Get-FileHash out\win-unpacked\resources\LICENSE -Algorithm SHA256
+Get-FileHash FORK-NOTICE.md -Algorithm SHA256
+Get-FileHash out\win-unpacked\resources\FORK-NOTICE.md -Algorithm SHA256
+```
+
+每一對 hash 必須相同。
+
+## 安全啟動
+
+用隔離的暫存 user-data directory 啟動 unpacked app，確認 process 已啟動後關閉該 process，最後移除暫存目錄。不要使用正式使用者資料，也不要關閉任何其他 Electron process。
+
+```powershell
+$temporaryUserData = Join-Path $env:TEMP "kangentic-installer-qa-$PID"
+$userDataArgument = "--user-data-dir=`"$temporaryUserData`""
+$appProcess = Start-Process -FilePath "out\win-unpacked\Kangentic.exe" -ArgumentList $userDataArgument -PassThru
+Start-Sleep -Seconds 5
+Get-Process -Id $appProcess.Id
+Stop-Process -Id $appProcess.Id
+Wait-Process -Id $appProcess.Id
+Remove-Item -LiteralPath $temporaryUserData -Recurse -Force
+```
+
+啟動成功表示缺少 `app-update.yml` 不會妨礙本機使用。若啟動失敗，保留診斷資訊，先修正問題再重新建置。
+
+## 不得發布確認
+
+- 不執行 `npm publish`、不帶 `--dry-run` 的 `npm pack`，或任何 GitHub release、tag、draft、upload 指令。
+- 不建立或觸發 publication workflow。
+- 不把 EXE 提供給其他人。若未來需要 conveying，必須先依 [Fork AGPL Compliance Guide](fork-agpl-compliance.md) 核准 exact source、notices、provenance 與 identity 設計。
+- `npx kangentic` 是 upstream-only launcher，不是此 fork 的測試、安裝或更新方式。

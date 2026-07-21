@@ -1,115 +1,116 @@
 # Cross-Agent Handoff
 
-When a task moves to a column with a different agent (e.g. Claude Code to Codex), Kangentic locates the source agent's native session history file and passes its path to the target agent. This enables seamless continuation across different AI coding tools without losing progress.
+When a task changes to a different agent, Kangentic can give the receiving agent a reference to the source adapter's native conversation history. It does not synthesize a transcript, git summary, metrics packet, or `handoff-context.md` file.
 
 ## Overview
 
-The handoff system uses a **session history passthrough** approach: instead of manufacturing a synthetic context document, it locates the source agent's native session file on disk and tells the target agent to read it directly.
+The handoff pipeline resolves an optional native history location through the source adapter, then prepends XML instructions and the location to the target agent's initial prompt. The target starts a new session. The reference is guidance, not a forced read, so the target agent might not consume the path.
 
 | Component | File | Purpose |
 |-----------|------|---------|
-| Session History Reference | `handoff/session-history-reference.ts` | Builds the prompt pointing the target agent to the session file |
-| Transcript Cleanup | `handoff/transcript-cleanup.ts` | Shared utilities for cleaning PTY transcripts |
-| Handoff Repository | `db/repositories/handoff-repository.ts` | Stores handoff audit trail in the database |
+| Session History Reference | `src/main/agent/handoff/session-history-reference.ts` | Builds the XML reference and fallback guidance for the target prompt |
+| Prompt XML | `src/main/agent/shared/prompt-xml.ts` | Renders `<handoff_context>` with the source agent and optional path |
+| Handoff Repository | `src/main/db/repositories/handoff-repository.ts` | Stores the handoff audit metadata |
 
-## When Handoff Triggers
+Native conversation history remains owned by each adapter in its user or project storage. Depending on the adapter and CLI version, that storage can be a file, project-level history, or a database. Adapter paths are empirical implementation details and can change between CLI releases.
 
-Handoff is triggered by `resolveTargetAgent()` in `src/main/transition-engine/agent-resolver.ts` when all three conditions are met:
+## When Handoff Runs
 
-1. The task has a previous agent (`task.agent` is set)
-2. The resolved target agent differs from `task.agent`
-3. A previous session exists for the task
+`spawnAgent()` prepares a handoff only when all of these conditions hold:
 
-If `task.agent` is null (fresh task, never spawned), no handoff occurs even if the target column has an agent override.
+1. Resolving the destination lane selects a different agent from the task's current agent.
+2. The task has a prior session record.
+3. The destination lane has `handoff_context` enabled.
+
+The destination setting defaults to disabled. A new task, a task whose agent does not change, or a destination lane with handoff disabled starts through the normal spawn path without a handoff audit row.
 
 ## Handoff Flow
 
 ```
-Task moves to column with different agent_override
+Task moves to a lane resolved to a different agent
     |
     v
-resolveTargetAgent() detects isHandoff=true
+spawnAgent() confirms prior session and enabled handoff_context
     |
     v
-spawnAgent() enters handoff path (agent-spawn.ts)
+Source adapter attempts locateSessionHistoryFile(agent_session_id, cwd)
+    |
+    +-- path found: XML reference points to native history
+    |
+    +-- no path: XML reference advises checking git log
     |
     v
-Locate source agent's native session file:
-    |--- Claude: ~/.claude/projects/<slug>/<sessionId>.jsonl
-    |--- Codex:  ~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-<ts>-<uuid>.jsonl
-    |--- Gemini: ~/.gemini/tmp/<projectDir>/chats/session-<id>.json
-    |--- Aider:  null (no session history files)
+Insert handoffs audit row with metadata and nullable session_history_path
     |
     v
-buildSessionHistoryReference() creates prompt with file path
+Start a new target PTY session with the XML reference before its task prompt
     |
     v
-engine.resumeSuspendedSession() spawns target agent with:
-    - session history prompt prepended to the task prompt
-    - agentOverride set to target agent
-    |
-    v
-Post-spawn: handoff DB record updated with target session ID
+Update the audit row with the target session record ID when spawn succeeds
 ```
 
-## Session History File Locations
+History lookup is best effort. A missing source adapter, missing `agent_session_id`, unsupported lookup, or absent history file still permits the handoff record to be written with `session_history_path = NULL`. The target prompt then advises the agent to inspect `git log` for prior branch changes.
 
-Each agent adapter implements `locateSessionHistoryFile(agentSessionId, cwd)` to find the native session file. The full per-agent table (file patterns + lookup methods for all 12 supported adapters) lives in [Agent Integration > Session History File Location](agent-integration.md#session-history-file-location); maintained there as the single source of truth.
+## Identity and Storage Boundaries
+
+Kangentic creates each runtime session directory at:
+
+```
+<project>/.kangentic/sessions/<ptySessionId>/
+```
+
+`ptySessionId` is the `sessions.id` database value and is distinct from `sessions.agent_session_id`. The latter is adapter-native, may be null, and is used for native history lookup and adapter-specific resume behavior. Kangentic-owned session files are:
+
+```
+.kangentic/sessions/<ptySessionId>/
+  status.json
+  events.jsonl
+  settings.json       # present when the adapter writes merged settings
+  mcp.json            # present when the adapter and MCP configuration use it
+  commands.jsonl      # present only for adapters or features that use it
+  responses/          # present only for adapters or features that use it
+```
+
+Only `status.json` and `events.jsonl` are the standard Kangentic telemetry outputs. The other entries are conditional. Native conversation history is not copied into this directory.
 
 ## Prompt Delivery
 
-`buildSessionHistoryReference()` in `src/main/agent/handoff/session-history-reference.ts` builds a prompt that points the target agent to the source session file:
+`buildSessionHistoryReference()` creates top-level instructions followed by a `<handoff_context>` XML element. When a native path is found, the prompt tells the target agent where to find it and asks it to read the prior history for context. Claude targets also receive the optional MCP hint `kangentic_get_session_history`.
 
-```
-You are continuing work on this task that was previously handled by Claude Code.
-The prior agent's full session history is at: /home/user/.claude/projects/slug/session-id.jsonl
-Read this file for context on what was done, decisions made, and current state.
-```
+The direct history hint is separate from `kangentic_get_transcript`. The former reads an adapter-native history source when it can be located. The latter is structured transcript tooling that parses supported native histories or returns raw PTY scrollback, depending on the requested format and adapter capability.
 
-For Claude (MCP-capable), it also appends: "You can also use the `kangentic_get_transcript` MCP tool for a structured view of the prior session."
+## Aider
 
-For agents without session files (Aider), the prompt falls back to: "No session history file is available - check `git log` for prior changes."
-
-The prompt is built entirely by `buildSessionHistoryReference()` with no per-adapter customization needed.
+Aider has no native resume ID and no per-session native history. Its adapter can locate the project-level `.aider.chat.history.md` when present, but that cumulative file is not tied to a specific session. Handoff therefore treats any Aider path as best-effort context, not a session-scoped resume artifact.
 
 ## Database Storage
 
-Handoff records are stored in the `handoffs` table for audit trail:
+Handoff records in `handoffs` provide an audit trail:
 
 | Column | Type | Purpose |
 |--------|------|---------|
 | `id` | TEXT PK | Unique handoff ID |
 | `task_id` | TEXT FK | Task being handed off |
-| `from_session_id` | TEXT FK | Source session (nullable) |
-| `to_session_id` | TEXT FK | Target session (filled post-spawn) |
-| `from_agent` | TEXT | Source agent name |
-| `to_agent` | TEXT | Target agent name |
-| `trigger` | TEXT | What caused the handoff (`column_transition`) |
-| `session_history_path` | TEXT | Absolute path to source session file (nullable) |
-| `packet_json` | TEXT | Legacy column (pre-`session_history_path`). Still present in the schema for backward compatibility but excluded from every `HandoffRepository` SELECT, so it is never read or written by current code. |
+| `from_session_id` | TEXT FK | Source PTY session record, nullable |
+| `to_session_id` | TEXT FK | Target PTY session record, set after a successful spawn |
+| `from_agent` | TEXT | Source adapter name |
+| `to_agent` | TEXT | Target adapter name |
+| `trigger` | TEXT | Handoff cause, currently `column_transition` |
+| `session_history_path` | TEXT | Optional source adapter-native history location |
+| `packet_json` | TEXT | Legacy schema field, not current runtime input or repository output |
 | `created_at` | TEXT | ISO timestamp |
 
 ## MCP Access
 
-Claude Code sessions can access handoff metadata via the `kangentic_get_handoff_context` MCP tool, which returns the session history file path and handoff metadata. The `kangentic_get_transcript` tool provides structured access to session transcripts for Claude, Droid, Codex, Gemini, Qwen, Kimi, and OpenCode sessions (other agents fall back to raw scrollback). See [MCP Server](mcp-server.md) for details.
+`kangentic_get_handoff_context` returns the latest handoff metadata and its optional native-history path. `kangentic_get_session_history` is the direct native-history lookup. `kangentic_get_transcript` remains separate structured transcript tooling. See [MCP Server](mcp-server.md) for adapter support and format details.
 
-## Disabling Session History Passthrough
+## Disabling Handoff
 
-Each column has a "Session history passthrough" toggle (default: **off**). When disabled, cross-agent transitions still detect the agent change and spawn the correct target agent, but no session history is passed - no file location, no handoff DB record. The new agent receives only the task title and description, starting with a clean slate.
-
-This is useful for workflows where independent review is desired. For example, a "Code Review" column with `agent_override` set to a different agent can disable passthrough so the reviewing agent assesses the code without being influenced by the previous agent's conversation or reasoning.
-
-The toggle is a per-column setting in the Edit Column dialog, under the Agent section. The underlying DB field is `handoff_context` on the swimlanes table.
-
-## Per-Agent Transcript Cleanup
-
-TUI agents (Claude Code, Codex CLI, Gemini CLI, Qwen Code, Aider, Kimi Code, Droid, OpenCode) produce raw PTY output with agent-specific rendering artifacts. Cleanup utilities in `src/main/agent/handoff/transcript-cleanup.ts` provide shared functions (`filterNoiseLines`, `finalizeTranscript`) used by per-adapter transcript cleanup files. Each agent's cleanup lives in its adapter folder: `src/main/agent/adapters/<name>/transcript-cleanup.ts`.
-
-GitHub Copilot CLI is also a TUI agent but does not yet ship its own `transcript-cleanup.ts`, so its handoff transcripts may contain rendering artifacts until one is added. Cursor CLI, Oz CLI (Warp), and Ollama stream plain text output (no alternate screen buffer) and do not need per-adapter cleanup.
+The destination lane's handoff-context setting controls this behavior. When it is disabled, an agent change still selects and starts the destination adapter, but Kangentic does not resolve native history, build handoff XML, or create a handoff audit row. This supports independent review lanes that should begin from the task and repository state alone.
 
 ## See Also
 
-- [Agent Integration](agent-integration.md) - Adapter interface, per-agent CLI details
-- [Session Lifecycle](session-lifecycle.md) - Spawn flow, suspend, resume
-- [Database](database.md) - Schema for handoffs table
-- [MCP Server](mcp-server.md) - `kangentic_get_handoff_context` and `kangentic_get_transcript` tools
+- [Agent Integration](agent-integration.md)
+- [Session Lifecycle](session-lifecycle.md)
+- [Database](database.md)
+- [MCP Server](mcp-server.md)

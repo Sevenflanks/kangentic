@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, sevenflanks-main]
   pull_request:
-    branches: [main]
+    branches: [main, sevenflanks-main]
   workflow_dispatch:
 
 permissions:
@@ -26,11 +26,8 @@ concurrency:
 # Concurrency budget (GitHub Free caps concurrent jobs at ~20): shard counts are
 # sized so the test shards plus the always-on jobs fit the cap with NO queueing
 # (queueing, not shard count, was the real wall-clock bottleneck). Current
-# budget: UI 9 + E2E 5 + unit 3 = 17 shards, plus lint + typecheck + build + the
-# CLA workflow = 4, totalling 21 - one over the cap, deliberately: the CLA check
-# finishes in ~10-17s and frees its slot, so the single over-cap shard queues
-# only that briefly (far under its ~70-90s runtime) and still lands inside the
-# envelope. node_modules is cached under one shared lockfile-keyed key, so npm ci
+# budget: UI 9 + E2E 5 + unit 3 = 17 shards, plus lint + typecheck + build = 20,
+# exactly at the cap. node_modules is cached under one shared lockfile-keyed key, so npm ci
 # runs only on a lockfile change. The thin gates run AFTER their shards (`needs`),
 # so they do not consume a shard-phase slot. To scale as the suites grow: either
 # rebalance the shard counts (UI is test-count-bound and wants the most shards;
@@ -39,7 +36,7 @@ concurrency:
 # the GitHub plan (Team = 60 concurrent).
 #
 # The job `name:` is the status-check context used by branch protection - keep
-# these in sync with main's required checks if you rename one.
+# these in sync with both branches' required checks if you rename one.
 
 jobs:
   lint:
@@ -198,11 +195,8 @@ jobs:
         run: npm ci
       - name: Build (production bundle)
         run: npm run build
-      # @kangentic/protocol publishes through its own independent workflow
-      # (publish-protocol.yml), not this one -- but that workflow only runs
-      # at publish time (a protocol-v* tag push), so without this step a
-      # broken package build (a declaration-emit error, an esbuild config
-      # regression) would go undetected until an actual release attempt.
+      # CI builds the package on every PR, so a declaration-emit or esbuild
+      # configuration regression is caught alongside the app bundle.
       # This proves `npm run build -w packages/protocol` still succeeds on
       # every PR, same as the app bundle above.
       - name: Build @kangentic/protocol package

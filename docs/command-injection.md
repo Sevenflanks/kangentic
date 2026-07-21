@@ -1,11 +1,12 @@
 # Command Injection
 
-Kangentic injects per-column "auto-commands" and per-column model/effort settings into a live agent session when a task moves between columns. `TerminalSubmitScheduler` (`src/main/transition-engine/terminal-submit-scheduler.ts`) schedules each task's burst and decides whether the burst is prefixed with a `Ctrl+C` (live-injection) or not (fresh-spawn). `TerminalSubmit.submitKeystrokes` (`src/main/pty/terminal-submit.ts`) executes the byte-level keystroke sequence (`Ctrl+C? → text → Esc → Enter` per command). This document covers how the **command-injection** verification context confirms each chained command lands cleanly on the agent's TUI.
+Kangentic injects per-column `auto_command` values and supported effort changes into a live agent session when a task moves between columns. Model changes set `needsRestartForModel` and are handled by the caller before any live writes. `TerminalSubmitScheduler` (`src/main/transition-engine/terminal-submit-scheduler.ts`) schedules each task's burst and decides whether the burst is prefixed with a `Ctrl+C` (live-injection) or not (fresh-spawn). `TerminalSubmit.submitKeystrokes` (`src/main/pty/terminal-submit.ts`) executes the byte-level keystroke sequence (`Ctrl+C? → text → Esc → Enter` per command). This document covers how the **command-injection** verification context confirms each chained command lands cleanly on the agent's TUI.
 
 ## What gets injected (the settings delta)
 
-`prepareInjectionPlan` (`src/main/transition-engine/injection-plan.ts`) decides which `/model` / `/effort`
-slashes a column transition emits by diffing a **source** against a **target**:
+`prepareInjectionPlan` (`src/main/transition-engine/injection-plan.ts`) decides whether a model
+change requires restart and which supported `/effort` slashes a column transition emits by diffing
+a **source** against a **target**:
 
 - **Target** is the destination column's effective value: `task.<override> ?? toLane.<override> ?? project.default_<field> ?? null`.
   The project-default tier is read on both sides of the diff: without it, a task moving between
@@ -20,16 +21,16 @@ slashes a column transition emits by diffing a **source** against a **target**:
   injection even though the spawn/resume `--model` / `--effort` flags had already applied the value.
   A per-task override still wins for that field (source = target = pin, so no slash fires).
 
-When a field changes to a concrete target, the returned `InjectionPlan` carries an
-`appliedSettings: { model?, effort? }` for the emitted fields. Each caller (the `task-move`
-Priority 3c path, the `SWIMLANE_UPDATE` propagation, and the `task:setRuntimeOverride` live path)
-persists it via `SessionRepository.updateAppliedSettings` after scheduling the burst, so the
-session's recorded running value stays current and the *next* transition diffs against the truth.
-The same `updateAppliedSettings` is written at spawn/resume with the resolved spawn overrides.
+When supported effort changes to a concrete target, the returned `InjectionPlan` carries
+`appliedSettings: { effort? }` for the emitted write. The `task-move` Priority 3c path and
+`SWIMLANE_UPDATE` propagation persist it via `SessionRepository.updateAppliedSettings` after
+scheduling the burst, so the session's recorded running value stays current and the *next*
+transition diffs against the truth. Model state is recorded by spawn or resume with the resolved
+launch overrides.
 
 ## Why verification exists
 
-Column transitions can chain several commands in sequence: `/model X`, `/effort Y`, then a user-supplied `auto_command`. Without verification, an Enter key can be silently dropped by the TUI (autocomplete still showing, model picker overlay open, render frame skipped), causing the next command's text to concatenate into the previous prompt buffer. The result is a single combined entry like `<command-args>claude-opus-4-7\n/effort xhigh</command-args>` -- a "model not found" failure that quietly leaves the column's intended settings unapplied.
+Column transitions can chain several commands in sequence: `/effort Y`, then a user-supplied `auto_command`. Without verification, an Enter key can be silently dropped by the TUI (autocomplete still showing, an overlay open, render frame skipped), causing the next command's text to concatenate into the previous prompt buffer. The result is a single combined entry like `<command-args>xhigh\n/code-review</command-args>` that quietly leaves the column's intended settings unapplied.
 
 Time-based settles cannot detect this because the writes did succeed; only the input semantics broke. We need an **authoritative signal** from the agent that the command was processed as the discrete invocation we intended.
 
@@ -68,7 +69,7 @@ The scan is bounded by a 50ms tolerance window around the send time (`Date.now()
 
 `TerminalSubmitScheduler.scheduleKeystrokes` hands a chain of commands to `TerminalSubmit.submitKeystrokes`, which delivers them with the following timing:
 
-0. **Optional leading `Ctrl+C`** (`sendCtrlC` opt-in, default true). The scheduler passes `sendCtrlC: false` when `opts.freshlySpawned` is true so fresh-spawn auto_command bursts skip the interrupt entirely. Live-injection paths (`/model` swap, board column-edit on a running session) keep `sendCtrlC: true` so they can interrupt mid-thinking before delivering the new flags.
+0. **Optional leading `Ctrl+C`** (`sendCtrlC` opt-in, default true). The scheduler passes `sendCtrlC: false` when `opts.freshlySpawned` is true so fresh-spawn auto_command bursts skip the interrupt entirely. Live-injection paths (supported effort changes and board column edits on a running session) keep `sendCtrlC: true` so they can interrupt mid-thinking before delivering the new write.
 1. Initial write of command text + Escape + Enter (text → `\x1b` → `\r`).
 2. **If the command falls within `verifiedPrefixLength`**: poll the verifier every 25ms for up to 400ms. If unconfirmed, re-fire `\r` and try again. After 4 retries, log a warning, send Ctrl+C to clear the prompt buffer, and continue with the next command.
 3. **Otherwise** (no verifier, or command falls outside the verified prefix): wait a fixed 500ms settle window before the next command.
@@ -77,7 +78,7 @@ The scan is bounded by a 50ms tolerance window around the send time (`Date.now()
 
 The `Ctrl+C` opt-out exists to prevent a distinct concatenation failure mode from the chained-command one above. Fresh-spawn auto_command paths just consumed the CLI prompt arg (e.g. `claude -- "<task>...</task>"`) and the CLI is mid-render of that first user turn. On Windows ConPTY + Ink, sending `Ctrl+C` during that render lands in a state where the just-submitted prompt and the follow-up keystrokes get rendered as one user message: `</task>/test` glued together. Suppressing the leading `Ctrl+C` lets the keystrokes queue cleanly behind the in-flight turn and submit as a distinct second user message.
 
-The `verifiedPrefixLength` distinction is critical: deterministic adapter-emitted writes (`/model X`, `/effort Y` from `getInjectionSequence`) are safe to verify because we know exactly what JSONL entry to expect. A trailing user-supplied `auto_command` is **not** verified: it may not produce a matching JSONL entry the verifier recognizes, and retry exhaustion would drop the user's intended action. So we let auto-commands sail through with a time-based settle.
+The `verifiedPrefixLength` distinction is critical: the deterministic adapter-emitted `/effort Y` write from `getInjectionSequence` is safe to verify because we know exactly what JSONL entry to expect. A trailing user-supplied `auto_command` is **not** verified: it may not produce a matching JSONL entry the verifier recognizes, and retry exhaustion would drop the user's intended action. So we let auto-commands sail through with a time-based settle.
 
 ## When to use `'paste'` vs `'command-injection'`
 

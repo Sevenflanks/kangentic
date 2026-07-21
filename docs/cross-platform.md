@@ -82,15 +82,11 @@ Bridge scripts (`event-bridge.js`, `status-bridge.js`) are executed by Claude Co
 
 Overridable via `KANGENTIC_DATA_DIR` environment variable.
 
-## Packaging
+## Fork Packaging
 
-electron-builder handles platform-specific packaging via `electron-builder.yml`:
+Kangentic runtime supports Windows, macOS, and Linux, but this fork only provides a local Windows packaging path. Run `npm run make:win` on the maintainer's Windows computer. It produces the unsigned `out/Kangentic-Setup-X.Y.Z.exe`; the script includes `--publish never`, `electron-builder.yml` sets `publish: null`, and no fork artifact is published.
 
-| Platform | Format | Builder |
-|----------|--------|---------|
-| Windows | Installer | NSIS |
-| macOS | Disk image + ZIP | DMG |
-| Linux | Package | deb, rpm |
+The package includes `resources/LICENSE` and `resources/FORK-NOTICE.md`. There is no `app-update.yml`, so the packaged updater guard disables auto-update without affecting local startup.
 
 ## Windows Taskbar Identity (AUMID)
 
@@ -102,17 +98,9 @@ Windows resolves taskbar icons by matching the running window's AppUserModelID (
 
 `BrowserWindow` uses `titleBarStyle: 'hidden'` with `trafficLightPosition: { x: 12, y: 12 }` to position the native traffic lights within the custom TitleBar. The renderer detects macOS via `window.electronAPI.platform === 'darwin'` and applies `pl-20` (80px left padding) to prevent content from rendering under the traffic lights. On Windows/Linux, the custom TitleBar renders its own minimize/maximize/close buttons instead.
 
-## macOS Code Signing
-
-macOS builds use hardened runtime with `build/entitlements.plist` providing JIT, unsigned executable memory, and dyld environment variable entitlements (required by node-pty). Notarization uses `notarytool` via electron-builder, gated on the `APPLE_ID` and `APPLE_APP_SPECIFIC_PASSWORD` environment variables.
-
-## Linux System Dependencies
-
-The deb package declares `depends` on Electron's required system libraries (`libnss3`, `libatk-bridge2.0-0`, `libgtk-3-0`, `libgbm1`, `libasound2`, `libdrm2`, `libxshmfence1`). The rpm package uses equivalent `requires` (`nss`, `atk`, `gtk3`, `mesa-libgbm`, `alsa-lib`, `libdrm`, `libXShmfence`). Without these, the app crashes on launch on fresh Linux installations.
-
 ## Auto-Update Platform Guard
 
-Auto-update via `electron-updater` runs on Windows and macOS only. The guard in `src/main/updater.ts` checks `app.isPackaged && process.platform !== 'linux'` -- dev mode and Linux are excluded. Linux users update via the launcher package (`npx kangentic`).
+The fork does not provide an auto-update feed. When `app-update.yml` is absent, the guard in `src/main/updater.ts` disables auto-update without affecting local startup. The `npx kangentic` launcher is an upstream distribution path, never a path to this fork.
 
 ## Security Fuses
 

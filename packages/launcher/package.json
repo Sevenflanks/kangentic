@@ -2,12 +2,14 @@
   "name": "kangentic",
   "version": "0.30.0",
   "description": "Install and launch Kangentic -- visual agent orchestration for Claude Code",
+  "private": true,
   "bin": {
     "kangentic": "bin/kangentic.js"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Kangentic/kangentic.git"
+    "url": "git+https://github.com/Sevenflanks/kangentic.git",
+    "directory": "packages/launcher"
   },
   "keywords": [
     "kangentic",
@@ -29,6 +31,7 @@
   "files": [
     "bin/",
     "LICENSE",
+    "FORK-NOTICE.md",
     "README.md"
   ]
 }

@@ -1,5 +1,5 @@
 /**
- * Spawn entry-point parity guard (see .claude/rules/spawn-entry-point-parity.md).
+ * Spawn entry-point parity guard (see the spawn chokepoint guardrail in root CLAUDE.md).
  *
  * Every way a task agent can be spawned must route through one of the two
  * spawn chokepoints, because spawn-affecting behavior (the first-spawn
@@ -37,7 +37,7 @@
  *
  * A new entry point therefore cannot ship without a deliberate decision:
  * route it through a chokepoint, or add a justified allowlist entry here AND
- * update the rule file.
+ * update the corresponding guardrail in root CLAUDE.md.
  */
 
 import { describe, it, expect } from 'vitest';
@@ -46,7 +46,7 @@ import path from 'node:path';
 
 const REPO_ROOT = path.resolve(__dirname, '../..');
 const MAIN_DIR = path.join(REPO_ROOT, 'src/main');
-const RULE_FILE = '.claude/rules/spawn-entry-point-parity.md';
+const ROOT_GUIDANCE_FILE = 'CLAUDE.md';
 const SOURCE_EXTENSIONS = new Set(['.ts', '.tsx']);
 
 /**
@@ -142,7 +142,7 @@ describe('spawn entry-point parity: engine sinks', () => {
         + `A board-driven spawn must route through spawnAgent (src/main/ipc/helpers/agent-spawn.ts) `
         + `so the shared spawn preamble (first-spawn override lock + agent resolution) applies. `
         + `Either route through spawnAgent / prepareAgentSpawn, or add a justified ENGINE_SINK_FILES `
-        + `entry here and update ${RULE_FILE}.`,
+        + `entry here and update ${ROOT_GUIDANCE_FILE}.`,
     ).toEqual([]);
   });
 });
@@ -158,7 +158,7 @@ describe('spawn entry-point parity: raw PTY sinks', () => {
         + `A new spawn stack bypasses BOTH spawn chokepoints (spawnAgent and prepareAgentSpawn), so `
         + `none of the shared spawn behavior (override lock, agent/permission resolution) applies. `
         + `Route through a chokepoint, or add a justified PTY_SINK_FILES entry here and update `
-        + `${RULE_FILE}.`,
+        + `${ROOT_GUIDANCE_FILE}.`,
     ).toEqual([]);
   });
 });
@@ -174,7 +174,7 @@ describe('spawn entry-point parity: chokepoints actually run the shared preamble
     expect(
       fileHasNonCommentCall(relativePath, 'runSpawnPreamble'),
       `${relativePath} must call runSpawnPreamble() (the first-spawn override lock + agent `
-        + `resolution, in that order) before spawning. See ${RULE_FILE}.`,
+        + `resolution, in that order) before spawning. See ${ROOT_GUIDANCE_FILE}.`,
     ).toBe(true);
   });
 
@@ -185,7 +185,7 @@ describe('spawn entry-point parity: chokepoints actually run the shared preamble
     expect(
       fileHasNonCommentCall(relativePath, 'prepareAgentSpawn'),
       `${relativePath} must build its spawns through prepareAgentSpawn() so the startup path `
-        + `shares the spawn preamble. See ${RULE_FILE}.`,
+        + `shares the spawn preamble. See ${ROOT_GUIDANCE_FILE}.`,
     ).toBe(true);
   });
 
@@ -197,7 +197,7 @@ describe('spawn entry-point parity: chokepoints actually run the shared preamble
       fileHasNonCommentCall(relativePath, 'resolveEffectivePermissionMode'),
       `${relativePath} must resolve the effective permission mode via `
         + `resolveEffectivePermissionMode() (lane 'plan' always wins, else task -> lane -> global) `
-        + `instead of an inline ternary. See ${RULE_FILE}.`,
+        + `instead of an inline ternary. See ${ROOT_GUIDANCE_FILE}.`,
     ).toBe(true);
   });
 });
@@ -213,7 +213,7 @@ describe('spawn entry-point parity: single lock call site', () => {
         + `${outsideCalls.join('\n')}\n\n`
         + `The lock runs only inside runSpawnPreamble, BEFORE agent resolution - a handler-level `
         + `call site can drift out of that ordering. Route the path through a spawn chokepoint `
-        + `instead. See ${RULE_FILE}.`,
+        + `instead. See ${ROOT_GUIDANCE_FILE}.`,
     ).toEqual([]);
   });
 });

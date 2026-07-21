@@ -1,25 +1,14 @@
 # Contributing to Kangentic
 
-Thank you for your interest in contributing to Kangentic! This guide covers everything you need to know to get started.
+感謝你有興趣為 Kangentic 貢獻。本指南說明此 fork 的來源建置、分支與驗證方式。
 
-## Contributor License Agreement (CLA)
+## Fork 貢獻授權政策
 
-**All contributors must sign a CLA before their first pull request can be merged.**
+本 fork 只接受以 `AGPL-3.0-only` 授權的貢獻。提交 PR 即表示你同意以此授權提供該貢獻。
 
-When you open your first PR, the CLA Assistant bot will post a comment asking you to sign. You sign by adding a comment to the PR. It takes about 30 seconds and only needs to be done once.
+本 fork 不收集 upstream CLA，也不提供商業或雙重授權。若你要將獨立、乾淨的變更提交給 upstream，請依 upstream 當時的貢獻與 CLA 規則處理。
 
-### Why we require a CLA
-
-Kangentic is dual-licensed. The public open-source version uses the [AGPLv3 license](LICENSE), and we also offer commercial licenses for organizations that need proprietary modifications. The CLA ensures we can continue offering both licensing options as the project grows.
-
-**What the CLA says (in plain language):**
-
-- You grant VORPAHL LLC a perpetual, worldwide, non-exclusive, royalty-free license to use, modify, sublicense, and distribute your contribution under any license
-- You retain full copyright to your contribution. You can use it however you want
-- You confirm you have the right to make this grant (i.e., you wrote the code yourself or have permission)
-- If your contribution includes third-party code, you must identify it and its license in the PR description
-
-The CLA is modeled after the [Apache Individual Contributor License Agreement](https://www.apache.org/licenses/icla.pdf), which is widely used and well-understood in the open-source community. The full text is in [CLA.md](CLA.md).
+分支角色與 release 邊界以 [docs/fork-governance.md](docs/fork-governance.md) 為準。
 
 ## Getting Started
 
@@ -36,18 +25,18 @@ Visual Studio Build Tools on Windows, Xcode Command Line Tools on macOS, or `bui
 ### Setup
 
 ```bash
-git clone https://github.com/Kangentic/kangentic.git
+git clone https://github.com/Sevenflanks/kangentic.git
 cd kangentic
-npm install
+git checkout sevenflanks-main
+npm ci
 npm start
 ```
 
 ### Where the conventions live
 
-The authoritative conventions for this codebase are [CLAUDE.md](CLAUDE.md) and the focused rule files
-in [.claude/rules/](.claude/rules/). Each rule names how it is enforced (a CI test, an ESLint rule,
-or code review). The sections below distill the human-relevant subset so you do not have to read all
-of them before your first PR, but those files are the source of truth if anything here is ambiguous.
+Use [docs/developer-guide.md](docs/developer-guide.md) for setup and testing, and rely on executable
+tests, ESLint, and CI for enforceable behavior. Fork roles, upstream synchronization, and release
+boundaries are defined in [docs/fork-governance.md](docs/fork-governance.md).
 
 ### Project Structure
 
@@ -73,10 +62,16 @@ Use descriptive branch names:
 - `feature/multi-agent-support`
 - `docs/update-architecture`
 
+Fork 的 feature 與 fix branch 必須從 `sevenflanks-main` 建立，並透過 PR 回到
+`sevenflanks-main`。不要把個人 fork 工作放在 `main`。
+
+若要貢獻 upstream，請從乾淨的 `main` checkout 建立 branch，並確保 branch 不含 fork
+governance 或 `sevenflanks-main` 的變更。提交時請遵循 upstream 的獨立規則。
+
 ### Conventions
 
-These are the conventions that most often need a maintainer follow-up when missed. Each notes how it
-is enforced. The full set lives in [.claude/rules/](.claude/rules/).
+These are the conventions that most often need a maintainer follow-up when missed. Their enforcement
+comes from executable tests, ESLint, CI, or review as noted below.
 
 - **Text formatting.** No em-dashes (U+2014) and no `--` used as punctuation in anything you author
   (code, comments, tests, docs, commit messages). Use a single dash for inline separators or
@@ -103,30 +98,28 @@ is enforced. The full set lives in [.claude/rules/](.claude/rules/).
   (Enforced by review.)
 - **Docs stay in sync.** When you change an anchor source file (union types, IPC channels, DB
   migrations, adapter capabilities, or settings), update the matching docs under `docs/`.
-  (Enforced by an automated doc-anchor check when the PR is opened and merged.)
+  (Checked during review.)
 
 ### Testing
 
 Tests run in three tiers. See [docs/developer-guide.md](docs/developer-guide.md) for the full
 description of each tier and the headless mock.
 
-- **Unit** (`tests/unit/`, Vitest, sub-second, pure logic): `npm run test:unit`
-- **UI** (`tests/ui/`, headless Playwright, no Electron): `npx playwright test --project=ui`
-- **E2E** (`tests/e2e/`, real Electron, opens windows): `npm run build` then
-  `npx playwright test --project=electron`
+- **Unit** (`tests/unit/`, Vitest, sub-second, pure logic)：執行直接受影響的檔案，例如
+  `npx vitest run tests/unit/example.test.ts`
+- **UI** (`tests/ui/`, headless Playwright, no Electron)：執行直接受影響的檔案，例如
+  `npx playwright test tests/ui/example.spec.ts`
+- **E2E** (`tests/e2e/`, real Electron, opens windows)：需要時執行直接受影響的檔案，並可先執行
+  `npm run build`
 
-Stay scoped to what you changed while iterating (run only the tests you added or touched). Before you
-open a PR, the quick local pass is:
+迭代時只執行你新增、修改或直接影響的測試檔。開啟 PR 前，先執行直接受影響的測試檔，再執行：
 
 ```bash
 npm run lint
 npm run typecheck
-npm run test:unit
-npx playwright test --project=ui
 ```
 
-CI is the authoritative full gate (see "What to expect" below), so you do not need to run every tier
-locally, especially the E2E tier.
+若變更會影響 production bundle，或你需要在本機確認 bundle，可執行 `npm run build`。完整 CI 是權威 gate，因此不需要在本機執行每個測試層級。
 
 ### Commit Messages
 
@@ -147,12 +140,11 @@ Allowed types: `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `buil
 
 ## Pull Requests
 
-1. Fork the repo and create a branch from `main`
-2. Make your changes and add or update tests for them
-3. Run the quick local pass above (`lint`, `typecheck`, unit, UI)
-4. Sign the CLA when prompted on your first PR
-5. Open the PR. The template prompts you for What / Why / How / Tests and a short checklist
-6. Link any related issues
+1. 從 `sevenflanks-main` 建立 feature 或 fix branch
+2. 完成變更，並新增或更新對應測試
+3. 執行直接受影響的測試檔、`npm run lint` 與 `npm run typecheck`，必要時執行 build
+4. 開啟目標為 `sevenflanks-main` 的 PR。模板會要求填寫 What / Why / How / Tests 與簡短 checklist
+5. 連結相關 issue
 
 ### What to expect
 
@@ -191,12 +183,7 @@ screenshot or short clip in the PR makes that review much faster and is always a
 
 ### How maintainers land your PR
 
-You do not need to run any of this; it is just so the flow is not a mystery. Maintainers drive a PR
-to green and merge it through an internal Kanban board: a Tests column runs `/pull-request` (which
-pushes the branch and drives the CI checks to green, auto-fixing and de-flaking along the way), and a
-Ship It column runs `/merge-pull-request` (which merges the green PR). The internal board mechanics,
-git worktrees, and agent skills are documented in [CLAUDE.md](CLAUDE.md) and are not something a
-contributor is expected to set up.
+不需要執行任何內部 maintainer workflow。Maintainer 會審查 PR、確認 CI 全數通過，並依一般 GitHub 流程合併。Upstream contribution 必須從乾淨的 `main` checkout 建立。Fork 專用的同步與 release 規則見 [docs/fork-governance.md](docs/fork-governance.md)。
 
 ## Finding Work
 
@@ -208,4 +195,4 @@ Be respectful, constructive, and collaborative. We're all here to build somethin
 
 ## Questions?
 
-Open a [discussion](https://github.com/Kangentic/kangentic/discussions) or comment on the relevant issue.
+Open a [discussion](https://github.com/Sevenflanks/kangentic/discussions) or comment on the relevant issue.

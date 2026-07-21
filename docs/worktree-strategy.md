@@ -117,7 +117,7 @@ Activity state (thinking/idle) is derived from event types in the events pipelin
 
 ### Settings Merge
 
-All sessions (main repo and worktree) use a unified approach. For each session, a merged settings file is built at `.kangentic/sessions/<sessionId>/settings.json` and passed via `--settings`:
+Claude Code sessions in the main repo and worktrees use a unified settings approach. Kangentic writes their merged settings at `.kangentic/sessions/<ptySessionId>/settings.json` and passes that path through the adapter command:
 
 1. Read `.claude/settings.json` from project root (committed, shared)
 2. Deep-merge `.claude/settings.local.json` from project root (gitignored, personal)
@@ -139,16 +139,19 @@ Both must match. This prevents false positives on user-defined hooks with simila
 
 ## Session Directory
 
-Each Claude Code session gets a directory at `<project>/.kangentic/sessions/<claudeSessionId>/`:
+Each Kangentic PTY session gets a directory at `<project>/.kangentic/sessions/<ptySessionId>/`. `ptySessionId` is the `sessions.id` database primary key, not the adapter-native `agent_session_id`. The adapter-native ID can be null and is used for native resume and history lookup when the adapter supports those capabilities.
 
 ```
-.kangentic/sessions/<uuid>/
-  settings.json    # Merged settings passed via --settings
-  status.json      # Usage data (written by status-bridge, watched by SessionManager)
-  events.jsonl     # Structured event log + activity state (appended by event-bridge)
+.kangentic/sessions/<ptySessionId>/
+  status.json      # Kangentic telemetry output when the adapter emits status
+  events.jsonl     # Kangentic activity telemetry when the adapter emits events
+  settings.json    # Conditional merged settings file
+  mcp.json         # Conditional MCP configuration
+  commands.jsonl   # Conditional adapter or feature command queue
+  responses/       # Conditional adapter or feature response directory
 ```
 
-The SessionManager watches these files with debounced `fs.watch` and emits IPC events to the renderer. Activity state (thinking/idle) is derived from event types -- see [Activity Detection](activity-detection.md).
+`status.json` and `events.jsonl` are the standard Kangentic-owned telemetry files. The remaining entries are conditional, and native conversation history is not stored in this directory. The SessionManager watches available telemetry files with debounced `fs.watch` and emits IPC events to the renderer. Activity state (thinking/idle) is derived from event types. See [Activity Detection](activity-detection.md).
 
 ## Session Lifecycle
 
@@ -164,8 +167,11 @@ Task moved to active column (e.g., Planning)
   → File watchers emit usage/activity/events to UI
 
 Task moved between active columns (e.g., Planning → Code Review)
-  → If no auto_command: session stays alive (regardless of permission mode)
-  → If auto_command configured on target: suspend and resume with command as prompt
+  → A track change, target always_spawn_new, agent change, or model change can suspend
+    and spawn or resume the target session
+  → Otherwise, the same-track, same-agent, same-model live session stays live and injects
+    supported auto_command and effort changes; an unsupported concrete effort target can
+    respawn, while permission-only changes or no setting delta stay live
 
 Task moved to Done
   → Confirmation dialog ONLY when the worktree has uncommitted files or unpushed

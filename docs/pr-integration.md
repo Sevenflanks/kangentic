@@ -83,7 +83,7 @@ Both errors are platform-agnostic (a leaf module with no connector imports) so `
 
 `src/main/pr/pr-registry.ts`
 
-The registry holds a plain `connectors` array populated at module import time, and exposes a platform-agnostic API that iterates connectors and returns the first match. There is no provider-name branching here (mirrors `.claude/rules/agent-adapters-boundary.md`).
+The registry holds a plain `connectors` array populated at module import time, and exposes a platform-agnostic API that iterates connectors and returns the first match. There is no provider-name branching here, consistent with the adapter-boundary guardrail in root `CLAUDE.md`.
 
 ```ts
 const connectors: PRConnector[] = [
@@ -123,7 +123,7 @@ The registry also re-exports the contract types and both error classes, so consu
 
 `src/main/pr/pr-linking.ts`
 
-`linkPRForTask` is the single backbone every trigger funnels through. It resolves a task's PR via a confidence ladder, short-circuiting on the first hit, and writes only on change. It is wrapped in `withTaskLock` because it crosses an await boundary and mutates per-task state (see `.claude/rules/task-lifecycle-lock.md`).
+`linkPRForTask` is the single backbone every trigger funnels through. It resolves a task's PR via a confidence ladder, short-circuiting on the first hit, and writes only on change. It is wrapped in `withTaskLock` because it crosses an await boundary and mutates per-task state, as required by root `CLAUDE.md`. `tests/unit/task-lifecycle-lock.test.ts` verifies the lock's serialization contract.
 
 ### The confidence ladder
 
@@ -184,7 +184,7 @@ The companion `head_sha` column stores the last-captured worktree HEAD commit as
 
 ### IPC channel
 
-`task:resolvePr` (`IPC.TASK_RESOLVE_PR`) is the renderer-facing, on-demand resolver behind the task detail header's "Link / refresh PR" control. Per `.claude/rules/project-scoped-ipc.md` it forwards an explicit interaction-time `projectId`. The handler (in `src/main/ipc/handlers/sessions.ts`) calls `linkPR` with `force: true` and returns a `TaskResolvePrResult`:
+`task:resolvePr` (`IPC.TASK_RESOLVE_PR`) is the renderer-facing, on-demand resolver behind the task detail header's "Link / refresh PR" control. Root `CLAUDE.md` requires it to forward an explicit interaction-time `projectId`, and `tests/unit/project-scoped-ipc.test.ts` enforces that IPC parity. The handler (in `src/main/ipc/handlers/sessions.ts`) calls `linkPR` with `force: true` and returns a `TaskResolvePrResult`:
 
 | Field | Purpose |
 |-------|---------|

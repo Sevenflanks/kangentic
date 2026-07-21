@@ -80,7 +80,7 @@ src/
         github-issues/     # GitHub Issues adapter (stable)
         github-projects/   # GitHub Projects v2 adapter (stable)
         azure-devops/      # Azure DevOps adapter (stable)
-        asana/             # Asana adapter (stub)
+        asana/             # Asana adapter (stable, Personal Access Token auth)
         jira/              # Jira adapter (stub)
         linear/            # Linear adapter (stub)
         trello/            # Trello adapter (stub)
@@ -256,15 +256,11 @@ npx playwright test --project=electron
 | Component rendering, user interaction, form validation | UI |
 | Real IPC, PTY spawning, terminal output, file I/O | E2E |
 
-Release-time manual validation against real authenticated agent CLIs lives in [release-checklist.md](release-checklist.md). Automated tests use mock fixtures and intentionally do not exercise real model latency, real tool calls, or conversation continuity across resume.
+Local Windows installer validation lives in [release-checklist.md](release-checklist.md). Automated tests use mock fixtures and intentionally do not exercise real model latency, real tool calls, or conversation continuity across resume.
 
 ### Run All
 
-The `/test` command is the full local gate: typecheck, build, then unit + UI + E2E (all tests,
-no selection heuristic). `/test quick` runs unit + UI only for the fast inner loop. It is for
-manual local runs - the automated gate now runs on CI as PR checks (the **Tests** column runs
-`/pull-request`, which pushes a branch and drives the CI checks to green; CI runs lint, typecheck,
-unit, build, the UI shards, and the Linux Electron E2E shards under xvfb). To run tiers directly:
+完整本機驗證包含 typecheck、build、unit、UI 與 E2E，應只在明確需要手動完整驗證時執行。日常迭代請依變更範圍執行單一相關測試。CI 會執行 lint、typecheck、unit、build、UI shards 與 Linux Electron E2E shards。若明確要直接執行完整測試層級：
 
 ```bash
 npx playwright test              # UI + E2E
@@ -338,24 +334,15 @@ npm run test:unit                 # Unit (separate runner)
 
 ## Documentation Maintenance
 
-Run `/sync-docs` to review and update documentation after code changes. This command:
-- Maps changed source files to affected docs using the source-to-doc mapping in `.claude/skills/sync-docs/SKILL.md`
-- Checks for stale facts (schema, config keys, constants, types)
-- Updates docs in-place and reports what changed
-
-The targeted doc-anchor check runs automatically inside `/pull-request` (commit time),
-`/merge-pull-request` (merge time), and `/merge-back` (direct push). To run the full review
-manually: `/sync-docs`.
+程式變更後，請人工比對受影響的來源與對應文件，確認 schema、設定鍵、常數與型別等事實仍正確。依變更範圍執行相關的單一測試、`npm run typecheck` 與 `npm run lint`，再檢查文件中的指令、連結和行為描述是否仍與目前來源一致。
 
 ## Packaging
 
 electron-builder handles platform-specific packaging via `electron-builder.yml`:
 
-| Platform | Format | Builder |
-|----------|--------|---------|
-| Windows | Installer | NSIS |
-| macOS | Disk image + ZIP | DMG |
-| Linux | Package | deb, rpm |
+| Fork package path | Format | Builder |
+|-------------------|--------|---------|
+| Windows only | Local unsigned installer | NSIS |
 
 Native modules:
 - `better-sqlite3` -- rebuilt against Electron headers via `scripts/rebuild-native.js`
@@ -365,7 +352,7 @@ Native modules:
 Security fuses enabled: no RunAsNode, no NodeOptions, no inspection, cookie encryption, ASAR integrity validation.
 
 ```bash
-npm run package    # Package for current platform
-npm run make       # Create distributable
-npm run publish    # Publish to GitHub (draft release)
+npm run make:win
 ```
+
+此 fork 的正式封裝入口只有 `npm run make:win`。script 依序執行 `npm run rebuild`、production `npm run build`，再執行 `electron-builder --win --publish never`。它輸出 `out/Kangentic-Setup-X.Y.Z.exe`，不會發布 artifact 或設定 update feed。`electron-builder.yml` 的 legal `extraResources` 會把 `LICENSE` 與 `FORK-NOTICE.md` 放入封裝資源。

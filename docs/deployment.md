@@ -1,142 +1,64 @@
-# Deployment
+# 本機 Windows Installer
 
-This document covers the full deployment pipeline for maintainers and the update experience for users.
+此文件說明 `Sevenflanks/kangentic` 的唯一封裝契約。此 fork 不建立 GitHub Release、draft workflow、npm publication、public artifact 或 auto-update feed。維護者只在自己的 Windows 電腦建置並使用 installer。
 
-## For Users
+## 建置
 
-### Install
-
-```bash
-npx kangentic
-```
-
-This downloads the pre-built binary for your platform, installs it, and launches the app. After the first run, auto-updates handle everything (Windows and macOS).
-
-### Auto-Update Behavior
-
-| Platform | Update mechanism | User action |
-|----------|-----------------|-------------|
-| Windows | `electron-updater` (NSIS) | Click "Restart to update" toast, or quit normally -- installs silently on next launch. |
-| macOS | `electron-updater` | Click "Restart to update" when prompted. Requires code signing -- see [macOS signing note](#macos-auto-update-requires-signing). |
-| Linux | None | Re-run `npx kangentic` or download from [GitHub Releases](https://github.com/Kangentic/kangentic/releases). |
-
-Auto-update is implemented in `src/main/updater.ts`. It checks for updates 5 seconds after launch, then every 4 hours. Updates download in the background; a persistent toast notifies the user when ready. v0.1.0 users must manually update to v0.2.0 -- auto-update kicks in from v0.2.0 onward.
-
-### Install a Specific Version
+從個人整合主線 `sevenflanks-main` 取得來源：
 
 ```bash
-npx kangentic@0.2.0
+git clone https://github.com/Sevenflanks/kangentic.git
+cd kangentic
+git checkout sevenflanks-main
+npm ci
 ```
 
-The launcher version matches the app version. This downloads the exact matching release.
+來源執行使用：
 
-### Rollback
+```bash
+npm run dev
+```
 
-To roll back to a previous version, run `npx kangentic@X.Y.Z` with the desired version. On Windows, the NSIS installer will replace the current version. On macOS, the .app is replaced in `~/Applications/`.
+建立 installer 使用：
 
-## For Maintainers
+```bash
+npm run make:win
+```
 
-### Release Sequencing
+這是唯一支援的 fork 封裝命令。`make:win` 依序執行 `npm run rebuild`、production `npm run build`，最後執行 `electron-builder --win --publish never`。因此環境變數、tag 或 token 不會改變為發布行為。
 
-1. **`/release patch`** (or `minor`/`major`) -- analyzes conventional commits, bumps version in root `package.json` + `packages/launcher/package.json`, generates CHANGELOG entry + user-friendly release notes, commits, tags, pushes.
-2. **Tag push triggers `release.yml`** -- requires approval from the `release` environment (Settings > Environments). Builds all platforms (Linux x64, Windows x64, macOS arm64), signs binaries (when signing secrets are configured), creates a **draft** GitHub Release with artifacts attached.
-3. **Run the [release smoke checklist](release-checklist.md)** against the draft build before publishing. Automated tests use mock CLI fixtures, so this manual gate is the only place real model latency, real tool calls, and conversation continuity across resume get exercised. Failure here blocks publish.
-4. **Review and publish the draft release** at [github.com/Kangentic/kangentic/releases](https://github.com/Kangentic/kangentic/releases). Paste the release notes from `/release` output. Publishing is a manual gate.
-5. **The `publish-npm` job in `release.yml`** publishes the launcher package to npm after `publish-release` succeeds, using Trusted Publishing (OIDC) -- no token required.
-6. **`npx kangentic`** now downloads the new version's signed binaries.
+## 產物與更新行為
 
-### Commit Conventions
+成功建置會產生：
 
-All commits must use [Conventional Commits](https://www.conventionalcommits.org/) format. A husky commit-msg hook runs commitlint to enforce this. The commit skills (`/commit`, `/pull-request`, `/merge-pull-request`, `/merge-back`) auto-generate conventional commit messages from diffs.
+```text
+out/Kangentic-Setup-X.Y.Z.exe
+```
 
-Common prefixes: `feat:`, `fix:`, `refactor:`, `chore:`, `docs:`, `test:`, `perf:`, `ci:`, `build:`. Add `!` after the type for breaking changes (e.g., `feat!:`).
+installer 為未簽署 EXE。Windows 可能顯示 SmartScreen 警告，僅在確認本機來源與版本後才執行。`electron-builder.yml` 的 `publish: null` 不設定 publish provider，封裝的 `out/win-unpacked/resources/` 也不得有 `app-update.yml`。既有 updater guard 會因此停用 auto-update，不影響本機啟動。
 
-### Release Permissions
+封裝資源必須包含下列檔案，且內容要與根目錄完全一致：
 
-Releases require two things:
-- **Write** role (minimum) to trigger the workflow or push a tag
-- **`release` environment reviewer** to approve the workflow run
+- `resources/LICENSE`
+- `resources/FORK-NOTICE.md`
 
-Configure the `release` environment in Settings > Environments with required reviewers. Even Admin users cannot bypass environment approval.
+這些 legal resources 保留授權與 fork 通知，但不代表可將 EXE 交付給其他人。相關 conveying 要求見 [Fork AGPL Compliance Guide](fork-agpl-compliance.md)。
 
-### Code Signing Secrets
+## 本機 QA
 
-Signing only activates when the corresponding env vars are present. Local dev builds remain unsigned. CI builds sign when secrets exist.
+每次建立 installer 後，依 [Local Windows Installer QA](release-checklist.md) 確認產物路徑、未簽署狀態、缺少 `app-update.yml`、legal hash 與安全啟動。QA 不會建立 tag、上傳檔案、發布 npm package 或建立 release。
 
-| Secret | Source |
-|--------|--------|
-| `APPLE_IDENTITY` | Apple Developer ID Application certificate name |
-| `APPLE_ID` | Apple ID email |
-| `APPLE_PASSWORD` | App-specific password (not account password) |
-| `APPLE_TEAM_ID` | Apple Developer Team ID |
-| `AZURE_TENANT_ID` | Azure AD tenant ID |
-| `AZURE_CLIENT_ID` | App registration (service principal) client ID |
-| `AZURE_CLIENT_SECRET` | App registration client secret |
-| `AZURE_SIGNING_ENDPOINT` | Regional endpoint (e.g., `https://eus.codesigning.azure.net/`) |
-| `AZURE_SIGNING_ACCOUNT` | Trusted Signing account name |
-| `AZURE_CERT_PROFILE` | Certificate profile name |
+## Protocol Workspace
 
-The launcher publishes to npm via Trusted Publishing (OIDC), so no npm token secret is
-required. The `publish-npm` job proves its identity to npm per-run with a short-lived OIDC
-token (`id-token: write`). Configure the trusted publisher on npmjs.com for the `kangentic`
-package: GitHub Actions, org `Kangentic`, repo `kangentic`, workflow `release.yml`.
+`@kangentic/protocol` 是 private workspace，不發布到 npm。需要驗證時只執行本機命令：
 
-### macOS Auto-Update Requires Signing
+```bash
+npm run build --workspace packages/protocol
+npm pack --dry-run --workspace packages/protocol
+```
 
-Electron's `autoUpdater` on macOS only works with signed apps (Electron docs: "mandatory for auto-update on macOS"). Until the Apple Developer certificate secrets are configured:
+這些命令建置或檢視 pack 清單，不會發布 package。
 
-- macOS users will NOT receive auto-updates
-- They must re-run `npx kangentic` manually to get new versions
-- The Gatekeeper bypass is also required on each install (see [Installation Guide](installation.md#macos-gatekeeper))
+## Upstream Launcher
 
-### Draft Releases Are Invisible to Auto-Updater
-
-`electron-updater` only sees **published** releases. Draft releases are invisible to the auto-updater and to `npx kangentic`. The manual publish step is the review gate -- always verify artifacts before publishing.
-
-### GitHub Actions Workflows
-
-| Workflow | Trigger | Purpose |
-|----------|---------|---------|
-| `ci.yml` | Push to main, PRs | Typecheck, unit tests, UI tests |
-| `release.yml` | Tag push (`v*`) or `workflow_dispatch` | Build + sign + draft GitHub Release, then publish + set notes + publish launcher to npm (via OIDC trusted publishing) |
-
-### CI Build Matrix
-
-The release workflow produces 3 builds:
-
-| Runner | Platform | Artifacts |
-|--------|----------|-----------|
-| `ubuntu-latest` | linux-x64 | `.deb`, `.rpm` |
-| `windows-latest` | windows-x64 | `Setup.exe`, `.nupkg` |
-| `macos-latest` | macos-arm64 | `.dmg`, `.zip` |
-
-Linux arm64 and macOS x64 are not built in v1. Documented in the [Installation Guide](installation.md).
-
-### Local Testing
-
-Test the packaged app locally before releasing:
-
-| Command | What it does |
-|---------|-------------|
-| `npm run make` | Creates platform installers in `out/make/` |
-| `npm run publish -- --dry-run` | Builds installers + simulates publishing (no upload) |
-| `npm run publish -- --from-dry-run` | Uploads previously dry-run artifacts |
-
-The installed app and `npm run dev` share the same data directory. Set `KANGENTIC_DATA_DIR` to isolate them if needed.
-
-## Troubleshooting
-
-### Update not appearing
-
-- Verify the release is **published** (not draft) on GitHub
-- The app checks hourly -- restart the app to trigger an immediate check
-- On macOS, auto-update requires code signing. Without it, updates won't be detected.
-
-### Rollback
-
-Run `npx kangentic@X.Y.Z` with the desired version to download and install that specific release.
-
-### Clearing update cache
-
-- **Windows:** Delete `%LOCALAPPDATA%\Kangentic\packages\` and restart
-- **macOS:** Delete `~/Library/Caches/Kangentic/` and restart
+`npx kangentic` 是 upstream 的 distribution path，不會下載、安裝或執行此 fork。此 fork 的使用方式只有從來源執行，或由維護者自行建立本機 Windows installer。
