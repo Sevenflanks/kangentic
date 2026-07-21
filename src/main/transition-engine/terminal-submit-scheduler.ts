@@ -1,6 +1,6 @@
 import type { SessionManager } from '../pty/session-manager';
 import type { CommandVerifier, TerminalSubmit } from '../pty/terminal-submit';
-import type { SubmissionVerifier } from '../../shared/types';
+import type { SessionStatus, SubmissionVerifier } from '../../shared/types';
 
 /**
  * Re-export so callers in injection-plan and slash-command-verifier can keep
@@ -83,10 +83,10 @@ export interface ScheduleContentOptions {
  *      share one start guard. Content completion releases only the latest
  *      queued fresh-spawn keystroke follower.
  *
- * Cancellation tears down event listeners + timers AND aborts an in-flight
- * burst via the per-task `AbortController` plumbed through to
- * TerminalSubmit. Re-scheduling for the same task cancels any prior pending
- * injection.
+ * Cancellation tears down content and keystroke readiness listeners/timers,
+ * drops queued content followers and burst follow-ups, and aborts in-flight
+ * content or keystroke delivery through the per-task `AbortController`.
+ * Re-scheduling for the same task cancels any prior pending injection.
  *
  * Used by every column-transition / lifecycle path that injects keystrokes:
  * auto_command on column move, `/model X` + `/effort Y` settings burst,
@@ -113,6 +113,24 @@ export class TerminalSubmitScheduler {
     const session = this.sessionManager.getSession(sessionId);
     if (!session) return;
 
+    const status: SessionStatus = session.status;
+    let isQueued: boolean;
+    switch (status) {
+      case 'running':
+        isQueued = false;
+        break;
+      case 'queued':
+        isQueued = true;
+        break;
+      case 'exited':
+      case 'suspended':
+        return;
+      default: {
+        const unhandledStatus: never = status;
+        return unhandledStatus;
+      }
+    }
+
     this.cancel(taskId);
     const entry: PendingContent = {
       controller: new AbortController(),
@@ -125,7 +143,7 @@ export class TerminalSubmitScheduler {
       { kind: 'content', sessionId, text },
       opts,
       entry,
-      session.status === 'queued',
+      isQueued,
     );
   }
 

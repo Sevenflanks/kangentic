@@ -25,19 +25,25 @@ import { EventEmitter } from 'node:events';
 import { TerminalSubmitScheduler } from '../../src/main/transition-engine/terminal-submit-scheduler';
 import type { TerminalSubmit } from '../../src/main/pty/terminal-submit';
 import type { SubmitContentOptions, SubmitKeystrokesOptions } from '../../src/main/pty/terminal-submit';
-import type { SubmissionVerifier } from '../../src/shared/types';
+import type { SessionStatus, SubmissionVerifier } from '../../src/shared/types';
 
 class MockSessionManager extends EventEmitter {
-  registry = new Map<string, { status: string }>();
+  registry = new Map<string, { status: SessionStatus }>();
   firstOutput = new Set<string>();
   firstOutputListenerCounts: number[] = [];
+  firstOutputDuringCacheRead: string | null = null;
 
-  getSession(id: string): { status: string } | undefined {
+  getSession(id: string): { status: SessionStatus } | undefined {
     return this.registry.get(id);
   }
 
   getFirstOutputCache(): Record<string, boolean> {
     this.firstOutputListenerCounts.push(this.listenerCount('first-output'));
+    if (this.firstOutputDuringCacheRead !== null) {
+      const sessionId = this.firstOutputDuringCacheRead;
+      this.firstOutputDuringCacheRead = null;
+      this.emitFirstOutput(sessionId);
+    }
     return Object.fromEntries([...this.firstOutput].map((id) => [id, true]));
   }
 
@@ -50,7 +56,7 @@ class MockSessionManager extends EventEmitter {
     this.emit('activity', id, state);
   }
 
-  emitSessionChanged(id: string, session: { status: string }): void {
+  emitSessionChanged(id: string, session: { status: SessionStatus }): void {
     this.emit('session-changed', id, session);
   }
 
@@ -193,6 +199,55 @@ describe('TerminalSubmitScheduler', () => {
   });
 
   describe('ready-gated content', () => {
+    describe('session status', () => {
+      it('submits cached content for a running session', async () => {
+        sessionManager.registry.set('s1', { status: 'running' });
+        sessionManager.firstOutput.add('s1');
+
+        scheduler.scheduleContent('task-1', 's1', 'content');
+        await tick();
+
+        expect(terminalSubmit.contentCalls).toHaveLength(1);
+      });
+
+      it('waits for a queued session to become running before using its cache', async () => {
+        sessionManager.registry.set('s1', { status: 'queued' });
+        sessionManager.firstOutput.add('s1');
+
+        scheduler.scheduleContent('task-1', 's1', 'content');
+        await tick();
+
+        expect(terminalSubmit.contentCalls).toHaveLength(0);
+        expect(vi.getTimerCount()).toBe(0);
+
+        sessionManager.emitSessionChanged('s1', { status: 'running' });
+        await tick();
+
+        expect(terminalSubmit.contentCalls).toHaveLength(1);
+      });
+
+      it.each([
+        'exited',
+        'suspended',
+      ] satisfies readonly SessionStatus[])('ignores cached content for inactive %s status without scheduler state', async (status) => {
+        sessionManager.registry.set('s1', { status });
+        sessionManager.firstOutput.add('s1');
+
+        scheduler.scheduleContent('task-1', 's1', 'content');
+        await tick();
+
+        expect(terminalSubmit.contentCalls).toHaveLength(0);
+        expect(sessionManager.eventNames()).toEqual([]);
+        expect(vi.getTimerCount()).toBe(0);
+
+        sessionManager.registry.set('s1', { status: 'running' });
+        scheduler.scheduleKeystrokes('task-1', 's1', ['/standalone']);
+        await tick();
+
+        expect(terminalSubmit.calls).toHaveLength(1);
+      });
+    });
+
     it('waits for matching first-output without a fallback and submits once', async () => {
       sessionManager.registry.set('s1', { status: 'running' });
 
@@ -213,13 +268,13 @@ describe('TerminalSubmitScheduler', () => {
 
     it('attaches the listener before checking cache and shares one start guard', async () => {
       sessionManager.registry.set('s1', { status: 'running' });
-      sessionManager.firstOutput.add('s1');
+      sessionManager.firstOutputDuringCacheRead = 's1';
 
       scheduler.scheduleContent('task-1', 's1', 'cached content');
-      sessionManager.emitFirstOutput('s1');
       await tick();
 
       expect(sessionManager.firstOutputListenerCounts).toEqual([1]);
+      expect(sessionManager.firstOutput.has('s1')).toBe(true);
       expect(terminalSubmit.contentCalls).toHaveLength(1);
     });
 
