@@ -72,11 +72,12 @@ async function flushSetImmediate(): Promise<void> {
 }
 
 describe('sanitizeForPaste', () => {
-  it('strips lone CR', () => {
-    expect(sanitizeForPaste('hello\rworld')).toBe('hello\nworld');
+  it('preserves lone CR byte-for-byte for bracketed paste content', () => {
+    expect(sanitizeForPaste('hello\rworld')).toBe('hello\rworld');
   });
-  it('normalizes CRLF to LF', () => {
-    expect(sanitizeForPaste('a\r\nb\r\nc')).toBe('a\nb\nc');
+  it('preserves CRLF byte-for-byte for bracketed paste content', () => {
+    const input = '<task>\r\n  <description>繁體中文\r\nline two</description>\r\n</task>';
+    expect(sanitizeForPaste(input)).toBe(input);
   });
   it('preserves tab and newline', () => {
     expect(sanitizeForPaste('a\tb\nc')).toBe('a\tb\nc');
@@ -300,14 +301,14 @@ describe('PasteEngine.pasteAndSubmit', () => {
     await expect(promise).resolves.toBeUndefined();
   });
 
-  it('sanitizes embedded CR before writing', async () => {
+  it('preserves embedded CR before writing', async () => {
     const promise = engine.pasteAndSubmit('s1', 'line one\rline two', { bracketed: false });
 
     await tick();
     mockSessionManager.flushDrain();
     await tick();
 
-    expect(mockSessionManager.writeRawCalls[0].data).toBe('line one\nline two');
+    expect(mockSessionManager.writeRawCalls[0].data).toBe('line one\rline two');
 
     vi.advanceTimersByTime(1100);
     await tick();

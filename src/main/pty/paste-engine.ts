@@ -115,12 +115,9 @@ const EVIDENCE_RETRY_WAIT_MS = 2000;
  * (capMs scales with packet length). Keep `timeoutMs` (default 15000ms in
  * `pasteAndSubmit`) comfortably above this sum. */
 
-/** Strip CR and other C0 controls that would corrupt paste; keep \t and \n. */
+/** Strip C0 controls that would corrupt paste; keep \r, \t, and \n. */
 export function sanitizeForPaste(text: string): string {
-  return text
-    .replace(/\r\n/g, '\n')
-    .replace(/\r/g, '\n')
-    .replace(/[\x00-\x08\x0b-\x1f]/g, '');
+  return text.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, '');
 }
 
 /**
