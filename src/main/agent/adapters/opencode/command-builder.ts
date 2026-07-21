@@ -71,11 +71,10 @@ export class OpenCodeCommandBuilder {
 
     if (options.resume && options.sessionId) {
       parts.push('--session', quoteArg(options.sessionId, shell));
-      // Resume attaches to the existing OpenCode session - no prompt
-      // is delivered (mirrors Claude's --resume convention). We also
-      // do not pass --agent on resume: the saved session already has
-      // an active agent and the user may have Tab-switched mid-session.
-      // Forcing it here would shadow that runtime choice.
+      // Resume carries no prompt in the command. `initialPromptDelivery`
+      // routes current prompt content through terminal submission after
+      // the TUI is ready. We also omit --agent because the saved session
+      // may have a user-selected agent that this command must not shadow.
       return parts.join(' ');
     }
 
