@@ -41,7 +41,7 @@
 - **Embedded browser** - point a sandboxed Chromium pane at any URL inside the task dialog, draw annotations, pick DOM elements, and submit the rendered frame plus context to the active agent as a multi-modal prompt, all without leaving the task.
 - **Search & memory** - one overlay (Ctrl+Shift+F) searches everything on your machine: tasks, backlog, session events, projects, and every past agent conversation, by keyword or on-device semantic memory. Land on the exact turn where you solved something before, no API key required, and your agents can recall it too through the board's MCP tools.
 - **Voice dictation** - hold a key, talk, release: local push-to-talk speech-to-text drops your words into the agent's terminal, transcribed on-device with a streaming preview and a refinement pass. Punctuation, language, and auto-submit are all configurable.
-- **Model & effort routing** - use Opus for Planning, Sonnet for Code Review, change efforts for the harder steps. Model changes suspend and resume with new launch flags; supported effort changes apply live, while unsupported concrete effort changes respawn.
+- **Model & effort routing** - use Opus for Planning, Sonnet for Code Review, change efforts for the harder steps. Only a concrete model target suspends and resumes with new launch flags; clearing a model to the default keeps the live session. Supported effort changes apply live, while unsupported concrete effort changes respawn.
 - **Your tools, your machine** - runs entirely on your desktop (Windows, macOS, Linux, and WSL) with no cloud service and no data leaving your machine. Kangentic launches native agent CLIs where they apply, plus Ollama for local LLM chat, using your own logins and subscriptions.
 
 ## How It Works

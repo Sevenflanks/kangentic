@@ -77,13 +77,10 @@ const packageManifestSchema = z.object({
 });
 
 function readRequiredFile(filePath: string): string {
-  // Given an explicit repository contract file
   const exists = fs.existsSync(filePath);
 
-  // When the test loads that contract
   expect(exists, `Required contract file is missing: ${filePath}`).toBe(true);
 
-  // Then the file is read without discovering or traversing other paths
   return fs.readFileSync(filePath, 'utf-8');
 }
 
@@ -100,13 +97,10 @@ function readGovernanceContract(): z.infer<typeof governanceContractSchema> {
 
 describe('fork governance contract', () => {
   it('locks main as the upstream mirror and uses sevenflanks-main as the personal integration trunk', () => {
-    // Given the documented branch policy
     const branches = readGovernanceContract().branches;
 
-    // When each mainline role is evaluated
     const policy = branchPolicySchema.parse(branches);
 
-    // Then personal and upstream work use separate, explicit branch flows
     expect(policy.upstreamMirror).toEqual({ name: 'main', locked: true, remoteConfigured: false });
     expect(policy.personalIntegration).toEqual({
       name: 'sevenflanks-main',
@@ -117,7 +111,6 @@ describe('fork governance contract', () => {
   });
 
   it('uses defaultBaseBranch only as the worktree base and never as Git tracking configuration', () => {
-    // Given the board config and documented setting scope
     const boardConfig = boardConfigSchema.parse(JSON.parse(readRequiredFile(BOARD_CONFIG_PATH)));
     const documentedConfig = readGovernanceContract().boardConfig;
 
@@ -130,29 +123,23 @@ describe('fork governance contract', () => {
   });
 
   it('keeps the fork and its governance changes AGPL-3.0-only', () => {
-    // Given the package manifest, root license, and governance contract
     const packageManifest = packageManifestSchema.parse(JSON.parse(readRequiredFile(PACKAGE_MANIFEST_PATH)));
     const license = readRequiredFile(LICENSE_PATH);
     const governanceLicense = readGovernanceContract().license;
 
-    // When all explicit license declarations are evaluated
     const hasAgplV3LicenseText = license.includes('GNU AFFERO GENERAL PUBLIC LICENSE')
       && license.includes('Version 3, 19 November 2007');
 
-    // Then no governance artifact introduces a different license
     expect(packageManifest.license).toBe('AGPL-3.0-only');
     expect(governanceLicense).toBe('AGPL-3.0-only');
     expect(hasAgplV3LicenseText).toBe(true);
   });
 
   it('blocks upstream-identity releases and locks distribution to local unsigned Windows packaging', () => {
-    // Given the documented release policy
     const release = readGovernanceContract().release;
 
-    // When the approved distribution boundary is evaluated
     const distribution = release;
 
-    // Then only local unsigned Windows packaging remains enabled
     expect(distribution).toEqual({
       upstreamIdentity: 'blocked',
       blocker: 'branding-decision',
@@ -184,7 +171,10 @@ describe('fork governance contract', () => {
     expect(release.linuxPackaging).toBe('retained-upstream-development-only-unapproved');
   });
 
-  it('keeps distribution and live-session transition documentation within the fork contract', () => {
+  it('keeps distribution and recovered session-routing documentation within the fork contract', () => {
+    const readme = readRequiredFile(path.join(REPO_ROOT, 'README.md'));
+    const architecture = readRequiredFile(path.join(REPO_ROOT, 'docs', 'architecture.md'));
+    const transitionEngine = readRequiredFile(path.join(REPO_ROOT, 'docs', 'transition-engine.md'));
     const overview = readRequiredFile(OVERVIEW_DOCUMENT_PATH);
     const worktreeStrategy = readRequiredFile(WORKTREE_STRATEGY_DOCUMENT_PATH);
     const falseLiveSettingsClaims = [
@@ -203,6 +193,16 @@ describe('fork governance contract', () => {
       expect.soft(readRequiredFile(path.join(REPO_ROOT, relativePath))).not.toMatch(falseClaim);
     }
 
+    expect(readme).not.toContain('Model changes suspend and resume with new launch flags;');
+    expect(transitionEngine).not.toContain('**Fresh spawns** (priority 4, no suspended session to resume):');
+    expect(transitionEngine).not.toContain('Transition action chains (priority 4) only fire when a task has no active session.');
+    expect(architecture).not.toContain('Transitions only fire for case 5.');
+    expect(readme).toContain('Only a concrete model target suspends and resumes with new launch flags; clearing a model to the default keeps the live session.');
+    expect(transitionEngine).toContain('A default model target does not restart a live session.');
+    expect(transitionEngine).toContain('Fresh spawns with `skipPromptTemplate` pass `auto_command` as the initial prompt.');
+    expect(transitionEngine).toContain('Fresh spawns with a task prompt template schedule `auto_command` through `TerminalSubmitScheduler.scheduleKeystrokes` with `sendCtrlC: false`.');
+    expect(transitionEngine).toContain('Transition action chains run for Priority 3 cases that suspend and fall through to `spawnAgent`, as well as Priority 4 no-active-session cases.');
+    expect(architecture).toContain('Transitions run for Priority 3 cases that suspend and fall through to `spawnAgent`, and for Priority 4 no-active-session cases.');
     expect(overview).not.toContain('Native installers for Windows (NSIS), macOS (DMG), and Linux (deb/rpm).');
     expect(overview).toContain('Only approved fork distribution: local unsigned Windows `npm run make:win`.');
     expect(overview).toContain('Kangentic runs across Windows, macOS, and Linux');

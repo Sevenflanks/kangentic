@@ -23,7 +23,7 @@ When a task moves from one column to another, the IPC handler (`task:move`) chec
 | 1 | Target is **To Do** (role=`todo`) | Kill session, delete session history and worktree, and delete the branch when `git.autoCleanup` is enabled |
 | 2 | Target is **Done** (role=`done`) | Suspend session (resumable), archive task |
 | 2.5 | Target has `auto_spawn=false` (non-todo, non-done) | Suspend session |
-| 3 | Task has **active session** | Agent, model, session-track, or force-fresh changes can suspend and respawn. An adapter may live-swap an effort change. A permission-only change never restarts a live session. |
+| 3 | Task has **active session** | Agent, a concrete model target, session-track, or force-fresh changes can suspend and respawn. An adapter may live-swap an effort change. A permission-only change or clearing the model to the default never restarts a live session. |
 | 4 | Task has **no session** | Resume suspended session (with `auto_command` preloaded as resume prompt) OR create worktree (if enabled) + execute transition action chain |
 
 ### Priority 3: Active Session Handling
@@ -32,7 +32,7 @@ Priority 3 has five sub-cases, checked in order:
 
 **a) Agent change (handoff):** If `resolveTargetAgent()` returns a different agent than the current session's agent, the session is suspended and the engine falls through to the `spawnAgent` path. The `agentOverride` parameter prevents the target session from resuming the old agent's session. Per-task `model_override` and `effort_override` are cleared on handoff because their values are agent-specific; this clear is skipped when `task.agent_override` locks the agent. Native-history handoff behavior additionally requires a prior session, project context, and enabled destination `handoff_context`. It then attempts to locate the source adapter's native history file and gives the target prompt an optional path reference. Without those conditions, the agent change still spawns normally with no history reference or handoff audit row. See [Cross-Agent Handoff](#cross-agent-handoff) below.
 
-**b) Same agent + model change:** A model change is the restart marker. The handler suspends the session and continues through Phases 2 and 3, where the resumed spawn applies the destination model, effort, and permission as adapter-built command options. It does not try a live model swap.
+**b) Same agent + model change:** Only a concrete model target is the restart marker. The handler suspends the session and continues through Phases 2 and 3, where the resumed spawn applies the destination model, effort, and permission as adapter-built command options. It does not try a live model swap. A default model target does not restart a live session.
 
 **c) Same agent + effort change:** The adapter decides whether it can apply a concrete effort change live. A live-swap plan is scheduled through `TerminalSubmitScheduler.scheduleKeystrokes`, then its applied settings are persisted on the session record. Without a live-swap capability, a concrete effort delta suspends and respawns so the new setting reaches the adapter command. Deltas compare the session record's `applied_effort`, not the source lane. Entering a default-effort lane does not respawn because resume preserves the existing agent setting.
 
@@ -40,7 +40,7 @@ Priority 3 has five sub-cases, checked in order:
 
 **e) Same agent, no restart condition:** The session stays alive. An adapter may still schedule a configured `auto_command` through its injection plan.
 
-Transition action chains (priority 4) only fire when a task has no active session.
+Transition action chains run for Priority 3 cases that suspend and fall through to `spawnAgent`, as well as Priority 4 no-active-session cases.
 
 ## Transition Lookup
 
@@ -190,10 +190,13 @@ When a task moves to a column with `auto_command` set, the command delivery depe
 - The `auto_command` is interpolated and passed as the resume prompt to `claude --resume <id>`
 - This is deterministic: the command is the first thing the agent sees on resume
 
-**Fresh spawns** (priority 4, no suspended session to resume):
-- `TerminalSubmitScheduler.scheduleKeystrokes` schedules the command for deferred PTY injection
-- Interpolates the `auto_command` template with task variables
-- Waits for the CLI's first `'thinking'` activity event, then uses `sendCtrlC: false` to write text → Esc → Enter via `TerminalSubmit.submitKeystrokes`
+**Fresh spawns with `skipPromptTemplate`** (no suspended destination session to resume):
+- Fresh spawns with `skipPromptTemplate` pass `auto_command` as the initial prompt.
+- The command is interpolated with task variables, so the promptless CLI starts work immediately instead of waiting for a deferred keystroke.
+
+**Fresh spawns with a task prompt template** (no suspended destination session to resume):
+- Fresh spawns with a task prompt template schedule `auto_command` through `TerminalSubmitScheduler.scheduleKeystrokes` with `sendCtrlC: false`.
+- The scheduler interpolates the command, waits for the CLI's first `'thinking'` activity event, then writes text → Esc → Enter via `TerminalSubmit.submitKeystrokes`.
 
 This enables workflows like moving a task from "Running" to "Code Review" to automatically send a review prompt to the agent.
 
