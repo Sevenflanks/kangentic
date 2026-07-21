@@ -48,6 +48,8 @@ const governanceContractSchema = z.object({
     blocker: z.literal('branding-decision'),
     distributionMode: z.literal('local-only'),
     windowsPackaging: z.literal('local-unsigned-only'),
+    macosPackaging: z.literal('retained-upstream-development-only-unapproved'),
+    linuxPackaging: z.literal('retained-upstream-development-only-unapproved'),
     publicArtifacts: z.literal('disabled'),
     npmPublication: z.literal('disabled'),
     autoUpdateFeed: z.literal('disabled'),
@@ -65,6 +67,11 @@ const boardConfigSchema = z.object({
 
 const packageManifestSchema = z.object({
   license: z.literal('AGPL-3.0-only'),
+  scripts: z.object({
+    'make:win': z.literal('npm run rebuild && npm run build && electron-builder --win --publish never'),
+    'make:mac': z.literal('npm run rebuild && npm run build && electron-builder --mac'),
+    'make:linux': z.literal('npm run rebuild && npm run build && electron-builder --linux'),
+  }),
 });
 
 function readRequiredFile(filePath: string): string {
@@ -149,10 +156,30 @@ describe('fork governance contract', () => {
       blocker: 'branding-decision',
       distributionMode: 'local-only',
       windowsPackaging: 'local-unsigned-only',
+      macosPackaging: 'retained-upstream-development-only-unapproved',
+      linuxPackaging: 'retained-upstream-development-only-unapproved',
       publicArtifacts: 'disabled',
       npmPublication: 'disabled',
       autoUpdateFeed: 'disabled',
     });
+  });
+
+  it('retains upstream macOS and Linux packaging scripts without approving their distribution', () => {
+    // Given the package scripts and documented release policy
+    const packageManifest = packageManifestSchema.parse(JSON.parse(readRequiredFile(PACKAGE_MANIFEST_PATH)));
+    const release = readGovernanceContract().release;
+
+    // When retained platform tooling is evaluated
+    const scripts = packageManifest.scripts;
+
+    // Then the scripts remain exact while both platforms stay explicitly unapproved
+    expect(scripts).toEqual({
+      'make:win': 'npm run rebuild && npm run build && electron-builder --win --publish never',
+      'make:mac': 'npm run rebuild && npm run build && electron-builder --mac',
+      'make:linux': 'npm run rebuild && npm run build && electron-builder --linux',
+    });
+    expect(release.macosPackaging).toBe('retained-upstream-development-only-unapproved');
+    expect(release.linuxPackaging).toBe('retained-upstream-development-only-unapproved');
   });
 
   it('keeps repository-local .claude absent while supporting content in external user projects', () => {

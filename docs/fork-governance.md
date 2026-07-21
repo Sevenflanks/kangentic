@@ -43,6 +43,8 @@
 
 目前唯一核准的 distribution mode 是由維護者在自己的 Windows 電腦上建立並使用 unsigned installer。此 repository 不提供 GitHub Release、npm publication、public artifact 或 auto-update feed。
 
+`make:mac`、`make:linux` 以及對應的 electron-builder targets 因 upstream development tooling 而保留，但僅供 fork 內部開發使用。它們不是此 fork 支援、驗證或核准的 distribution path，也不代表任何 signing、notarization 或 publication 承諾。
+
 ## Repository 指令範圍
 
 `.claude` 目錄刻意維持不存在。本次治理不新增或搬移任何 `.claude` 規則，也不以 repository-local agent 設定取代本文件。
@@ -86,6 +88,8 @@
     "blocker": "branding-decision",
     "distributionMode": "local-only",
     "windowsPackaging": "local-unsigned-only",
+    "macosPackaging": "retained-upstream-development-only-unapproved",
+    "linuxPackaging": "retained-upstream-development-only-unapproved",
     "publicArtifacts": "disabled",
     "npmPublication": "disabled",
     "autoUpdateFeed": "disabled"
