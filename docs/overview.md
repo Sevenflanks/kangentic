@@ -112,7 +112,7 @@ Kangentic is an **agent orchestration desktop app** - a visual control surface f
 | Backend      | better-sqlite3, node-pty, simple-git             |
 | Build        | Vite (renderer), esbuild (main), electron-builder |
 | Testing      | Playwright (E2E + UI), Vitest (unit)              |
-| Distribution | NSIS (Windows), DMG (macOS), deb/rpm (Linux)      |
+| Distribution | Only approved fork distribution: local unsigned Windows `npm run make:win`. Retained macOS DMG and Linux deb/rpm targets are unsupported, unverified, and unapproved upstream development tooling. |
 
 ## Target Audience
 
