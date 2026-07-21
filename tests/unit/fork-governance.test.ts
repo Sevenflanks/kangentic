@@ -194,15 +194,15 @@ describe('fork governance contract', () => {
     }
 
     expect(readme).not.toContain('Model changes suspend and resume with new launch flags;');
-    expect(transitionEngine).not.toContain('**Fresh spawns** (priority 4, no suspended session to resume):');
+    expect(transitionEngine).toContain('When a `spawn_agent` transition action creates the session itself (a custom action wired onto the entry transition), that action\'s own prompt template runs and the fallback `auto_command` / continuation injection is skipped for that spawn.');
     expect(transitionEngine).not.toContain('Transition action chains (priority 4) only fire when a task has no active session.');
     expect(architecture).not.toContain('Transitions only fire for case 5.');
-    expect(readme).toContain('Only a concrete model target suspends and resumes with new launch flags; clearing a model to the default keeps the live session.');
-    expect(transitionEngine).toContain('A default model target does not restart a live session.');
-    expect(transitionEngine).toContain('Fresh spawns with `skipPromptTemplate` pass `auto_command` as the initial prompt.');
-    expect(transitionEngine).toContain('Fresh spawns with a task prompt template schedule `auto_command` through `TerminalSubmitScheduler.scheduleKeystrokes` with `sendCtrlC: false`.');
-    expect(transitionEngine).toContain('Transition action chains run for Priority 3 cases that suspend and fall through to `spawnAgent`, as well as Priority 4 no-active-session cases.');
-    expect(architecture).toContain('Transitions run for Priority 3 cases that suspend and fall through to `spawnAgent`, and for Priority 4 no-active-session cases.');
+    expect(readme).toContain('Only a changed, concrete effective model target restarts a live session; a null or unchanged target keeps it, while clearing an override can expose a changed project default.');
+    expect(transitionEngine).toContain('The effective model target resolves task override, then lane override, then project default; only a changed, concrete result restarts a live session.');
+    expect(transitionEngine).toContain('On the normal `spawnAgent` fallback path, fresh spawns with `skipPromptTemplate` pass `auto_command` as the initial prompt.');
+    expect(transitionEngine).toContain('On the normal `spawnAgent` fallback path, a templated fresh spawn schedules `auto_command` through `TerminalSubmitScheduler.scheduleKeystrokes` with `sendCtrlC: false`.');
+    expect(transitionEngine).toContain('Native-history handoff bypasses the transition action chain and schedules `auto_command` after the target spawn.');
+    expect(architecture).toContain('Transition action chains run for Priority 3 fallthrough and Priority 4 only on the normal `spawnAgent` path; native-history handoff bypasses the chain.');
     expect(overview).not.toContain('Native installers for Windows (NSIS), macOS (DMG), and Linux (deb/rpm).');
     expect(overview).toContain('Only approved fork distribution: local unsigned Windows `npm run make:win`.');
     expect(overview).toContain('Kangentic runs across Windows, macOS, and Linux');

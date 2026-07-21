@@ -477,10 +477,10 @@ When a task moves between swimlanes, the IPC handler checks priorities in order:
 1. **Target is To Do** → Kill session, delete session history and worktree, and delete the branch when `git.autoCleanup` is enabled
 2. **Target is Done** → Suspend session (resumable), archive task
 3. **Target has auto_spawn=false** → Suspend session
-4. **Task has active session** → A permission-only lane change keeps the live session running. A concrete model target restarts the session; clearing a model to the default keeps the live session. An effort change is live-swapped when the adapter supports it, otherwise a concrete effort change restarts the session. Agent, session-track, and force-fresh changes also follow the spawn path. See [Transition Engine](transition-engine.md) Priority 3 for the full sub-case order.
-5. **Task has no session** → Create worktree (if enabled), execute transition action chain. For resumed sessions, `auto_command` is preloaded as the resume prompt. A fresh spawn with `skipPromptTemplate` receives `auto_command` as its initial prompt; a templated fresh spawn receives it through `TerminalSubmitScheduler.scheduleKeystrokes` with `sendCtrlC: false`.
+4. **Task has active session** → A permission-only lane change keeps the live session running. The effective model target resolves task override, then lane override, then project default; only a changed, concrete result restarts the session. An effort change is live-swapped when the adapter supports it, otherwise a concrete effort change restarts the session. Agent, session-track, and force-fresh changes also follow the spawn path. See [Transition Engine](transition-engine.md) Priority 3 for the full sub-case order.
+5. **Task has no session** → The normal `spawnAgent` path creates a worktree (if enabled), runs the transition action chain, then applies fallback prompt delivery. For resumed sessions, `auto_command` is preloaded as the resume prompt. A fresh spawn with `skipPromptTemplate` receives `auto_command` as its initial prompt; a templated fresh spawn receives it through `TerminalSubmitScheduler.scheduleKeystrokes` with `sendCtrlC: false`.
 
-Transitions run for Priority 3 cases that suspend and fall through to `spawnAgent`, and for Priority 4 no-active-session cases. The action chain runs in `execution_order`: typically `create_worktree` → `spawn_agent`.
+Transition action chains run for Priority 3 fallthrough and Priority 4 only on the normal `spawnAgent` path; native-history handoff bypasses the chain. The normal action chain runs in `execution_order`: typically `create_worktree` → `spawn_agent`.
 
 ### Split-Lock Move Flow
 
