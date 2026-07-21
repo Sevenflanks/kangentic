@@ -453,55 +453,49 @@ Mobile (kangentic-mobile board):
   on-device; full notification-category parity with per-category toggles; device management /
   revocation UX; store-release prep (TestFlight + Play internal, EAS Update).
 
-## 10. Monetization & licensing (open-core)
+## 10. Historical upstream monetization and licensing research
 
-The desktop app is open source. The mobile app and relay follow an OPEN-CORE model: the software
-is open source and self-hostable, while a Kangentic-operated HOSTED service (relay + push, behind
-signup and a free/Pro pricing tier) is the paid product. This is the Tailscale / Bitwarden /
-Syncthing / Supabase shape and does not conflict with the open-source promise.
+> **Fork policy override:** This section preserves historical upstream research. It is not current
+> Sevenflanks fork policy. The fork is `AGPL-3.0-only`, does not collect upstream CLA signatures,
+> and offers no commercial, alternative, or dual license. See
+> [Fork governance](../fork-governance.md) for the controlling policy.
 
-Rollout: v1 ships FREE and ACCOUNTLESS while the user base is small and under test. The paid
-migration is a purely ADDITIVE flip enabled by the maintainer's existing dual license + SLA - the
-account/entitlement gate is layered onto the hosted relay later, NOT a rearchitecture - precisely
-because the core stays accountless and cleanly separated. Build v1 as if free forever; add the
-gate when ready.
+The original research assumed an open-core model: self-hostable mobile and relay software alongside
+a maintainer-operated hosted relay and push service with signup and paid tiers. That was an
+assumption for the upstream research, not a model adopted by this fork.
 
-Two things are monetized separately:
-- The relay SOFTWARE (`kangentic-relay`) stays open source and self-hostable forever.
-- The relay HOSTED SERVICE (Kangentic-operated: accounts, quotas, managed reliability, hosted
-  push) is the paid product.
+The original proposal also assumed an accountless v1 followed by a later entitlement layer on a
+hosted relay. It treated that future change as additive because the E2E pairing and transport core
+would remain separate from accounts and billing. This fork has not adopted that proposal.
 
-LOAD-BEARING SEPARATION (do not violate): the E2E pairing + transport (device identity, Noise KK,
-capability roster) stays ACCOUNTLESS and open source, and works identically self-hosted or on the
-paid relay. A Kangentic account/entitlement check sits ONLY on the hosted relay and decides
-whether a device may use KANGENTIC'S relay and at what plan limits; it never touches the crypto or
-the pairing model. Free/self-host stays zero-signup; the account is required only to use
-Kangentic's hosted relay/push beyond a free cap. The relay stays blind either way ("even our paid
-relay cannot read your data" - the thing the closest competitor claims but half-breaks).
+The historical separation described two possible layers:
+- Relay software, including `kangentic-relay`, as open source and self-hostable.
+- A maintainer-operated hosted service for accounts, quotas, managed reliability, and push.
 
-Repo structure:
-- `@kangentic/protocol` (pairing + E2E crypto): OPEN, in the kangentic repo. An auditable crypto
-  core is a feature for a security product.
-- `kangentic-relay`: OPEN, its own repo. The blind byte-forwarder, self-hostable via Docker.
-- Commercial control plane (accounts, billing, quotas, hosted signup): a SEPARATE PRIVATE repo,
-  added only when monetizing. Keeps business logic out of the open repos.
-- `kangentic-mobile`: its own repo (the app-store build can be the paid product).
+The research treated the E2E pairing and transport layer, including device identity, Noise KK, and
+the capability roster, as accountless and independent from any hosted service. It also proposed
+that a hosted relay entitlement check would not affect the cryptography or pairing model. These are
+architecture considerations from the original research, not a current service commitment by this
+fork.
 
-Licensing (decide before the first outside contributor - expensive to retrofit):
-- License the mobile app + relay defensively (AGPL, or a source-available license like BSL/FSL) so
-  a cloud competitor cannot run them as a competing service. The desktop app's license is
-  unaffected.
-- Require a CLA/DCO from the first external contributor to preserve relicensing / dual-licensing.
+The original repository sketch proposed an open `@kangentic/protocol`, an open separate
+`kangentic-relay` repository, a private account and billing control plane, and a separate mobile
+repository. No such repository or hosted-service model is approved by this fork.
 
-Natural Pro/hosted levers (self-hosters cannot easily replicate):
-- Hosted PUSH: the Expo/APNs/FCM credentials are inherently the maintainer's; a self-hoster would
-  need their own Apple/Google accounts and app build.
-- Managed relay reliability, multi-region, higher/unlimited relay limits, priority TURN,
-  multi-device beyond a free cap.
+### Current fork contribution policy
 
-The Phase-4 WebRTC/IPv6 direct path REDUCES traffic through the hosted relay, lowering Kangentic's
-COGS; the hosted relay's value is reliability + convenience + no self-host ops, not "we carry all
-your bytes."
+- This fork accepts and maintains contributions only under `AGPL-3.0-only`.
+- This fork does not collect upstream CLA signatures, does not offer relicensing, and does not
+  provide commercial, alternative, or dual licensing.
+- Contributions intended for upstream must follow the upstream process at the time of submission,
+  as described in [Fork governance](../fork-governance.md).
+- Any future repository or hosted-service model that differs from this policy requires a separate
+  governance decision before it is proposed or implemented.
+
+The original research identified hosted push credentials, managed relay reliability, multi-region
+operation, higher relay limits, priority TURN, and multi-device capacity as possible paid-service
+levers. It also noted that a WebRTC and IPv6 direct path could reduce relay traffic. Neither point
+creates a current paid offering or licensing plan for this fork.
 
 ## 11. Sources (load-bearing subset)
 
