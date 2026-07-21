@@ -185,7 +185,6 @@ describe('fork governance contract', () => {
   });
 
   it('keeps distribution and live-session transition documentation within the fork contract', () => {
-    // Given the overview and worktree lifecycle documentation
     const overview = readRequiredFile(OVERVIEW_DOCUMENT_PATH);
     const worktreeStrategy = readRequiredFile(WORKTREE_STRATEGY_DOCUMENT_PATH);
     const falseLiveSettingsClaims = [
@@ -195,13 +194,15 @@ describe('fork governance contract', () => {
       ['docs/user-guide.md', /supports live model changes \(Claude's `\/model`\)/],
       ['docs/agent-integration.md', /changing model\/effort on a live session without respawn/],
       ['docs/command-injection.md', /which `\/model` \/ `\/effort`\s+slashes a column transition emits/],
+      ['docs/database.md', /Live-applied to running sessions via adapter-specific slash injection/],
+      ['docs/database.md', /a move injects `\/model` or `\/effort`/],
+      ['docs/configuration.md', /switch models\/effort without restarting the session/],
+      ['docs/transition-engine.md', /writes Ctrl\+C → text → Esc → Enter/],
     ] as const;
     for (const [relativePath, falseClaim] of falseLiveSettingsClaims) {
       expect.soft(readRequiredFile(path.join(REPO_ROOT, relativePath))).not.toMatch(falseClaim);
     }
 
-    // When distribution and same-session active-column transitions are described
-    // Then the fork approval boundary and live injection behavior remain explicit
     expect(overview).not.toContain('Native installers for Windows (NSIS), macOS (DMG), and Linux (deb/rpm).');
     expect(overview).toContain('Only approved fork distribution: local unsigned Windows `npm run make:win`.');
     expect(overview).toContain('Kangentic runs across Windows, macOS, and Linux');

@@ -193,7 +193,7 @@ When a task moves to a column with `auto_command` set, the command delivery depe
 **Fresh spawns** (priority 4, no suspended session to resume):
 - `TerminalSubmitScheduler.scheduleKeystrokes` schedules the command for deferred PTY injection
 - Interpolates the `auto_command` template with task variables
-- Waits for the CLI's first `'thinking'` activity event, then writes Ctrl+C → text → Esc → Enter via `TerminalSubmit.submitKeystrokes`
+- Waits for the CLI's first `'thinking'` activity event, then uses `sendCtrlC: false` to write text → Esc → Enter via `TerminalSubmit.submitKeystrokes`
 
 This enables workflows like moving a task from "Running" to "Code Review" to automatically send a review prompt to the agent.
 
