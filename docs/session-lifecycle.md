@@ -162,9 +162,10 @@ When a suspended task moves to an active column:
 - New session DB record inserted, old record marked `exited`
 - The destination column's settings are re-applied as CLI flags on the resume
   command: `--permission-mode` (lane override, else global default), `--model`,
-  and `--effort`. A column move that changes the effective permission mode
-  forces this suspend + respawn cycle, because no adapter can switch
-  permission mode on a live session.
+  and `--effort`. On an active same-agent session, a concrete model change
+  suspends and respawns; supported effort changes apply live, unsupported
+  concrete effort changes respawn, and permission-only changes leave the live
+  session running.
 - A plan-exit auto-move (Planning -> Executing), triggered when the user
   approves the plan (the `ExitPlanMode` tool completes, not when the agent
   merely invokes it), passes a continuation prompt

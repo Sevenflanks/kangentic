@@ -335,7 +335,7 @@ Each swimlane has its own overrides (stored in the per-project DB):
 | `auto_command` | string \| null | null | Command injected into running session on task arrival |
 | `plan_exit_target_id` | string \| null | null | Target column when plan-mode agent exits |
 | `agent_override` | string \| null | null | Agent CLI override for sessions spawned in this column |
-| `model_override` | string \| null | null | Adapter-specific model identifier passed at spawn time (e.g. Claude `--model opus`). Live-applied via `/model` slash on column transition when supported. |
+| `model_override` | string \| null | null | Adapter-specific model identifier passed at spawn time (e.g. Claude `--model opus`). A concrete model change on an automated path suspends and respawns the active session with the resolved model flag; it is never live-applied via `/model`. |
 | `effort_override` | string \| null | null | Adapter-specific effort/reasoning level passed at spawn time (e.g. Claude `--effort xhigh`). Live-applied via `/effort` slash on column transition when supported. |
 | `handoff_context` | boolean | false | When enabled, cross-agent transitions package prior session context for the target agent |
 | `session_target` | `'main'` \| `'isolated'` | `'main'` | Which session track a task runs on in this column. `main` = the task's shared main conversation; `isolated` = this column's own context-isolated session (keyed by the swimlane id). See `SessionTarget` in `src/shared/types.ts`. |

@@ -188,14 +188,27 @@ describe('fork governance contract', () => {
     // Given the overview and worktree lifecycle documentation
     const overview = readRequiredFile(OVERVIEW_DOCUMENT_PATH);
     const worktreeStrategy = readRequiredFile(WORKTREE_STRATEGY_DOCUMENT_PATH);
+    const falseLiveSettingsClaims = [
+      ['README.md', /live-applies changes as cards cross columns: no restart/],
+      ['docs/session-lifecycle.md', /permission mode\s+forces this suspend \+ respawn cycle/],
+      ['docs/configuration.md', /model_override[^\n]*Live-applied via `\/model`/],
+      ['docs/user-guide.md', /supports live model changes \(Claude's `\/model`\)/],
+      ['docs/agent-integration.md', /changing model\/effort on a live session without respawn/],
+      ['docs/command-injection.md', /which `\/model` \/ `\/effort`\s+slashes a column transition emits/],
+    ] as const;
+    for (const [relativePath, falseClaim] of falseLiveSettingsClaims) {
+      expect.soft(readRequiredFile(path.join(REPO_ROOT, relativePath))).not.toMatch(falseClaim);
+    }
 
     // When distribution and same-session active-column transitions are described
     // Then the fork approval boundary and live injection behavior remain explicit
     expect(overview).not.toContain('Native installers for Windows (NSIS), macOS (DMG), and Linux (deb/rpm).');
     expect(overview).toContain('Only approved fork distribution: local unsigned Windows `npm run make:win`.');
+    expect(overview).toContain('Kangentic runs across Windows, macOS, and Linux');
+    expect(overview).toContain('unsupported, unverified, and unapproved upstream development tooling.');
     expect(worktreeStrategy).not.toContain('suspend and resume with command as prompt');
     expect(worktreeStrategy).toMatch(
-      /same-track, same-agent, same-model live session stays live and injects\s+supported auto_command and effort changes/,
+      /same-track, same-agent, same-model live session stays live and injects\s+supported auto_command and effort changes; an unsupported concrete effort target can\s+respawn, while permission-only changes or no setting delta stay live/,
     );
   });
 

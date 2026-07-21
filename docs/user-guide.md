@@ -48,7 +48,7 @@ A per-task pick **stays with the task across column moves** - column settings ar
 
 Before the first spawn, the task detail dialog also shows a slim **pre-spawn context bar** with the same Model and Effort pills. Set them there to avoid the spawn -> cancel -> restart loop: the picker writes the override to the DB, and `prepare-spawn` picks it up on the next agent launch.
 
-When an agent is already running, the same Model / Effort pills appear in the live context bar below the terminal. Picking a value there delivers the change to the running session via the adapter's slash-command injection sequence when it supports live model changes (Claude's `/model`), or suspends and respawns when it does not.
+When an agent is already running, the same Model / Effort pills appear in the live context bar below the terminal. A concrete Model selection suspends and respawns the session with the resolved launch flag. Effort applies live only when the adapter supports it; an unsupported concrete effort selection suspends and respawns.
 
 ### Spawn an Agent
 
