@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import {
@@ -30,11 +30,18 @@ describe('opencode-plugin', () => {
       });
     });
 
-    it('maps session.start to a private created boundary', () => {
-      const result = extractSessionEvent({
+    it('establishes session.start as the process root for subsequent tool execution', async () => {
+      vi.resetModules();
+      const freshPlugin = await import('../../src/main/agent/adapters/opencode/plugin/kangentic-activity.mjs');
+      const result = freshPlugin.extractSessionEvent({
         type: 'session.start',
         properties: { sessionID: 'ses_started123' },
       }, FIXED_TIMESTAMP);
+      const toolResult = freshPlugin.extractToolStartEvent(
+        { tool: 'bash', sessionID: 'ses_started123' },
+        { args: { command: 'pwd' } },
+        FIXED_TIMESTAMP + 1,
+      );
 
       expect(result).toEqual({
         ts: FIXED_TIMESTAMP,
@@ -45,6 +52,11 @@ describe('opencode-plugin', () => {
           nativeSessionId: 'ses_started123',
           occurredAt: FIXED_TIMESTAMP,
         },
+      });
+      expect(toolResult.privateNativeBoundary).toEqual({
+        kind: 'turn-start',
+        nativeSessionId: 'ses_started123',
+        occurredAt: FIXED_TIMESTAMP + 1,
       });
     });
 
