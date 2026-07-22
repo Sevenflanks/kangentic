@@ -174,6 +174,7 @@ describe('opencode-plugin', () => {
 
     it('marks matching-root tool execution as a private turn start', () => {
       const fixture = fixtures.tool_before_bash;
+      extractSessionEvent(fixtures.event_session_created, FIXED_TIMESTAMP - 1);
       const result = extractToolStartEvent(
         { ...fixture.input, sessionID: 'ses_2349b5c91ffeKd6qajuUTR4clq' },
         fixture.output,
