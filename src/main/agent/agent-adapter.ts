@@ -80,6 +80,15 @@ export type SpawnCommandOptions = Omit<CommandOptions, 'cliPath'> & { agentPath:
 
 export type InitialPromptDelivery = 'command-argument' | 'terminal-submit';
 
+export type LiveSubmissionPolicy =
+  | { readonly mode: 'interrupt-immediately'; readonly sendCtrlC: true }
+  | { readonly mode: 'wait-for-native-idle'; readonly timeoutMs: 120_000; readonly cancelOnUserInput: true; readonly sendCtrlC: false };
+
+export const DEFAULT_LIVE_SUBMISSION_POLICY: LiveSubmissionPolicy = {
+  mode: 'interrupt-immediately',
+  sendCtrlC: true,
+};
+
 /** Interface that every agent adapter must implement. */
 export interface AgentAdapter {
   /** Unique identifier for this agent type (e.g. 'claude', 'codex', 'aider'). */
@@ -142,6 +151,8 @@ export interface AgentAdapter {
   buildCommand(options: SpawnCommandOptions): string;
 
   readonly initialPromptDelivery?: InitialPromptDelivery;
+
+  readonly liveSubmissionPolicy?: LiveSubmissionPolicy;
 
   /**
    * Build adapter-specific environment variables to inject into the PTY

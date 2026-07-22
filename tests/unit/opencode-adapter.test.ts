@@ -62,6 +62,15 @@ describe('OpenCode Adapter', () => {
       expect(adapter.initialPromptDelivery).toBe('terminal-submit');
     });
 
+    it('opts into waiting for native idle after live submissions', () => {
+      expect(adapter.liveSubmissionPolicy).toEqual({
+        mode: 'wait-for-native-idle',
+        timeoutMs: 120_000,
+        cancelOnUserInput: true,
+        sendCtrlC: false,
+      });
+    });
+
     it('declares only OpenCode-native permission options (Plan and Build)', () => {
       // OpenCode's autonomy is expressed through agents, not the
       // Claude-shaped 4-mode union. The dropdown should only offer

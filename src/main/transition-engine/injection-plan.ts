@@ -1,5 +1,5 @@
 import type { Project, SessionRecord, Swimlane, Task } from '../../shared/types';
-import type { AgentAdapter } from '../agent/agent-adapter';
+import { DEFAULT_LIVE_SUBMISSION_POLICY, type AgentAdapter, type LiveSubmissionPolicy } from '../agent/agent-adapter';
 import type { SessionRepository } from '../db/repositories/session-repository';
 import type { CommandVerifier } from './terminal-submit-scheduler';
 
@@ -85,6 +85,7 @@ export interface InjectionPlan {
    * and the respawn records `applied_model` itself via its `--model` flag.
    */
   appliedSettings?: { effort?: string };
+  liveSubmissionPolicy?: LiveSubmissionPolicy;
 }
 
 export function prepareInjectionPlan(input: InjectionPlanInput): InjectionPlan | null {
@@ -168,6 +169,9 @@ export function prepareInjectionPlan(input: InjectionPlanInput): InjectionPlan |
     verifiedPrefixLength: settingsSequence.length,
     needsRestartForModel,
     ...(hasApplied ? { appliedSettings } : {}),
+    ...(trimmedAutoCommand
+      ? { liveSubmissionPolicy: adapter?.liveSubmissionPolicy ?? DEFAULT_LIVE_SUBMISSION_POLICY }
+      : {}),
   };
 }
 
