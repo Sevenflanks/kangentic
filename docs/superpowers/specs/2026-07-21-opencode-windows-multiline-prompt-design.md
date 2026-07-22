@@ -83,7 +83,7 @@ type ScheduledSubmission =
 
 ## TUI Readiness
 
-OpenCode adapter 現有 `detectFirstOutput()` 以 cursor-hide sequence 判斷 TUI 已接管 terminal。Initial content 只能在該 `first-output` 後送出。
+OpenCode adapter 的 `detectFirstOutput()` 只以 `ESC[?1049h` alternate-screen takeover 判斷 TUI 已接管 terminal。Windows shell 在 command dispatch 前也可能輸出 cursor-hide `ESC[?25l`，interactive shell 也可能啟用 generic bracketed-paste mode `ESC[?2004h`；這兩者都不足以表示 OpenCode ready。Initial content 只能在確認 alternate-screen takeover 的 `first-output` 後送出。
 
 - Session 已是 `running`：監聽 `first-output`。
 - Session 尚在 queue：先等待 `session-changed` 進入 `running`，再開始 readiness timeout。
