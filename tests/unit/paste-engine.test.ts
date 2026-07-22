@@ -7,7 +7,7 @@
  *   2. CHUNKED writeRaw of paste packet (1024-byte chunks with
  *      setImmediate yields between)
  *   3. Wait for output-settle: first `data` event, then 250ms idle.
- *      Cap at SETTLE_CAP_MIN_MS + payloadLength * 0.5ms. Floor at
+ *      Cap at SETTLE_CAP_MIN_MS + packet UTF-8 bytes * 0.5ms. Floor at
  *      MIN_GAP_MS (1000ms) for React commit.
  *   4. Submit `\r` via the QUEUE (sessionManager.write), then drain.
  *   5. Wait for SUBMISSION VERIFICATION: optional verifier callback returns
@@ -114,6 +114,26 @@ describe('PasteEngine.pasteAndSubmit', () => {
     await tick();
   }
 
+  function expectBracketedWriteInvariants(text: string): void {
+    const startMarker = '\x1b[200~';
+    const endMarker = '\x1b[201~';
+    const expectedPacket = `${startMarker}${text}${endMarker}`;
+    const writes = mockSessionManager.writeRawCalls.map(({ data }) => data);
+    const joinedWrites = writes.join('');
+    const concatenatedBytes = Buffer.concat(writes.map((write) => Buffer.from(write, 'utf8')));
+
+    expect(writes.every((write) => Buffer.byteLength(write, 'utf8') <= 1024)).toBe(true);
+    expect(concatenatedBytes).toEqual(Buffer.from(expectedPacket, 'utf8'));
+    expect(concatenatedBytes.toString('utf8')).not.toContain('\uFFFD');
+    expect(joinedWrites).toBe(expectedPacket);
+    expect(joinedWrites.split(startMarker)).toHaveLength(2);
+    expect(joinedWrites.split(endMarker)).toHaveLength(2);
+    expect(writes.filter((write) => write.includes(startMarker))).toHaveLength(1);
+    expect(writes.filter((write) => write.includes(endMarker))).toHaveLength(1);
+    expect(writes).not.toContain(startMarker);
+    expect(writes).not.toContain(endMarker);
+  }
+
   it('drains, writes one chunk for small payload, observes settle, sends \\r via queue', async () => {
     const promise = engine.pasteAndSubmit('s1', 'hello world');
 
@@ -192,6 +212,44 @@ describe('PasteEngine.pasteAndSubmit', () => {
     await reachEvidenceWait();
     await emitEvidence();
 
+    await expect(promise).resolves.toBeUndefined();
+  });
+
+  it('keeps the end marker whole when its ESC would land at byte index 1023', async () => {
+    const text = 'x'.repeat(1017);
+    const promise = engine.pasteAndSubmit('s1', text);
+
+    await tick();
+    mockSessionManager.flushDrain();
+    await tick();
+    await flushSetImmediate();
+    await tick();
+
+    expectBracketedWriteInvariants(text);
+
+    vi.advanceTimersByTime(1600);
+    await tick();
+    await reachEvidenceWait();
+    await emitEvidence();
+    await expect(promise).resolves.toBeUndefined();
+  });
+
+  it('preserves non-BMP UTF-8 bytes when a surrogate pair crosses the old boundary', async () => {
+    const text = `${'x'.repeat(1017)}😀`;
+    const promise = engine.pasteAndSubmit('s1', text);
+
+    await tick();
+    mockSessionManager.flushDrain();
+    await tick();
+    await flushSetImmediate();
+    await tick();
+
+    expectBracketedWriteInvariants(text);
+
+    vi.advanceTimersByTime(1600);
+    await tick();
+    await reachEvidenceWait();
+    await emitEvidence();
     await expect(promise).resolves.toBeUndefined();
   });
 

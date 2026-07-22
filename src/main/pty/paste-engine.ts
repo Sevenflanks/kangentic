@@ -10,8 +10,8 @@ import type { SubmissionVerifier } from '../../shared/types';
  *
  * Algorithm:
  *   1. drain pending writeQueue bytes
- *   2. chunked writeRaw of `\e[200~payload\e[201~` (1KB chunks with
- *      setImmediate yields - keeps ConPTY's child-side reads atomic)
+ *   2. chunked writeRaw of `\e[200~payload\e[201~` (1KB UTF-8-byte-bounded
+ *      chunks with setImmediate yields - keeps ConPTY's child-side reads atomic)
  *   3. wait for output-settle (data + 250ms idle, capped per-byte,
  *      floored at MIN_GAP_MS for React's commit cycle)
  *   4. queue write of `\r` + drain (queue path matches what real user
@@ -121,7 +121,7 @@ export function sanitizeForPaste(text: string): string {
 }
 
 /**
- * Write packet in PASTE_CHUNK_SIZE chunks with event-loop yields between.
+ * Write packet in PASTE_CHUNK_SIZE UTF-8-byte chunks with event-loop yields between.
  * The yield (setImmediate, not a wall-clock delay) lets node-pty/ConPTY
  * deliver each chunk to the agent before the next arrives, preventing
  * the close marker from landing in a different child-side ReadFile call
@@ -141,22 +141,78 @@ export function sanitizeForPaste(text: string): string {
  * PTYs are microseconds. Not a bug, just a latency floor users on
  * Windows may notice for very large pastes.
  */
+interface ChunkedWriteResult {
+  readonly chunkCount: number;
+  readonly packetByteLength: number;
+}
+
 async function writeChunked(
   sessionManager: SessionManager,
   sessionId: string,
-  packet: string,
+  content: string,
+  bracketed: boolean,
   signal: AbortSignal,
-): Promise<void> {
-  for (let offset = 0; offset < packet.length; offset += PASTE_CHUNK_SIZE) {
+): Promise<ChunkedWriteResult> {
+  let chunk = bracketed ? BRACKETED_PASTE_START : '';
+  let chunkBytes = Buffer.byteLength(chunk, 'utf8');
+  let chunkCount = 0;
+  let packetByteLength = bracketed
+    ? chunkBytes + Buffer.byteLength(BRACKETED_PASTE_END, 'utf8')
+    : 0;
+  let pendingCodePoint: string | undefined;
+
+  // UTF-16 slicing can split surrogate pairs or a marker. Reserve the final
+  // code point with the close marker while emitting bounded chunks immediately.
+  const emitIntermediateChunk = async (): Promise<void> => {
     if (signal.aborted) {
       throw new PasteSubmitError('aborted', 'paste-engine: aborted during chunked write');
     }
-    const end = Math.min(offset + PASTE_CHUNK_SIZE, packet.length);
-    sessionManager.writeRaw(sessionId, packet.slice(offset, end));
-    if (end < packet.length) {
-      await new Promise<void>((resolve) => setImmediate(resolve));
+    sessionManager.writeRaw(sessionId, chunk);
+    chunkCount += 1;
+    chunk = '';
+    chunkBytes = 0;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  };
+
+  for (const codePoint of content) {
+    if (pendingCodePoint === undefined) {
+      pendingCodePoint = codePoint;
+      continue;
     }
+    const pendingBytes = Buffer.byteLength(pendingCodePoint, 'utf8');
+    if (chunkBytes + pendingBytes > PASTE_CHUNK_SIZE) {
+      await emitIntermediateChunk();
+    }
+    chunk += pendingCodePoint;
+    chunkBytes += pendingBytes;
+    packetByteLength += pendingBytes;
+    pendingCodePoint = codePoint;
   }
+
+  if (pendingCodePoint !== undefined) {
+    const pendingBytes = Buffer.byteLength(pendingCodePoint, 'utf8');
+    const suffixBytes = bracketed ? Buffer.byteLength(BRACKETED_PASTE_END, 'utf8') : 0;
+    if (chunkBytes + pendingBytes + suffixBytes > PASTE_CHUNK_SIZE) {
+      await emitIntermediateChunk();
+    }
+    chunk += pendingCodePoint;
+    chunkBytes += pendingBytes;
+    packetByteLength += pendingBytes;
+    if (bracketed) {
+      chunk += BRACKETED_PASTE_END;
+    }
+  } else if (bracketed) {
+    chunk += BRACKETED_PASTE_END;
+  }
+
+  if (chunk.length > 0) {
+    if (signal.aborted) {
+      throw new PasteSubmitError('aborted', 'paste-engine: aborted during chunked write');
+    }
+    sessionManager.writeRaw(sessionId, chunk);
+    chunkCount += 1;
+  }
+  return { chunkCount, packetByteLength };
 }
 
 interface SettleResult {
@@ -177,10 +233,10 @@ interface SettleResult {
 function waitForPasteSettle(
   sessionManager: SessionManager,
   sessionId: string,
-  packetLength: number,
+  packetByteLength: number,
   signal: AbortSignal,
 ): Promise<SettleResult> {
-  const capMs = Math.max(SETTLE_CAP_MIN_MS, Math.round(packetLength * SETTLE_CAP_PER_BYTE_MS) + SETTLE_CAP_MIN_MS);
+  const capMs = Math.max(SETTLE_CAP_MIN_MS, Math.round(packetByteLength * SETTLE_CAP_PER_BYTE_MS) + SETTLE_CAP_MIN_MS);
   return new Promise<SettleResult>((resolve, reject) => {
     if (signal.aborted) {
       reject(new PasteSubmitError('aborted', 'paste-engine: aborted before settle'));
@@ -383,9 +439,6 @@ export function createPasteEngine(sessionManager: SessionManager): PasteEngine {
       );
 
       const safeText = sanitizeForPaste(text);
-      const packet = bracketed
-        ? `${BRACKETED_PASTE_START}${safeText}${BRACKETED_PASTE_END}`
-        : safeText;
 
       // Track bracketed-paste-mode toggles in the output stream. If the TUI
       // disables mode mid-call, a modal/permission prompt has taken focus
@@ -415,11 +468,13 @@ export function createPasteEngine(sessionManager: SessionManager): PasteEngine {
         if (linkedSignal.aborted) throw new PasteSubmitError('aborted', 'paste-engine: aborted before write');
 
         const writeStart = Date.now();
-        await writeChunked(sessionManager, sessionId, packet, linkedSignal);
+        const { chunkCount, packetByteLength } = await writeChunked(
+          sessionManager, sessionId, safeText, bracketed, linkedSignal,
+        );
         const writeMs = Date.now() - writeStart;
 
         const settleStart = Date.now();
-        const settle = await waitForPasteSettle(sessionManager, sessionId, packet.length, linkedSignal);
+        const settle = await waitForPasteSettle(sessionManager, sessionId, packetByteLength, linkedSignal);
         const settleMs = Date.now() - settleStart;
 
         // Send \r through the queue (not writeRaw). The queue's setImmediate-
@@ -475,7 +530,7 @@ export function createPasteEngine(sessionManager: SessionManager): PasteEngine {
 
         const totalMs = Date.now() - start;
         console.log(
-          `[paste-engine] ${source}: ${packet.length}b in ${Math.ceil(packet.length / PASTE_CHUNK_SIZE)} chunks (${writeMs}ms) + settle ${settleMs}ms (${settle.reason}, output=${settle.observedOutput}) + evidence=${evidenceResult}${retried ? ' (after 1 retry)' : ''} ${evidenceMs}ms = ${totalMs}ms total`,
+          `[paste-engine] ${source}: ${packetByteLength}b in ${chunkCount} chunks (${writeMs}ms) + settle ${settleMs}ms (${settle.reason}, output=${settle.observedOutput}) + evidence=${evidenceResult}${retried ? ' (after 1 retry)' : ''} ${evidenceMs}ms = ${totalMs}ms total`,
         );
       } catch (caughtError) {
         if (timeoutController.signal.aborted && !options.signal?.aborted) {
