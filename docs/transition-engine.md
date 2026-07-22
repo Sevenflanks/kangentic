@@ -186,6 +186,8 @@ The transition engine receives that resolved agent and uses its `AgentAdapter` c
 
 When a task moves to a column with `auto_command` set, the command delivery depends on how the session was started:
 
+OpenCode uses **TUI-ready terminal submission** for initial content. A fresh session receives the full Task XML after its TUI reports the adapter-defined `ESC[?1049h` alternate-screen takeover. A resumed session starts with `--session <id>` and receives only the current `resumePrompt`; a promptless resume restores the native session without submitting content or replaying Task XML. Cursor-hide and generic bracketed-paste mode are not valid OpenCode readiness signals.
+
 **Resumed sessions** (priority 3 suspend-and-resume, or priority 4 resume from suspended):
 - The `auto_command` is interpolated and passed as the resume prompt to `claude --resume <id>`
 - This is deterministic: the command is the first thing the agent sees on resume
@@ -196,6 +198,7 @@ When a task moves to a column with `auto_command` set, the command delivery depe
 
 **Fresh spawns with a task prompt template on the normal `spawnAgent` fallback path** (no suspended destination session to resume):
 - On the normal `spawnAgent` fallback path, a templated fresh spawn schedules `auto_command` through `TerminalSubmitScheduler.scheduleKeystrokes` with `sendCtrlC: false`.
+- For an OpenCode fresh spawn, the initial free-form content job completes before the scheduler sends the latest queued fresh-spawn `auto_command` directly as a keystroke burst. The burst uses `sendCtrlC: false`.
 - The scheduler interpolates the command, waits for the CLI's first `'thinking'` activity event, then writes text → Esc → Enter via `TerminalSubmit.submitKeystrokes`.
 
 This enables workflows like moving a task from "Running" to "Code Review" to automatically send a review prompt to the agent.

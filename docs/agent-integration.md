@@ -184,10 +184,10 @@ Each adapter implements `detectFirstOutput(data)` to signal when the agent's TUI
 | Oz CLI (Warp) | `data.length > 0` | `oz agent run` streams output, no alternate screen |
 | Kimi Code | `\x1b[?25l` (cursor hide) | TUI hides cursor when its alternate-screen buffer takes over (verified empirically with kimi v1.37.0) |
 | Droid | `\x1b[?25l` (cursor hide) | Ink-based TUI, same pattern as Claude (verified empirically) |
-| OpenCode | `\x1b[?25l` (cursor hide) | Full-screen TUI initializes alternate screen buffer with cursor hide on first frame |
+| OpenCode | `\x1b[?1049h` (alternate-screen takeover) | The observed OpenCode TUI takeover required before TUI-ready terminal submission; cursor hide and bracketed-paste mode can occur earlier and do not establish readiness |
 | Ollama | `data.length > 0` | Ollama streams output immediately (no alternate screen buffer) |
 
-The `\x1b[?25l` (ANSI cursor hide) sequence fires after the shell prompt noise but before the TUI draws its startup banner. This keeps the shell command hidden behind the shimmer overlay.
+For the cursor-hide adapters, the `\x1b[?25l` (ANSI cursor hide) sequence fires after shell prompt noise but before the TUI draws its startup banner. This keeps the shell command hidden behind the shimmer overlay. OpenCode instead requires its own alternate-screen signal above.
 
 ## Exit Sequences
 
@@ -567,14 +567,16 @@ Caller-owned via `--session-id <uuid>`, mirroring Claude. `supportsCallerSession
 `src/main/agent/adapters/opencode/command-builder.ts`
 
 ```
-opencode [--session <id>] [--prompt <text>]
+opencode [--session <id>]
 ```
 
 Important shape constraints (verified against /anomalyco/opencode docs):
 
-- The TUI's positional argument is a **project directory**, not a prompt. Initial prompts must go through `--prompt <text>` or OpenCode tries to chdir into the prompt text. The PTY layer already sets the shell cwd, so Kangentic never emits a positional or `--dir` value.
-- Resume uses `--session <id>` (alias `-s`) on the TUI command - not the `run` subcommand. The prompt is omitted on resume so the user continues the prior conversation (mirrors Claude's `--resume` convention).
-- Windows shells get embedded `"` characters in the prompt rewritten to `'` to keep the cmd.exe / PowerShell quoting parser happy.
+- The TUI's positional argument is a **project directory**, not a prompt. The PTY layer already sets the shell cwd, so Kangentic never emits a positional or `--dir` value.
+- OpenCode initial prompt delivery uses **TUI-ready terminal submission**, not `--prompt` or shell argument parsing. Kangentic launches a fresh TUI, or resumes with `--session <id>` (alias `-s`), then waits for adapter-defined first output before `TerminalSubmit.submitContent()` sends bracketed paste.
+- A fresh OpenCode session sends the full Task XML. A resumed session sends only the current `resumePrompt`; a promptless resume restores the native session without content submission or replaying Task XML. No prompt content is part of the shell command.
+- OpenCode readiness is specifically the observed alternate-screen takeover `ESC[?1049h`. Cursor-hide from the shell or OpenCode, and generic bracketed-paste mode, are not sufficient readiness signals. This observation is OpenCode-specific, not a universal adapter rule.
+- The session record still retains the intended prompt for existing lifecycle and audit display, while errors log metadata only and never prompt content.
 
 ### Permission Modes
 

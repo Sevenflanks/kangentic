@@ -2,6 +2,8 @@
 
 Kangentic injects per-column `auto_command` values and supported effort changes into a live agent session when a task moves between columns. Model changes set `needsRestartForModel` and are handled by the caller before any live writes. `TerminalSubmitScheduler` (`src/main/transition-engine/terminal-submit-scheduler.ts`) schedules each task's burst and decides whether the burst is prefixed with a `Ctrl+C` (live-injection) or not (fresh-spawn). `TerminalSubmit.submitKeystrokes` (`src/main/pty/terminal-submit.ts`) executes the byte-level keystroke sequence (`Ctrl+C? → text → Esc → Enter` per command). This document covers how the **command-injection** verification context confirms each chained command lands cleanly on the agent's TUI.
 
+OpenCode's initial content follows a separate **TUI-ready terminal submission** path. A fresh session receives the full Task XML through `TerminalSubmit.submitContent()` bracketed paste after the adapter observes `ESC[?1049h` alternate-screen takeover. A resumed session receives only its current `resumePrompt`, and a promptless resume restores the native session without content submission or Task XML replay. Cursor-hide and generic bracketed-paste mode are not enough to treat OpenCode as ready.
+
 ## What gets injected (the settings delta)
 
 `prepareInjectionPlan` (`src/main/transition-engine/injection-plan.ts`) decides whether a model
@@ -78,6 +80,8 @@ The scan is bounded by a 50ms tolerance window around the send time (`Date.now()
 
 The `Ctrl+C` opt-out exists to prevent a distinct concatenation failure mode from the chained-command one above. Fresh-spawn auto_command paths just consumed the CLI prompt arg (e.g. `claude -- "<task>...</task>"`) and the CLI is mid-render of that first user turn. On Windows ConPTY + Ink, sending `Ctrl+C` during that render lands in a state where the just-submitted prompt and the follow-up keystrokes get rendered as one user message: `</task>/test` glued together. Suppressing the leading `Ctrl+C` lets the keystrokes queue cleanly behind the in-flight turn and submit as a distinct second user message.
 
+For OpenCode, the queued fresh-spawn burst waits until the initial free-form content job completes, then sends only the latest burst directly with `sendCtrlC: false`. It does not replace the initial TUI-ready terminal submission.
+
 The `verifiedPrefixLength` distinction is critical: the deterministic adapter-emitted `/effort Y` write from `getInjectionSequence` is safe to verify because we know exactly what JSONL entry to expect. A trailing user-supplied `auto_command` is **not** verified: it may not produce a matching JSONL entry the verifier recognizes, and retry exhaustion would drop the user's intended action. So we let auto-commands sail through with a time-based settle.
 
 ## When to use `'paste'` vs `'command-injection'`
@@ -88,6 +92,8 @@ The `verifiedPrefixLength` distinction is critical: the deterministic adapter-em
 | `'command-injection'` | `TerminalSubmit.submitKeystrokes` (chained slash commands) | "this exact command was processed as a discrete invocation" | 50-150ms typical, ~2s worst case |
 
 The two contexts solve different problems: `'paste'` confirms one-shot paste submissions of arbitrary user prompts, while `'command-injection'` confirms each link in a multi-command chain landed cleanly. They share an interface (`getSubmissionVerifier`) so adapters declare what they support per context, and the renderer/IPC layer never has to branch on agent name.
+
+Paste acceptance evidence is evaluated after Enter. It is distinct from readiness: OpenCode has no pre-readiness content-delivery fallback, so acceptance evidence cannot authorize delivery before the adapter has observed its TUI-ready terminal submission signal.
 
 **OR-combine vs poll-and-retry.** The two contexts also differ in how the engine consumes the verifier:
 

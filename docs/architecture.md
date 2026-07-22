@@ -523,6 +523,14 @@ Template variables available: `{{title}}`, `{{description}}`, `{{task_xml}}`, `{
 6. Set up output handler (16ms batched flush)
 7. After 100ms delay, write the CLI command to PTY stdin
 
+### OpenCode Prompt Delivery
+
+OpenCode uses **TUI-ready terminal submission**, not `--prompt` or shell argument parsing. Kangentic launches a fresh OpenCode TUI, or resumes with `--session <id>`, then waits for the OpenCode adapter's observed `ESC[?1049h` alternate-screen takeover before `TerminalSubmit.submitContent()` sends bracketed paste. Shell or OpenCode cursor-hide and generic bracketed-paste mode are insufficient readiness signals, and this `1049h` rule applies only to OpenCode.
+
+A fresh OpenCode session receives the full Task XML. A resumed session receives only the current `resumePrompt`; a promptless resume restores the native session without content submission or Task XML replay. The session queue wait sits outside the 120-second readiness limit, which starts only after the session reaches `running`. There is no pre-readiness content-delivery fallback.
+
+After the initial free-form content job completes, the scheduler sends only the latest queued fresh-spawn auto-command directly as a keystroke burst with `sendCtrlC: false`. Paste acceptance evidence is collected after Enter and is separate from readiness. Session records retain the intended prompt for lifecycle and audit display, while error logs contain metadata only and never prompt content.
+
 ### Output Streaming
 
 - **Buffer:** PTY `onData` accumulates into per-session buffer

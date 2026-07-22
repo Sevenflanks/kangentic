@@ -30,9 +30,6 @@ import {
 import type { SpawnCommandOptions } from '../../src/main/agent/agent-adapter';
 import type { PermissionMode } from '../../src/shared/types';
 
-const isWindows = process.platform === 'win32';
-const q = (str: string) => (isWindows ? `"${str}"` : `'${str}'`);
-
 function makeOptions(overrides: Partial<SpawnCommandOptions> = {}): SpawnCommandOptions {
   return {
     agentPath: '/usr/bin/opencode',
@@ -61,6 +58,10 @@ describe('OpenCode Adapter', () => {
       expect(adapter.supportsCallerSessionId).toBe(false);
     });
 
+    it('declares terminal submission for the initial prompt', () => {
+      expect(adapter.initialPromptDelivery).toBe('terminal-submit');
+    });
+
     it('declares only OpenCode-native permission options (Plan and Build)', () => {
       // OpenCode's autonomy is expressed through agents, not the
       // Claude-shaped 4-mode union. The dropdown should only offer
@@ -80,37 +81,10 @@ describe('OpenCode Adapter', () => {
   });
 
   describe('buildCommand - fresh session', () => {
-    it('emits the binary path and no positional prompt', () => {
-      const command = adapter.buildCommand(makeOptions({ prompt: 'fix the bug' }));
-      expect(command).toContain('/usr/bin/opencode');
-      // Prompt MUST go through --prompt, not as a positional. The TUI
-      // positional is a project directory.
-      expect(command).toContain('--prompt');
-      expect(command).toContain('fix the bug');
-    });
-
-    it('passes prompt via --prompt flag with shell-safe quoting', () => {
-      const command = adapter.buildCommand(makeOptions({ prompt: 'fix the bug' }));
-      expect(command).toContain(`--prompt ${q('fix the bug')}`);
-    });
-
-    it('omits --prompt entirely when no prompt is supplied', () => {
-      const command = adapter.buildCommand(makeOptions());
+    it('omits prompt text and --prompt on a fresh command', () => {
+      const command = adapter.buildCommand(makeOptions({ prompt: '<task>保留內容</task>' }));
       expect(command).not.toContain('--prompt');
-    });
-
-    it('does not emit a positional project directory', () => {
-      // The PTY layer sets the shell cwd; we must not pass a
-      // positional, otherwise OpenCode would chdir into the prompt
-      // text or some other accidental value.
-      const command = adapter.buildCommand(makeOptions({ prompt: 'hello' }));
-      const tokens = command.split(' ').filter((t) => t.length > 0);
-      // First token is the binary path. Whitespace-free paths are not
-      // quoted by quoteArg, so we accept either form.
-      expect(tokens[0].replace(/^["']|["']$/g, '')).toBe('/usr/bin/opencode');
-      // The very next token must be a flag - never a bare value that
-      // OpenCode would interpret as a project directory positional.
-      expect(tokens[1]).toBe('--prompt');
+      expect(command).not.toContain('<task>保留內容</task>');
     });
 
     it('does not emit --dangerously-skip-permissions in TUI mode', () => {
@@ -158,34 +132,15 @@ describe('OpenCode Adapter', () => {
   });
 
   describe('buildCommand - resume session', () => {
-    it('builds resume command with --session flag and session ID', () => {
+    it('keeps --session but omits prompt text on resume', () => {
       const command = adapter.buildCommand(makeOptions({
         resume: true,
         sessionId: 'ses_abc123def456',
+        prompt: 'current resume prompt',
       }));
-      expect(command).toContain('--session');
-      expect(command).toContain('ses_abc123def456');
-    });
-
-    it('omits prompt on resume (matches Claude --resume convention)', () => {
-      const command = adapter.buildCommand(makeOptions({
-        resume: true,
-        sessionId: 'ses_abc123def456',
-        prompt: 'this should be dropped',
-      }));
+      expect(command).toContain('--session ses_abc123def456');
       expect(command).not.toContain('--prompt');
-      expect(command).not.toContain('this should be dropped');
-    });
-
-    it('falls through to fresh-session shape when resume is true but sessionId is missing', () => {
-      const command = adapter.buildCommand(makeOptions({
-        resume: true,
-        sessionId: undefined,
-        prompt: 'fallback prompt',
-      }));
-      expect(command).not.toContain('--session');
-      expect(command).toContain('--prompt');
-      expect(command).toContain('fallback prompt');
+      expect(command).not.toContain('current resume prompt');
     });
 
     it('omits --agent on resume so the user\'s runtime Tab choice is preserved', () => {
@@ -299,9 +254,20 @@ describe('OpenCode Adapter', () => {
   });
 
   describe('lifecycle hooks', () => {
-    it('detects first output via cursor-hide ESC sequence', () => {
-      expect(adapter.detectFirstOutput('\x1b[?25l')).toBe(true);
-      expect(adapter.detectFirstOutput('hello world')).toBe(false);
+    it('does not detect cursor-hide as first output', () => {
+      expect(adapter.detectFirstOutput('\x1b[?25l')).toBe(false);
+    });
+
+    it('does not detect bracketed-paste mode as first output', () => {
+      expect(adapter.detectFirstOutput('\x1b[?2004h')).toBe(false);
+    });
+
+    it('does not detect combined cursor-hide and bracketed-paste modes as first output', () => {
+      expect(adapter.detectFirstOutput('\x1b[?25l\x1b[?2004h')).toBe(false);
+    });
+
+    it('detects first output when OpenCode takes over the alternate screen', () => {
+      expect(adapter.detectFirstOutput('shell output\x1b[?1049hOpenCode')).toBe(true);
     });
 
     it('exit sequence is Ctrl+C only (verified empirically: /exit and /quit are not recognised commands)', () => {
@@ -670,69 +636,24 @@ describe('OpenCodeDetector - parseVersion', () => {
   });
 });
 
-describe('OpenCodeCommandBuilder - Windows quote replacement', () => {
-  // The command builder replaces double quotes with single quotes in the
-  // prompt text when targeting a non-Unix shell (cmd.exe, PowerShell).
-  // This branch is NOT exercised by the existing tests which use a
-  // Unix-style path and rely on process.platform detection.
-
-  it('replaces double quotes in prompt with single quotes for cmd.exe', () => {
-    const builder = new OpenCodeCommandBuilder();
-    const command = builder.buildOpenCodeCommand({
-      opencodePath: 'opencode',
-      taskId: 'task-001',
-      cwd: 'C:\\Users\\dev\\project',
-      permissionMode: 'default',
-      prompt: 'fix "all" the bugs',
-      shell: 'cmd.exe',
-    });
-    // The double quotes in the prompt must become single quotes before quoting.
-    expect(command).toContain("fix 'all' the bugs");
-    expect(command).not.toContain('fix "all" the bugs');
-  });
-
-  it('replaces double quotes in prompt with single quotes for PowerShell', () => {
-    const builder = new OpenCodeCommandBuilder();
-    const command = builder.buildOpenCodeCommand({
-      opencodePath: 'opencode',
-      taskId: 'task-001',
-      cwd: 'C:\\Users\\dev\\project',
-      permissionMode: 'default',
-      prompt: 'add "verbose" logging',
-      shell: 'powershell.exe',
-    });
-    expect(command).toContain("add 'verbose' logging");
-    expect(command).not.toContain('add "verbose" logging');
-  });
-
-  it('preserves double quotes in prompt on Unix-like shells', () => {
-    const builder = new OpenCodeCommandBuilder();
-    const command = builder.buildOpenCodeCommand({
-      opencodePath: '/usr/bin/opencode',
-      taskId: 'task-001',
-      cwd: '/home/dev/project',
-      permissionMode: 'default',
-      prompt: 'add "verbose" logging',
-      shell: '/bin/bash',
-    });
-    // Unix shells do not need the replacement - the prompt is quoted
-    // with single quotes by quoteArg, which handles the content safely.
-    expect(command).toContain('add "verbose" logging');
-  });
-
-  it('does not emit --session on fresh session with cmd.exe shell', () => {
-    const builder = new OpenCodeCommandBuilder();
-    const command = builder.buildOpenCodeCommand({
-      opencodePath: 'opencode',
-      taskId: 'task-001',
-      cwd: 'C:\\Users\\dev\\project',
-      permissionMode: 'default',
-      prompt: 'hello',
-      shell: 'cmd.exe',
-    });
-    expect(command).not.toContain('--session');
-    expect(command).toContain('--prompt');
-  });
+describe('OpenCodeCommandBuilder - initial prompt omission', () => {
+  it.each(['cmd.exe', 'powershell.exe', '/bin/bash'])(
+    'omits --prompt and prompt text for %s',
+    (shell) => {
+      const builder = new OpenCodeCommandBuilder();
+      const command = builder.buildOpenCodeCommand({
+        opencodePath: 'opencode',
+        taskId: 'task-001',
+        cwd: 'C:\\project',
+        permissionMode: 'default',
+        shell,
+        prompt: 'fix "quoted"\r\n內容 & | < > ^ %',
+      });
+      expect(command).not.toContain('--prompt');
+      expect(command).not.toContain('fix "quoted"');
+      expect(command).not.toContain('內容');
+    },
+  );
 });
 
 describe('agent-display-name - opencode entry', () => {
