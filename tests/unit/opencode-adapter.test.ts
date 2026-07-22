@@ -254,9 +254,20 @@ describe('OpenCode Adapter', () => {
   });
 
   describe('lifecycle hooks', () => {
-    it('detects first output via cursor-hide ESC sequence', () => {
-      expect(adapter.detectFirstOutput('\x1b[?25l')).toBe(true);
-      expect(adapter.detectFirstOutput('hello world')).toBe(false);
+    it('does not detect cursor-hide as first output', () => {
+      expect(adapter.detectFirstOutput('\x1b[?25l')).toBe(false);
+    });
+
+    it('does not detect bracketed-paste mode as first output', () => {
+      expect(adapter.detectFirstOutput('\x1b[?2004h')).toBe(false);
+    });
+
+    it('does not detect combined cursor-hide and bracketed-paste modes as first output', () => {
+      expect(adapter.detectFirstOutput('\x1b[?25l\x1b[?2004h')).toBe(false);
+    });
+
+    it('detects first output when OpenCode takes over the alternate screen', () => {
+      expect(adapter.detectFirstOutput('shell output\x1b[?1049hOpenCode')).toBe(true);
     });
 
     it('exit sequence is Ctrl+C only (verified empirically: /exit and /quit are not recognised commands)', () => {

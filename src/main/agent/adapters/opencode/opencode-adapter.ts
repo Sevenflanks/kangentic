@@ -317,11 +317,8 @@ export class OpenCodeAdapter implements AgentAdapter {
   }
 
   detectFirstOutput(data: string): boolean {
-    // OpenCode is a full-screen TUI like Codex/Claude. The first
-    // meaningful frame begins with the cursor-hide ESC sequence as the
-    // alternate screen buffer is initialized. This keeps the shell
-    // command echo hidden behind the shimmer overlay.
-    return data.includes('\x1b[?25l');
+    // 只接受實測發生於 OpenCode child TUI 接管 PTY 後的 alternate screen；Windows shell 也會 hide cursor，bracketed paste 也可能由 shell 啟用。
+    return data.includes('\x1b[?1049h');
   }
 
   async locateSessionHistoryFile(agentSessionId: string, cwd: string): Promise<string | null> {
