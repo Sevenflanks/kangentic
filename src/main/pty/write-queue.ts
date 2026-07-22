@@ -3,15 +3,16 @@
  *
  * `pty.write` on Windows ConPTY is fire-and-forget; sustained large writes
  * can saturate the input pipe and reorder bytes. To avoid that, every
- * `enqueue` for a given session appends to a single buffer drained by one
- * loop that emits at most `chunkSize` bytes per tick, yielding via
- * `setImmediate` between chunks so libuv can flush the named pipe.
+ * `enqueue` for a given session appends a FIFO entry drained by one loop
+ * that emits at most `chunkSize` bytes per tick, yielding via `setImmediate`
+ * between chunks so libuv can flush the named pipe.
  *
- * Concurrent enqueues append to the same buffer, so byte order is FIFO
- * regardless of how many callers (user input, terminal-submit keystrokes, paste)
- * write to the same session at once. This is the invariant that prevents
- * bracketed-paste sequences from being fragmented by interleaved writes -
- * the regression that caused Ctrl+V truncation.
+ * Entries never coalesce across caller boundaries. The loop drains each entry
+ * completely before advancing, so byte order is FIFO regardless of how many
+ * callers (user input, terminal-submit keystrokes, paste) write to the same
+ * session at once. This is the invariant that prevents bracketed-paste
+ * sequences from being fragmented by interleaved writes - the regression that
+ * caused Ctrl+V truncation.
  *
  * The queue is also surrogate-pair-safe: chunks never split a JavaScript
  * UTF-16 surrogate pair, which would otherwise produce U+FFFD replacement
@@ -22,17 +23,27 @@ export interface PtyWriteTarget {
   write(data: string): void;
 }
 
+export class PtyWriteError extends Error {
+  readonly name = 'PtyWriteError';
+
+  constructor(readonly code: 'missing-pty' | 'write-failed' | 'disposed') {
+    super(code);
+  }
+}
+
 export interface WriteQueue {
-  /** Append bytes to the buffer; starts the drain loop if idle. */
+  /** Append a fire-and-forget entry; starts the drain loop if idle. */
   enqueue(data: string): void;
+  /** Resolve after this entry's final chunk passes `pty.write`. */
+  enqueueAcknowledged(data: string): Promise<void>;
   /**
-   * Resolve once the buffer is empty and the drain loop has stopped.
+   * Resolve once the queue is empty and the drain loop has stopped.
    * Resolves immediately if already idle. Used by callers that need to
    * sequence follow-up writes (e.g. submit-keystrokes after a paste)
    * without racing the chunked drain.
    */
   drained(): Promise<void>;
-  /** Drop pending bytes and stop the drain loop. Idempotent. */
+  /** Drop pending entries and stop the drain loop. Idempotent. */
   dispose(): void;
 }
 
@@ -101,12 +112,23 @@ export interface CreateWriteQueueOptions {
   onAutoDispose?: () => void;
 }
 
+interface WriteAcknowledgement {
+  settled: boolean;
+  readonly resolve: () => void;
+  readonly reject: (error: PtyWriteError) => void;
+}
+
+interface WriteEntry {
+  remaining: string;
+  readonly acknowledgement?: WriteAcknowledgement;
+}
+
 export function createWriteQueue(
   getPty: () => PtyWriteTarget | null,
   chunkSize: number = DEFAULT_CHUNK_SIZE,
   options: CreateWriteQueueOptions = {},
 ): WriteQueue {
-  let buffer = '';
+  const entries: WriteEntry[] = [];
   let draining = false;
   let disposed = false;
   const drainResolvers: Array<() => void> = [];
@@ -117,30 +139,53 @@ export function createWriteQueue(
     for (const resolve of pending) resolve();
   }
 
+  function stopDraining(): void {
+    draining = false;
+    fireDrainResolvers();
+  }
+
+  function resolveAcknowledgement(entry: WriteEntry): void {
+    const acknowledgement = entry.acknowledgement;
+    if (!acknowledgement || acknowledgement.settled) return;
+    acknowledgement.settled = true;
+    acknowledgement.resolve();
+  }
+
+  function rejectEntries(code: PtyWriteError['code']): void {
+    const error = new PtyWriteError(code);
+    const pending = entries.splice(0, entries.length);
+    for (const entry of pending) {
+      const acknowledgement = entry.acknowledgement;
+      if (!acknowledgement || acknowledgement.settled) continue;
+      acknowledgement.settled = true;
+      acknowledgement.reject(error);
+    }
+  }
+
   const drain = (): void => {
     if (disposed) {
-      buffer = '';
-      draining = false;
-      fireDrainResolvers();
+      rejectEntries('disposed');
+      stopDraining();
       return;
     }
     const pty = getPty();
     if (!pty) {
       // Session ended mid-drain. Drop pending bytes; the renderer will not
       // be notified - matching the existing fire-and-forget IPC contract.
-      buffer = '';
-      draining = false;
-      fireDrainResolvers();
+      rejectEntries('missing-pty');
+      stopDraining();
       return;
     }
-    if (buffer.length === 0) {
-      draining = false;
-      fireDrainResolvers();
+    const entry = entries[0];
+    if (!entry) {
+      stopDraining();
       return;
     }
-    const end = buffer.length > chunkSize ? safeChunkEnd(buffer, chunkSize) : buffer.length;
-    const chunk = buffer.slice(0, end);
-    buffer = buffer.slice(end);
+    const end = entry.remaining.length > chunkSize
+      ? safeChunkEnd(entry.remaining, chunkSize)
+      : entry.remaining.length;
+    const chunk = entry.remaining.slice(0, end);
+    entry.remaining = entry.remaining.slice(end);
     try {
       pty.write(chunk);
     } catch (error) {
@@ -149,40 +194,59 @@ export function createWriteQueue(
       // rather than re-entering and looping on the same failure. Notify
       // the owner so it can clear its map entry; otherwise the next write
       // for this session would silently reuse a disposed queue.
-      console.error('[write-queue] pty.write threw, dropping pending bytes:', error);
-      buffer = '';
-      draining = false;
+      const loggedError = error instanceof Error ? error : new Error(String(error));
+      console.error('[write-queue] pty.write threw, dropping pending bytes:', loggedError);
       disposed = true;
-      fireDrainResolvers();
+      rejectEntries('write-failed');
+      stopDraining();
       options.onAutoDispose?.();
       return;
     }
-    if (buffer.length === 0) {
-      draining = false;
-      fireDrainResolvers();
+
+    if (entry.remaining.length === 0) {
+      entries.shift();
+      resolveAcknowledgement(entry);
+    }
+    if (entries.length === 0) {
+      stopDraining();
       return;
     }
     setImmediate(drain);
   };
 
+  function enqueueEntry(entry: WriteEntry): void {
+    entries.push(entry);
+    if (draining) return;
+    draining = true;
+    drain();
+  }
+
   return {
     enqueue(data: string): void {
       if (disposed || data.length === 0) return;
-      buffer += data;
-      if (draining) return;
-      draining = true;
-      drain();
+      enqueueEntry({ remaining: data });
+    },
+    enqueueAcknowledged(data: string): Promise<void> {
+      if (disposed) return Promise.reject(new PtyWriteError('disposed'));
+      if (data.length === 0) return Promise.resolve();
+      return new Promise<void>((resolve, reject) => {
+        enqueueEntry({
+          remaining: data,
+          acknowledgement: { settled: false, resolve, reject },
+        });
+      });
     },
     drained(): Promise<void> {
-      if (disposed || (!draining && buffer.length === 0)) return Promise.resolve();
+      if (disposed || (!draining && entries.length === 0)) return Promise.resolve();
       return new Promise<void>((resolve) => {
         drainResolvers.push(resolve);
       });
     },
     dispose(): void {
+      if (disposed) return;
       disposed = true;
-      buffer = '';
-      fireDrainResolvers();
+      rejectEntries('disposed');
+      stopDraining();
     },
   };
 }
