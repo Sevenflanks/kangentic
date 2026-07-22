@@ -15,6 +15,22 @@ function createRecorder(): PtyWriteTarget & { readonly calls: string[] } {
   };
 }
 
+function createHostileThrownValue(): object {
+  const throwOnCoercion = (): never => {
+    throw new Error('hostile coercion escaped');
+  };
+  const value = {
+    [Symbol.toPrimitive]: throwOnCoercion,
+    toString: throwOnCoercion,
+    valueOf: throwOnCoercion,
+  };
+  return new Proxy(value, {
+    getPrototypeOf(): never {
+      throw new Error('hostile prototype inspection escaped');
+    },
+  });
+}
+
 async function expectWriteError(
   promise: Promise<void>,
   code: PtyWriteError['code'],
@@ -120,6 +136,61 @@ describe('createWriteQueue acknowledged entries', () => {
     }
   });
 
+  it('tears down without throwing when legacy enqueue receives a hostile thrown value', async () => {
+    // Given
+    let writeCount = 0;
+    const pty: PtyWriteTarget = {
+      write(): never {
+        writeCount += 1;
+        throw createHostileThrownValue();
+      },
+    };
+    const onAutoDispose = vi.fn();
+    const queue = createWriteQueue(() => pty, 2, { onAutoDispose });
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    try {
+      // When
+      expect(() => queue.enqueue('legacy')).not.toThrow();
+
+      // Then
+      await expect(queue.drained()).resolves.toBeUndefined();
+      expect(onAutoDispose).toHaveBeenCalledTimes(1);
+      queue.enqueue('after-failure');
+      expect(writeCount).toBe(1);
+      expect(errorSpy).toHaveBeenCalledWith(
+        '[write-queue] pty.write threw, dropping pending bytes:',
+        expect.any(Error),
+      );
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  it('rejects acknowledged writes with write-failed for a hostile thrown value', async () => {
+    // Given
+    const pty: PtyWriteTarget = {
+      write(): never {
+        throw createHostileThrownValue();
+      },
+    };
+    const onAutoDispose = vi.fn();
+    const queue = createWriteQueue(() => pty, 2, { onAutoDispose });
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    try {
+      // When
+      const acknowledged = queue.enqueueAcknowledged('acknowledged');
+
+      // Then
+      await expectWriteError(acknowledged, 'write-failed');
+      await expect(queue.drained()).resolves.toBeUndefined();
+      expect(onAutoDispose).toHaveBeenCalledTimes(1);
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
   it('rejects every pending acknowledged entry when disposed', async () => {
     // Given
     const pty = createRecorder();
@@ -173,5 +244,87 @@ describe('createWriteQueue acknowledged entries', () => {
     await acknowledged;
     expect(pty.calls).toEqual(['AA', 'AA', 'B']);
     expect(resolved).toBe(true);
+  });
+
+  it('resolves drained after normal multi-chunk completion', async () => {
+    // Given
+    const pty = createRecorder();
+    const queue = createWriteQueue(() => pty, 2);
+    queue.enqueue('ABCD');
+    let settled = false;
+    const drained = queue.drained().then(() => {
+      settled = true;
+    });
+
+    // When
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    vi.advanceTimersToNextTimer();
+
+    // Then
+    await drained;
+    expect(settled).toBe(true);
+    expect(pty.calls).toEqual(['AB', 'CD']);
+  });
+
+  it('resolves drained when a live PTY disappears mid-drain', async () => {
+    // Given
+    const pty = createRecorder();
+    let livePty: PtyWriteTarget | null = pty;
+    const queue = createWriteQueue(() => livePty, 2);
+    queue.enqueue('ABCD');
+    const drained = queue.drained();
+
+    // When
+    livePty = null;
+    vi.advanceTimersToNextTimer();
+
+    // Then
+    await expect(drained).resolves.toBeUndefined();
+    expect(pty.calls).toEqual(['AB']);
+  });
+
+  it('resolves drained after a later chunk throws', async () => {
+    // Given
+    let writeCount = 0;
+    const pty: PtyWriteTarget = {
+      write(): void {
+        writeCount += 1;
+        if (writeCount === 2) throw new Error('pty handle gone');
+      },
+    };
+    const onAutoDispose = vi.fn();
+    const queue = createWriteQueue(() => pty, 2, { onAutoDispose });
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    try {
+      queue.enqueue('ABCD');
+      const drained = queue.drained();
+
+      // When
+      vi.advanceTimersToNextTimer();
+
+      // Then
+      await expect(drained).resolves.toBeUndefined();
+      expect(onAutoDispose).toHaveBeenCalledTimes(1);
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  it('resolves drained after explicit disposal', async () => {
+    // Given
+    const pty = createRecorder();
+    const queue = createWriteQueue(() => pty, 2);
+    queue.enqueue('ABCD');
+    const drained = queue.drained();
+
+    // When
+    queue.dispose();
+
+    // Then
+    await expect(drained).resolves.toBeUndefined();
+    vi.runAllTimers();
+    expect(pty.calls).toEqual(['AB']);
   });
 });

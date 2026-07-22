@@ -194,12 +194,17 @@ export function createWriteQueue(
       // rather than re-entering and looping on the same failure. Notify
       // the owner so it can clear its map entry; otherwise the next write
       // for this session would silently reuse a disposed queue.
-      const loggedError = error instanceof Error ? error : new Error(String(error));
-      console.error('[write-queue] pty.write threw, dropping pending bytes:', loggedError);
       disposed = true;
       rejectEntries('write-failed');
       stopDraining();
       options.onAutoDispose?.();
+      const genericError = new Error('pty.write threw a non-Error value');
+      try {
+        const loggedError = error instanceof Error ? error : genericError;
+        console.error('[write-queue] pty.write threw, dropping pending bytes:', loggedError);
+      } catch {
+        console.error('[write-queue] pty.write threw, dropping pending bytes:', genericError);
+      }
       return;
     }
 
