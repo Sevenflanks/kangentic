@@ -8,6 +8,7 @@ import {
   type StatusFileHook,
 } from '../../src/main/pty/readers/status-file-reader';
 import { ClaudeStatusParser } from '../../src/main/agent/adapters/claude/status-parser';
+import { OpenCodeAdapter } from '../../src/main/agent/adapters/opencode/opencode-adapter';
 import {
   EventType,
   type SessionUsage,
@@ -504,6 +505,43 @@ describe('StatusFileReader', () => {
     const call = (callbacks.onEventsParsed as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(call[1]).toEqual(['good-line', 'unparseable-line']);
     expect(call[2]).toHaveLength(1);
+  });
+
+  it('projects OpenCode private native metadata out of public parsed events', () => {
+    const eventsPath = path.join(tempDir, 'events.jsonl');
+    const adapter = new OpenCodeAdapter();
+    const statusFileHook = adapter.runtime.statusFile;
+    expect(statusFileHook).toBeDefined();
+    if (!statusFileHook) return;
+
+    reader.attach({
+      sessionId: 'session-opencode',
+      statusOutputPath: null,
+      eventsOutputPath: eventsPath,
+      statusFileHook,
+    });
+
+    const rawLine = JSON.stringify({
+      ts: 10,
+      type: EventType.Idle,
+      detail: 'complete',
+      hookContext: JSON.stringify({ sessionID: 'root-a' }),
+      privateNativeBoundary: {
+        kind: 'idle',
+        nativeSessionId: 'root-a',
+        occurredAt: 10,
+      },
+      unexpected: 'private',
+    });
+    fs.writeFileSync(eventsPath, rawLine + '\n');
+
+    reader.flushPendingEvents('session-opencode');
+
+    expect(callbacks.onEventsParsed).toHaveBeenCalledWith(
+      'session-opencode',
+      [rawLine],
+      [{ ts: 10, type: EventType.Idle, detail: 'complete' }],
+    );
   });
 
   it('tails events.jsonl for adapters without a statusFileHook (Codex/Gemini)', () => {

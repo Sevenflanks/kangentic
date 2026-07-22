@@ -22,19 +22,59 @@ describe('opencode-plugin', () => {
         ts: FIXED_TIMESTAMP,
         type: 'session_start',
         hookContext: JSON.stringify({ sessionID: 'ses_2349b5c91ffeKd6qajuUTR4clq' }),
+        privateNativeBoundary: {
+          kind: 'created',
+          nativeSessionId: 'ses_2349b5c91ffeKd6qajuUTR4clq',
+          occurredAt: FIXED_TIMESTAMP,
+        },
+      });
+    });
+
+    it('maps session.start to a private created boundary', () => {
+      const result = extractSessionEvent({
+        type: 'session.start',
+        properties: { sessionID: 'ses_started123' },
+      }, FIXED_TIMESTAMP);
+
+      expect(result).toEqual({
+        ts: FIXED_TIMESTAMP,
+        type: 'session_start',
+        hookContext: JSON.stringify({ sessionID: 'ses_started123' }),
+        privateNativeBoundary: {
+          kind: 'created',
+          nativeSessionId: 'ses_started123',
+          occurredAt: FIXED_TIMESTAMP,
+        },
       });
     });
 
     it('maps session.idle to idle', () => {
       const result = extractSessionEvent(fixtures.event_session_idle, FIXED_TIMESTAMP);
 
-      expect(result).toEqual({ ts: FIXED_TIMESTAMP, type: 'idle' });
+      expect(result).toEqual({
+        ts: FIXED_TIMESTAMP,
+        type: 'idle',
+        privateNativeBoundary: {
+          kind: 'idle',
+          nativeSessionId: 'ses_2349b5c91ffeKd6qajuUTR4clq',
+          occurredAt: FIXED_TIMESTAMP,
+        },
+      });
     });
 
     it('maps session.error to idle with detail=error', () => {
       const result = extractSessionEvent(fixtures.event_session_error, FIXED_TIMESTAMP);
 
-      expect(result).toEqual({ ts: FIXED_TIMESTAMP, type: 'idle', detail: 'error' });
+      expect(result).toEqual({
+        ts: FIXED_TIMESTAMP,
+        type: 'idle',
+        detail: 'error',
+        privateNativeBoundary: {
+          kind: 'error',
+          nativeSessionId: 'ses_2349b5c91ffeKd6qajuUTR4clq',
+          occurredAt: FIXED_TIMESTAMP,
+        },
+      });
     });
 
     it('returns null for unrecognized session event types', () => {
@@ -54,7 +94,15 @@ describe('opencode-plugin', () => {
       const result = extractSessionEvent(event, FIXED_TIMESTAMP);
 
       // No sessionID anywhere -> session_start without hookContext
-      expect(result).toEqual({ ts: FIXED_TIMESTAMP, type: 'session_start' });
+      expect(result).toEqual({
+        ts: FIXED_TIMESTAMP,
+        type: 'session_start',
+        privateNativeBoundary: {
+          kind: 'created',
+          nativeSessionId: null,
+          occurredAt: FIXED_TIMESTAMP,
+        },
+      });
     });
 
     it('falls back to properties.sessionID when properties.info.id is missing', () => {
@@ -103,6 +151,43 @@ describe('opencode-plugin', () => {
     it('builds tool_start with tool name and detail from a bash invocation', () => {
       const fixture = fixtures.tool_before_bash;
       const result = extractToolStartEvent(fixture.input, fixture.output, FIXED_TIMESTAMP);
+
+      expect(result).toEqual({
+        ts: FIXED_TIMESTAMP,
+        type: 'tool_start',
+        tool: 'bash',
+        detail: 'ls -la /tmp',
+      });
+    });
+
+    it('marks matching-root tool execution as a private turn start', () => {
+      const fixture = fixtures.tool_before_bash;
+      const result = extractToolStartEvent(
+        { ...fixture.input, sessionID: 'ses_2349b5c91ffeKd6qajuUTR4clq' },
+        fixture.output,
+        FIXED_TIMESTAMP,
+      );
+
+      expect(result).toEqual({
+        ts: FIXED_TIMESTAMP,
+        type: 'tool_start',
+        tool: 'bash',
+        detail: 'ls -la /tmp',
+        privateNativeBoundary: {
+          kind: 'turn-start',
+          nativeSessionId: 'ses_2349b5c91ffeKd6qajuUTR4clq',
+          occurredAt: FIXED_TIMESTAMP,
+        },
+      });
+    });
+
+    it('does not mark child tool execution as a root turn start', () => {
+      const fixture = fixtures.tool_before_bash;
+      const result = extractToolStartEvent(
+        { ...fixture.input, sessionID: 'ses_child123' },
+        fixture.output,
+        FIXED_TIMESTAMP,
+      );
 
       expect(result).toEqual({
         ts: FIXED_TIMESTAMP,

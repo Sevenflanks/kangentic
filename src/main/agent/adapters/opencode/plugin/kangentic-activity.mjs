@@ -19,6 +19,18 @@
 // (tests/fixtures/opencode-plugin-events.json).
 import fs from 'node:fs';
 
+function nativeSessionIdFrom(properties) {
+  const value = properties?.sessionID ?? properties?.info?.id ?? null;
+  return typeof value === 'string' && value.length > 0 ? value : null;
+}
+
+function privateBoundary(kind, nativeSessionId, occurredAt) {
+  return { kind, nativeSessionId, occurredAt };
+}
+
+// 這個 module instance 只屬於單一 OpenCode process；root identity 只用來辨識 child event，不可投影到 public SessionEvent。
+let rootSessionId = null;
+
 /**
  * Extract a Kangentic JSONL event from an OpenCode `event` payload.
  * Returns null when the event type is not one we surface.
@@ -35,8 +47,8 @@ export function extractSessionEvent(event, now = Date.now()) {
   const eventType = event.type;
   if (eventType === 'session.created' || eventType === 'session.start') {
     const properties = event.properties ?? {};
-    const sessionInfo = properties.info ?? {};
-    const sessionID = sessionInfo.id ?? properties.sessionID ?? null;
+    const sessionID = nativeSessionIdFrom(properties);
+    rootSessionId ??= sessionID;
     const hookContext = sessionID
       ? JSON.stringify({ sessionID }).slice(0, 2048)
       : undefined;
@@ -44,13 +56,31 @@ export function extractSessionEvent(event, now = Date.now()) {
       ts: now,
       type: 'session_start',
       ...(hookContext ? { hookContext } : {}),
+      privateNativeBoundary: privateBoundary('created', sessionID, now),
     };
   }
   if (eventType === 'session.idle') {
-    return { ts: now, type: 'idle' };
+    return {
+      ts: now,
+      type: 'idle',
+      privateNativeBoundary: privateBoundary(
+        'idle',
+        nativeSessionIdFrom(event.properties),
+        now,
+      ),
+    };
   }
   if (eventType === 'session.error') {
-    return { ts: now, type: 'idle', detail: 'error' };
+    return {
+      ts: now,
+      type: 'idle',
+      detail: 'error',
+      privateNativeBoundary: privateBoundary(
+        'error',
+        nativeSessionIdFrom(event.properties),
+        now,
+      ),
+    };
   }
   return null;
 }
@@ -76,11 +106,16 @@ export function extractToolDetail(args) {
  */
 export function extractToolStartEvent(input, output, now = Date.now()) {
   const detail = extractToolDetail(output?.args);
+  const nativeSessionId = nativeSessionIdFrom(input);
+  const isRootTurn = rootSessionId !== null && nativeSessionId === rootSessionId;
   return {
     ts: now,
     type: 'tool_start',
     ...(input?.tool ? { tool: input.tool } : {}),
     ...(detail ? { detail } : {}),
+    ...(isRootTurn
+      ? { privateNativeBoundary: privateBoundary('turn-start', nativeSessionId, now) }
+      : {}),
   };
 }
 

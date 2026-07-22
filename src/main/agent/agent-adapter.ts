@@ -12,7 +12,9 @@ import type {
   TranscriptEntry,
   TranscriptUsage,
   TranscriptToolCounts,
+  AgentParser,
 } from '../../shared/types';
+import type { NativeIdleEvidence } from '../activity-engine/native-idle-evidence';
 
 /**
  * Result of `AgentAdapter.parseTranscript`. `entries` is the parsed
@@ -89,6 +91,24 @@ export const DEFAULT_LIVE_SUBMISSION_POLICY: LiveSubmissionPolicy = {
   sendCtrlC: true,
 };
 
+export interface PrivateEventLinesInput {
+  readonly ptySessionId: string;
+  readonly rawLines: readonly string[];
+  readonly nativeIdleEvidence: NativeIdleEvidence;
+}
+
+interface PrivateEventLinesAdapter {
+  ingestPrivateEventLines(input: PrivateEventLinesInput): void;
+}
+
+export function hasPrivateEventLinesHook(
+  adapter: AgentParser | undefined,
+): adapter is AgentParser & PrivateEventLinesAdapter {
+  return adapter !== undefined
+    && 'ingestPrivateEventLines' in adapter
+    && typeof adapter.ingestPrivateEventLines === 'function';
+}
+
 /** Interface that every agent adapter must implement. */
 export interface AgentAdapter {
   /** Unique identifier for this agent type (e.g. 'claude', 'codex', 'aider'). */
@@ -153,6 +173,8 @@ export interface AgentAdapter {
   readonly initialPromptDelivery?: InitialPromptDelivery;
 
   readonly liveSubmissionPolicy?: LiveSubmissionPolicy;
+
+  ingestPrivateEventLines?(input: PrivateEventLinesInput): void;
 
   /**
    * Build adapter-specific environment variables to inject into the PTY

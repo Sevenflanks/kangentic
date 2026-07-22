@@ -15,9 +15,10 @@ import { isGitRepo } from '../../../git/git-checks';
  * OpenCode plugin event names (verified against
  * https://opencode.ai/docs/plugins/, April 2026):
  *  - `event` with `event.type === 'session.created'` -> session_start
+ *  - `event` with `event.type === 'session.start'`   -> session_start
  *  - `event` with `event.type === 'session.idle'`    -> idle
  *  - `event` with `event.type === 'session.error'`   -> idle (detail: 'error')
- *  - `tool.execute.before`                           -> tool_start
+ *  - `tool.execute.before`                           -> tool_start + private root turn boundary
  *  - `tool.execute.after`                            -> tool_end
  */
 export const OPENCODE_HOOK_EVENTS: Array<{
@@ -25,10 +26,11 @@ export const OPENCODE_HOOK_EVENTS: Array<{
   bridgeEventType: EventType;
   notes?: string;
 }> = [
-  { hook: 'event:session.created', bridgeEventType: EventType.SessionStart, notes: 'captures sessionID into hookContext' },
+  { hook: 'event:session.created', bridgeEventType: EventType.SessionStart, notes: 'captures sessionID and private native boundary' },
+  { hook: 'event:session.start', bridgeEventType: EventType.SessionStart, notes: 'captures sessionID and private native boundary' },
   { hook: 'event:session.idle', bridgeEventType: EventType.Idle },
   { hook: 'event:session.error', bridgeEventType: EventType.Idle, notes: "detail: 'error'" },
-  { hook: 'tool.execute.before', bridgeEventType: EventType.ToolStart },
+  { hook: 'tool.execute.before', bridgeEventType: EventType.ToolStart, notes: 'private turn-start only for the process root' },
   { hook: 'tool.execute.after', bridgeEventType: EventType.ToolEnd },
 ];
 

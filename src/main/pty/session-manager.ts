@@ -7,6 +7,8 @@ import { PtyBufferManager } from './buffer/pty-buffer-manager';
 import { SessionHistoryReader } from './readers/session-history-reader';
 import { StatusFileReader } from './readers/status-file-reader';
 import { SessionTelemetry } from '../activity-engine/session-telemetry';
+import { NativeIdleEvidence } from '../activity-engine/native-idle-evidence';
+import { hasPrivateEventLinesHook } from '../agent/agent-adapter';
 import { TranscriptWriter } from './buffer/transcript-writer';
 import { SessionIdManager } from './lifecycle/session-id-manager';
 import { SessionFileManager } from './lifecycle/session-file-manager';
@@ -118,6 +120,7 @@ export class SessionManager extends EventEmitter {
   private telemetry!: SessionTelemetry;
   private sessionHistoryReader!: SessionHistoryReader;
   private statusFileReader: StatusFileReader;
+  private readonly nativeIdleEvidence = new NativeIdleEvidence();
   private sessionFiles: SessionFileManager;
   private sessionIdManager: SessionIdManager;
   private activityEngineOptions: ActivityEngineOptions | undefined;
@@ -306,6 +309,15 @@ export class SessionManager extends EventEmitter {
     this.statusFileReader = new StatusFileReader({
       onUsageParsed: (sessionId, usage) => this.telemetry.processStatusUpdate(sessionId, usage),
       onEventsParsed: (sessionId, rawLines, events) => {
+        const adapter = this.registry.get(sessionId)?.agentParser;
+        // raw plugin identity 必須留在 main process；只有 adapter hook 可解析，public telemetry 仍只收到 allowlisted SessionEvent。
+        if (hasPrivateEventLinesHook(adapter)) {
+          adapter.ingestPrivateEventLines({
+            ptySessionId: sessionId,
+            rawLines,
+            nativeIdleEvidence: this.nativeIdleEvidence,
+          });
+        }
         this.telemetry.captureHookSessionIds(sessionId, rawLines);
         this.telemetry.ingestEvents(sessionId, events);
       },

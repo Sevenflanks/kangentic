@@ -12,6 +12,10 @@ import { runCliPrintSummarize, buildSummarizePrompt } from '../../shared/auto-na
 import type { AgentAdapter, AgentInfo, SpawnCommandOptions, SettingsChangeSpec, ParsedTranscript } from '../../agent-adapter';
 import type { AgentPermissionEntry, PermissionMode, AdapterRuntimeStrategy, SessionEvent, SubmissionContextType, SubmissionVerifier, AgentCapabilities } from '../../../../shared/types';
 import { ActivityDetection } from '../../../../shared/types';
+import { EventTypeActivity } from '../../../../shared/types';
+import { parseOpenCodeNativeBoundary } from './native-boundary';
+import type { EventType as SessionEventType } from '../../../../shared/types';
+import type { PrivateEventLinesInput } from '../../agent-adapter';
 
 // Session-ID regexes hoisted to module scope so they compile once.
 // `fromOutput` is invoked on every PTY chunk during the pre-capture
@@ -46,6 +50,39 @@ const LABELED_SESSION_ID_REGEX = new RegExp(
   'i',
 );
 const ANSI_ESCAPE_REGEX = /\x1b\[[0-9;?]*[a-zA-Z]/g;
+
+type JsonRecord = { readonly [key: string]: unknown };
+
+function isJsonRecord(value: unknown): value is JsonRecord {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isEventType(value: unknown): value is SessionEventType {
+  return typeof value === 'string'
+    && Object.prototype.hasOwnProperty.call(EventTypeActivity, value);
+}
+
+function parsePublicSessionEvent(line: string): SessionEvent | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(line);
+  } catch (error) {
+    if (error instanceof SyntaxError) return null;
+    throw error;
+  }
+  if (!isJsonRecord(parsed)
+    || typeof parsed.ts !== 'number'
+    || !Number.isFinite(parsed.ts)
+    || !isEventType(parsed.type)) return null;
+
+  return {
+    ts: parsed.ts,
+    type: parsed.type,
+    ...(typeof parsed.detail === 'string' ? { detail: parsed.detail } : {}),
+    ...(typeof parsed.tool === 'string' ? { tool: parsed.tool } : {}),
+    ...(typeof parsed.toolId === 'string' ? { toolId: parsed.toolId } : {}),
+  };
+}
 
 /**
  * OpenCode CLI adapter (https://github.com/sst/opencode). OpenCode is a
@@ -91,6 +128,13 @@ export class OpenCodeAdapter implements AgentAdapter {
     cancelOnUserInput: true,
     sendCtrlC: false,
   } as const;
+
+  ingestPrivateEventLines(input: PrivateEventLinesInput): void {
+    for (const line of input.rawLines) {
+      const boundary = parseOpenCodeNativeBoundary(line);
+      if (boundary) input.nativeIdleEvidence.recordBoundary(input.ptySessionId, boundary);
+    }
+  }
   // OpenCode's autonomy is expressed through "agents" (Build, Plan,
   // and any custom agents the user defines in opencode.json), cycled
   // at runtime via Tab. We expose those native concepts directly
@@ -237,13 +281,7 @@ export class OpenCodeAdapter implements AgentAdapter {
     activity: ActivityDetection.hooksAndPty(),
     statusFile: {
       parseStatus: () => null,
-      parseEvent: (line: string): SessionEvent | null => {
-        try {
-          return JSON.parse(line) as SessionEvent;
-        } catch {
-          return null;
-        }
-      },
+      parseEvent: parsePublicSessionEvent,
       isFullRewrite: false,
     },
     sessionId: {
