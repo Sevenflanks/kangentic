@@ -297,6 +297,11 @@ describe('TerminalSubmitScheduler', () => {
         verifier,
         verifiedPrefixLength: 1,
       });
+
+      expect(sessionManager.listenerCount('first-output')).toBe(1);
+      expect(sessionManager.listenerCount('session-changed')).toBe(1);
+      expect(sessionManager.listenerCount('exit')).toBe(1);
+
       sessionManager.emitFirstOutput('s1');
       await tick();
 
@@ -304,6 +309,10 @@ describe('TerminalSubmitScheduler', () => {
       expect(terminalSubmit.observableOrder).toEqual([
         { kind: 'content', text: 'content' },
       ]);
+      expect(sessionManager.listenerCount('first-output')).toBe(0);
+      expect(sessionManager.listenerCount('session-changed')).toBe(0);
+      expect(sessionManager.listenerCount('exit')).toBe(1);
+      expect(vi.getTimerCount()).toBe(0);
 
       terminalSubmit.finishContentLatest();
       await tick();
@@ -315,6 +324,8 @@ describe('TerminalSubmitScheduler', () => {
       expect(terminalSubmit.calls[0].opts.sendCtrlC).toBe(false);
       expect(terminalSubmit.calls[0].opts.verifier).toBe(verifier);
       expect(terminalSubmit.calls[0].opts.verifiedPrefixLength).toBe(1);
+      expect(sessionManager.eventNames()).toEqual([]);
+      expect(vi.getTimerCount()).toBe(0);
     });
 
     it('keeps only the latest keystroke follower', async () => {
@@ -398,6 +409,27 @@ describe('TerminalSubmitScheduler', () => {
       expect(terminalSubmit.calls).toHaveLength(0);
     });
 
+    it('aborts in-flight content and drops its same-session follower when the session exits', async () => {
+      // Given: matching content has passed readiness but has not settled.
+      sessionManager.registry.set('s1', { status: 'running' });
+      scheduler.scheduleContent('task-1', 's1', 'content');
+      scheduler.scheduleKeystrokes('task-1', 's1', ['/follow']);
+      sessionManager.emitFirstOutput('s1');
+      await tick();
+      const exitListenersWhilePending = sessionManager.listenerCount('exit');
+
+      // When: the owning session exits.
+      sessionManager.emitExit('s1');
+      await tick();
+
+      // Then: content ownership ends without releasing its follower.
+      expect(terminalSubmit.contentCalls[0].aborted).toBe(true);
+      expect(exitListenersWhilePending).toBe(1);
+      expect(terminalSubmit.calls).toHaveLength(0);
+      expect(sessionManager.eventNames()).toEqual([]);
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
     it('drops content and its follower on explicit cancel before readiness', async () => {
       sessionManager.registry.set('s1', { status: 'running' });
 
@@ -476,6 +508,54 @@ describe('TerminalSubmitScheduler', () => {
       terminalSubmit.finishContentLatest();
       await tick();
       expect(terminalSubmit.calls).toHaveLength(0);
+    });
+
+    it('keeps replacement content owned only by its new session', async () => {
+      // Given: old-session content is in flight for a task.
+      sessionManager.registry.set('old-session', { status: 'running' });
+      sessionManager.registry.set('new-session', { status: 'running' });
+      scheduler.scheduleContent('task-1', 'old-session', 'old content');
+      sessionManager.emitFirstOutput('old-session');
+      await tick();
+      const oldContent = terminalSubmit.contentCalls[0];
+
+      // When: new-session content replaces it and the old session exits late.
+      scheduler.scheduleContent('task-1', 'new-session', 'new content');
+      sessionManager.emitFirstOutput('new-session');
+      await tick();
+      const newContent = terminalSubmit.contentCalls[1];
+      sessionManager.emitExit('old-session');
+      await tick();
+
+      // Then: replacement aborts the old owner, while the late exit cannot abort the new owner.
+      expect(oldContent.aborted).toBe(true);
+      expect(newContent.aborted).toBe(false);
+      expect(sessionManager.listenerCount('exit')).toBe(1);
+
+      terminalSubmit.finishContentLatest();
+      await tick();
+      expect(sessionManager.eventNames()).toEqual([]);
+    });
+
+    it('routes a different-session keystroke normally instead of attaching it as a content follower', async () => {
+      // Given: old-session content is in flight when the task has a new running session.
+      sessionManager.registry.set('old-session', { status: 'running' });
+      sessionManager.registry.set('new-session', { status: 'running' });
+      scheduler.scheduleContent('task-1', 'old-session', 'old content');
+      sessionManager.emitFirstOutput('old-session');
+      await tick();
+
+      // When: a keystroke arrives for the new session.
+      scheduler.scheduleKeystrokes('task-1', 'new-session', ['/new-session']);
+      await tick();
+
+      // Then: stale content is cancelled and normal live-injection semantics apply.
+      expect(terminalSubmit.contentCalls[0].aborted).toBe(true);
+      expect(terminalSubmit.calls).toHaveLength(1);
+      expect(terminalSubmit.calls[0].sessionId).toBe('new-session');
+      expect(terminalSubmit.calls[0].commands).toEqual(['/new-session']);
+      expect(terminalSubmit.calls[0].opts.sendCtrlC).toBe(true);
+      expect(sessionManager.listenerCount('exit')).toBe(0);
     });
 
     it.each([

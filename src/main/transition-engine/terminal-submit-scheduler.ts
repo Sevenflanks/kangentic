@@ -28,7 +28,9 @@ type ScheduledSubmission =
 
 interface PendingContent {
   controller: AbortController;
-  cleanup: () => void;
+  sessionId: string;
+  cleanupReadiness: () => void;
+  cleanupLifetime: () => void;
   nextKeystrokes: Extract<ScheduledSubmission, { kind: 'keystrokes' }> | null;
 }
 
@@ -134,7 +136,9 @@ export class TerminalSubmitScheduler {
 
     const entry: PendingContent = {
       controller: new AbortController(),
-      cleanup: () => undefined,
+      sessionId,
+      cleanupReadiness: () => undefined,
+      cleanupLifetime: () => undefined,
       nextKeystrokes: null,
     };
     this.content.set(taskId, entry);
@@ -175,8 +179,11 @@ export class TerminalSubmitScheduler {
     };
     const pendingContent = this.content.get(taskId);
     if (pendingContent) {
-      pendingContent.nextKeystrokes = submission;
-      return;
+      if (pendingContent.sessionId === sessionId) {
+        pendingContent.nextKeystrokes = submission;
+        return;
+      }
+      this.cancelContent(taskId);
     }
 
     this.scheduleKeystrokeBurst(taskId, submission, session.status === 'queued');
@@ -226,7 +233,7 @@ export class TerminalSubmitScheduler {
 
     this.content.delete(taskId);
     pending.nextKeystrokes = null;
-    pending.cleanup();
+    pending.cleanupLifetime();
     pending.controller.abort();
   }
 
@@ -272,21 +279,29 @@ export class TerminalSubmitScheduler {
     let state: 'queued' | 'waiting' = isQueued ? 'queued' : 'waiting';
     let readinessTimer: ReturnType<typeof setTimeout> | null = null;
     let started = false;
-    let cleaned = false;
+    let readinessCleaned = false;
+    let lifetimeCleaned = false;
 
-    const cleanup = (): void => {
-      if (cleaned) return;
-      cleaned = true;
+    const cleanupReadiness = (): void => {
+      if (readinessCleaned) return;
+      readinessCleaned = true;
       this.sessionManager.off('first-output', onFirstOutput);
       this.sessionManager.off('session-changed', onSessionChanged);
-      this.sessionManager.off('exit', onExit);
       if (readinessTimer !== null) clearTimeout(readinessTimer);
+    };
+
+    const cleanupLifetime = (): void => {
+      if (lifetimeCleaned) return;
+      lifetimeCleaned = true;
+      cleanupReadiness();
+      this.sessionManager.off('exit', onExit);
     };
 
     const startContent = (): void => {
       if (started || this.content.get(taskId) !== entry) return;
       started = true;
-      cleanup();
+      // Readiness 結束後仍保留 exit listener；session ownership 必須持續到 submitContent() settle。
+      cleanupReadiness();
       void this.runContent(taskId, submission, opts, entry);
     };
 
@@ -323,7 +338,7 @@ export class TerminalSubmitScheduler {
     };
 
     const onExit = (eventSessionId: string): void => {
-      if (eventSessionId !== submission.sessionId) return;
+      if (eventSessionId !== entry.sessionId) return;
       if (this.content.get(taskId) !== entry) return;
       console.log(
         `[TerminalSubmitScheduler] submit-content session exit task=${taskId.slice(0, 8)} session=${submission.sessionId.slice(0, 8)}`,
@@ -331,7 +346,8 @@ export class TerminalSubmitScheduler {
       this.cancel(taskId);
     };
 
-    entry.cleanup = cleanup;
+    entry.cleanupReadiness = cleanupReadiness;
+    entry.cleanupLifetime = cleanupLifetime;
     this.sessionManager.on('first-output', onFirstOutput);
     this.sessionManager.on('session-changed', onSessionChanged);
     this.sessionManager.on('exit', onExit);
@@ -369,7 +385,7 @@ export class TerminalSubmitScheduler {
     const follower = entry.nextKeystrokes;
     entry.nextKeystrokes = null;
     this.content.delete(taskId);
-    entry.cleanup();
+    entry.cleanupLifetime();
 
     if (follower) {
       this.startBurst(taskId, follower.sessionId, follower.commands, {
