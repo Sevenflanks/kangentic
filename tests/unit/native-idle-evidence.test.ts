@@ -161,4 +161,21 @@ describe('NativeIdleEvidence', () => {
 
     unsubscribe();
   });
+
+  it('notifies an existing listener and clears the snapshot when removing a session', () => {
+    const evidence = new NativeIdleEvidence();
+    const listener = vi.fn();
+    const unsubscribe = evidence.subscribe('pty-a', listener);
+    evidence.initializeSession('pty-a', 1);
+
+    expect(listener).toHaveBeenCalledTimes(1);
+    expect(evidence.snapshot('pty-a')).not.toBeNull();
+
+    evidence.removeSession('pty-a');
+
+    expect(listener).toHaveBeenCalledTimes(2);
+    expect(evidence.snapshot('pty-a')).toBeNull();
+
+    unsubscribe();
+  });
 });
