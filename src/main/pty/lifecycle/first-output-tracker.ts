@@ -4,24 +4,24 @@
  * overlay in the renderer and to clear the `resuming` flag on resumed
  * sessions.
  *
- * What counts as meaningful is adapter-specific. Claude waits for the
- * alternate-screen-buffer escape (`\x1b[?1049h`) because its shell prompt
- * renders before the CLI actually boots. Other agents default to any
- * non-empty data. The decision is delegated to the agent adapter via the
- * `detectFirstOutput` callback passed to `consume()`; when no detector is
- * given, any non-empty chunk qualifies.
+ * What counts as meaningful is adapter-specific. The tracker never interprets
+ * marker content: it delegates that decision to the `detectFirstOutput`
+ * callback passed to `consume()`. For custom detectors, it only reconstructs
+ * input across chunk boundaries using a bounded per-session tail. When no
+ * detector is given, any non-empty chunk qualifies.
  *
- * The tracker holds only a set of session IDs. Call `removeSession()`
- * when a session is fully cleaned up, or `clear()` during killAll().
+ * Call `removeSession()` when a session is fully cleaned up, or `clear()`
+ * during killAll(), so both emitted and partial-input state are discarded.
  */
 export class FirstOutputTracker {
-  private emitted = new Set<string>();
+  private readonly emitted = new Set<string>();
+  private readonly carry = new Map<string, string>();
 
   /**
    * Feed a fresh PTY chunk. If the session has not yet emitted first
-   * output and the chunk qualifies, mark it emitted and return true.
-   * Returns false if the session already emitted, the chunk doesn't
-   * qualify, or the detector rejects it.
+   * output and the current detector input qualifies, mark it emitted and
+   * return true. Returns false if the session already emitted or the input
+   * does not qualify.
    */
   consume(
     sessionId: string,
@@ -29,8 +29,16 @@ export class FirstOutputTracker {
     detectFirstOutput?: (data: string) => boolean,
   ): boolean {
     if (this.emitted.has(sessionId)) return false;
-    const isReady = detectFirstOutput ? detectFirstOutput(data) : data.length > 0;
-    if (!isReady) return false;
+    if (detectFirstOutput) {
+      const detectorInput = `${this.carry.get(sessionId) ?? ''}${data}`;
+      if (!detectFirstOutput(detectorInput)) {
+        this.carry.set(sessionId, detectorInput.slice(-64));
+        return false;
+      }
+    } else if (data.length === 0) {
+      return false;
+    }
+    this.carry.delete(sessionId);
     this.emitted.add(sessionId);
     return true;
   }
@@ -53,10 +61,12 @@ export class FirstOutputTracker {
   /** Drop per-session state. Called from SessionManager.remove(). */
   removeSession(sessionId: string): void {
     this.emitted.delete(sessionId);
+    this.carry.delete(sessionId);
   }
 
   /** Drop all state. Called from SessionManager.killAll(). */
   clear(): void {
     this.emitted.clear();
+    this.carry.clear();
   }
 }

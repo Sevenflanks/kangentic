@@ -32,6 +32,33 @@ describe('FirstOutputTracker', () => {
       expect(tracker.consume('s1', '\x1b[?1049hCLI booting', claudeDetector)).toBe(true);
     });
 
+    it('reconstructs detector input split across chunks', () => {
+      const tracker = new FirstOutputTracker();
+      const detector = (data: string) => data.includes('\x1b[?1049h');
+
+      expect(tracker.consume('s1', '\x1b[?104', detector)).toBe(false);
+      expect(tracker.consume('s1', '9hCLI booting', detector)).toBe(true);
+    });
+
+    it('emits exactly once after reconstructing split detector input', () => {
+      const tracker = new FirstOutputTracker();
+      const detector = (data: string) => data.includes('\x1b[?1049h');
+
+      expect(tracker.consume('s1', '\x1b[?104', detector)).toBe(false);
+      expect(tracker.consume('s1', '9hCLI booting', detector)).toBe(true);
+      expect(tracker.consume('s1', '\x1b[?1049hagain', detector)).toBe(false);
+      expect(tracker.consume('s1', 'later output', detector)).toBe(false);
+    });
+
+    it('does not combine detector input from different sessions', () => {
+      const tracker = new FirstOutputTracker();
+      const detector = (data: string) => data.includes('\x1b[?1049h');
+
+      expect(tracker.consume('s1', '\x1b[?104', detector)).toBe(false);
+      expect(tracker.consume('s2', '9hCLI booting', detector)).toBe(false);
+      expect(tracker.consume('s1', '9hCLI booting', detector)).toBe(true);
+    });
+
     it('tracks sessions independently', () => {
       const tracker = new FirstOutputTracker();
       expect(tracker.consume('s1', 'hello')).toBe(true);
@@ -59,6 +86,15 @@ describe('FirstOutputTracker', () => {
       expect(tracker.consume('s1', 'hello again')).toBe(true);
     });
 
+    it('removeSession discards partial detector input', () => {
+      const tracker = new FirstOutputTracker();
+      const detector = (data: string) => data.includes('\x1b[?1049h');
+
+      expect(tracker.consume('s1', '\x1b[?104', detector)).toBe(false);
+      tracker.removeSession('s1');
+      expect(tracker.consume('s1', '9hCLI booting', detector)).toBe(false);
+    });
+
     it('clear drops all sessions', () => {
       const tracker = new FirstOutputTracker();
       tracker.consume('s1', 'a');
@@ -66,6 +102,17 @@ describe('FirstOutputTracker', () => {
       tracker.clear();
       expect(tracker.hasEmitted('s1')).toBe(false);
       expect(tracker.hasEmitted('s2')).toBe(false);
+    });
+
+    it('clear discards partial detector input for every session', () => {
+      const tracker = new FirstOutputTracker();
+      const detector = (data: string) => data.includes('\x1b[?1049h');
+
+      expect(tracker.consume('s1', '\x1b[?104', detector)).toBe(false);
+      expect(tracker.consume('s2', '\x1b[?104', detector)).toBe(false);
+      tracker.clear();
+      expect(tracker.consume('s1', '9hCLI booting', detector)).toBe(false);
+      expect(tracker.consume('s2', '9hCLI booting', detector)).toBe(false);
     });
   });
 
