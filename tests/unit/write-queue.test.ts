@@ -76,9 +76,8 @@ describe('createWriteQueue', () => {
     const combined = pty.calls.join('');
     expect(combined.length).toBe(100000);
     expect(combined).toBe(first + second);
-    // Stronger assertion: no chunk straddles the A/B boundary except the one
-    // chunk that includes the last A's and first B's. All earlier chunks
-    // must be pure A's; all later chunks must be pure B's.
+    // Each enqueue is its own FIFO entry, so chunks never cross the A/B
+    // boundary. The joined output must transition exactly between entries.
     const boundaryIndex = combined.indexOf('B');
     expect(boundaryIndex).toBe(50000);
   });
