@@ -40,6 +40,20 @@ describe('FirstOutputTracker', () => {
       expect(tracker.consume('s1', '9hCLI booting', detector)).toBe(true);
     });
 
+    it('carries only the trailing 64 characters into the next detector input', () => {
+      const tracker = new FirstOutputTracker();
+      let observedInput = '';
+      const detector = (data: string) => {
+        observedInput = data;
+        return false;
+      };
+
+      expect(tracker.consume('s1', 'a'.repeat(40), detector)).toBe(false);
+      expect(tracker.consume('s1', 'b'.repeat(40), detector)).toBe(false);
+      expect(tracker.consume('s1', 'current', detector)).toBe(false);
+      expect(observedInput).toBe(`${'a'.repeat(24)}${'b'.repeat(40)}current`);
+    });
+
     it('emits exactly once after reconstructing split detector input', () => {
       const tracker = new FirstOutputTracker();
       const detector = (data: string) => data.includes('\x1b[?1049h');
