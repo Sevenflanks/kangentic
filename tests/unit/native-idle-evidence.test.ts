@@ -47,20 +47,75 @@ describe('NativeIdleEvidence', () => {
     });
   });
 
-  it('latches root and missing-id errors until a root turn starts', () => {
+  it('a matching-root error clears clean idle and latches only its PTY', () => {
+    const evidence = new NativeIdleEvidence();
+    evidence.initializeSession('pty-a', 1);
+    evidence.initializeSession('pty-b', 2);
+    evidence.recordBoundary('pty-a', { kind: 'created', nativeSessionId: 'root-a', occurredAt: 1 });
+    evidence.recordBoundary('pty-b', { kind: 'created', nativeSessionId: 'root-b', occurredAt: 1 });
+    evidence.recordBoundary('pty-a', { kind: 'idle', nativeSessionId: 'root-a', occurredAt: 2 });
+    evidence.recordBoundary('pty-b', { kind: 'idle', nativeSessionId: 'root-b', occurredAt: 2 });
+
+    evidence.recordBoundary('pty-a', { kind: 'error', nativeSessionId: 'root-a', occurredAt: 3 });
+    evidence.recordBoundary('pty-a', { kind: 'idle', nativeSessionId: 'root-a', occurredAt: 4 });
+
+    expect(evidence.snapshot('pty-a')).toMatchObject({ errorLatched: true, cleanIdle: null });
+    expect(evidence.snapshot('pty-b')).toMatchObject({
+      errorLatched: false,
+      cleanIdle: { nativeSessionId: 'root-b', occurredAt: 2 },
+    });
+  });
+
+  it('a missing-id error clears clean idle and latches only its PTY', () => {
+    const evidence = new NativeIdleEvidence();
+    evidence.initializeSession('pty-a', 1);
+    evidence.initializeSession('pty-b', 2);
+    evidence.recordBoundary('pty-a', { kind: 'created', nativeSessionId: 'root-a', occurredAt: 1 });
+    evidence.recordBoundary('pty-b', { kind: 'created', nativeSessionId: 'root-b', occurredAt: 1 });
+    evidence.recordBoundary('pty-a', { kind: 'idle', nativeSessionId: 'root-a', occurredAt: 2 });
+    evidence.recordBoundary('pty-b', { kind: 'idle', nativeSessionId: 'root-b', occurredAt: 2 });
+
+    evidence.recordBoundary('pty-a', { kind: 'error', nativeSessionId: null, occurredAt: 3 });
+    evidence.recordBoundary('pty-a', { kind: 'idle', nativeSessionId: 'root-a', occurredAt: 4 });
+
+    expect(evidence.snapshot('pty-a')).toMatchObject({ errorLatched: true, cleanIdle: null });
+    expect(evidence.snapshot('pty-b')).toMatchObject({
+      errorLatched: false,
+      cleanIdle: { nativeSessionId: 'root-b', occurredAt: 2 },
+    });
+  });
+
+  it('subsequent user input clears an error latch and permits a newer root idle', () => {
     const evidence = new NativeIdleEvidence();
     evidence.initializeSession('pty-a', 1);
     evidence.recordBoundary('pty-a', { kind: 'created', nativeSessionId: 'root-a', occurredAt: 1 });
-    evidence.recordBoundary('pty-a', { kind: 'error', nativeSessionId: null, occurredAt: 2 });
-    evidence.recordBoundary('pty-a', { kind: 'idle', nativeSessionId: 'root-a', occurredAt: 3 });
+    evidence.recordBoundary('pty-a', { kind: 'error', nativeSessionId: 'root-a', occurredAt: 2 });
 
-    expect(evidence.snapshot('pty-a')).toMatchObject({ errorLatched: true, cleanIdle: null });
+    expect(evidence.snapshot('pty-a')?.errorLatched).toBe(true);
 
-    evidence.recordBoundary('pty-a', { kind: 'turn-start', nativeSessionId: 'root-a', occurredAt: 4 });
+    evidence.recordUserInput('pty-a', 1, 3);
+
+    expect(evidence.snapshot('pty-a')).toMatchObject({ errorLatched: false, inputGeneration: 1 });
+
+    evidence.recordBoundary('pty-a', { kind: 'idle', nativeSessionId: 'root-a', occurredAt: 4 });
+    expect(evidence.snapshot('pty-a')?.cleanIdle?.occurredAt).toBe(4);
+  });
+
+  it.each([
+    { nativeSessionId: 'root-a', label: 'matching-root' },
+    { nativeSessionId: null, label: 'missing-id' },
+  ])('ignores a delayed $label error older than subsequent user input', ({ nativeSessionId }) => {
+    const evidence = new NativeIdleEvidence();
+    evidence.initializeSession('pty-a', 1);
+    evidence.recordBoundary('pty-a', { kind: 'created', nativeSessionId: 'root-a', occurredAt: 10 });
+    evidence.recordUserInput('pty-a', 1, 30);
+
+    evidence.recordBoundary('pty-a', { kind: 'error', nativeSessionId, occurredAt: 20 });
+
     expect(evidence.snapshot('pty-a')).toMatchObject({ errorLatched: false, cleanIdle: null });
 
-    evidence.recordBoundary('pty-a', { kind: 'idle', nativeSessionId: 'root-a', occurredAt: 5 });
-    expect(evidence.snapshot('pty-a')?.cleanIdle?.occurredAt).toBe(5);
+    evidence.recordBoundary('pty-a', { kind: 'idle', nativeSessionId: 'root-a', occurredAt: 31 });
+    expect(evidence.snapshot('pty-a')?.cleanIdle?.occurredAt).toBe(31);
   });
 
   it('invalidates idle on user input and rejects an earlier delayed idle', () => {
@@ -84,29 +139,25 @@ describe('NativeIdleEvidence', () => {
     expect(evidence.snapshot('pty-a')?.cleanIdle?.occurredAt).toBe(31);
   });
 
-  it('isolates missing-id errors by PTY session key', () => {
+  it('supports listener-first snapshot-second across initialization and state changes', () => {
     const evidence = new NativeIdleEvidence();
-    evidence.initializeSession('pty-a', 1);
-    evidence.initializeSession('pty-b', 2);
-    evidence.recordBoundary('pty-a', { kind: 'created', nativeSessionId: 'root-a', occurredAt: 1 });
-    evidence.recordBoundary('pty-b', { kind: 'created', nativeSessionId: 'root-b', occurredAt: 1 });
-    evidence.recordBoundary('pty-a', { kind: 'error', nativeSessionId: null, occurredAt: 2 });
-
-    expect(evidence.snapshot('pty-a')).toMatchObject({ errorLatched: true, cleanIdle: null });
-    expect(evidence.snapshot('pty-b')).toMatchObject({ errorLatched: false, cleanIdle: null });
-  });
-
-  it('notifies subscribers and exposes null after removal', () => {
-    const evidence = new NativeIdleEvidence();
-    evidence.initializeSession('pty-a', 1);
     const listener = vi.fn();
     const unsubscribe = evidence.subscribe('pty-a', listener);
 
+    expect(evidence.snapshot('pty-a')).toBeNull();
+
+    evidence.initializeSession('pty-a', 1);
+
+    expect(listener).toHaveBeenCalledTimes(1);
+    expect(evidence.snapshot('pty-a')).toMatchObject({
+      rootNativeSessionId: null,
+      sessionGeneration: 1,
+    });
+
     evidence.recordBoundary('pty-a', { kind: 'created', nativeSessionId: 'root-a', occurredAt: 1 });
-    evidence.removeSession('pty-a');
 
     expect(listener).toHaveBeenCalledTimes(2);
-    expect(evidence.snapshot('pty-a')).toBeNull();
+    expect(evidence.snapshot('pty-a')?.rootNativeSessionId).toBe('root-a');
 
     unsubscribe();
   });

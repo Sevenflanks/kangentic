@@ -67,11 +67,17 @@ export class NativeIdleEvidence {
         };
         break;
       case 'error':
+        // Hook delivery 可能延遲；舊 error 不可覆蓋已開始較新 turn 的 user input。
+        if (boundary.occurredAt <= state.lastInputAt) return;
         if (boundary.nativeSessionId !== null
           && boundary.nativeSessionId !== state.rootNativeSessionId) return;
         state.cleanIdle = null;
         state.errorLatched = true;
         break;
+      default: {
+        const unhandledKind: never = boundary.kind;
+        return unhandledKind;
+      }
     }
 
     this.notify(ptySessionId);
