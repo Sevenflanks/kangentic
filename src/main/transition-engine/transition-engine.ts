@@ -5,6 +5,7 @@ import type { Task, Action, ActionConfig, AppConfig, PermissionMode } from '../.
 import { sanitizeForPty } from '../../shared/paths';
 import { SessionManager } from '../pty/session-manager';
 import type { TerminalSubmit } from '../pty/terminal-submit';
+import type { TerminalSubmitScheduler } from './terminal-submit-scheduler';
 import { interpolateTemplate, buildTaskXml } from '../agent/shared';
 import { WorktreeManager, prepareWorktreeForRemoval, GitQueuePriority } from '../git/worktree-manager';
 import { agentRegistry } from '../agent/agent-registry';
@@ -57,6 +58,7 @@ export class TransitionEngine {
   constructor(
     private sessionManager: SessionManager,
     private terminalSubmit: TerminalSubmit,
+    private terminalSubmitScheduler: TerminalSubmitScheduler,
     private actionRepo: ActionRepository,
     private taskRepo: TaskRepository,
     private getConfig: () => TransitionEngineConfig,
@@ -270,6 +272,10 @@ export class TransitionEngine {
         ? handoffPromptPrefix + '\n\n' + prompt
         : handoffPromptPrefix;
     }
+    const intendedPrompt = prompt;
+    const commandPrompt = (adapter.initialPromptDelivery ?? 'command-argument') === 'terminal-submit'
+      ? undefined
+      : intendedPrompt;
 
     // Ensure the per-session directory exists and compute output paths.
     // Directory is named by ptySessionId (internal), NOT agentSessionId (CLI-specific).
@@ -287,7 +293,7 @@ export class TransitionEngine {
     const commandOptions = {
       agentPath: detection.path,
       taskId: task.id,
-      prompt,
+      prompt: commandPrompt,
       cwd,
       permissionMode,
       projectRoot: appConfig.projectPath || undefined,
@@ -355,7 +361,7 @@ export class TransitionEngine {
         command,
         cwd,
         permission_mode: permissionMode,
-        prompt: prompt ?? null,
+        prompt: intendedPrompt ?? null,
         status: session.status as 'running' | 'queued',
         exit_code: null,
         started_at: new Date().toISOString(),
@@ -372,6 +378,12 @@ export class TransitionEngine {
       this.sessionRepo.updateAppliedSettings(ptySessionId, {
         model: spawnOverrides?.model ?? null,
         effort: spawnOverrides?.effort ?? null,
+      });
+    }
+
+    if ((adapter.initialPromptDelivery ?? 'command-argument') === 'terminal-submit' && intendedPrompt) {
+      this.terminalSubmitScheduler.scheduleContent(task.id, session.id, intendedPrompt, {
+        verifier: adapter.getSubmissionVerifier?.('paste') ?? null,
       });
     }
   }

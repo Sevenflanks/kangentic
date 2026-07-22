@@ -7,7 +7,7 @@
  *   2. CHUNKED writeRaw of paste packet (1024-byte chunks with
  *      setImmediate yields between)
  *   3. Wait for output-settle: first `data` event, then 250ms idle.
- *      Cap at SETTLE_CAP_MIN_MS + payloadLength * 0.5ms. Floor at
+ *      Cap at SETTLE_CAP_MIN_MS + packet UTF-8 bytes * 0.5ms. Floor at
  *      MIN_GAP_MS (1000ms) for React commit.
  *   4. Submit `\r` via the QUEUE (sessionManager.write), then drain.
  *   5. Wait for SUBMISSION VERIFICATION: optional verifier callback returns
@@ -72,11 +72,12 @@ async function flushSetImmediate(): Promise<void> {
 }
 
 describe('sanitizeForPaste', () => {
-  it('strips lone CR', () => {
-    expect(sanitizeForPaste('hello\rworld')).toBe('hello\nworld');
+  it('preserves lone CR byte-for-byte for bracketed paste content', () => {
+    expect(sanitizeForPaste('hello\rworld')).toBe('hello\rworld');
   });
-  it('normalizes CRLF to LF', () => {
-    expect(sanitizeForPaste('a\r\nb\r\nc')).toBe('a\nb\nc');
+  it('preserves CRLF byte-for-byte for bracketed paste content', () => {
+    const input = '<task>\r\n  <description>繁體中文\r\nline two</description>\r\n</task>';
+    expect(sanitizeForPaste(input)).toBe(input);
   });
   it('preserves tab and newline', () => {
     expect(sanitizeForPaste('a\tb\nc')).toBe('a\tb\nc');
@@ -111,6 +112,26 @@ describe('PasteEngine.pasteAndSubmit', () => {
   async function emitEvidence(): Promise<void> {
     mockSessionManager.emitActivity('s1', 'thinking');
     await tick();
+  }
+
+  function expectBracketedWriteInvariants(text: string): void {
+    const startMarker = '\x1b[200~';
+    const endMarker = '\x1b[201~';
+    const expectedPacket = `${startMarker}${text}${endMarker}`;
+    const writes = mockSessionManager.writeRawCalls.map(({ data }) => data);
+    const joinedWrites = writes.join('');
+    const concatenatedBytes = Buffer.concat(writes.map((write) => Buffer.from(write, 'utf8')));
+
+    expect(writes.every((write) => Buffer.byteLength(write, 'utf8') <= 1024)).toBe(true);
+    expect(concatenatedBytes).toEqual(Buffer.from(expectedPacket, 'utf8'));
+    expect(concatenatedBytes.toString('utf8')).not.toContain('\uFFFD');
+    expect(joinedWrites).toBe(expectedPacket);
+    expect(joinedWrites.split(startMarker)).toHaveLength(2);
+    expect(joinedWrites.split(endMarker)).toHaveLength(2);
+    expect(writes.filter((write) => write.includes(startMarker))).toHaveLength(1);
+    expect(writes.filter((write) => write.includes(endMarker))).toHaveLength(1);
+    expect(writes).not.toContain(startMarker);
+    expect(writes).not.toContain(endMarker);
   }
 
   it('drains, writes one chunk for small payload, observes settle, sends \\r via queue', async () => {
@@ -191,6 +212,44 @@ describe('PasteEngine.pasteAndSubmit', () => {
     await reachEvidenceWait();
     await emitEvidence();
 
+    await expect(promise).resolves.toBeUndefined();
+  });
+
+  it('keeps the end marker whole when its ESC would land at byte index 1023', async () => {
+    const text = 'x'.repeat(1017);
+    const promise = engine.pasteAndSubmit('s1', text);
+
+    await tick();
+    mockSessionManager.flushDrain();
+    await tick();
+    await flushSetImmediate();
+    await tick();
+
+    expectBracketedWriteInvariants(text);
+
+    vi.advanceTimersByTime(1600);
+    await tick();
+    await reachEvidenceWait();
+    await emitEvidence();
+    await expect(promise).resolves.toBeUndefined();
+  });
+
+  it('preserves non-BMP UTF-8 bytes when a surrogate pair crosses the old boundary', async () => {
+    const text = `${'x'.repeat(1017)}😀`;
+    const promise = engine.pasteAndSubmit('s1', text);
+
+    await tick();
+    mockSessionManager.flushDrain();
+    await tick();
+    await flushSetImmediate();
+    await tick();
+
+    expectBracketedWriteInvariants(text);
+
+    vi.advanceTimersByTime(1600);
+    await tick();
+    await reachEvidenceWait();
+    await emitEvidence();
     await expect(promise).resolves.toBeUndefined();
   });
 
@@ -300,14 +359,14 @@ describe('PasteEngine.pasteAndSubmit', () => {
     await expect(promise).resolves.toBeUndefined();
   });
 
-  it('sanitizes embedded CR before writing', async () => {
+  it('preserves embedded CR before writing', async () => {
     const promise = engine.pasteAndSubmit('s1', 'line one\rline two', { bracketed: false });
 
     await tick();
     mockSessionManager.flushDrain();
     await tick();
 
-    expect(mockSessionManager.writeRawCalls[0].data).toBe('line one\nline two');
+    expect(mockSessionManager.writeRawCalls[0].data).toBe('line one\rline two');
 
     vi.advanceTimersByTime(1100);
     await tick();

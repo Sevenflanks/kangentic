@@ -2,16 +2,18 @@
  * Unit tests for src/main/transition-engine/terminal-submit-scheduler.ts.
  *
  * `TerminalSubmitScheduler` adds task-keyed lifecycle on top of
- * `TerminalSubmit.submitKeystrokes`. The scheduler's responsibilities:
+ * `TerminalSubmit`. The scheduler's responsibilities:
  *
- *   1. Existing session: deliver immediately. If a burst is in flight,
+ *   1. Free-form content: wait listener-first/cache-second for first output,
+ *      then submit once before the latest queued fresh keystroke follower.
+ *   2. Existing session: deliver immediately. If a burst is in flight,
  *      stash the new request as `next` so rapid drag-through transitions
  *      coalesce (only the latest survives).
- *   2. Freshly spawned (`opts.freshlySpawned: true`): wait for the CLI's
+ *   3. Freshly spawned (`opts.freshlySpawned: true`): wait for the CLI's
  *      first `'thinking'` activity event. 30s fallback delivers anyway
  *      if hooks never fire. `opts.timeoutMs` (default 120s) hard-caps.
- *   3. Queued: wait for `status:running`, then apply the `'thinking'` wait.
- *   4. Cancel: tears down event listeners + timers AND aborts an in-flight
+ *   4. Queued: wait for `status:running`, then apply the `'thinking'` wait.
+ *   5. Cancel: tears down event listeners + timers AND aborts an in-flight
  *      burst via the per-task `AbortController` plumbed through.
  *
  * The byte-pushing path (write order, sanitize, verifier polling) is
@@ -22,20 +24,39 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { TerminalSubmitScheduler } from '../../src/main/transition-engine/terminal-submit-scheduler';
 import type { TerminalSubmit } from '../../src/main/pty/terminal-submit';
-import type { SubmitKeystrokesOptions } from '../../src/main/pty/terminal-submit';
+import type { SubmitContentOptions, SubmitKeystrokesOptions } from '../../src/main/pty/terminal-submit';
+import type { SessionStatus, SubmissionVerifier } from '../../src/shared/types';
 
 class MockSessionManager extends EventEmitter {
-  registry = new Map<string, { status: string }>();
+  registry = new Map<string, { status: SessionStatus }>();
+  firstOutput = new Set<string>();
+  firstOutputListenerCounts: number[] = [];
+  firstOutputDuringCacheRead: string | null = null;
 
-  getSession(id: string): { status: string } | undefined {
+  getSession(id: string): { status: SessionStatus } | undefined {
     return this.registry.get(id);
+  }
+
+  getFirstOutputCache(): Record<string, boolean> {
+    this.firstOutputListenerCounts.push(this.listenerCount('first-output'));
+    if (this.firstOutputDuringCacheRead !== null) {
+      const sessionId = this.firstOutputDuringCacheRead;
+      this.firstOutputDuringCacheRead = null;
+      this.emitFirstOutput(sessionId);
+    }
+    return Object.fromEntries([...this.firstOutput].map((id) => [id, true]));
+  }
+
+  emitFirstOutput(id: string): void {
+    this.firstOutput.add(id);
+    this.emit('first-output', id);
   }
 
   emitActivity(id: string, state: string): void {
     this.emit('activity', id, state);
   }
 
-  emitSessionChanged(id: string, session: { status: string }): void {
+  emitSessionChanged(id: string, session: { status: SessionStatus }): void {
     this.emit('session-changed', id, session);
   }
 
@@ -53,6 +74,19 @@ class MockTerminalSubmit {
     resolve: () => void;
     aborted: boolean;
   }> = [];
+  contentCalls: Array<{
+    sessionId: string;
+    text: string;
+    opts: SubmitContentOptions;
+    resolve: () => void;
+    reject: (error: Error) => void;
+    aborted: boolean;
+    settled: boolean;
+  }> = [];
+  observableOrder: Array<
+    | { kind: 'content'; text: string }
+    | { kind: 'keystrokes'; commands: string[] }
+  > = [];
 
   submitKeystrokes(
     sessionId: string,
@@ -62,6 +96,7 @@ class MockTerminalSubmit {
     return new Promise<void>((resolve) => {
       const call = { sessionId, commands, opts, resolve, aborted: false };
       this.calls.push(call);
+      this.observableOrder.push({ kind: 'keystrokes', commands });
       if (opts.signal) {
         if (opts.signal.aborted) {
           call.aborted = true;
@@ -82,8 +117,57 @@ class MockTerminalSubmit {
     if (pending) pending.resolve();
   }
 
-  // Stub other PasteEngine methods we don't exercise here.
-  submitContent = vi.fn();
+  submitContent(
+    sessionId: string,
+    text: string,
+    opts: SubmitContentOptions,
+  ): Promise<void> {
+    let completePromise: () => void = () => undefined;
+    let rejectPromise: (error: Error) => void = () => undefined;
+    const promise = new Promise<void>((resolve, reject) => {
+      completePromise = resolve;
+      rejectPromise = reject;
+    });
+    const call = {
+      sessionId,
+      text,
+      opts,
+      aborted: false,
+      settled: false,
+      resolve: (): void => {
+        if (call.settled) return;
+        call.settled = true;
+        completePromise();
+      },
+      reject: (error: Error): void => {
+        if (call.settled) return;
+        call.settled = true;
+        rejectPromise(error);
+      },
+    };
+    this.contentCalls.push(call);
+    this.observableOrder.push({ kind: 'content', text });
+    if (opts.signal) {
+      if (opts.signal.aborted) {
+        call.aborted = true;
+        call.resolve();
+      } else {
+        opts.signal.addEventListener('abort', () => {
+          call.aborted = true;
+          call.resolve();
+        });
+      }
+    }
+    return promise;
+  }
+
+  finishContentLatest(): void {
+    this.contentCalls.find((call) => !call.settled)?.resolve();
+  }
+
+  rejectContentLatest(error: Error): void {
+    this.contentCalls.find((call) => !call.settled)?.reject(error);
+  }
 }
 
 async function tick(): Promise<void> {
@@ -108,8 +192,521 @@ describe('TerminalSubmitScheduler', () => {
   });
 
   afterEach(() => {
+    scheduler.cancelAll();
     vi.useRealTimers();
+    vi.restoreAllMocks();
     sessionManager.removeAllListeners();
+  });
+
+  describe('ready-gated content', () => {
+    describe('session status', () => {
+      it('submits cached content for a running session', async () => {
+        sessionManager.registry.set('s1', { status: 'running' });
+        sessionManager.firstOutput.add('s1');
+
+        scheduler.scheduleContent('task-1', 's1', 'content');
+        await tick();
+
+        expect(terminalSubmit.contentCalls).toHaveLength(1);
+      });
+
+      it('waits for a queued session to become running before using its cache', async () => {
+        sessionManager.registry.set('s1', { status: 'queued' });
+        sessionManager.firstOutput.add('s1');
+
+        scheduler.scheduleContent('task-1', 's1', 'content');
+        await tick();
+
+        expect(terminalSubmit.contentCalls).toHaveLength(0);
+        expect(vi.getTimerCount()).toBe(0);
+
+        sessionManager.emitSessionChanged('s1', { status: 'running' });
+        await tick();
+
+        expect(terminalSubmit.contentCalls).toHaveLength(1);
+      });
+
+      it.each([
+        'exited',
+        'suspended',
+      ] satisfies readonly SessionStatus[])('ignores cached content for inactive %s status without scheduler state', async (status) => {
+        sessionManager.registry.set('s1', { status });
+        sessionManager.firstOutput.add('s1');
+
+        scheduler.scheduleContent('task-1', 's1', 'content');
+        await tick();
+
+        expect(terminalSubmit.contentCalls).toHaveLength(0);
+        expect(sessionManager.eventNames()).toEqual([]);
+        expect(vi.getTimerCount()).toBe(0);
+
+        sessionManager.registry.set('s1', { status: 'running' });
+        scheduler.scheduleKeystrokes('task-1', 's1', ['/standalone']);
+        await tick();
+
+        expect(terminalSubmit.calls).toHaveLength(1);
+      });
+    });
+
+    it('waits for matching first-output without a fallback and submits once', async () => {
+      sessionManager.registry.set('s1', { status: 'running' });
+
+      scheduler.scheduleContent('task-1', 's1', 'content');
+      vi.advanceTimersByTime(30_000);
+      await tick();
+
+      expect(terminalSubmit.contentCalls).toHaveLength(0);
+
+      sessionManager.emitFirstOutput('other-session');
+      sessionManager.emitFirstOutput('s1');
+      sessionManager.emitFirstOutput('s1');
+      await tick();
+
+      expect(terminalSubmit.contentCalls).toHaveLength(1);
+      expect(terminalSubmit.contentCalls[0].text).toBe('content');
+    });
+
+    it('attaches the listener before checking cache and shares one start guard', async () => {
+      sessionManager.registry.set('s1', { status: 'running' });
+      sessionManager.firstOutputDuringCacheRead = 's1';
+
+      scheduler.scheduleContent('task-1', 's1', 'cached content');
+      await tick();
+
+      expect(sessionManager.firstOutputListenerCounts).toEqual([1]);
+      expect(sessionManager.firstOutput.has('s1')).toBe(true);
+      expect(terminalSubmit.contentCalls).toHaveLength(1);
+    });
+
+    it('ignores stale first-output cache entries for another session', async () => {
+      sessionManager.registry.set('s1', { status: 'running' });
+      sessionManager.firstOutput.add('stale-session');
+
+      scheduler.scheduleContent('task-1', 's1', 'content');
+      await tick();
+
+      expect(terminalSubmit.contentCalls).toHaveLength(0);
+    });
+
+    it('finishes content before directly sending the fresh latest follower', async () => {
+      sessionManager.registry.set('s1', { status: 'running' });
+      const verifier = vi.fn(async () => true);
+
+      scheduler.scheduleContent('task-1', 's1', 'content');
+      scheduler.scheduleKeystrokes('task-1', 's1', ['/follow'], {
+        verifier,
+        verifiedPrefixLength: 1,
+      });
+
+      expect(sessionManager.listenerCount('first-output')).toBe(1);
+      expect(sessionManager.listenerCount('session-changed')).toBe(1);
+      expect(sessionManager.listenerCount('exit')).toBe(1);
+
+      sessionManager.emitFirstOutput('s1');
+      await tick();
+
+      expect(terminalSubmit.calls).toHaveLength(0);
+      expect(terminalSubmit.observableOrder).toEqual([
+        { kind: 'content', text: 'content' },
+      ]);
+      expect(sessionManager.listenerCount('first-output')).toBe(0);
+      expect(sessionManager.listenerCount('session-changed')).toBe(0);
+      expect(sessionManager.listenerCount('exit')).toBe(1);
+      expect(vi.getTimerCount()).toBe(0);
+
+      terminalSubmit.finishContentLatest();
+      await tick();
+
+      expect(terminalSubmit.observableOrder).toEqual([
+        { kind: 'content', text: 'content' },
+        { kind: 'keystrokes', commands: ['/follow'] },
+      ]);
+      expect(terminalSubmit.calls[0].opts.sendCtrlC).toBe(false);
+      expect(terminalSubmit.calls[0].opts.verifier).toBe(verifier);
+      expect(terminalSubmit.calls[0].opts.verifiedPrefixLength).toBe(1);
+      expect(sessionManager.eventNames()).toEqual([]);
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it('keeps only the latest keystroke follower', async () => {
+      sessionManager.registry.set('s1', { status: 'running' });
+
+      scheduler.scheduleContent('task-1', 's1', 'content');
+      scheduler.scheduleKeystrokes('task-1', 's1', ['/discarded']);
+      scheduler.scheduleKeystrokes('task-1', 's1', ['/latest']);
+      sessionManager.emitFirstOutput('s1');
+      await tick();
+
+      terminalSubmit.finishContentLatest();
+      await tick();
+
+      expect(terminalSubmit.calls).toHaveLength(1);
+      expect(terminalSubmit.calls[0].commands).toEqual(['/latest']);
+    });
+
+    it('excludes queued time from the readiness timeout budget', async () => {
+      vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      sessionManager.registry.set('s1', { status: 'queued' });
+
+      scheduler.scheduleContent('task-1', 's1', 'content', { readinessTimeoutMs: 1_000 });
+      scheduler.scheduleKeystrokes('task-1', 's1', ['/follow']);
+      vi.advanceTimersByTime(5_000);
+      await tick();
+
+      sessionManager.emitSessionChanged('s1', { status: 'running' });
+      vi.advanceTimersByTime(999);
+      await tick();
+
+      expect(sessionManager.listenerCount('first-output')).toBe(1);
+      expect(terminalSubmit.contentCalls).toHaveLength(0);
+
+      vi.advanceTimersByTime(1);
+      sessionManager.emitFirstOutput('s1');
+      await tick();
+
+      expect(terminalSubmit.contentCalls).toHaveLength(0);
+      expect(terminalSubmit.calls).toHaveLength(0);
+    });
+
+    it('checks first-output cache when a queued session becomes running', async () => {
+      sessionManager.registry.set('s1', { status: 'queued' });
+
+      scheduler.scheduleContent('task-1', 's1', 'content');
+      sessionManager.firstOutput.add('s1');
+      sessionManager.emitSessionChanged('s1', { status: 'running' });
+      await tick();
+
+      expect(terminalSubmit.contentCalls).toHaveLength(1);
+    });
+
+    it('uses a 120-second readiness timeout by default', async () => {
+      vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      sessionManager.registry.set('s1', { status: 'running' });
+
+      scheduler.scheduleContent('task-1', 's1', 'content');
+      vi.advanceTimersByTime(119_999);
+      await tick();
+
+      expect(sessionManager.listenerCount('first-output')).toBe(1);
+
+      vi.advanceTimersByTime(1);
+      await tick();
+
+      expect(sessionManager.listenerCount('first-output')).toBe(0);
+      expect(terminalSubmit.contentCalls).toHaveLength(0);
+    });
+
+    it('drops content and its follower when the session exits before readiness', async () => {
+      sessionManager.registry.set('s1', { status: 'running' });
+
+      scheduler.scheduleContent('task-1', 's1', 'content');
+      scheduler.scheduleKeystrokes('task-1', 's1', ['/follow']);
+      sessionManager.emitExit('s1');
+      sessionManager.emitFirstOutput('s1');
+      await tick();
+
+      expect(terminalSubmit.contentCalls).toHaveLength(0);
+      expect(terminalSubmit.calls).toHaveLength(0);
+    });
+
+    it('aborts in-flight content and drops its same-session follower when the session exits', async () => {
+      // Given: matching content has passed readiness but has not settled.
+      sessionManager.registry.set('s1', { status: 'running' });
+      scheduler.scheduleContent('task-1', 's1', 'content');
+      scheduler.scheduleKeystrokes('task-1', 's1', ['/follow']);
+      sessionManager.emitFirstOutput('s1');
+      await tick();
+      const exitListenersWhilePending = sessionManager.listenerCount('exit');
+
+      // When: the owning session exits.
+      sessionManager.emitExit('s1');
+      await tick();
+
+      // Then: content ownership ends without releasing its follower.
+      expect(terminalSubmit.contentCalls[0].aborted).toBe(true);
+      expect(exitListenersWhilePending).toBe(1);
+      expect(terminalSubmit.calls).toHaveLength(0);
+      expect(sessionManager.eventNames()).toEqual([]);
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it('drops content and its follower on explicit cancel before readiness', async () => {
+      sessionManager.registry.set('s1', { status: 'running' });
+
+      scheduler.scheduleContent('task-1', 's1', 'content');
+      scheduler.scheduleKeystrokes('task-1', 's1', ['/follow']);
+      scheduler.cancel('task-1');
+      sessionManager.emitFirstOutput('s1');
+      await tick();
+
+      expect(terminalSubmit.contentCalls).toHaveLength(0);
+      expect(terminalSubmit.calls).toHaveLength(0);
+    });
+
+    it('drops every content job and follower on cancelAll', async () => {
+      sessionManager.registry.set('s1', { status: 'running' });
+      sessionManager.registry.set('s2', { status: 'running' });
+
+      scheduler.scheduleContent('task-1', 's1', 'first');
+      scheduler.scheduleKeystrokes('task-1', 's1', ['/first-follow']);
+      scheduler.scheduleContent('task-2', 's2', 'second');
+      scheduler.scheduleKeystrokes('task-2', 's2', ['/second-follow']);
+      scheduler.cancelAll();
+      sessionManager.emitFirstOutput('s1');
+      sessionManager.emitFirstOutput('s2');
+      await tick();
+
+      expect(terminalSubmit.contentCalls).toHaveLength(0);
+      expect(terminalSubmit.calls).toHaveLength(0);
+    });
+
+    it('aborts in-flight content and drops its follower on cancel', async () => {
+      sessionManager.registry.set('s1', { status: 'running' });
+
+      scheduler.scheduleContent('task-1', 's1', 'content');
+      scheduler.scheduleKeystrokes('task-1', 's1', ['/follow']);
+      sessionManager.emitFirstOutput('s1');
+      await tick();
+
+      scheduler.cancel('task-1');
+      await tick();
+
+      expect(terminalSubmit.contentCalls[0].aborted).toBe(true);
+      expect(terminalSubmit.calls).toHaveLength(0);
+    });
+
+    it('replaces pending content for the same task', async () => {
+      sessionManager.registry.set('s1', { status: 'running' });
+
+      scheduler.scheduleContent('task-1', 's1', 'discarded');
+      scheduler.scheduleKeystrokes('task-1', 's1', ['/discarded-follow']);
+      scheduler.scheduleContent('task-1', 's1', 'latest');
+      sessionManager.emitFirstOutput('s1');
+      await tick();
+
+      expect(terminalSubmit.contentCalls).toHaveLength(1);
+      expect(terminalSubmit.contentCalls[0].text).toBe('latest');
+      terminalSubmit.finishContentLatest();
+      await tick();
+      expect(terminalSubmit.calls).toHaveLength(0);
+    });
+
+    it('aborts in-flight content when content is rescheduled for the same task', async () => {
+      sessionManager.registry.set('s1', { status: 'running' });
+
+      scheduler.scheduleContent('task-1', 's1', 'discarded');
+      sessionManager.emitFirstOutput('s1');
+      await tick();
+      scheduler.scheduleKeystrokes('task-1', 's1', ['/discarded-follow']);
+
+      scheduler.scheduleContent('task-1', 's1', 'latest');
+      await tick();
+
+      expect(terminalSubmit.contentCalls).toHaveLength(2);
+      expect(terminalSubmit.contentCalls[0].aborted).toBe(true);
+      expect(terminalSubmit.contentCalls[1].text).toBe('latest');
+      terminalSubmit.finishContentLatest();
+      await tick();
+      expect(terminalSubmit.calls).toHaveLength(0);
+    });
+
+    it('keeps replacement content owned only by its new session', async () => {
+      // Given: old-session content is in flight for a task.
+      sessionManager.registry.set('old-session', { status: 'running' });
+      sessionManager.registry.set('new-session', { status: 'running' });
+      scheduler.scheduleContent('task-1', 'old-session', 'old content');
+      sessionManager.emitFirstOutput('old-session');
+      await tick();
+      const oldContent = terminalSubmit.contentCalls[0];
+
+      // When: new-session content replaces it and the old session exits late.
+      scheduler.scheduleContent('task-1', 'new-session', 'new content');
+      sessionManager.emitFirstOutput('new-session');
+      await tick();
+      const newContent = terminalSubmit.contentCalls[1];
+      sessionManager.emitExit('old-session');
+      await tick();
+
+      // Then: replacement aborts the old owner, while the late exit cannot abort the new owner.
+      expect(oldContent.aborted).toBe(true);
+      expect(newContent.aborted).toBe(false);
+      expect(sessionManager.listenerCount('exit')).toBe(1);
+
+      terminalSubmit.finishContentLatest();
+      await tick();
+      expect(sessionManager.eventNames()).toEqual([]);
+    });
+
+    it('routes a different-session keystroke normally instead of attaching it as a content follower', async () => {
+      // Given: old-session content is in flight when the task has a new running session.
+      sessionManager.registry.set('old-session', { status: 'running' });
+      sessionManager.registry.set('new-session', { status: 'running' });
+      scheduler.scheduleContent('task-1', 'old-session', 'old content');
+      sessionManager.emitFirstOutput('old-session');
+      await tick();
+
+      // When: a keystroke arrives for the new session.
+      scheduler.scheduleKeystrokes('task-1', 'new-session', ['/new-session']);
+      await tick();
+
+      // Then: stale content is cancelled and normal live-injection semantics apply.
+      expect(terminalSubmit.contentCalls[0].aborted).toBe(true);
+      expect(terminalSubmit.calls).toHaveLength(1);
+      expect(terminalSubmit.calls[0].sessionId).toBe('new-session');
+      expect(terminalSubmit.calls[0].commands).toEqual(['/new-session']);
+      expect(terminalSubmit.calls[0].opts.sendCtrlC).toBe(true);
+      expect(sessionManager.listenerCount('exit')).toBe(0);
+    });
+
+    it.each([
+      'exited',
+      'suspended',
+    ] satisfies readonly SessionStatus[])('cancels pending content and its follower when the same task reruns against %s status', async (status) => {
+      sessionManager.registry.set('running-session', { status: 'running' });
+      sessionManager.registry.set('inactive-session', { status });
+
+      scheduler.scheduleContent('task-1', 'running-session', 'old content');
+      scheduler.scheduleKeystrokes('task-1', 'running-session', ['/old-follower']);
+
+      scheduler.scheduleContent('task-1', 'inactive-session', 'inactive rerun');
+      sessionManager.emitFirstOutput('running-session');
+      await tick();
+      terminalSubmit.finishContentLatest();
+      await tick();
+
+      expect(terminalSubmit.contentCalls).toHaveLength(0);
+      expect(terminalSubmit.calls).toHaveLength(0);
+      expect(sessionManager.eventNames()).toEqual([]);
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it.each([
+      'exited',
+      'suspended',
+    ] satisfies readonly SessionStatus[])('aborts in-flight content and drops its follower when the same task reruns against %s status', async (status) => {
+      sessionManager.registry.set('running-session', { status: 'running' });
+      sessionManager.registry.set('inactive-session', { status });
+
+      scheduler.scheduleContent('task-1', 'running-session', 'old content');
+      sessionManager.emitFirstOutput('running-session');
+      await tick();
+      scheduler.scheduleKeystrokes('task-1', 'running-session', ['/old-follower']);
+      const oldContent = terminalSubmit.contentCalls[0];
+
+      scheduler.scheduleContent('task-1', 'inactive-session', 'inactive rerun');
+      terminalSubmit.finishContentLatest();
+      await tick();
+
+      expect(oldContent.aborted).toBe(true);
+      expect(terminalSubmit.contentCalls).toHaveLength(1);
+      expect(terminalSubmit.calls).toHaveLength(0);
+      expect(sessionManager.eventNames()).toEqual([]);
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it('drops the follower and cleans task state when submitContent fails', async () => {
+      vi.spyOn(console, 'error').mockImplementation(() => undefined);
+      sessionManager.registry.set('s1', { status: 'running' });
+
+      scheduler.scheduleContent('task-1', 's1', 'content');
+      scheduler.scheduleKeystrokes('task-1', 's1', ['/discarded-follow']);
+      sessionManager.emitFirstOutput('s1');
+      await tick();
+      terminalSubmit.rejectContentLatest(new Error('submission failed'));
+      await tick();
+
+      expect(terminalSubmit.calls).toHaveLength(0);
+
+      scheduler.scheduleKeystrokes('task-1', 's1', ['/after-failure']);
+      await tick();
+
+      expect(terminalSubmit.calls).toHaveLength(1);
+      expect(terminalSubmit.calls[0].commands).toEqual(['/after-failure']);
+    });
+
+    it('forwards free-form content byte-for-byte', async () => {
+      const text = '第一行\r\n第二行「引號」 "quotes" & | < > ^ %';
+      sessionManager.registry.set('s1', { status: 'running' });
+      sessionManager.firstOutput.add('s1');
+
+      scheduler.scheduleContent('task-1', 's1', text);
+      await tick();
+
+      expect(terminalSubmit.contentCalls[0].text).toBe(text);
+    });
+
+    it('forwards a non-null SubmissionVerifier unchanged', async () => {
+      const verifier: SubmissionVerifier = async () => true;
+      sessionManager.registry.set('s1', { status: 'running' });
+      sessionManager.firstOutput.add('s1');
+
+      scheduler.scheduleContent('task-1', 's1', 'content', { verifier });
+      await tick();
+
+      expect(terminalSubmit.contentCalls[0].opts.verifier).toBe(verifier);
+    });
+
+    it('forwards an explicit null verifier as undefined', async () => {
+      sessionManager.registry.set('s1', { status: 'running' });
+      sessionManager.firstOutput.add('s1');
+
+      scheduler.scheduleContent('task-1', 's1', 'content', { verifier: null });
+      await tick();
+
+      expect(terminalSubmit.contentCalls[0].opts.verifier).toBeUndefined();
+    });
+
+    it('keeps submit failure logs metadata-only', async () => {
+      const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+      const text = '內容 & <task>';
+      sessionManager.registry.set('session-123456789', { status: 'running' });
+      sessionManager.firstOutput.add('session-123456789');
+
+      scheduler.scheduleContent('task-123456789', 'session-123456789', text);
+      await tick();
+      terminalSubmit.rejectContentLatest(new Error(`failed: ${text}`));
+      await tick();
+
+      const logged = errorSpy.mock.calls.flat().join(' ');
+      expect(logged).toContain('submit-content failed');
+      expect(logged).toContain('task-123');
+      expect(logged).toContain('session=session-');
+      expect(logged).not.toContain('內容');
+      expect(logged).not.toContain('&');
+      expect(logged).not.toContain('<task>');
+    });
+
+    it('keeps readiness timeout logs metadata-only', async () => {
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      const text = '內容 & <task>';
+      sessionManager.registry.set('session-123456789', { status: 'running' });
+
+      scheduler.scheduleContent('task-123456789', 'session-123456789', text, {
+        readinessTimeoutMs: 10,
+      });
+      vi.advanceTimersByTime(10);
+      await tick();
+
+      const logged = warnSpy.mock.calls.flat().join(' ');
+      expect(logged).toContain('submit-content readiness timeout');
+      expect(logged).toContain('task-123');
+      expect(logged).toContain('session=session-');
+      expect(logged).not.toContain('內容');
+      expect(logged).not.toContain('&');
+      expect(logged).not.toContain('<task>');
+    });
+
+    it('has no side effects for empty content or a missing session', async () => {
+      sessionManager.registry.set('s1', { status: 'running' });
+
+      scheduler.scheduleContent('task-1', 's1', '');
+      scheduler.scheduleContent('task-2', 'missing', 'content');
+      await tick();
+
+      expect(terminalSubmit.contentCalls).toHaveLength(0);
+      expect(terminalSubmit.calls).toHaveLength(0);
+      expect(sessionManager.eventNames()).toEqual([]);
+    });
   });
 
   describe('existing session (immediate delivery)', () => {

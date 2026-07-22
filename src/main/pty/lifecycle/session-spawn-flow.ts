@@ -14,6 +14,7 @@ import type { StatusFileReader } from '../readers/status-file-reader';
 import type { SessionHistoryReader } from '../readers/session-history-reader';
 import type { SessionQueue } from '../session-queue';
 import type { TranscriptWriter } from '../buffer/transcript-writer';
+import type { FirstOutputTracker } from './first-output-tracker';
 import { attachAdapter, disposeAdapterAttachment, removeAdapterHooks } from './adapter-lifecycle';
 import { safeKillPty } from './pty-kill';
 import { resolveShellArgs, buildSpawnEnv, resolveSpawnCwd } from '../spawn/pty-spawn';
@@ -51,6 +52,7 @@ export interface SpawnFlowContext {
   statusFileReader: StatusFileReader;
   sessionHistoryReader: SessionHistoryReader;
   sessionQueue: SessionQueue;
+  firstOutputTracker: FirstOutputTracker;
   getTranscriptWriter: () => TranscriptWriter | null;
   getShell: () => Promise<string>;
   /**
@@ -123,6 +125,7 @@ export async function performSpawn(
     // so a spurious "session ID not captured" warning cannot fire
     // 30s after respawn.
     context.sessionIdManager.removeSession(existing.id);
+    context.firstOutputTracker.removeSession(existing.id);
     // Tear down any adapter-attached work from the previous spawn.
     disposeAdapterAttachment(existing);
   }

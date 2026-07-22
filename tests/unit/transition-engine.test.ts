@@ -1,5 +1,6 @@
 /**
- * Unit tests for TransitionEngine raw/sanitized description split.
+ * Unit tests for TransitionEngine prompt construction, capability routing,
+ * resume behavior, and adjacent spawn wiring.
  *
  * History: prior to this fix, both `task_xml` and the `{{description}}`
  * template var received the sanitized (newline-stripped) description. This
@@ -11,20 +12,23 @@
  *   - `task_xml`        uses raw `task.description` (multi-line preserved)
  *   - `{{description}}` uses `sanitizeForPty(task.description)` (newlines stripped)
  *
- * These tests pin that contract by inspecting:
+ * These tests pin prompt construction and delivery by inspecting:
  *   1. `executeAction` (spawn_agent case) via `executeTransition`
  *   2. `resumeSuspendedSession`
+ *   3. command/environment adapter options, persistence, and scheduler calls
  *
  * Strategy: mock everything the engine touches except the logic under test
- * (buildTaskXml + sanitizeForPty). We capture the `prompt` field written
- * to the session repo and the command built by the adapter mock to verify
- * what was interpolated.
+ * (buildTaskXml + sanitizeForPty). We capture command/environment options,
+ * persisted prompts, and terminal-submit scheduling to verify interpolation
+ * and adapter-capability routing without invoking a real CLI.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { TransitionEngine } from '../../src/main/transition-engine/transition-engine';
 import { buildTaskXml } from '../../src/main/agent/shared/prompt-xml';
 import { sanitizeForPty } from '../../src/shared/paths';
 import { migrateResumeCwdIfRenamed } from '../../src/main/transition-engine/resume-cwd-migration';
+import type { InitialPromptDelivery } from '../../src/main/agent/agent-adapter';
+import type { SubmissionVerifier } from '../../src/shared/types';
 
 // ---------------------------------------------------------------------------
 // Minimal mock factories
@@ -64,9 +68,8 @@ function makeSessionRepo() {
     insert: vi.fn((record: unknown) => { insertedRecords.push(record); }),
     update: vi.fn(),
     updateAppliedSettings: vi.fn(),
-    // Needed by retireRecord() which fires in the resume path when
-    // intent.retireRecordId is non-null (existing tests never reach it
-    // because they always produce a fresh spawn with retireRecordId=null).
+    // Needed by retireRecord() when capability-routing and cwd-migration tests
+    // exercise resumable records with a non-null retireRecordId.
     compareAndUpdateStatus: vi.fn(() => true),
     insertedRecords,
   };
@@ -118,12 +121,21 @@ function makeTerminalSubmit() {
   };
 }
 
+function makeTerminalSubmitScheduler() {
+  return {
+    scheduleContent: vi.fn(),
+  };
+}
+
 /**
  * Stub adapter that:
  * - Claims to be found
  * - buildCommand returns its prompt option unchanged (for inspection)
  * - No filesystem side effects
  */
+let initialPromptDelivery: InitialPromptDelivery | undefined;
+let pasteVerifier: SubmissionVerifier | null = null;
+
 const mockAdapter = {
   name: 'claude',
   displayName: 'Claude',
@@ -136,7 +148,13 @@ const mockAdapter = {
     // Return a string that embeds the prompt so we can inspect it from outside
     return `claude ${options.prompt ?? ''}`;
   }),
-  buildEnv: undefined,
+  buildEnv: vi.fn((_options: { prompt?: string }) => null),
+  get initialPromptDelivery() {
+    return initialPromptDelivery;
+  },
+  getSubmissionVerifier: vi.fn((contextType: 'paste' | 'command-injection') => (
+    contextType === 'paste' ? pasteVerifier : null
+  )),
   getExitSequence: vi.fn(() => ['\x03']),
   removeHooks: vi.fn(),
 };
@@ -148,9 +166,8 @@ vi.mock('../../src/main/agent/agent-registry', () => ({
   },
 }));
 
-// Mocked so executeSpawnAgent's unconditional migrateResumeCwdIfRenamed call
-// does not touch the real filesystem. Existing tests never reach the migration
-// body (canResume is always false there); this mock makes it transparent.
+// Mocked so fresh and resume routing tests never touch native session files.
+// The dedicated migration describe still verifies the exact resume wiring.
 vi.mock('../../src/main/transition-engine/resume-cwd-migration', () => ({
   migrateResumeCwdIfRenamed: vi.fn(async () => {}),
 }));
@@ -197,9 +214,12 @@ function makeEngine(options: {
   sessionManager?: ReturnType<typeof makeSessionManager>;
   sessionRepo?: ReturnType<typeof makeSessionRepo>;
   action?: ReturnType<typeof makeAction>;
+  includeSessionRepo?: boolean;
 }) {
   const sessionManager = options.sessionManager ?? makeSessionManager();
-  const sessionRepo = options.sessionRepo ?? makeSessionRepo();
+  const sessionRepo = options.includeSessionRepo === false
+    ? undefined
+    : (options.sessionRepo ?? makeSessionRepo());
   const action = options.action ?? makeAction();
   const actionRepo = makeActionRepo(action);
   const taskRepo = makeTaskRepo();
@@ -223,23 +243,230 @@ function makeEngine(options: {
   }));
 
   const terminalSubmit = makeTerminalSubmit();
+  const terminalSubmitScheduler = makeTerminalSubmitScheduler();
   type EngineArgs = ConstructorParameters<typeof TransitionEngine>;
   const engine = new TransitionEngine(
     sessionManager as unknown as EngineArgs[0],
     terminalSubmit as unknown as EngineArgs[1],
-    actionRepo as unknown as EngineArgs[2],
-    taskRepo as unknown as EngineArgs[3],
-    getConfig as unknown as EngineArgs[4],
-    sessionRepo as unknown as EngineArgs[5],
-    attachmentRepo as unknown as EngineArgs[6],
+    terminalSubmitScheduler as unknown as EngineArgs[2],
+    actionRepo as unknown as EngineArgs[3],
+    taskRepo as unknown as EngineArgs[4],
+    getConfig as unknown as EngineArgs[5],
+    sessionRepo as unknown as EngineArgs[6],
+    attachmentRepo as unknown as EngineArgs[7],
   );
 
-  return { engine, sessionManager, sessionRepo, taskRepo, actionRepo };
+  return { engine, sessionManager, sessionRepo, terminalSubmitScheduler, taskRepo, actionRepo };
 }
 
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  initialPromptDelivery = undefined;
+  pasteVerifier = null;
+  mockAdapter.buildCommand.mockImplementation((options: { prompt?: string }) => (
+    `claude ${options.prompt ?? ''}`
+  ));
+  mockAdapter.buildEnv.mockImplementation((_options: { prompt?: string }) => null);
+  mockAdapter.getSubmissionVerifier.mockImplementation((contextType: 'paste' | 'command-injection') => (
+    contextType === 'paste' ? pasteVerifier : null
+  ));
+});
+
+describe('TransitionEngine - capability-based initial prompt delivery', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockAdapter.buildCommand.mockImplementation((options: { prompt?: string }) => (
+      `claude ${options.prompt ?? ''}`
+    ));
+  });
+
+  it('schedules the exact fresh Task XML after persistence for terminal-submit adapters', async () => {
+    // Given
+    initialPromptDelivery = 'terminal-submit';
+    const task = makeTask({ description: 'CRLF\r\n繁體中文 "quote" `tick` & | < > ^ %' });
+    const expectedPrompt = buildTaskXml({ title: task.title, description: task.description });
+    const sessionRepo = makeSessionRepo();
+    const { engine, terminalSubmitScheduler } = makeEngine({ sessionRepo });
+
+    // When
+    await engine.resumeSuspendedSession(task as Parameters<typeof engine.resumeSuspendedSession>[0]);
+
+    // Then
+    expect(mockAdapter.buildCommand).toHaveBeenCalledOnce();
+    expect(mockAdapter.buildEnv).toHaveBeenCalledOnce();
+    const commandOptions = mockAdapter.buildCommand.mock.calls[0][0];
+    const environmentOptions = mockAdapter.buildEnv.mock.calls[0][0];
+    expect(environmentOptions).toBe(commandOptions);
+    expect(commandOptions.prompt).toBeUndefined();
+    expect(environmentOptions.prompt).toBeUndefined();
+    expect(sessionRepo.insert).toHaveBeenCalledWith(expect.objectContaining({ prompt: expectedPrompt }));
+    expect(terminalSubmitScheduler.scheduleContent).toHaveBeenCalledOnce();
+    expect(terminalSubmitScheduler.scheduleContent.mock.calls).toEqual([[
+      task.id, 'pty-session-1', expectedPrompt, { verifier: null },
+    ]]);
+    expect(sessionRepo.insert.mock.invocationCallOrder[0]).toBeLessThan(
+      terminalSubmitScheduler.scheduleContent.mock.invocationCallOrder[0],
+    );
+  });
+
+  it('schedules only the current resume prompt and preserves native resume options', async () => {
+    // Given
+    initialPromptDelivery = 'terminal-submit';
+    const task = makeTask();
+    const taskXml = buildTaskXml({ title: task.title, description: task.description });
+    const resumePrompt = 'Continue only this step';
+    const sessionRepo = makeSessionRepo();
+    sessionRepo.getLatestForTaskByTypeAndIsolation.mockReturnValue({
+      id: 'old-record',
+      agent_session_id: 'native-session-id',
+      session_type: 'claude_agent',
+      status: 'suspended',
+      cwd: '/some/project',
+    });
+    const { engine, terminalSubmitScheduler } = makeEngine({ sessionRepo });
+
+    // When
+    await engine.resumeSuspendedSession(
+      task as Parameters<typeof engine.resumeSuspendedSession>[0],
+      undefined,
+      undefined,
+      resumePrompt,
+    );
+
+    // Then
+    expect(mockAdapter.buildCommand).toHaveBeenCalledWith(expect.objectContaining({
+      prompt: undefined,
+      resume: true,
+      sessionId: 'native-session-id',
+    }));
+    expect(terminalSubmitScheduler.scheduleContent).toHaveBeenCalledOnce();
+    expect(terminalSubmitScheduler.scheduleContent.mock.calls).toEqual([[
+      task.id, 'pty-session-1', resumePrompt, { verifier: null },
+    ]]);
+    expect(terminalSubmitScheduler.scheduleContent).not.toHaveBeenCalledWith(
+      task.id, 'pty-session-1', taskXml, expect.anything(),
+    );
+    expect(sessionRepo.insert).toHaveBeenCalledWith(expect.objectContaining({ prompt: resumePrompt }));
+  });
+
+  it('keeps a promptless resume native and schedules no terminal content', async () => {
+    // Given
+    initialPromptDelivery = 'terminal-submit';
+    const sessionRepo = makeSessionRepo();
+    sessionRepo.getLatestForTaskByTypeAndIsolation.mockReturnValue({
+      id: 'old-record',
+      agent_session_id: 'native-session-id',
+      session_type: 'claude_agent',
+      status: 'suspended',
+      cwd: '/some/project',
+    });
+    const { engine, terminalSubmitScheduler } = makeEngine({ sessionRepo });
+
+    // When
+    await engine.resumeSuspendedSession(
+      makeTask() as Parameters<typeof engine.resumeSuspendedSession>[0],
+      undefined,
+      true,
+    );
+
+    // Then
+    expect(mockAdapter.buildCommand).toHaveBeenCalledWith(expect.objectContaining({
+      prompt: undefined,
+      resume: true,
+      sessionId: 'native-session-id',
+    }));
+    expect(terminalSubmitScheduler.scheduleContent.mock.calls).toEqual([]);
+    expect(sessionRepo.insert).toHaveBeenCalledWith(expect.objectContaining({ prompt: null }));
+  });
+
+  it('schedules the handoff prefix and current Task XML as one intended prompt', async () => {
+    // Given
+    initialPromptDelivery = 'terminal-submit';
+    const handoffPrefix = '<handoff>source history</handoff>';
+    const task = makeTask();
+    const taskXml = buildTaskXml({ title: task.title, description: task.description });
+    const intendedPrompt = `${handoffPrefix}\n\n${taskXml}`;
+    const sessionRepo = makeSessionRepo();
+    const { engine, terminalSubmitScheduler } = makeEngine({ sessionRepo });
+
+    // When
+    await engine.resumeSuspendedSession(
+      task as Parameters<typeof engine.resumeSuspendedSession>[0],
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      handoffPrefix,
+    );
+
+    // Then
+    expect(mockAdapter.buildCommand).toHaveBeenCalledWith(expect.objectContaining({ prompt: undefined }));
+    expect(terminalSubmitScheduler.scheduleContent).toHaveBeenCalledOnce();
+    expect(terminalSubmitScheduler.scheduleContent.mock.calls).toEqual([[
+      task.id, 'pty-session-1', intendedPrompt, { verifier: null },
+    ]]);
+    expect(sessionRepo.insert).toHaveBeenCalledWith(expect.objectContaining({ prompt: intendedPrompt }));
+  });
+
+  it('forwards the terminal-submit adapter paste verifier unchanged', async () => {
+    // Given
+    initialPromptDelivery = 'terminal-submit';
+    const verifier: SubmissionVerifier = async () => true;
+    pasteVerifier = verifier;
+    const task = makeTask();
+    const expectedPrompt = buildTaskXml({ title: task.title, description: task.description });
+    const { engine, terminalSubmitScheduler } = makeEngine({});
+
+    // When
+    await engine.resumeSuspendedSession(task as Parameters<typeof engine.resumeSuspendedSession>[0]);
+
+    // Then
+    expect(mockAdapter.getSubmissionVerifier).toHaveBeenCalledOnce();
+    expect(mockAdapter.getSubmissionVerifier).toHaveBeenCalledWith('paste');
+    expect(terminalSubmitScheduler.scheduleContent).toHaveBeenCalledOnce();
+    expect(terminalSubmitScheduler.scheduleContent.mock.calls).toEqual([[
+      task.id, 'pty-session-1', expectedPrompt, { verifier },
+    ]]);
+  });
+
+  it('retains command-argument delivery for adapters without a declared capability', async () => {
+    // Given
+    const task = makeTask();
+    const expectedPrompt = buildTaskXml({ title: task.title, description: task.description });
+    const sessionRepo = makeSessionRepo();
+    const { engine, terminalSubmitScheduler } = makeEngine({ sessionRepo });
+
+    // When
+    await engine.resumeSuspendedSession(task as Parameters<typeof engine.resumeSuspendedSession>[0]);
+
+    // Then
+    expect(mockAdapter.buildCommand).toHaveBeenCalledWith(expect.objectContaining({ prompt: expectedPrompt }));
+    expect(terminalSubmitScheduler.scheduleContent.mock.calls).toEqual([]);
+    expect(sessionRepo.insert).toHaveBeenCalledWith(expect.objectContaining({ prompt: expectedPrompt }));
+  });
+
+  it('schedules fresh terminal content when no session repository is configured', async () => {
+    // Given
+    initialPromptDelivery = 'terminal-submit';
+    const task = makeTask();
+    const expectedPrompt = buildTaskXml({ title: task.title, description: task.description });
+    const { engine, terminalSubmitScheduler } = makeEngine({ includeSessionRepo: false });
+
+    // When
+    await engine.resumeSuspendedSession(task as Parameters<typeof engine.resumeSuspendedSession>[0]);
+
+    // Then
+    expect(terminalSubmitScheduler.scheduleContent).toHaveBeenCalledOnce();
+    expect(terminalSubmitScheduler.scheduleContent.mock.calls).toEqual([[
+      task.id, 'pty-session-1', expectedPrompt, { verifier: null },
+    ]]);
+  });
+});
 
 describe('TransitionEngine - raw/sanitized description split', () => {
   beforeEach(() => {

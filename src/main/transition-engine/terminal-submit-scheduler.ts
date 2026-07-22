@@ -1,5 +1,6 @@
 import type { SessionManager } from '../pty/session-manager';
 import type { CommandVerifier, TerminalSubmit } from '../pty/terminal-submit';
+import type { SessionStatus, SubmissionVerifier } from '../../shared/types';
 
 /**
  * Re-export so callers in injection-plan and slash-command-verifier can keep
@@ -19,6 +20,18 @@ interface ActiveBurst {
 /** State for a task waiting on a fresh-spawn `'thinking'` event. */
 interface PendingDeferred {
   cleanup: () => void;
+}
+
+type ScheduledSubmission =
+  | { kind: 'content'; text: string; sessionId: string }
+  | { kind: 'keystrokes'; commands: string[]; sessionId: string; opts: ScheduleKeystrokesOptions };
+
+interface PendingContent {
+  controller: AbortController;
+  sessionId: string;
+  cleanupReadiness: () => void;
+  cleanupLifetime: () => void;
+  nextKeystrokes: Extract<ScheduledSubmission, { kind: 'keystrokes' }> | null;
 }
 
 /** Options for `scheduleKeystrokes`. */
@@ -42,10 +55,16 @@ export interface ScheduleKeystrokesOptions {
   timeoutMs?: number;
 }
 
+/** Options for first-output-gated free-form content delivery. */
+export interface ScheduleContentOptions {
+  readinessTimeoutMs?: number;
+  verifier?: SubmissionVerifier | null;
+}
+
 /**
- * `TerminalSubmitScheduler` is the lifecycle wrapper for keystroke
- * delivery. Where `TerminalSubmit.submitKeystrokes` answers "HOW the bytes
- * go out", this class answers "WHEN":
+ * `TerminalSubmitScheduler` is the task-keyed lifecycle wrapper for terminal
+ * delivery. Where `TerminalSubmit` answers "HOW the bytes go out", this
+ * class answers "WHEN":
  *
  *   1. **Existing session** -- delivers immediately. If a burst is already
  *      in flight for this task, the new request stashes as `next`; only the
@@ -61,16 +80,22 @@ export interface ScheduleKeystrokesOptions {
  *   3. **Queued session** -- waits for `status:running`, then applies the
  *      `'thinking'` wait. Same fallback / hard-timeout structure.
  *
- * Cancellation tears down event listeners + timers AND aborts an in-flight
- * burst via the per-task `AbortController` plumbed through to
- * TerminalSubmit. Re-scheduling for the same task cancels any prior pending
- * injection.
+ *   4. **Free-form content** -- waits for first output with no fallback.
+ *      Queue time is outside the readiness timeout, and event/cache readiness
+ *      share one start guard. Content completion releases only the latest
+ *      queued fresh-spawn keystroke follower.
+ *
+ * Cancellation tears down content and keystroke readiness listeners/timers,
+ * drops queued content followers and burst follow-ups, and aborts in-flight
+ * content or keystroke delivery through the per-task `AbortController`.
+ * Re-scheduling for the same task cancels any prior pending injection.
  *
  * Used by every column-transition / lifecycle path that injects keystrokes:
  * auto_command on column move, `/model X` + `/effort Y` settings burst,
  * fresh-spawn auto_command, archive/un-archive flows.
  */
 export class TerminalSubmitScheduler {
+  private content = new Map<string, PendingContent>();
   private deferred = new Map<string, PendingDeferred>();
   private active = new Map<string, ActiveBurst>();
 
@@ -78,6 +103,53 @@ export class TerminalSubmitScheduler {
     private sessionManager: SessionManager,
     private terminalSubmit: TerminalSubmit,
   ) {}
+
+  scheduleContent(
+    taskId: string,
+    sessionId: string,
+    text: string,
+    opts: ScheduleContentOptions = {},
+  ): void {
+    if (text.length === 0) return;
+
+    const session = this.sessionManager.getSession(sessionId);
+    if (!session) return;
+
+    this.cancel(taskId);
+    const status: SessionStatus = session.status;
+    let isQueued: boolean;
+    switch (status) {
+      case 'running':
+        isQueued = false;
+        break;
+      case 'queued':
+        isQueued = true;
+        break;
+      case 'exited':
+      case 'suspended':
+        return;
+      default: {
+        const unhandledStatus: never = status;
+        return unhandledStatus;
+      }
+    }
+
+    const entry: PendingContent = {
+      controller: new AbortController(),
+      sessionId,
+      cleanupReadiness: () => undefined,
+      cleanupLifetime: () => undefined,
+      nextKeystrokes: null,
+    };
+    this.content.set(taskId, entry);
+    this.scheduleContentReadiness(
+      taskId,
+      { kind: 'content', sessionId, text },
+      opts,
+      entry,
+      isQueued,
+    );
+  }
 
   /**
    * Schedule a keystroke sequence for a task's PTY session. A single command
@@ -99,8 +171,31 @@ export class TerminalSubmitScheduler {
       return;
     }
 
+    const submission: Extract<ScheduledSubmission, { kind: 'keystrokes' }> = {
+      kind: 'keystrokes',
+      commands,
+      sessionId,
+      opts,
+    };
+    const pendingContent = this.content.get(taskId);
+    if (pendingContent) {
+      if (pendingContent.sessionId === sessionId) {
+        pendingContent.nextKeystrokes = submission;
+        return;
+      }
+      this.cancelContent(taskId);
+    }
+
+    this.scheduleKeystrokeBurst(taskId, submission, session.status === 'queued');
+  }
+
+  private scheduleKeystrokeBurst(
+    taskId: string,
+    submission: Extract<ScheduledSubmission, { kind: 'keystrokes' }>,
+    isQueued: boolean,
+  ): void {
+    const { sessionId, commands, opts } = submission;
     const freshlySpawned = opts.freshlySpawned ?? false;
-    const isQueued = session.status === 'queued';
 
     // Existing session, ready right now: try to claim the active-burst slot.
     if (!freshlySpawned && !isQueued) {
@@ -118,17 +213,31 @@ export class TerminalSubmitScheduler {
     }
 
     // Fresh spawn or queued - wait for CLI to come alive, then start the burst.
-    this.cancel(taskId);
+    this.cancelKeystrokeBurst(taskId);
     this.scheduleDeferred(taskId, sessionId, commands, opts, isQueued);
   }
 
   /**
-   * Cancel any pending or in-flight injection for a specific task. Aborts
-   * the AbortController plumbed through to TerminalSubmit so an in-flight
-   * burst stops at the next write/wait boundary. Drops the queued "next"
-   * sequence on any active worker.
+   * Cancel any pending or in-flight injection for a specific task. Content
+   * cancellation also drops its follower; keystroke cancellation drops the
+   * active worker's queued `next` sequence.
    */
   cancel(taskId: string): void {
+    this.cancelContent(taskId);
+    this.cancelKeystrokeBurst(taskId);
+  }
+
+  private cancelContent(taskId: string): void {
+    const pending = this.content.get(taskId);
+    if (!pending) return;
+
+    this.content.delete(taskId);
+    pending.nextKeystrokes = null;
+    pending.cleanupLifetime();
+    pending.controller.abort();
+  }
+
+  private cancelKeystrokeBurst(taskId: string): void {
     const pending = this.deferred.get(taskId);
     if (pending) {
       this.deferred.delete(taskId);
@@ -143,12 +252,146 @@ export class TerminalSubmitScheduler {
 
   /** Cancel all pending injections. Called on `killAll`/`suspendAll`. */
   cancelAll(): void {
+    for (const taskId of [...this.content.keys()]) {
+      this.cancelContent(taskId);
+    }
+    this.cancelAllKeystrokeBursts();
+  }
+
+  private cancelAllKeystrokeBursts(): void {
     const pending = [...this.deferred.values()];
     this.deferred.clear();
     for (const entry of pending) entry.cleanup();
     for (const burst of this.active.values()) {
       burst.next = null;
       burst.controller.abort();
+    }
+  }
+
+  private scheduleContentReadiness(
+    taskId: string,
+    submission: Extract<ScheduledSubmission, { kind: 'content' }>,
+    opts: ScheduleContentOptions,
+    entry: PendingContent,
+    isQueued: boolean,
+  ): void {
+    const readinessTimeoutMs = opts.readinessTimeoutMs ?? 120_000;
+    let state: 'queued' | 'waiting' = isQueued ? 'queued' : 'waiting';
+    let readinessTimer: ReturnType<typeof setTimeout> | null = null;
+    let started = false;
+    let readinessCleaned = false;
+    let lifetimeCleaned = false;
+
+    const cleanupReadiness = (): void => {
+      if (readinessCleaned) return;
+      readinessCleaned = true;
+      this.sessionManager.off('first-output', onFirstOutput);
+      this.sessionManager.off('session-changed', onSessionChanged);
+      if (readinessTimer !== null) clearTimeout(readinessTimer);
+    };
+
+    const cleanupLifetime = (): void => {
+      if (lifetimeCleaned) return;
+      lifetimeCleaned = true;
+      cleanupReadiness();
+      this.sessionManager.off('exit', onExit);
+    };
+
+    const startContent = (): void => {
+      if (started || this.content.get(taskId) !== entry) return;
+      started = true;
+      // Readiness 結束後仍保留 exit listener；session ownership 必須持續到 submitContent() settle。
+      cleanupReadiness();
+      void this.runContent(taskId, submission, opts, entry);
+    };
+
+    const startFromCache = (): void => {
+      if (this.sessionManager.getFirstOutputCache()[submission.sessionId] === true) {
+        startContent();
+      }
+    };
+
+    const startReadinessTimer = (): void => {
+      if (readinessTimer !== null) return;
+      readinessTimer = setTimeout(() => {
+        if (this.content.get(taskId) !== entry) return;
+        console.warn(
+          `[TerminalSubmitScheduler] submit-content readiness timeout task=${taskId.slice(0, 8)} session=${submission.sessionId.slice(0, 8)}`,
+        );
+        this.cancel(taskId);
+      }, readinessTimeoutMs);
+    };
+
+    const onFirstOutput = (eventSessionId: string): void => {
+      if (eventSessionId !== submission.sessionId || state !== 'waiting') return;
+      startContent();
+    };
+
+    const onSessionChanged = (eventSessionId: string, eventSession: { status: string }): void => {
+      if (eventSessionId !== submission.sessionId) return;
+      if (this.content.get(taskId) !== entry) return;
+      if (state === 'queued' && eventSession.status === 'running') {
+        state = 'waiting';
+        startReadinessTimer();
+        startFromCache();
+      }
+    };
+
+    const onExit = (eventSessionId: string): void => {
+      if (eventSessionId !== entry.sessionId) return;
+      if (this.content.get(taskId) !== entry) return;
+      console.log(
+        `[TerminalSubmitScheduler] submit-content session exit task=${taskId.slice(0, 8)} session=${submission.sessionId.slice(0, 8)}`,
+      );
+      this.cancel(taskId);
+    };
+
+    entry.cleanupReadiness = cleanupReadiness;
+    entry.cleanupLifetime = cleanupLifetime;
+    this.sessionManager.on('first-output', onFirstOutput);
+    this.sessionManager.on('session-changed', onSessionChanged);
+    this.sessionManager.on('exit', onExit);
+
+    if (!isQueued) {
+      startReadinessTimer();
+      startFromCache();
+    }
+  }
+
+  private async runContent(
+    taskId: string,
+    submission: Extract<ScheduledSubmission, { kind: 'content' }>,
+    opts: ScheduleContentOptions,
+    entry: PendingContent,
+  ): Promise<void> {
+    try {
+      await this.terminalSubmit.submitContent(submission.sessionId, submission.text, {
+        signal: entry.controller.signal,
+        source: `task:${taskId.slice(0, 8)}`,
+        verifier: opts.verifier ?? undefined,
+      });
+    } catch {
+      if (this.content.get(taskId) === entry) {
+        console.error(
+          `[TerminalSubmitScheduler] submit-content failed task=${taskId.slice(0, 8)} session=${submission.sessionId.slice(0, 8)}`,
+        );
+        this.cancel(taskId);
+      }
+      return;
+    }
+
+    if (this.content.get(taskId) !== entry || entry.controller.signal.aborted) return;
+
+    const follower = entry.nextKeystrokes;
+    entry.nextKeystrokes = null;
+    this.content.delete(taskId);
+    entry.cleanupLifetime();
+
+    if (follower) {
+      this.startBurst(taskId, follower.sessionId, follower.commands, {
+        ...follower.opts,
+        freshlySpawned: true,
+      });
     }
   }
 

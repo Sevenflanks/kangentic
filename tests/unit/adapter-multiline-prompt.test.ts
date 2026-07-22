@@ -9,7 +9,7 @@
  * to multiline mode. Dropping the option from any adapter regresses prompt
  * delivery for tasks with multi-line descriptions.
  *
- * Coverage: codex, aider, opencode, kimi, droid, warp, ollama.
+ * Coverage: codex, aider, kimi, droid, warp, ollama.
  * (claude, gemini, copilot, qwen-code are covered in their own test files.)
  *
  * Strategy: build the command with `shell: 'bash'` and a multi-line XML
@@ -18,9 +18,6 @@
  * `sanitizeForPty` first, which collapses all newlines to spaces - so the
  * newline assertion fails immediately on regression.
  *
- * File writes are suppressed by vi.mock for hook-managers that have side
- * effects. Adapters without hook side effects (warp, droid, opencode) need
- * no mocking.
  */
 import { describe, it, expect, vi } from 'vitest';
 
@@ -34,13 +31,6 @@ vi.mock('../../src/main/agent/adapters/codex/hook-manager', () => ({
   removeHooks: vi.fn(),
 }));
 
-// OpenCode installs a plugin file on spawn - mock to skip it.
-vi.mock('../../src/main/agent/adapters/opencode/hook-manager', () => ({
-  buildHooks: vi.fn(),
-  removeHooks: vi.fn(),
-  OPENCODE_HOOK_EVENTS: {},
-}));
-
 // bridge-utils is used by some adapters during hook injection - stub the path.
 vi.mock('../../src/main/agent/shared/bridge-utils', () => ({
   resolveBridgeScript: vi.fn((name: string) => `/fake/scripts/${name}.js`),
@@ -52,7 +42,6 @@ vi.mock('../../src/main/agent/shared/bridge-utils', () => ({
 
 import { CodexCommandBuilder } from '../../src/main/agent/adapters/codex';
 import { AiderAdapter } from '../../src/main/agent/adapters/aider';
-import { OpenCodeCommandBuilder } from '../../src/main/agent/adapters/opencode';
 import { KimiCommandBuilder } from '../../src/main/agent/adapters/kimi';
 import { DroidCommandBuilder } from '../../src/main/agent/adapters/droid';
 import { WarpAdapter } from '../../src/main/agent/adapters/warp';
@@ -95,19 +84,6 @@ describe('Adapter multiline prompt - regression guard for { multiline: true }', 
     const adapter = new AiderAdapter();
     const command = adapter.buildCommand({
       agentPath: '/usr/bin/aider',
-      taskId: 'task-1',
-      cwd: '/project',
-      permissionMode: 'default',
-      shell: 'bash',
-      prompt: MULTILINE_XML,
-    });
-    expect(command).toContain(EXPECTED_FRAGMENT);
-  });
-
-  it('OpenCodeCommandBuilder preserves newlines in prompt under bash', () => {
-    const builder = new OpenCodeCommandBuilder();
-    const command = builder.buildOpenCodeCommand({
-      opencodePath: '/usr/bin/opencode',
       taskId: 'task-1',
       cwd: '/project',
       permissionMode: 'default',
