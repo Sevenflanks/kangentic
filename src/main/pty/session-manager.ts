@@ -499,6 +499,7 @@ export class SessionManager extends EventEmitter {
       statusFileReader: this.statusFileReader,
       sessionHistoryReader: this.sessionHistoryReader,
       sessionQueue: this.sessionQueue,
+      firstOutputTracker: this.firstOutputTracker,
       getTranscriptWriter: () => this.transcriptWriter,
       getShell: () => this.getShell(),
       takePendingResize: (sessionId) => {

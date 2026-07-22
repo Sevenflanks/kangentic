@@ -174,6 +174,9 @@ function makeContext(): SpawnFlowContext {
     sessionQueue: {
       notifySlotFreed: vi.fn(),
     },
+    firstOutputTracker: {
+      removeSession: vi.fn(),
+    },
     getTranscriptWriter: vi.fn(() => null),
     getShell: vi.fn().mockResolvedValue('/bin/bash'),
     takePendingResize: vi.fn(() => undefined),
@@ -197,6 +200,29 @@ function makeInput(overrides: Partial<SpawnSessionInput> = {}): SpawnSessionInpu
 }
 
 // ---- Tests ----
+
+describe('performSpawn - same-task replacement cleanup', () => {
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('clears first-output tracker state for the replaced session', async () => {
+    // Given
+    const context = makeContext();
+    const existing = context.registry.registerSuspendedPlaceholder({
+      taskId: 'task-001',
+      projectId: 'project-001',
+      cwd: '/home/dev/project',
+    });
+
+    // When
+    await performSpawn(makeInput(), context);
+
+    // Then
+    expect(context.firstOutputTracker.removeSession).toHaveBeenCalledOnce();
+    expect(context.firstOutputTracker.removeSession).toHaveBeenCalledWith(existing.id);
+  });
+});
 
 describe('performSpawn - KANGENTIC_EVENTS_PATH env injection', () => {
   // ptyModule.spawn is the vi.fn() from the module-level vi.mock('node-pty').
