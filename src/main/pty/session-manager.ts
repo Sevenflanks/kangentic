@@ -14,7 +14,7 @@ import { gracefulPtyShutdown } from './shutdown/session-suspend';
 import { suspendAllSessions, killAllSessions } from './shutdown/session-shutdown';
 import { ResizeManager } from './lifecycle/resize-manager';
 import { FirstOutputTracker } from './lifecycle/first-output-tracker';
-import { disposeAdapterAttachment, removeAdapterHooks } from './lifecycle/adapter-lifecycle';
+import { disposeAdapterAttachment, disposeSpawnCleanup, removeAdapterHooks } from './lifecycle/adapter-lifecycle';
 import { safeKillPty } from './lifecycle/pty-kill';
 import { DEFAULT_PTY_COLS, DEFAULT_PTY_ROWS, performSpawn } from './lifecycle/session-spawn-flow';
 import { SessionRegistry, toSession, filterCacheByProject, type ManagedSession } from './session-registry';
@@ -445,29 +445,38 @@ export class SessionManager extends EventEmitter {
 
   async spawn(input: SpawnSessionInput): Promise<Session> {
     if (isShuttingDown()) {
+      disposeSpawnCleanup(input);
+      if (input.id !== undefined) removeAdapterHooks(input);
       throw new Error('Cannot spawn session during shutdown');
     }
+
+    // 從呼叫 spawn() 起 SessionManager 接管這次 invocation 的資源。未註冊前失敗由此處釋放；註冊後改由 session lifecycle 接管，避免釋放 replacement owner。
+    const ownedInput = { ...input };
+    input.spawnCleanup = undefined;
 
     if (this.sessionQueue.shouldQueue()) {
       // Return a queued placeholder immediately (don't block the caller).
       // SessionQueue will promote it to a running PTY when a slot opens.
-      const id = input.id ?? uuidv4();
-      const inputWithId = { ...input, id };
+      const id = ownedInput.id ?? uuidv4();
+      const spawnCleanup = ownedInput.spawnCleanup;
+      ownedInput.spawnCleanup = undefined;
+      const inputWithId = { ...ownedInput, id };
       const session: ManagedSession = {
         id,
-        taskId: input.taskId,
-        projectId: input.projectId,
+        taskId: ownedInput.taskId,
+        projectId: ownedInput.projectId,
         pty: null,
         status: 'queued',
         shell: '',
-        cwd: input.cwd,
+        cwd: ownedInput.cwd,
         startedAt: new Date().toISOString(),
         exitCode: null,
-        resuming: input.resuming ?? false,
-        transient: input.transient ?? false,
-        isolatedSwimlaneId: input.isolatedSwimlaneId,
-        exitSequence: input.exitSequence ?? ['\x03'],
-        agentParser: input.agentParser,
+        resuming: ownedInput.resuming ?? false,
+        transient: ownedInput.transient ?? false,
+        isolatedSwimlaneId: ownedInput.isolatedSwimlaneId,
+        exitSequence: ownedInput.exitSequence ?? ['\x03'],
+        agentParser: ownedInput.agentParser,
+        spawnCleanup,
       };
       this.registry.set(id, session);
       this.sessionQueue.enqueue(inputWithId);
@@ -478,7 +487,14 @@ export class SessionManager extends EventEmitter {
     // Reserve a slot so concurrent spawn() calls see the correct count
     this.spawningCount++;
     try {
-      return await this.doSpawn(input);
+      return await this.doSpawn(ownedInput);
+    } catch (error) {
+      const isRegistered = ownedInput.id !== undefined && this.registry.has(ownedInput.id);
+      if (!isRegistered) {
+        disposeSpawnCleanup(ownedInput);
+        if (ownedInput.id !== undefined) removeAdapterHooks(ownedInput);
+      }
+      throw error;
     } finally {
       this.spawningCount--;
       // Essential on failure path (doSpawn throws before onExit is registered).
@@ -707,7 +723,10 @@ export class SessionManager extends EventEmitter {
     // intentionalExit unset. Unlike suspend(), kill() does not set
     // status='suspended' (a hard reset is 'exited', not resumable), so this
     // orthogonal marker carries the intent.
-    if (session) session.intentionalExit = true;
+    if (session) {
+      session.intentionalExit = true;
+      disposeSpawnCleanup(session);
+    }
     // Drop any queued pre-spawn resize: a killed session will not respawn to
     // consume it, and a stale entry keyed by this id must not survive. The
     // desktop-dims restore target dies with the session for the same reason.
@@ -733,7 +752,9 @@ export class SessionManager extends EventEmitter {
     // Remove from queue if queued, and mark as exited.
     // Queued sessions have no PTY, so onExit never fires. Emit the exit
     // event explicitly so the DB listener marks the record as exited.
-    if (this.sessionQueue.remove(sessionId) && session) {
+    this.sessionQueue.remove(sessionId);
+    if (session?.status === 'queued') {
+      removeAdapterHooks(session);
       session.status = 'exited';
       session.exitCode = -1;
       // Queued sessions never spawn a PTY, so onExit (which reads
@@ -806,10 +827,12 @@ export class SessionManager extends EventEmitter {
     const session = this.registry.get(sessionId);
     if (!session) return;
 
+    disposeSpawnCleanup(session);
+
     // Strip agent hooks from the project's settings file before
     // closing down. Prevents hook accumulation across sessions. Both
     // this path and the onExit handler call removeAdapterHooks;
-    // adapters key on taskId so the duplicate call is idempotent.
+    // the lifecycle helper guards the session instance so cleanup runs once.
     removeAdapterHooks(session);
 
     // Close watchers and detach telemetry readers WITHOUT deleting
