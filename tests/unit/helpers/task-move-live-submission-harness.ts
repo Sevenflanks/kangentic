@@ -25,7 +25,15 @@ export const sessionManager = {
   listSessions: vi.fn(() => []),
 };
 
-export const updateAppliedSettings = vi.fn();
+export const updateAppliedSettings = vi.fn((
+  _sessionId: string,
+  settings: { readonly effort?: string },
+) => {
+  state.record = {
+    ...state.record,
+    ...(settings.effort !== undefined ? { applied_effort: settings.effort } : {}),
+  };
+});
 export const spawnAgent = vi.fn(async () => undefined);
 
 export const state: {
@@ -145,7 +153,8 @@ vi.mock('../../../src/main/agent/agent-registry', () => ({
   agentRegistry: { get: vi.fn((name: string) => ({
     name,
     liveSubmissionPolicy: name === 'opencode' ? WAIT_POLICY : { mode: 'interrupt-immediately', sendCtrlC: true },
-    getInjectionSequence: vi.fn(() => state.settingsSequence),
+    getInjectionSequence: vi.fn(({ effortChanged }: { readonly effortChanged: boolean }) =>
+      effortChanged ? state.settingsSequence : []),
   })) },
 }));
 vi.mock('../../../src/main/ipc/helpers/index', () => ({

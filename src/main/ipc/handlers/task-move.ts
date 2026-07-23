@@ -700,6 +700,7 @@ export async function handleTaskMove(
                   sequence: plan.sequence,
                 })
               : null;
+            let scheduledLaneCommand = false;
 
             if (plan.liveSubmissionPolicy?.mode === 'wait-for-native-idle') {
               const settingsPrefix = plan.sequence.slice(0, plan.verifiedPrefixLength);
@@ -711,10 +712,46 @@ export async function handleTaskMove(
                 });
               }
 
+              if (plan.appliedSettings) {
+                sessionRepo.updateAppliedSettings(task.session_id, plan.appliedSettings);
+              }
+
               if (liveSubmission && nativeSnapshot?.rootNativeSessionId) {
+                // prefix 的 appliedSettings 已同步寫回；captured fingerprint 必須用相同
+                // post-persistence plan，否則 first-byte fresh validation 會誤判為 superseded。
+                const persistedPlan = prepareInjectionPlan({
+                  adapter,
+                  sessionRepo,
+                  task,
+                  toLane: toLane ?? null,
+                  project,
+                  autoCommand: interpolatedAuto,
+                });
+                const persistedRecord = sessionRepo.getLatestForTask(task.id);
+                const persistedSourceEffort = task.effort_override ?? persistedRecord?.applied_effort ?? null;
+                const persistedRestartNeededForEffort = targetEffort !== persistedSourceEffort
+                  && targetEffort !== null
+                  && (persistedPlan?.verifiedPrefixLength ?? 0) === 0;
+                const persistedLiveSubmission = persistedPlan?.liveSubmissionPolicy
+                  ? prepareLiveSubmission({
+                      destinationLaneId: toLane?.id ?? '',
+                      autoSpawn: toLane?.auto_spawn ?? false,
+                      interpolatedLaneCommand: interpolatedAuto,
+                      resolvedAgent: effectiveTargetAgent,
+                      currentAgent: task.agent ?? '',
+                      currentTrack: activeIsolatedSwimlaneId,
+                      destinationTrack: targetIsolatedSwimlaneId,
+                      forceFresh: targetForceFresh,
+                      restartNeededForModel: persistedPlan.needsRestartForModel,
+                      restartNeededForEffort: persistedRestartNeededForEffort,
+                      policy: persistedPlan.liveSubmissionPolicy,
+                      sequence: persistedPlan.sequence,
+                    })
+                  : null;
+                if (!persistedLiveSubmission) return null;
                 const capturedSessionId = task.session_id;
                 const capturedLaneId = toLane?.id ?? '';
-                const capturedFingerprint = liveSubmission.fingerprint;
+                const capturedFingerprint = persistedLiveSubmission.fingerprint;
                 const capturedNativeSessionId = nativeSnapshot.rootNativeSessionId;
                 const capturedSessionGeneration = nativeSnapshot.sessionGeneration;
                 const capturedInputGeneration = nativeSnapshot.inputGeneration;
@@ -726,7 +763,7 @@ export async function handleTaskMove(
                   sessionGeneration: capturedSessionGeneration,
                   inputGeneration: capturedInputGeneration,
                   command: interpolatedAuto,
-                  policy: liveSubmission.policy,
+                  policy: persistedLiveSubmission.policy,
                   validateCurrent: () => {
                     const { tasks: currentTasks, swimlanes: currentSwimlanes } = getProjectRepos(context, resolvedProjectId);
                     const currentTask = currentTasks.getById(task.id);
@@ -790,21 +827,23 @@ export async function handleTaskMove(
                     return currentPrepared?.fingerprint === capturedFingerprint ? 'valid' : 'superseded';
                   },
                 });
+                scheduledLaneCommand = true;
               }
             } else {
               context.terminalSubmitScheduler.scheduleKeystrokes(task.id, task.session_id, plan.sequence, {
                 verifier: plan.verifier,
                 verifiedPrefixLength: plan.verifiedPrefixLength,
               });
+              scheduledLaneCommand = plan.liveSubmissionPolicy !== undefined;
             }
             // Record what the burst applied so the NEXT move diffs against the
             // session's new running value instead of re-injecting it.
-            if (plan.appliedSettings) {
+            if (plan.appliedSettings && plan.liveSubmissionPolicy?.mode !== 'wait-for-native-idle') {
               sessionRepo.updateAppliedSettings(task.session_id, plan.appliedSettings);
             }
             console.log(
               `[TASK_MOVE] Scheduled ${plan.verifiedPrefixLength} setting command(s)`
-              + ` and ${plan.liveSubmissionPolicy ? '1 lane command' : 'no lane command'}`
+              + ` and ${scheduledLaneCommand ? '1 lane command' : 'no lane command'}`
               + ` for task ${task.id.slice(0, 8)}`
               + `${plan.verifier ? ' (with command verification)' : ''}.`,
             );

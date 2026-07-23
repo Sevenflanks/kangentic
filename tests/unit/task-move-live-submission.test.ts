@@ -33,6 +33,7 @@ describe('handleTaskMove live lane submission', () => {
   });
 
   it('schedules the settings prefix before the trailing lane command waits for native idle', async () => {
+    state.destinationLane = makeLane('lane-91', { auto_command: '/go', effort_override: 'high' });
     state.settingsSequence = ['/effort high'];
 
     await moveToDestination();
@@ -49,6 +50,7 @@ describe('handleTaskMove live lane submission', () => {
     expect(request?.nativeSessionId).toBe('private-native-id');
     expect(scheduler.scheduleKeystrokes.mock.invocationCallOrder[0])
       .toBeLessThan(scheduler.scheduleNativeIdleSubmission.mock.invocationCallOrder[0] ?? 0);
+    expect(request?.validateCurrent()).toBe('valid');
   });
 
   it('uses only destination lane auto_command even when task-level MCP autoCommand exists', async () => {
@@ -64,6 +66,7 @@ describe('handleTaskMove live lane submission', () => {
   it('preserves generic full-sequence delivery for non-wait policies', async () => {
     state.task = makeTask({ agent: 'claude' });
     state.project = { ...state.project, default_agent: 'claude' };
+    state.destinationLane = makeLane('lane-91', { auto_command: '/go', effort_override: 'high' });
     state.settingsSequence = ['/effort high'];
 
     await moveToDestination();
@@ -79,7 +82,9 @@ describe('handleTaskMove live lane submission', () => {
 
   it('does not fall back to generic lane-command delivery without private native identity', async () => {
     state.snapshot = makeSnapshot({ rootNativeSessionId: null });
+    state.destinationLane = makeLane('lane-91', { auto_command: '/go', effort_override: 'high' });
     state.settingsSequence = ['/effort high'];
+    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
 
     await moveToDestination();
 
@@ -93,6 +98,7 @@ describe('handleTaskMove live lane submission', () => {
     expect(scheduler.scheduleKeystrokes).not.toHaveBeenCalledWith(
       expect.anything(), expect.anything(), expect.arrayContaining(['/go']), expect.anything(),
     );
+    expect(log.mock.calls.flat().join(' ')).toContain('no lane command');
   });
 
   it('revalidates ownership, evidence generation, and current configuration before first byte', async () => {
