@@ -1454,6 +1454,21 @@
           if (idx >= 0) listeners.splice(idx, 1);
         };
       },
+      onLiveDeliveryStatus: function (callback) {
+        if (!window.__mockLiveDeliveryStatusListeners) window.__mockLiveDeliveryStatusListeners = [];
+        window.__mockLiveDeliveryStatusListeners.push(callback);
+        if (!window.__mockFireLiveDeliveryStatus) {
+          window.__mockFireLiveDeliveryStatus = function (status) {
+            var listeners = (window.__mockLiveDeliveryStatusListeners || []).slice();
+            for (var i = 0; i < listeners.length; i++) { listeners[i](status); }
+          };
+        }
+        return function () {
+          var listeners = window.__mockLiveDeliveryStatusListeners || [];
+          var idx = listeners.indexOf(callback);
+          if (idx >= 0) listeners.splice(idx, 1);
+        };
+      },
       onUsage: function () {
         return noop;
       },

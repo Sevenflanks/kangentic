@@ -1,4 +1,5 @@
 import type { PopOutDescriptor, PopOutKind, PopOutParamsByKind } from './pop-out';
+import type { LiveDeliveryStatus } from './live-delivery-status';
 
 // === Database Models ===
 
@@ -3531,6 +3532,7 @@ export interface ElectronAPI {
     onFirstOutput: (callback: (sessionId: string, projectId?: string) => void) => () => void;
     onExit: (callback: (sessionId: string, exitCode: number, projectId?: string, intentional?: boolean) => void) => () => void;
     onStatus: (callback: (sessionId: string, session: Session, projectId?: string) => void) => () => void;
+    onLiveDeliveryStatus: (callback: (status: LiveDeliveryStatus) => void) => () => void;
     onUsage: (callback: (sessionId: string, data: SessionUsage, projectId?: string) => void) => () => void;
     getActivity: (projectId?: string) => Promise<Record<string, ActivityState>>;
     onActivity: (callback: (sessionId: string, state: ActivityState, reason: ActivityReason, projectId?: string, taskId?: string, taskTitle?: string) => void) => () => void;

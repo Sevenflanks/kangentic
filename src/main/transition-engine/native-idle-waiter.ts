@@ -1,14 +1,6 @@
 import type { LiveSubmissionPolicy } from '../agent/agent-adapter';
 import type { NativeIdleSnapshot } from '../activity-engine/native-idle-evidence';
-
-export type LiveDeliveryCancellationReason =
-  | 'user-input'
-  | 'timeout'
-  | 'session-exit'
-  | 'turn-error'
-  | 'delivery-error'
-  | 'superseded'
-  | 'shutdown';
+import type { LiveDeliveryCancellationReason } from '../../shared/live-delivery-status';
 
 export interface NativeIdleExpectation {
   readonly nativeSessionId: string;
@@ -19,10 +11,10 @@ export interface NativeIdleExpectation {
 export type NativeIdleReadiness =
   | 'waiting'
   | 'ready'
-  | 'user-input'
-  | 'turn-error'
-  | 'session-exit'
-  | 'superseded';
+  | Extract<
+    LiveDeliveryCancellationReason,
+    'user-input' | 'turn-error' | 'session-exit' | 'superseded'
+  >;
 
 export function evaluateNativeIdleReadiness(
   snapshot: NativeIdleSnapshot | null,

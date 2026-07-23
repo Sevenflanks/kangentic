@@ -2,9 +2,12 @@ import type { SessionManager } from '../pty/session-manager';
 import type { CommandVerifier, TerminalSubmit } from '../pty/terminal-submit';
 import type { SubmissionLease } from '../pty/session-write-coordinator';
 import type { SessionStatus, SubmissionVerifier } from '../../shared/types';
+import type {
+  LiveDeliveryCancellationReason,
+  LiveDeliveryStatus,
+} from '../../shared/live-delivery-status';
 import {
   evaluateNativeIdleReadiness,
-  type LiveDeliveryCancellationReason,
   type NativeIdleRequest,
 } from './native-idle-waiter';
 
@@ -55,19 +58,6 @@ interface NativeIdleEntry {
   successor: ScheduledSubmission | null;
   terminalStatus: boolean;
 }
-
-interface LiveDeliveryBase {
-  readonly projectId: string;
-  readonly taskId: string;
-  readonly sessionId: string;
-  readonly generation: number;
-  readonly at: string;
-}
-
-type LiveDeliveryStatus = LiveDeliveryBase & (
-  | { readonly state: 'waiting' | 'sending' | 'delivered' }
-  | { readonly state: 'cancelled'; readonly reason: LiveDeliveryCancellationReason }
-);
 
 type LiveDeliveryStatusCallback = (status: LiveDeliveryStatus) => void;
 

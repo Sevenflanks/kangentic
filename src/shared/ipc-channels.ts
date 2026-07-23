@@ -107,6 +107,7 @@ export const IPC = {
   SESSION_GET_EVENTS: 'session:getEvents',
   SESSION_GET_EVENTS_CACHE: 'session:getEventsCache',
   SESSION_STATUS: 'session:status',
+  SESSION_LIVE_DELIVERY_STATUS: 'session:liveDeliveryStatus',
   SESSION_SUSPEND: 'session:suspend',
   SESSION_RESUME: 'session:resume',
   SESSION_RECONCILE: 'session:reconcile',
