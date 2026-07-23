@@ -112,4 +112,33 @@ describe('TerminalSubmitScheduler strict prefix successors', () => {
     expect(manager.listeners.size).toBe(0);
     expect(vi.getTimerCount()).toBe(0);
   });
+
+  it('keeps newer generic work scheduled by a failure status callback', async () => {
+    scheduler = new TerminalSubmitScheduler(manager as never, submit as never, (status) => {
+      statuses.push(status);
+      if (status.state === 'cancelled' && status.reason === 'delivery-error') {
+        scheduler.scheduleKeystrokes('t1', 's1', ['/replacement']);
+      }
+    });
+    submit.failPrefix = true;
+
+    scheduler.scheduleKeystrokes('t1', 's1', ['/effort high'], { strictVerification: true });
+    scheduler.scheduleNativeIdleSubmission(request(() => undefined));
+    await tick();
+
+    expect(statuses.filter((status) => status.state === 'cancelled')).toEqual([
+      expect.objectContaining({ state: 'cancelled', reason: 'delivery-error' }),
+    ]);
+    expect(submit.calls.map((call) => call.commands[0])).toEqual(['/effort high', '/replacement']);
+  });
+
+  it('retains an already queued generic successor after a strict prefix failure', async () => {
+    submit.failPrefix = true;
+
+    scheduler.scheduleKeystrokes('t1', 's1', ['/effort high'], { strictVerification: true });
+    scheduler.scheduleKeystrokes('t1', 's1', ['/generic-successor']);
+    await tick();
+
+    expect(submit.calls.map((call) => call.commands[0])).toEqual(['/effort high', '/generic-successor']);
+  });
 });

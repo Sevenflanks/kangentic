@@ -426,6 +426,13 @@ export class TerminalSubmitScheduler {
     if (submission?.kind === 'native-idle') this.cancelNativeEntry(submission.entry, reason);
   }
 
+  private cancelStrictNativeSuccessor(entry: ActiveBurst): void {
+    const successor = entry.next;
+    if (successor?.kind !== 'native-idle') return;
+    entry.next = null;
+    this.cancelNativeEntry(successor.entry, 'delivery-error');
+  }
+
   private startScheduledSubmission(taskId: string, submission: ScheduledSubmission): void {
     if (!this.acceptingSubmissions) return;
     switch (submission.kind) {
@@ -969,8 +976,7 @@ export class TerminalSubmitScheduler {
         console.error(`[TerminalSubmitScheduler] Burst failed for task ${taskId.slice(0, 8)}: ${message}`);
       }
       if (opts.strictVerification) {
-        this.cancelScheduledNative(entry.next, 'delivery-error');
-        entry.next = null;
+        this.cancelStrictNativeSuccessor(entry);
       }
     }
 
@@ -980,8 +986,7 @@ export class TerminalSubmitScheduler {
       } catch (caughtError) {
         const message = caughtError instanceof Error ? caughtError.message : String(caughtError);
         console.error(`[TerminalSubmitScheduler] Burst completion failed for task ${taskId.slice(0, 8)}: ${message}`);
-        this.cancelScheduledNative(entry.next, 'delivery-error');
-        entry.next = null;
+        this.cancelStrictNativeSuccessor(entry);
       }
     }
 
