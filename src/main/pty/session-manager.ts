@@ -7,7 +7,7 @@ import { PtyBufferManager } from './buffer/pty-buffer-manager';
 import { SessionHistoryReader } from './readers/session-history-reader';
 import { StatusFileReader } from './readers/status-file-reader';
 import { SessionTelemetry } from '../activity-engine/session-telemetry';
-import { NativeIdleEvidence } from '../activity-engine/native-idle-evidence';
+import { NativeIdleEvidence, type NativeIdleSnapshot } from '../activity-engine/native-idle-evidence';
 import { hasPrivateEventLinesHook } from '../agent/agent-adapter';
 import { TranscriptWriter } from './buffer/transcript-writer';
 import { SessionIdManager } from './lifecycle/session-id-manager';
@@ -563,6 +563,14 @@ export class SessionManager extends EventEmitter {
 
   getInputGeneration(sessionId: string): number | null {
     return this.writeCoordinator.getInputGeneration(sessionId);
+  }
+
+  snapshotNativeIdle(sessionId: string): NativeIdleSnapshot | null {
+    return this.nativeIdleEvidence.snapshot(sessionId);
+  }
+
+  subscribeNativeIdle(sessionId: string, listener: () => void): () => void {
+    return this.nativeIdleEvidence.subscribe(sessionId, listener);
   }
 
   acquireAutomation(

@@ -67,7 +67,8 @@ export function syncShutdownCleanup(dependencies: ShutdownDependencies): void {
     dependencies.getDiffWatcher()?.closeAll();
 
     const sessionManager = dependencies.getSessionManager();
-    dependencies.getTerminalSubmitScheduler().cancelAll();
+    // 必須先同步封住 scheduler status 與未 committed lease，DB cleanup 和 killAll 才不會收到晚到 completion。
+    dependencies.getTerminalSubmitScheduler().cancelAll('shutdown');
 
     // Mark running DB records as 'suspended' so sessions can resume on next launch.
     // This must happen BEFORE killAll() because killAll sends best-effort exit

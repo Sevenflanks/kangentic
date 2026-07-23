@@ -104,27 +104,31 @@ function buildRunningSession(overrides: Partial<Session> = {}): Session {
 function buildMockDependencies(sessions: Session[]) {
   // Stable diffWatcher stub so a test can assert closeAll() ran during cleanup.
   const diffWatcher = { closeAll: vi.fn() };
+  const callOrder: string[] = [];
+  const sessionManager = {
+    listSessions: vi.fn(() => sessions),
+    killAll: vi.fn(() => callOrder.push('killAll')),
+    dispose: vi.fn(),
+    cancelAll: vi.fn(),
+    getUsageCache: vi.fn(() => ({})),
+    getToolCallCount: vi.fn(() => 0),
+  };
+  const terminalSubmitScheduler = {
+    cancelAll: vi.fn((_reason?: 'shutdown') => callOrder.push('cancelAll')),
+  };
   return {
-    getSessionManager: vi.fn(() => ({
-      listSessions: vi.fn(() => sessions),
-      killAll: vi.fn(),
-      dispose: vi.fn(),
-      cancelAll: vi.fn(),
-      getUsageCache: vi.fn(() => ({})),
-      getToolCallCount: vi.fn(() => 0),
-    })),
+    getSessionManager: vi.fn(() => sessionManager),
     getBoardConfigManager: vi.fn(() => ({
       detach: vi.fn(),
     })),
     getDiffWatcher: vi.fn(() => diffWatcher),
-    getTerminalSubmitScheduler: vi.fn(() => ({
-      cancelAll: vi.fn(),
-    })),
+    getTerminalSubmitScheduler: vi.fn(() => terminalSubmitScheduler),
     getCurrentProjectId: vi.fn(() => null),
     deleteProjectFromIndex: vi.fn(),
     stopUpdaterTimers: vi.fn(),
     clearPendingTimers: vi.fn(),
     isEphemeral: false,
+    callOrder,
   };
 }
 
@@ -195,5 +199,14 @@ describe('syncShutdownCleanup history wire-up', () => {
 
     // Queued sessions are marked exited but never go through captureSessionMetrics.
     expect(mockCaptureSessionMetrics).not.toHaveBeenCalled();
+  });
+
+  it('cancels scheduler ownership for shutdown before killing PTY sessions', () => {
+    const dependencies = buildMockDependencies([]);
+
+    syncShutdownCleanup(dependencies);
+
+    expect(dependencies.getTerminalSubmitScheduler().cancelAll).toHaveBeenCalledWith('shutdown');
+    expect(dependencies.callOrder).toEqual(['cancelAll', 'killAll']);
   });
 });

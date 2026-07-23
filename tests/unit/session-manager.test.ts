@@ -2511,6 +2511,31 @@ describe('Input coordination', () => {
     expect(manager['nativeIdleEvidence'].snapshot(sessionId)).toBeNull();
   }
 
+  it('exposes a readonly native idle snapshot and returns null for an unknown session', async () => {
+    const { session } = await spawnCoordinatedSession('task-native-idle-snapshot');
+
+    expect(manager.snapshotNativeIdle('missing-session')).toBeNull();
+    expect(manager.snapshotNativeIdle(session.id)).toMatchObject({
+      sessionGeneration: 1,
+      inputGeneration: 0,
+      cleanIdle: null,
+      errorLatched: false,
+    });
+  });
+
+  it('forwards native idle notifications until the returned unsubscribe is called', async () => {
+    const { session } = await spawnCoordinatedSession('task-native-idle-subscribe');
+    const listener = vi.fn();
+    const unsubscribe = manager.subscribeNativeIdle(session.id, listener);
+
+    manager.writeUserInput(session.id, 'first', 20);
+    expect(listener).toHaveBeenCalledTimes(1);
+
+    unsubscribe();
+    manager.writeUserInput(session.id, 'second', 21);
+    expect(listener).toHaveBeenCalledTimes(1);
+  });
+
   it('uses Date.now for the two-argument writeUserInput shape', async () => {
     // Given
     const { session, writes } = await spawnCoordinatedSession('task-coordination-default-time');
