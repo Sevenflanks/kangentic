@@ -141,4 +141,36 @@ describe('TerminalSubmitScheduler strict prefix successors', () => {
 
     expect(submit.calls.map((call) => call.commands[0])).toEqual(['/effort high', '/generic-successor']);
   });
+
+  it('awaits an async completion gate before releasing a generic successor', async () => {
+    let release = (): void => undefined;
+    const completion = new Promise<void>((resolve) => { release = resolve; });
+
+    scheduler.scheduleKeystrokes('t1', 's1', ['/effort high'], { onDelivered: () => completion });
+    scheduler.scheduleKeystrokes('t1', 's1', ['/generic-successor']);
+    await tick();
+
+    expect(submit.calls.map((call) => call.commands[0])).toEqual(['/effort high']);
+    release();
+    await tick();
+    expect(submit.calls.map((call) => call.commands[0])).toEqual(['/effort high', '/generic-successor']);
+  });
+
+  it('keeps newer generic work when an async completion gate rejects', async () => {
+    scheduler = new TerminalSubmitScheduler(manager as never, submit as never, (status) => {
+      statuses.push(status);
+      if (status.state === 'cancelled' && status.reason === 'delivery-error') {
+        scheduler.scheduleKeystrokes('t1', 's1', ['/replacement']);
+      }
+    });
+
+    scheduler.scheduleKeystrokes('t1', 's1', ['/effort high'], {
+      onDelivered: async () => Promise.reject(new Error('stale completion')),
+    });
+    scheduler.scheduleNativeIdleSubmission(request(() => undefined));
+    await tick();
+
+    expect(submit.calls.map((call) => call.commands[0])).toEqual(['/effort high', '/replacement']);
+    expect(statuses).toContainEqual(expect.objectContaining({ state: 'cancelled', reason: 'delivery-error' }));
+  });
 });

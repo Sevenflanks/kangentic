@@ -85,7 +85,7 @@ export interface ScheduleKeystrokesOptions {
   /** Verifies leading prefix only; trailing commands fire-and-forget. */
   verifiedPrefixLength?: number;
   strictVerification?: boolean;
-  onDelivered?: () => void;
+  onDelivered?: () => void | Promise<void>;
   /**
    * Hard timeout for the fresh-spawn wait. When the CLI never emits
    * `'thinking'` (e.g. agent hung at startup), we cancel this task's
@@ -982,7 +982,7 @@ export class TerminalSubmitScheduler {
 
     if (delivered && this.active.get(taskId) === entry && !entry.controller.signal.aborted) {
       try {
-        opts.onDelivered?.();
+        await opts.onDelivered?.();
       } catch (caughtError) {
         const message = caughtError instanceof Error ? caughtError.message : String(caughtError);
         console.error(`[TerminalSubmitScheduler] Burst completion failed for task ${taskId.slice(0, 8)}: ${message}`);
