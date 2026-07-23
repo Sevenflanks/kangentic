@@ -76,6 +76,31 @@ function sessionRepoWith(record: Partial<SessionRecord> | null): SessionReposito
 }
 
 describe('prepareInjectionPlan', () => {
+  it('uses an explicit captured record instead of the repository latest record', async () => {
+    const verifierInputs: Array<{ readonly agentSessionId: string; readonly cwd: string }> = [];
+    const adapter = fakeAdapter({
+      getInjectionSequence: (spec) => spec.effortChanged && spec.effort ? [`/effort ${spec.effort}`] : [],
+      getSubmissionVerifier: () => async (input) => {
+        verifierInputs.push({ agentSessionId: input.agentSessionId, cwd: input.cwd });
+        return true;
+      },
+    });
+    const latest = { applied_model: 'latest-model', applied_effort: 'low', agent_session_id: 'latest-agent', cwd: '/latest' };
+    const captured = { applied_model: 'captured-model', applied_effort: 'high', agent_session_id: 'captured-agent', cwd: '/captured' };
+    const plan = prepareInjectionPlan({
+      adapter,
+      sessionRepo: sessionRepoWith(latest),
+      task: { id: 't1', agent: 'fake' },
+      toLane: lane({ effort_override: 'high' }),
+      sessionRecord: captured as SessionRecord,
+      autoCommand: '/go',
+    });
+
+    expect(plan?.sequence).toEqual(['/go']);
+    expect(plan?.verifier).not.toBeNull();
+    await plan?.verifier?.('/effort high', 1);
+    expect(verifierInputs).toEqual([{ agentSessionId: 'captured-agent', cwd: '/captured' }]);
+  });
   it('returns null when the session already runs at the target (no delta, no auto_command)', () => {
     const adapter = fakeAdapter({
       getInjectionSequence: () => [],
