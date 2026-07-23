@@ -125,7 +125,9 @@ export interface ScheduleContentOptions {
  * Cancellation tears down content and keystroke readiness listeners/timers,
  * drops queued content followers and burst follow-ups, and aborts in-flight
  * content or keystroke delivery through the per-task `AbortController`.
- * Re-scheduling for the same task cancels any prior pending injection.
+ * Re-scheduling for the same task cancels any prior pending injection. Native
+ * delivery becomes non-cancellable at its first byte; explicit cancellation
+ * then drops only its successor so settlement can report the real outcome.
  *
  * Used by every column-transition / lifecycle path that injects keystrokes:
  * auto_command on column move, `/model X` + `/effort Y` settings burst,
@@ -137,6 +139,8 @@ export class TerminalSubmitScheduler {
   private active = new Map<string, ActiveBurst>();
   private nativeIdle = new Map<string, NativeIdleEntry>();
   private nextNativeGeneration = 1;
+  private taskMutations = new Map<string, object>();
+  private acceptingSubmissions = true;
   private suppressNativeLateStatuses = false;
 
   constructor(
@@ -145,16 +149,36 @@ export class TerminalSubmitScheduler {
     private onLiveDeliveryStatus: LiveDeliveryStatusCallback = () => undefined,
   ) {}
 
+  private beginTaskMutation(taskId: string): object {
+    const mutation = {};
+    this.taskMutations.set(taskId, mutation);
+    return mutation;
+  }
+
+  private isTaskMutationCurrent(taskId: string, mutation: object): boolean {
+    return this.taskMutations.get(taskId) === mutation;
+  }
+
+  private cleanupTaskMutation(taskId: string, expectedMutation?: object): void {
+    if (this.content.has(taskId)
+      || this.deferred.has(taskId)
+      || this.active.has(taskId)
+      || this.nativeIdle.has(taskId)) return;
+    if (expectedMutation && !this.isTaskMutationCurrent(taskId, expectedMutation)) return;
+    this.taskMutations.delete(taskId);
+  }
+
   scheduleContent(
     taskId: string,
     sessionId: string,
     text: string,
     opts: ScheduleContentOptions = {},
   ): void {
-    if (text.length === 0) return;
+    if (!this.acceptingSubmissions || text.length === 0) return;
 
     const session = this.sessionManager.getSession(sessionId);
     if (!session) return;
+    const mutation = this.beginTaskMutation(taskId);
 
     const submission: Extract<ScheduledSubmission, { kind: 'content' }> = {
       kind: 'content',
@@ -164,12 +188,16 @@ export class TerminalSubmitScheduler {
     };
     const nativeEntry = this.nativeIdle.get(taskId);
     if (nativeEntry?.phase === 'committed') {
-      this.replaceSuccessor(nativeEntry, submission);
+      this.replaceSuccessor(nativeEntry, submission, mutation);
       return;
     }
     if (nativeEntry) this.cancelNativeEntry(nativeEntry, 'superseded');
+    if (!this.isTaskMutationCurrent(taskId, mutation)) {
+      return;
+    }
 
-    this.cancel(taskId);
+    this.cancelTask(taskId, 'superseded', mutation);
+    if (!this.isTaskMutationCurrent(taskId, mutation)) return;
     const status: SessionStatus = session.status;
     let isQueued: boolean;
     switch (status) {
@@ -181,6 +209,7 @@ export class TerminalSubmitScheduler {
         break;
       case 'exited':
       case 'suspended':
+        this.cleanupTaskMutation(taskId, mutation);
         return;
       default: {
         const unhandledStatus: never = status;
@@ -217,13 +246,14 @@ export class TerminalSubmitScheduler {
     commands: string[],
     opts: ScheduleKeystrokesOptions = {},
   ): void {
-    if (commands.length === 0) return;
+    if (!this.acceptingSubmissions || commands.length === 0) return;
 
     const session = this.sessionManager.getSession(sessionId);
     if (!session) {
       console.log(`[TerminalSubmitScheduler] No session ${sessionId.slice(0, 8)} for task ${taskId.slice(0, 8)} -- skipping`);
       return;
     }
+    const mutation = this.beginTaskMutation(taskId);
 
     const submission: Extract<ScheduledSubmission, { kind: 'keystrokes' }> = {
       kind: 'keystrokes',
@@ -233,26 +263,29 @@ export class TerminalSubmitScheduler {
     };
     const nativeEntry = this.nativeIdle.get(taskId);
     if (nativeEntry?.phase === 'committed') {
-      this.replaceSuccessor(nativeEntry, submission);
+      this.replaceSuccessor(nativeEntry, submission, mutation);
       return;
     }
     if (nativeEntry) this.cancelNativeEntry(nativeEntry, 'superseded');
+    if (!this.isTaskMutationCurrent(taskId, mutation)) return;
     const pendingContent = this.content.get(taskId);
     if (pendingContent) {
       if (pendingContent.sessionId === sessionId) {
-        this.replaceContentSuccessor(pendingContent, submission);
+        this.replaceContentSuccessor(taskId, pendingContent, submission);
         return;
       }
       this.cancelContent(taskId);
+      if (!this.isTaskMutationCurrent(taskId, mutation)) return;
     }
 
-    this.scheduleKeystrokeBurst(taskId, submission, session.status === 'queued');
+    this.scheduleKeystrokeBurst(taskId, submission, mutation);
   }
 
   scheduleNativeIdleSubmission(request: NativeIdleRequest): void {
-    if (this.suppressNativeLateStatuses) return;
+    if (!this.acceptingSubmissions) return;
+    const mutation = this.beginTaskMutation(request.taskId);
     const entry: NativeIdleEntry = {
-      token: {},
+      token: mutation,
       request,
       generation: this.nextNativeGeneration,
       deadline: Date.now() + request.policy.timeoutMs,
@@ -268,27 +301,46 @@ export class TerminalSubmitScheduler {
     const currentNative = this.nativeIdle.get(request.taskId);
     if (currentNative?.phase === 'committed') {
       // committed request 仍握有同一條 FIFO；successor 只能保留最新一筆，否則會形成第二個 task queue。
-      this.replaceSuccessor(currentNative, { kind: 'native-idle', entry });
-      this.watchNativeEntry(entry);
+      if (this.replaceSuccessor(currentNative, { kind: 'native-idle', entry }, mutation)) {
+        this.watchNativeEntry(entry);
+      } else {
+        this.cancelNativeEntry(entry, 'superseded');
+      }
       return;
     }
     if (currentNative) this.cancelNativeEntry(currentNative, 'superseded');
+    if (!this.isTaskMutationCurrent(request.taskId, mutation)) {
+      this.cancelNativeEntry(entry, 'superseded');
+      return;
+    }
 
     const pendingContent = this.content.get(request.taskId);
     if (pendingContent) {
-      this.replaceContentSuccessor(pendingContent, { kind: 'native-idle', entry });
-      this.watchNativeEntry(entry);
+      if (this.replaceContentSuccessor(
+        request.taskId,
+        pendingContent,
+        { kind: 'native-idle', entry },
+      )) this.watchNativeEntry(entry);
+      else this.cancelNativeEntry(entry, 'superseded');
       return;
     }
 
     const activeBurst = this.active.get(request.taskId);
     if (activeBurst) {
-      this.replaceActiveSuccessor(activeBurst, { kind: 'native-idle', entry });
-      this.watchNativeEntry(entry);
+      if (this.replaceActiveSuccessor(
+        request.taskId,
+        activeBurst,
+        { kind: 'native-idle', entry },
+      )) this.watchNativeEntry(entry);
+      else this.cancelNativeEntry(entry, 'superseded');
       return;
     }
 
     this.cancelKeystrokeBurst(request.taskId);
+    if (!this.isTaskMutationCurrent(request.taskId, mutation)) {
+      this.cancelNativeEntry(entry, 'superseded');
+      return;
+    }
     this.nativeIdle.set(request.taskId, entry);
     this.watchNativeEntry(entry);
   }
@@ -296,9 +348,11 @@ export class TerminalSubmitScheduler {
   private scheduleKeystrokeBurst(
     taskId: string,
     submission: Extract<ScheduledSubmission, { kind: 'keystrokes' }>,
-    isQueued: boolean,
+    mutation: object = this.beginTaskMutation(taskId),
   ): void {
+    if (!this.acceptingSubmissions || !this.isTaskMutationCurrent(taskId, mutation)) return;
     const { sessionId, commands, opts } = submission;
+    const isQueued = this.sessionManager.getSession(sessionId)?.status === 'queued';
     const freshlySpawned = opts.freshlySpawned ?? false;
 
     // Existing session, ready right now: try to claim the active-burst slot.
@@ -308,8 +362,9 @@ export class TerminalSubmitScheduler {
         // A burst is in flight. Stash this as "next"; the worker drains it
         // when the current burst finishes. Overwriting any previous "next"
         // intentionally coalesces transient drags.
-        this.replaceActiveSuccessor(existing, submission);
-        console.log(`[TerminalSubmitScheduler] Queueing burst for task ${taskId.slice(0, 8)} (in-flight burst running)`);
+        if (this.replaceActiveSuccessor(taskId, existing, submission)) {
+          console.log(`[TerminalSubmitScheduler] Queueing burst for task ${taskId.slice(0, 8)} (in-flight burst running)`);
+        }
         return;
       }
       this.startBurst(taskId, sessionId, commands, opts);
@@ -318,22 +373,45 @@ export class TerminalSubmitScheduler {
 
     // Fresh spawn or queued - wait for CLI to come alive, then start the burst.
     this.cancelKeystrokeBurst(taskId);
+    if (!this.isTaskMutationCurrent(taskId, mutation)) return;
     this.scheduleDeferred(taskId, sessionId, commands, opts, isQueued);
   }
 
-  private replaceContentSuccessor(entry: PendingContent, successor: ScheduledSubmission): void {
+  private replaceContentSuccessor(
+    taskId: string,
+    entry: PendingContent,
+    successor: ScheduledSubmission,
+  ): boolean {
+    const mutation = this.taskMutations.get(taskId);
+    if (!mutation) return false;
     this.cancelScheduledNative(entry.next, 'superseded');
+    if (!this.isTaskMutationCurrent(taskId, mutation)) return false;
     entry.next = successor;
+    return true;
   }
 
-  private replaceActiveSuccessor(entry: ActiveBurst, successor: ScheduledSubmission): void {
+  private replaceActiveSuccessor(
+    taskId: string,
+    entry: ActiveBurst,
+    successor: ScheduledSubmission,
+  ): boolean {
+    const mutation = this.taskMutations.get(taskId);
+    if (!mutation) return false;
     this.cancelScheduledNative(entry.next, 'superseded');
+    if (!this.isTaskMutationCurrent(taskId, mutation)) return false;
     entry.next = successor;
+    return true;
   }
 
-  private replaceSuccessor(entry: NativeIdleEntry, successor: ScheduledSubmission): void {
+  private replaceSuccessor(
+    entry: NativeIdleEntry,
+    successor: ScheduledSubmission,
+    mutation: object,
+  ): boolean {
     this.cancelScheduledNative(entry.successor, 'superseded');
+    if (!this.isTaskMutationCurrent(entry.request.taskId, mutation)) return false;
     entry.successor = successor;
+    return true;
   }
 
   private cancelScheduledNative(
@@ -344,18 +422,18 @@ export class TerminalSubmitScheduler {
   }
 
   private startScheduledSubmission(taskId: string, submission: ScheduledSubmission): void {
+    if (!this.acceptingSubmissions) return;
     switch (submission.kind) {
       case 'content':
         this.scheduleContent(taskId, submission.sessionId, submission.text, submission.opts);
         return;
       case 'keystrokes': {
-        const session = this.sessionManager.getSession(submission.sessionId);
-        if (!session) return;
-        this.scheduleKeystrokeBurst(taskId, submission, session.status === 'queued');
+        this.scheduleKeystrokes(taskId, submission.sessionId, submission.commands, submission.opts);
         return;
       }
       case 'native-idle':
         if (submission.entry.terminalStatus) return;
+        this.taskMutations.set(taskId, submission.entry.token);
         this.nativeIdle.set(taskId, submission.entry);
         this.evaluateNativeEntry(submission.entry);
         return;
@@ -372,10 +450,22 @@ export class TerminalSubmitScheduler {
    * active worker's queued `next` sequence.
    */
   cancel(taskId: string): void {
-    this.cancelContent(taskId, 'superseded');
-    this.cancelKeystrokeBurst(taskId, 'superseded');
+    const mutation = this.beginTaskMutation(taskId);
+    this.cancelTask(taskId, 'superseded', mutation);
+    this.cleanupTaskMutation(taskId, mutation);
+  }
+
+  private cancelTask(
+    taskId: string,
+    reason: LiveDeliveryCancellationReason,
+    mutation: object,
+  ): void {
+    this.cancelContent(taskId, reason);
+    if (!this.isTaskMutationCurrent(taskId, mutation)) return;
+    this.cancelKeystrokeBurst(taskId, reason);
+    if (!this.isTaskMutationCurrent(taskId, mutation)) return;
     const nativeEntry = this.nativeIdle.get(taskId);
-    if (nativeEntry) this.cancelNativeEntry(nativeEntry, 'superseded');
+    if (nativeEntry) this.cancelNativeEntry(nativeEntry, reason);
   }
 
   private cancelContent(
@@ -411,25 +501,25 @@ export class TerminalSubmitScheduler {
 
   /** Cancel all pending injections. Called on `killAll`/`suspendAll`. */
   cancelAll(reason?: 'shutdown'): void {
+    if (reason === 'shutdown') {
+      // admission 必須先關閉，否則 shutdown cancellation callback 可在 snapshot iteration 外建立新 owner。
+      this.acceptingSubmissions = false;
+    }
     const nativeReason: LiveDeliveryCancellationReason = reason ?? 'superseded';
-    for (const taskId of [...this.content.keys()]) {
-      this.cancelContent(taskId, nativeReason);
+    const taskIds = new Set([
+      ...this.content.keys(),
+      ...this.deferred.keys(),
+      ...this.active.keys(),
+      ...this.nativeIdle.keys(),
+    ]);
+    for (const taskId of taskIds) {
+      const mutation = this.beginTaskMutation(taskId);
+      this.cancelTask(taskId, nativeReason, mutation);
+      this.cleanupTaskMutation(taskId, mutation);
     }
-    this.cancelAllKeystrokeBursts(nativeReason);
-    for (const entry of [...this.nativeIdle.values()]) {
-      this.cancelNativeEntry(entry, nativeReason);
-    }
-    if (reason === 'shutdown') this.suppressNativeLateStatuses = true;
-  }
-
-  private cancelAllKeystrokeBursts(nativeReason: LiveDeliveryCancellationReason): void {
-    const pending = [...this.deferred.values()];
-    this.deferred.clear();
-    for (const entry of pending) entry.cleanup();
-    for (const burst of this.active.values()) {
-      this.cancelScheduledNative(burst.next, nativeReason);
-      burst.next = null;
-      burst.controller.abort();
+    if (reason === 'shutdown') {
+      this.suppressNativeLateStatuses = true;
+      this.taskMutations.clear();
     }
   }
 
@@ -447,7 +537,7 @@ export class TerminalSubmitScheduler {
 
   private evaluateNativeEntry(entry: NativeIdleEntry): void {
     if (!this.isNativeEntryOwned(entry) || entry.terminalStatus || entry.phase !== 'waiting') return;
-    if (Date.now() >= entry.deadline) {
+    if (this.hasNativeDeadlineElapsed(entry)) {
       this.cancelNativeEntry(entry, 'timeout');
       return;
     }
@@ -473,6 +563,10 @@ export class TerminalSubmitScheduler {
   }
 
   private acquireAndSubmitNative(entry: NativeIdleEntry): void {
+    if (this.hasNativeDeadlineElapsed(entry)) {
+      this.cancelNativeEntry(entry, 'timeout');
+      return;
+    }
     entry.phase = 'leased-uncommitted';
     const lease = this.sessionManager.acquireAutomation(
       entry.request.sessionId,
@@ -490,6 +584,10 @@ export class TerminalSubmitScheduler {
       this.cancelNativeEntry(entry, this.classifyNativeAdmissionFailure(entry));
       return;
     }
+    if (this.hasNativeDeadlineElapsed(entry)) {
+      this.cancelNativeEntry(entry, 'timeout');
+      return;
+    }
 
     this.emitNativeStatus(entry, { state: 'sending' });
 
@@ -498,18 +596,23 @@ export class TerminalSubmitScheduler {
       entry.request,
     );
     const validation = entry.request.validateCurrent();
+    const deadlineElapsed = this.hasNativeDeadlineElapsed(entry);
     const leaseMatches = lease.sessionId === entry.request.sessionId
       && lease.sessionGeneration === entry.request.sessionGeneration
       && lease.inputGeneration === entry.request.inputGeneration;
     if (this.nativeIdle.get(entry.request.taskId) !== entry
+      || !this.isTaskMutationCurrent(entry.request.taskId, entry.token)
       || entry.terminalStatus
       || entry.phase !== 'leased-uncommitted'
       || entry.lease !== lease
       || !leaseMatches
+      || deadlineElapsed
       || readiness !== 'ready'
       || validation !== 'valid') {
       if (!entry.terminalStatus) {
-        const reason = validation === 'valid'
+        const reason = deadlineElapsed
+          ? 'timeout'
+          : validation === 'valid'
           ? readiness === 'user-input' || readiness === 'turn-error' || readiness === 'session-exit'
             ? readiness
             : 'delivery-error'
@@ -541,6 +644,10 @@ export class TerminalSubmitScheduler {
     return 'delivery-error';
   }
 
+  private hasNativeDeadlineElapsed(entry: NativeIdleEntry): boolean {
+    return Date.now() >= entry.deadline;
+  }
+
   private settleNativeDelivery(entry: NativeIdleEntry, delivery: Promise<void>): void {
     void delivery.then(
       () => {
@@ -568,20 +675,30 @@ export class TerminalSubmitScheduler {
       if (!this.suppressNativeLateStatuses && successor) {
         this.startScheduledSubmission(entry.request.taskId, successor);
       }
+      this.cleanupTaskMutation(entry.request.taskId, entry.token);
     });
   }
 
   private cancelNativeEntry(entry: NativeIdleEntry, reason: LiveDeliveryCancellationReason): void {
-    if (entry.terminalStatus) return;
     const successor = entry.successor;
     entry.successor = null;
-    this.finishNativeStatus(entry, { state: 'cancelled', reason });
+    if (entry.terminalStatus) {
+      this.cancelScheduledNative(successor, reason);
+      return;
+    }
+    if (entry.phase === 'committed' && reason !== 'shutdown') {
+      this.cancelScheduledNative(successor, reason);
+      return;
+    }
+    if (!this.closeNativeEntry(entry)) return;
     if (entry.phase !== 'committed') {
       entry.lease?.release();
       entry.lease = null;
       this.removeNativeEntryOwnership(entry);
     }
+    this.emitNativeStatus(entry, { state: 'cancelled', reason });
     this.cancelScheduledNative(successor, reason);
+    this.cleanupTaskMutation(entry.request.taskId, entry.token);
   }
 
   private finishNativeStatus(
@@ -589,13 +706,18 @@ export class TerminalSubmitScheduler {
     status: { readonly state: 'delivered' }
       | { readonly state: 'cancelled'; readonly reason: LiveDeliveryCancellationReason },
   ): void {
-    if (entry.terminalStatus) return;
+    if (!this.closeNativeEntry(entry)) return;
+    this.emitNativeStatus(entry, status);
+  }
+
+  private closeNativeEntry(entry: NativeIdleEntry): boolean {
+    if (entry.terminalStatus) return false;
     entry.terminalStatus = true;
     entry.unsubscribe();
     entry.unsubscribe = () => undefined;
     if (entry.timeout !== null) clearTimeout(entry.timeout);
     entry.timeout = null;
-    this.emitNativeStatus(entry, status);
+    return true;
   }
 
   private emitNativeStatus(
@@ -749,10 +871,14 @@ export class TerminalSubmitScheduler {
         );
         this.cancel(taskId);
       }
+      this.cleanupTaskMutation(taskId);
       return;
     }
 
-    if (this.content.get(taskId) !== entry || entry.controller.signal.aborted) return;
+    if (this.content.get(taskId) !== entry || entry.controller.signal.aborted) {
+      this.cleanupTaskMutation(taskId);
+      return;
+    }
 
     const follower = entry.next;
     entry.next = null;
@@ -769,6 +895,7 @@ export class TerminalSubmitScheduler {
         this.startScheduledSubmission(taskId, follower);
       }
     }
+    this.cleanupTaskMutation(taskId);
   }
 
   /**
@@ -782,6 +909,7 @@ export class TerminalSubmitScheduler {
     commands: string[],
     opts: ScheduleKeystrokesOptions,
   ): void {
+    if (!this.acceptingSubmissions) return;
     const controller = new AbortController();
     const entry: ActiveBurst = { controller, next: null };
     this.active.set(taskId, entry);
@@ -825,11 +953,13 @@ export class TerminalSubmitScheduler {
       entry.next = null;
       this.active.delete(taskId);
       this.startScheduledSubmission(taskId, queued);
+      this.cleanupTaskMutation(taskId);
       return;
     }
     if (current === entry) {
       this.active.delete(taskId);
     }
+    this.cleanupTaskMutation(taskId);
   }
 
   /**
