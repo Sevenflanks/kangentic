@@ -2,6 +2,26 @@ import type { SessionManager } from './session-manager';
 import type { PasteEngine, PasteOptions } from './paste-engine';
 import { sanitizeForPty } from '../../shared/paths';
 
+const SUBMISSION_ABORTED = new Error('aborted');
+
+function makeAbortableWait(signal: AbortSignal | undefined): (ms: number) => Promise<void> {
+  return (ms: number) => new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(SUBMISSION_ABORTED);
+      return;
+    }
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      reject(SUBMISSION_ABORTED);
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
 /**
  * Re-export the PasteEngine error class so callers (`browser.ts`) can catch
  * specific submission failures without reaching into `pty/paste-engine.ts`
@@ -24,6 +44,8 @@ export { PasteSubmitError } from './paste-engine';
  */
 export type CommandVerifier = (command: string, sentAt: number) => Promise<boolean>;
 
+export interface TerminalKeystrokeWriter { write(data: string): Promise<void>; }
+
 /**
  * Free-form-content delivery options. Forwarded verbatim to PasteEngine.
  * Re-exported here as the public shape for `submitContent` callers.
@@ -32,6 +54,8 @@ export type SubmitContentOptions = PasteOptions;
 
 /** Manual-keystroke delivery options. */
 export interface SubmitKeystrokesOptions {
+  // Optional acknowledged sink. When present, it owns every emitted keystroke.
+  writer?: TerminalKeystrokeWriter;
   /**
    * Send Ctrl+C before the first command to clear half-typed input or
    * interrupt thinking. Default true. Set false for paths that just spawned
@@ -54,9 +78,9 @@ export interface SubmitKeystrokesOptions {
    */
   verifiedPrefixLength?: number;
   /**
-   * Caller cancellation. The current write/wait stops; previous writes have
-   * already been queued through `sessionManager.write` and cannot be
-   * un-pushed. Aborting between commands is the typical cancellation point.
+   * Caller cancellation. The current wait stops; writes already accepted by
+   * the selected sink cannot be undone. Aborting between commands is the
+   * typical cancellation point.
    */
   signal?: AbortSignal;
   /** Diagnostic label for `[terminal-submit]` log lines. */
@@ -142,6 +166,14 @@ export class TerminalSubmit {
       ? Math.min(opts.verifiedPrefixLength ?? sanitized.length, sanitized.length)
       : 0;
     const source = opts.source ?? 'unknown';
+    const write = async (data: string): Promise<void> => {
+      if (opts.writer) {
+        // 第一個成功的 lease write 會提交 sink ownership；之後取消已無法安全歸還 lease。
+        await opts.writer.write(data);
+        return;
+      }
+      this.sessionManager.write(sessionId, data);
+    };
 
     // Tunables. KEYPRESS_DELAY at 100ms gives Claude Code's Ink TUI enough
     // time to render the slash-command autocomplete picker BEFORE the Esc
@@ -161,29 +193,12 @@ export class TerminalSubmit {
     const RETRY_INTERVAL_MS = 400;
     const MAX_RETRIES = 4;
 
-    const wait = (ms: number): Promise<void> => new Promise((resolve, reject) => {
-      const signal = opts.signal;
-      if (signal?.aborted) {
-        reject(new Error('aborted'));
-        return;
-      }
-      const onAbort = (): void => {
-        clearTimeout(timer);
-        reject(new Error('aborted'));
-      };
-      const timer = setTimeout(() => {
-        // Detach the abort listener on success so signals reused across many
-        // waits in a single burst do not accumulate dead listeners.
-        signal?.removeEventListener('abort', onAbort);
-        resolve();
-      }, ms);
-      signal?.addEventListener('abort', onAbort, { once: true });
-    });
+    const wait = makeAbortableWait(opts.signal);
 
     try {
       if (sendCtrlC) {
         // Leading Ctrl+C clears any half-typed input or interrupts thinking.
-        this.sessionManager.write(sessionId, '\x03');
+        await write('\x03');
         await wait(CTRL_C_SETTLE);
       }
 
@@ -192,33 +207,31 @@ export class TerminalSubmit {
         const shouldVerify = verifier !== null && commandIndex < verifiedPrefixLength;
         const sentAt = Date.now();
 
-        this.sessionManager.write(sessionId, command);
+        await write(command);
         await wait(KEYPRESS_DELAY);
         // Escape dismisses any open slash-command autocomplete picker so the
         // following Enter resolves to "submit typed text" rather than "select
         // picker item" (or, if the picker is mid-render, getting swallowed).
-        this.sessionManager.write(sessionId, '\x1b');
+        await write('\x1b');
         await wait(KEYPRESS_DELAY);
-        this.sessionManager.write(sessionId, '\r');
+        await write('\r');
 
         if (shouldVerify && verifier) {
           const confirmed = await this.pollWithRetries(
             verifier,
             command,
             sentAt,
-            sessionId,
             { pollMs: VERIFY_POLL_MS, retryIntervalMs: RETRY_INTERVAL_MS, maxRetries: MAX_RETRIES },
-            opts.signal,
+            wait,
+            write,
           );
           if (!confirmed) {
             // After exhausting retries, clear any stuck text from the prompt
             // buffer so the next command does not concatenate into the failed
             // one. Better to drop the command than produce a malformed
             // combined invocation.
-            console.warn(
-              `[terminal-submit] ${source}: verification failed for "${command}" after ${MAX_RETRIES} retries -- clearing prompt and continuing`,
-            );
-            this.sessionManager.write(sessionId, '\x03');
+            console.warn(`[terminal-submit] ${source}: verification failed after ${MAX_RETRIES} retries -- clearing prompt and continuing`);
+            await write('\x03');
             await wait(50);
           }
         } else {
@@ -226,13 +239,10 @@ export class TerminalSubmit {
         }
       }
 
-      console.log(
-        `[terminal-submit] ${source}: delivered ${sanitized.length} command(s) to session ${sessionId.slice(0, 8)}: ${sanitized.join(' | ')}`,
-      );
+      console.log(`[terminal-submit] ${source}: delivered ${sanitized.length} command(s) to session ${sessionId.slice(0, 8)}`);
     } catch (caughtError) {
-      const message = caughtError instanceof Error ? caughtError.message : String(caughtError);
-      if (message.includes('abort')) return; // aborted writes are expected
-      console.error(`[terminal-submit] ${source}: keystroke delivery failed: ${message}`);
+      if (caughtError === SUBMISSION_ABORTED) return;
+      console.error(`[terminal-submit] ${source}: keystroke delivery failed`);
       throw caughtError;
     }
   }
@@ -249,26 +259,10 @@ export class TerminalSubmit {
     verifier: CommandVerifier,
     command: string,
     initialSentAt: number,
-    sessionId: string,
     opts: { pollMs: number; retryIntervalMs: number; maxRetries: number },
-    signal: AbortSignal | undefined,
+    wait: (ms: number) => Promise<void>,
+    write: (data: string) => Promise<void>,
   ): Promise<boolean> {
-    const wait = (ms: number): Promise<void> => new Promise((resolve, reject) => {
-      if (signal?.aborted) {
-        reject(new Error('aborted'));
-        return;
-      }
-      const onAbort = (): void => {
-        clearTimeout(timer);
-        reject(new Error('aborted'));
-      };
-      const timer = setTimeout(() => {
-        signal?.removeEventListener('abort', onAbort);
-        resolve();
-      }, ms);
-      signal?.addEventListener('abort', onAbort, { once: true });
-    });
-
     let sentAt = initialSentAt;
     let retries = 0;
     while (true) {
@@ -280,7 +274,7 @@ export class TerminalSubmit {
       if (retries >= opts.maxRetries) return false;
       retries += 1;
       sentAt = Date.now();
-      this.sessionManager.write(sessionId, '\r');
+      await write('\r');
     }
   }
 }

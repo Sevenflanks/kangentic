@@ -18,7 +18,7 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { EventEmitter } from 'node:events';
-import { TerminalSubmit, type CommandVerifier } from '../../src/main/pty/terminal-submit';
+import { TerminalSubmit, type CommandVerifier, type TerminalKeystrokeWriter } from '../../src/main/pty/terminal-submit';
 import type { PasteEngine, PasteOptions } from '../../src/main/pty/paste-engine';
 
 class MockSessionManager extends EventEmitter {
@@ -128,19 +128,61 @@ describe('TerminalSubmit', () => {
       expect(datas).toEqual(['/test', '\x1b', '\r']);
     });
 
-    it('regression: Escape is always positioned between text and Enter', async () => {
-      // The class of bug we shipped a fix for: bracketed-paste delivery left
-      // the slash-command picker open and Enter selected/swallowed the
-      // command. Manual Esc dismisses the picker so Enter submits.
-      const promise = submit.submitKeystrokes('s1', ['/test']);
+    it('uses the writer exclusively for ordered text, Escape, and Enter', async () => {
+      const logSpy = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+      const writer: TerminalKeystrokeWriter = { write: vi.fn(async () => undefined) };
+      const promise = submit.submitKeystrokes('s1', ['/safe'], {
+        writer, sendCtrlC: false, verifier: null, verifiedPrefixLength: 0,
+      });
       await advanceAndTick(1000);
       await promise;
 
-      const datas = sessionManager.writes.map((w) => w.data);
-      const textIndex = datas.indexOf('/test');
-      expect(textIndex).toBeGreaterThan(-1);
-      expect(datas[textIndex + 1]).toBe('\x1b');
-      expect(datas[textIndex + 2]).toBe('\r');
+      expect(writer.write).toHaveBeenNthCalledWith(1, '/safe');
+      expect(writer.write).toHaveBeenNthCalledWith(2, '\x1b');
+      expect(writer.write).toHaveBeenNthCalledWith(3, '\r');
+      expect(sessionManager.writes).toHaveLength(0);
+      expect(logSpy.mock.calls.flat().join(' ')).not.toContain('/safe');
+    });
+
+    it('awaits each writer delivery before starting the next', async () => {
+      const received: string[] = [];
+      const releases: Array<() => void> = [];
+      const writer: TerminalKeystrokeWriter = {
+        write: vi.fn((data: string) => new Promise<void>((resolve) => {
+          received.push(data);
+          releases.push(resolve);
+        })),
+      };
+      const promise = submit.submitKeystrokes('s1', ['/safe'], {
+        writer, sendCtrlC: false, verifier: null, verifiedPrefixLength: 0,
+      });
+      await tick();
+
+      await advanceAndTick(1000);
+      expect(received).toEqual(['/safe']);
+      releases[0]();
+      await advanceAndTick(200);
+      expect(received).toEqual(['/safe', '\x1b']);
+      releases[1]();
+      await advanceAndTick(200);
+      expect(received).toEqual(['/safe', '\x1b', '\r']);
+      releases[2]();
+      await advanceAndTick(600);
+      await promise;
+    });
+
+    it('rethrows writer failure without sending later bytes or logging its message', async () => {
+      const failure = new Error('aborted /failure-secret command');
+      const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+      const writer: TerminalKeystrokeWriter = { write: vi.fn(() => Promise.reject(failure)) };
+
+      await expect(submit.submitKeystrokes('s1', ['/failure-secret'], {
+        writer, sendCtrlC: false, verifier: null, verifiedPrefixLength: 0,
+      })).rejects.toBe(failure);
+
+      expect(writer.write).toHaveBeenCalledTimes(1);
+      expect(sessionManager.writes).toHaveLength(0);
+      expect(errorSpy.mock.calls.flat().join(' ')).not.toContain('/failure-secret');
     });
 
     it('writes each command in a chained sequence with Esc between', async () => {
@@ -230,6 +272,19 @@ describe('TerminalSubmit', () => {
       // The retry path fires extra `\r` writes when verifier keeps returning false.
       const enterCount = sessionManager.writes.filter((w) => w.data === '\r').length;
       expect(enterCount).toBeGreaterThan(1);
+    });
+
+    it('does not expose command text when verification fails', async () => {
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      const promise = submit.submitKeystrokes('s1', ['/verify-secret'], {
+        sendCtrlC: false,
+        verifier: vi.fn().mockResolvedValue(false),
+        verifiedPrefixLength: 1,
+      });
+      await advanceAndTick(3000, 300);
+      await promise;
+
+      expect(warnSpy.mock.calls.flat().join(' ')).not.toContain('/verify-secret');
     });
 
     it('time-settles trailing commands beyond verifiedPrefixLength', async () => {
