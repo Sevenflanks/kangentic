@@ -688,7 +688,11 @@ export class TerminalSubmitScheduler {
       if (!this.suppressNativeLateStatuses && successor) {
         this.startScheduledSubmission(entry.request.taskId, successor);
       }
-      this.cleanupTaskMutation(entry.request.taskId, entry.token);
+      // Successor timeout 可先移除 owner 卻留下較新的 token；此時只在所有 owner 都結束後清 current token。
+      this.cleanupTaskMutation(
+        entry.request.taskId,
+        this.taskMutations.get(entry.request.taskId),
+      );
     });
   }
 

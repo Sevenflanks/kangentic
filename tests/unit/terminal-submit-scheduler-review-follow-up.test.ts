@@ -6,10 +6,18 @@ import type { SubmissionLease } from '../../src/main/pty/session-write-coordinat
 import { TerminalSubmitScheduler } from '../../src/main/transition-engine/terminal-submit-scheduler';
 import type { NativeIdleRequest } from '../../src/main/transition-engine/native-idle-waiter';
 
-function deferred(): { readonly promise: Promise<void>; readonly resolve: () => void } {
+function deferred(): {
+  readonly promise: Promise<void>;
+  readonly resolve: () => void;
+  readonly reject: (error: Error) => void;
+} {
   let resolve = (): void => undefined;
-  const promise = new Promise<void>((resolvePromise) => { resolve = resolvePromise; });
-  return { promise, resolve };
+  let reject = (_error: Error): void => undefined;
+  const promise = new Promise<void>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
 }
 
 class FollowUpSessionManager extends EventEmitter {
@@ -207,6 +215,18 @@ describe('TerminalSubmitScheduler review follow-up', () => {
     expect(scheduler['taskMutations'].size).toBe(0);
   });
 
+  it('cleans the mutation token after explicitly cancelled committed work fails', async () => {
+    manager.updateSnapshot('s-a', manager.makeSnapshot('s-a', true));
+    scheduler.scheduleNativeIdleSubmission(request('task-a', 's-a', 'owner'));
+    scheduler.cancel('task-a');
+
+    submit.nativeCompletions[0]?.reject(new Error('delivery failed'));
+    await tick();
+
+    expect(statuses.at(-1)).toMatchObject({ state: 'cancelled', reason: 'delivery-error' });
+    expect(scheduler['taskMutations'].size).toBe(0);
+  });
+
   it('does not let an old committed completion delete its successor token', async () => {
     manager.updateSnapshot('s-a', manager.makeSnapshot('s-a', true));
     scheduler.scheduleNativeIdleSubmission(request('task-a', 's-a', 'owner'));
@@ -221,6 +241,32 @@ describe('TerminalSubmitScheduler review follow-up', () => {
     submit.nativeCompletions[1]?.resolve();
     await tick();
     expect(scheduler['taskMutations'].size).toBe(0);
+  });
+
+  it('cleans a timed-out successor token after its committed predecessor settles', async () => {
+    manager.updateSnapshot('s-a', manager.makeSnapshot('s-a', true));
+    scheduler.scheduleNativeIdleSubmission(request('task-a', 's-a', 'owner'));
+    const successor = request('task-a', 's-a', 'expired-successor');
+    scheduler.scheduleNativeIdleSubmission({
+      ...successor,
+      policy: { ...successor.policy, timeoutMs: 10 },
+    });
+
+    vi.advanceTimersByTime(10);
+    submit.nativeCompletions[0]?.resolve();
+    await tick();
+
+    expect(statuses).toContainEqual(expect.objectContaining({ generation: 2, reason: 'timeout' }));
+    expect(submit.nativeCalls).toEqual(['owner']);
+    expect([
+      scheduler['content'].size,
+      scheduler['deferred'].size,
+      scheduler['active'].size,
+      scheduler['nativeIdle'].size,
+      scheduler['taskMutations'].size,
+    ]).toEqual([0, 0, 0, 0, 0]);
+    expect([...manager.listeners.values()].every((listeners) => listeners.size === 0)).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it('classifies a null lease returned after the deadline as timeout', () => {
