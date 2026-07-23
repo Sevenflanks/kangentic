@@ -109,7 +109,7 @@ function expectPromptFreeLaunch(argv: readonly string[], excludedContent: readon
 
 const runId = Date.now();
 
-test.describe('OpenCode Windows multiline prompt transport', () => {
+test.describe('OpenCode multiline prompt transport', () => {
   test.describe.configure({ mode: 'serial' });
 
   const TEST_NAME = `opencode-task-prompt-${runId}`;
@@ -180,7 +180,7 @@ test.describe('OpenCode Windows multiline prompt transport', () => {
     }
   });
 
-  test('fresh and resumed prompts use bracketed paste without argv or shell execution', async () => {
+  test('fresh and resumed prompts use the plugin API without argv or shell execution', async () => {
     test.slow();
     const title = `OpenCode Prompt ${runId} 繁體 "title" & | < > ^ %`;
     const description = `line one\r\n繁體中文 "double" 'single' \`backtick\` & | < > ^ % & echo unsafe > "${sentinelPath}"\r\nline three`;
