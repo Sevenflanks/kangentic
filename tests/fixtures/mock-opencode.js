@@ -24,6 +24,8 @@
  */
 
 const fs = require('node:fs');
+const path = require('node:path');
+const { pathToFileURL } = require('node:url');
 
 const args = process.argv.slice(2);
 
@@ -37,9 +39,6 @@ if (args.includes('--help') || args.includes('-h')) {
   process.exit(0);
 }
 
-let pending = '';
-let pastedText = null;
-let awaitingEnter = false;
 const capturePath = process.env.MOCK_OPENCODE_CAPTURE_PATH;
 
 function appendCapture(event) {
@@ -52,6 +51,24 @@ appendCapture({ kind: 'launch', argv: process.argv.slice(2) });
 // Fixed session ID for new sessions - uses the native ses_* format
 // (ses_<26 alphanumeric>) that the adapter's fromOutput regex matches.
 const MOCK_SESSION_ID = 'ses_2349b5c91ffeKd6qajuUTR4clq';
+
+async function activateInstalledPlugin() {
+  const pluginPath = path.join(process.cwd(), '.opencode', 'plugins', 'kangentic-activity.mjs');
+  const { KangenticActivity } = await import(pathToFileURL(pluginPath).href);
+  await KangenticActivity({
+    client: {
+      session: {
+        create: async () => ({ id: MOCK_SESSION_ID }),
+        get: async ({ path: requestPath }) => ({ id: requestPath.id }),
+        promptAsync: async ({ body }) => {
+          const textPart = body.parts.find((part) => part.type === 'text');
+          if (textPart) appendCapture({ kind: 'prompt', text: textPart.text });
+        },
+      },
+    },
+    directory: process.cwd(),
+  });
+}
 
 let sessionId = null;
 let resumed = false;
@@ -103,35 +120,23 @@ setImmediate(() => process.stdout.write('\x1b[?1049h'));
 // Stay alive to simulate a running session (30s gives tests time to interact)
 const timeout = setTimeout(() => { process.exit(0); }, 30000);
 
+activateInstalledPlugin().catch((error) => {
+  console.error('MOCK_OPENCODE_PLUGIN_ERROR:', error);
+  clearTimeout(timeout);
+  process.exit(1);
+});
+
 // Exit cleanly on SIGTERM/SIGINT
 process.on('SIGTERM', () => { clearTimeout(timeout); process.exit(0); });
 process.on('SIGINT', () => { clearTimeout(timeout); process.exit(0); });
 
-// Keep stdin open so PTY doesn't close
-// Real OpenCode 以 raw TTY 接收 bracketed paste；Windows ConPTY 的 cooked mode 不會逐 chunk 交付控制序列。
+// Keep stdin open so PTY doesn't close.
 if (process.stdin.isTTY) process.stdin.setRawMode(true);
 process.stdin.setEncoding('utf8');
 process.stdin.on('data', (chunk) => {
   if (chunk.includes('\x03')) {
     clearTimeout(timeout);
     process.exit(0);
-    return;
-  }
-
-  pending += chunk;
-  if (pastedText === null) {
-    const start = pending.indexOf('\x1b[200~');
-    const end = pending.indexOf('\x1b[201~', start + 6);
-    if (start < 0 || end < 0) return;
-    pastedText = pending.slice(start + 6, end);
-    pending = pending.slice(end + 6);
-    awaitingEnter = true;
-  }
-  if (awaitingEnter && pending.startsWith('\r')) {
-    appendCapture({ kind: 'prompt', text: pastedText });
-    pending = pending.slice(1);
-    pastedText = null;
-    awaitingEnter = false;
   }
 });
 process.stdin.resume();

@@ -2759,10 +2759,10 @@ export interface AgentParser {
    * accumulation across sessions. Gemini and Codex write hooks to a
    * shared project-level file (no per-session settings flag), so each
    * session must clean up its own hooks when done. `taskId` identifies
-   * which spawn is releasing so adapters can reference-count per task
-   * and stay idempotent on double-releases (suspend + onExit).
+   * legacy task-keyed holders; `hookOwnerId` can identify one concrete
+   * spawn when an adapter supports overlapping same-task sessions.
    */
-  removeHooks(directory: string, taskId?: string): void;
+  removeHooks(directory: string, taskId?: string, hookOwnerId?: string): void;
   /**
    * Optional per-session lifecycle hook. When present, session manager
    * calls it once per spawn and disposes the returned attachment on
@@ -3175,6 +3175,12 @@ export interface SpawnSessionInput {
   resuming?: boolean;
   /** True for ephemeral command terminal sessions. */
   transient?: boolean;
+  /**
+   * Per-spawn cleanup transferred to SessionManager when spawn() accepts this
+   * input. It is distinct from post-spawn `adapterAttachment` and shared
+   * adapter hook cleanup, and must retain its exact identity through queuing.
+   */
+  spawnCleanup?: SessionAttachment;
   /** Agent-specific parser for status/event output. Falls back to ClaudeStatusParser if omitted. */
   agentParser?: AgentParser;
   /** Human-readable agent name for diagnostic logs (e.g. "claude", "gemini").

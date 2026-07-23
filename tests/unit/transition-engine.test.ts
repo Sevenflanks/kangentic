@@ -23,12 +23,18 @@
  * and adapter-capability routing without invoking a real CLI.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import fs from 'node:fs';
+import path from 'node:path';
 import { TransitionEngine } from '../../src/main/transition-engine/transition-engine';
 import { buildTaskXml } from '../../src/main/agent/shared/prompt-xml';
 import { sanitizeForPty } from '../../src/shared/paths';
 import { migrateResumeCwdIfRenamed } from '../../src/main/transition-engine/resume-cwd-migration';
-import type { InitialPromptDelivery } from '../../src/main/agent/agent-adapter';
-import type { SubmissionVerifier } from '../../src/shared/types';
+import type {
+  InitialPromptDelivery,
+  InitialPromptInput,
+  InitialPromptPreparation,
+} from '../../src/main/agent/agent-adapter';
+import type { SpawnSessionInput, SubmissionVerifier } from '../../src/shared/types';
 
 // ---------------------------------------------------------------------------
 // Minimal mock factories
@@ -99,10 +105,11 @@ function makeAttachmentRepo() {
  * quoted prompt that would be passed to the shell.
  */
 function makeSessionManager() {
-  const spawnedSessions: Array<{ command: string; prompt?: string }> = [];
+  type SpawnCapture = Pick<SpawnSessionInput, 'id' | 'command' | 'env' | 'spawnCleanup'>;
+  const spawnedSessions: SpawnCapture[] = [];
   return {
-    spawn: vi.fn(async (options: { command: string }) => {
-      spawnedSessions.push({ command: options.command });
+    spawn: vi.fn(async (options: SpawnCapture) => {
+      spawnedSessions.push(options);
       return { id: 'pty-session-1', status: 'running' };
     }),
     getShell: vi.fn(async () => 'bash'),
@@ -135,6 +142,8 @@ function makeTerminalSubmitScheduler() {
  */
 let initialPromptDelivery: InitialPromptDelivery | undefined;
 let pasteVerifier: SubmissionVerifier | null = null;
+let prepareInitialPrompt: ((input: InitialPromptInput) => InitialPromptPreparation) | undefined;
+const originalBuilderError = new Error('build failed');
 
 const mockAdapter = {
   name: 'claude',
@@ -151,6 +160,9 @@ const mockAdapter = {
   buildEnv: vi.fn((_options: { prompt?: string }) => null),
   get initialPromptDelivery() {
     return initialPromptDelivery;
+  },
+  get prepareInitialPrompt() {
+    return prepareInitialPrompt;
   },
   getSubmissionVerifier: vi.fn((contextType: 'paste' | 'command-injection') => (
     contextType === 'paste' ? pasteVerifier : null
@@ -267,6 +279,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   initialPromptDelivery = undefined;
   pasteVerifier = null;
+  prepareInitialPrompt = undefined;
   mockAdapter.buildCommand.mockImplementation((options: { prompt?: string }) => (
     `claude ${options.prompt ?? ''}`
   ));
@@ -464,9 +477,278 @@ describe('TransitionEngine - capability-based initial prompt delivery', () => {
     expect(terminalSubmitScheduler.scheduleContent).toHaveBeenCalledOnce();
     expect(terminalSubmitScheduler.scheduleContent.mock.calls).toEqual([[
       task.id, 'pty-session-1', expectedPrompt, { verifier: null },
-    ]]);
+      ]]);
+    });
+
+    it('gives an adapter preparation the fresh prompt and generic spawn context after creating an absolute session directory', async () => {
+      const task = makeTask();
+      const expectedPrompt = buildTaskXml({ title: task.title, description: task.description });
+      const cleanup = { dispose: vi.fn() };
+      const prepare = vi.fn(() => ({ cleanup }));
+      prepareInitialPrompt = prepare;
+      const { engine, terminalSubmitScheduler } = makeEngine({});
+
+      await engine.resumeSuspendedSession(
+        task as Parameters<typeof engine.resumeSuspendedSession>[0],
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { model: 'anthropic/claude-sonnet' },
+      );
+
+      expect(prepare).toHaveBeenCalledOnce();
+      const preparationInput = prepare.mock.calls[0][0];
+      expect(preparationInput).toMatchObject({
+        prompt: expectedPrompt,
+        resume: false,
+        model: 'anthropic/claude-sonnet',
+        permissionMode: 'default',
+      });
+      expect(path.isAbsolute(preparationInput.sessionDirectory)).toBe(true);
+      expect(preparationInput.sessionDirectory).toMatch(/[\\/]some[\\/]project[\\/]\.kangentic[\\/]sessions[\\/]/);
+      expect(preparationInput).not.toHaveProperty('sessionId');
+      expect(vi.mocked(fs.mkdirSync).mock.invocationCallOrder[0]).toBeLessThan(
+        prepare.mock.invocationCallOrder[0],
+      );
+      expect(terminalSubmitScheduler.scheduleContent).not.toHaveBeenCalled();
+    });
+
+    it('gives an adapter preparation the current resume prompt and native session ID', async () => {
+      const sessionRepo = makeSessionRepo();
+      sessionRepo.getLatestForTaskByTypeAndIsolation.mockReturnValue({
+        id: 'old-record',
+        agent_session_id: 'native-session-id',
+        session_type: 'claude_agent',
+        status: 'suspended',
+        cwd: '/some/project',
+      });
+      const prepare = vi.fn(() => ({}));
+      prepareInitialPrompt = prepare;
+      const { engine, terminalSubmitScheduler } = makeEngine({ sessionRepo });
+
+      await engine.resumeSuspendedSession(
+        makeTask() as Parameters<typeof engine.resumeSuspendedSession>[0],
+        undefined,
+        undefined,
+        'resume only this step',
+      );
+
+      expect(prepare).toHaveBeenCalledWith(expect.objectContaining({
+        prompt: 'resume only this step',
+        resume: true,
+        sessionId: 'native-session-id',
+        permissionMode: 'default',
+      }));
+      expect(terminalSubmitScheduler.scheduleContent).not.toHaveBeenCalled();
+    });
+
+    it('does not prepare a promptless resume', async () => {
+      const sessionRepo = makeSessionRepo();
+      sessionRepo.getLatestForTaskByTypeAndIsolation.mockReturnValue({
+        id: 'old-record',
+        agent_session_id: 'native-session-id',
+        session_type: 'claude_agent',
+        status: 'suspended',
+        cwd: '/some/project',
+      });
+      const prepare = vi.fn(() => ({}));
+      prepareInitialPrompt = prepare;
+      const { engine, terminalSubmitScheduler } = makeEngine({ sessionRepo });
+
+      await engine.resumeSuspendedSession(
+        makeTask() as Parameters<typeof engine.resumeSuspendedSession>[0],
+        undefined,
+        true,
+      );
+
+      expect(prepare).not.toHaveBeenCalled();
+      expect(mockAdapter.buildCommand).toHaveBeenCalledWith(expect.objectContaining({
+        prompt: undefined,
+        resume: true,
+        sessionId: 'native-session-id',
+      }));
+      expect(terminalSubmitScheduler.scheduleContent).not.toHaveBeenCalled();
+    });
+
+    it('passes only the preparation commandPrompt to both command and environment builders', async () => {
+      const prepare = vi.fn(() => ({ commandPrompt: 'prepared-command-prompt' }));
+      prepareInitialPrompt = prepare;
+      const { engine } = makeEngine({});
+
+      await engine.resumeSuspendedSession(makeTask() as Parameters<typeof engine.resumeSuspendedSession>[0]);
+
+      const commandOptions = mockAdapter.buildCommand.mock.calls[0][0];
+      const environmentOptions = mockAdapter.buildEnv.mock.calls[0][0];
+      expect(commandOptions.prompt).toBe('prepared-command-prompt');
+      expect(environmentOptions.prompt).toBe('prepared-command-prompt');
+      expect(commandOptions).not.toHaveProperty('adapterManagedPrompt');
+      expect(environmentOptions).not.toHaveProperty('adapterManagedPrompt');
+    });
+
+    it('uses the generated PTY session id as the command hook owner and spawn id', async () => {
+      const { engine, sessionManager } = makeEngine({});
+
+      await engine.resumeSuspendedSession(makeTask() as Parameters<typeof engine.resumeSuspendedSession>[0]);
+
+      const commandOptions = mockAdapter.buildCommand.mock.calls[0]?.[0];
+      const spawnInput = sessionManager.spawn.mock.calls[0]?.[0];
+      expect(commandOptions.hookOwnerId).toEqual(expect.any(String));
+      expect(commandOptions.hookOwnerId).toBe(spawnInput.id);
+    });
+
+    it('rethrows the original getExitSequence error after prep cleanup and hook removal', async () => {
+      const exitSequenceError = new Error('exit sequence failed');
+      const hookError = new Error('hook removal failed');
+      const cleanup = { dispose: vi.fn() };
+      prepareInitialPrompt = vi.fn(() => ({ cleanup }));
+      mockAdapter.getExitSequence.mockImplementationOnce(() => {
+        throw exitSequenceError;
+      });
+      mockAdapter.removeHooks.mockImplementationOnce(() => {
+        throw hookError;
+      });
+      const { engine, sessionManager } = makeEngine({});
+
+      await expect(engine.resumeSuspendedSession(makeTask() as Parameters<typeof engine.resumeSuspendedSession>[0]))
+        .rejects.toBe(exitSequenceError);
+
+      expect(cleanup.dispose).toHaveBeenCalledOnce();
+      expect(mockAdapter.removeHooks).toHaveBeenCalledOnce();
+      expect(mockAdapter.removeHooks).toHaveBeenCalledWith('/some/project', 'task-abc-1', expect.any(String));
+      expect(sessionManager.spawn).not.toHaveBeenCalled();
+    });
+
+    it('merges preparation environment after adapter environment and transfers its cleanup to SessionManager', async () => {
+      const cleanup = { dispose: vi.fn() };
+      prepareInitialPrompt = vi.fn(() => ({
+        env: { PREPARATION_ENV: 'prepared', SHARED_ENV: 'preparation-wins' },
+        cleanup,
+      }));
+      mockAdapter.buildEnv.mockReturnValueOnce({ ADAPTER_ENV: 'adapter', SHARED_ENV: 'adapter-loses' });
+      const sessionManager = makeSessionManager();
+      const { engine } = makeEngine({ sessionManager });
+
+      await engine.resumeSuspendedSession(makeTask() as Parameters<typeof engine.resumeSuspendedSession>[0]);
+
+      expect(sessionManager.spawnedSessions).toEqual([expect.objectContaining({
+        env: {
+          ADAPTER_ENV: 'adapter',
+          PREPARATION_ENV: 'prepared',
+          SHARED_ENV: 'preparation-wins',
+        },
+        spawnCleanup: cleanup,
+      })]);
+      expect(cleanup.dispose).not.toHaveBeenCalled();
+    });
+
+    const commandConstructionError = new Error('command construction failed');
+    const environmentConstructionError = new Error('environment construction failed');
+
+    it.each([
+      ['preparation command construction', commandConstructionError, () => {
+        mockAdapter.buildCommand.mockImplementationOnce(() => {
+          throw commandConstructionError;
+        });
+      }],
+      ['preparation environment construction', environmentConstructionError, () => {
+        mockAdapter.buildEnv.mockImplementationOnce(() => {
+          throw environmentConstructionError;
+        });
+      }],
+    ])('disposes exact preparation cleanup when %s fails before SessionManager ownership', async (
+      _caseName,
+      expectedError,
+      arrangeFailure,
+    ) => {
+      const cleanup = { dispose: vi.fn() };
+      prepareInitialPrompt = vi.fn(() => ({ cleanup }));
+      arrangeFailure();
+      const { engine, sessionManager } = makeEngine({});
+      let rejection: unknown;
+
+      try {
+        await engine.resumeSuspendedSession(makeTask() as Parameters<typeof engine.resumeSuspendedSession>[0]);
+      } catch (error) {
+        rejection = error;
+      }
+
+      expect(rejection).toBe(expectedError);
+      expect(cleanup.dispose).toHaveBeenCalledOnce();
+      expect(mockAdapter.removeHooks).toHaveBeenCalledOnce();
+      const commandOptions = mockAdapter.buildCommand.mock.calls[0]?.[0];
+      expect(commandOptions.hookOwnerId).toEqual(expect.any(String));
+      expect(mockAdapter.removeHooks).toHaveBeenCalledWith(
+        '/some/project',
+        'task-abc-1',
+        commandOptions.hookOwnerId,
+      );
+      expect(sessionManager.spawn).not.toHaveBeenCalled();
+    });
+
+    it('disposes exact preparation cleanup when an abort arrives before SessionManager ownership', async () => {
+      const cleanup = { dispose: vi.fn() };
+      prepareInitialPrompt = vi.fn(() => ({ cleanup }));
+      const controller = new AbortController();
+      mockAdapter.buildEnv.mockImplementationOnce(() => {
+        controller.abort();
+        return null;
+      });
+      const { engine, sessionManager } = makeEngine({});
+
+      await expect(engine.resumeSuspendedSession(
+        makeTask() as Parameters<typeof engine.resumeSuspendedSession>[0],
+        undefined,
+        undefined,
+        undefined,
+        controller.signal,
+      )).rejects.toThrow();
+
+      expect(cleanup.dispose).toHaveBeenCalledOnce();
+      expect(sessionManager.spawn).not.toHaveBeenCalled();
+    });
+
+    it('does not perform local cleanup after SessionManager.spawn rejects', async () => {
+      const cleanup = { dispose: vi.fn() };
+      prepareInitialPrompt = vi.fn(() => ({ cleanup }));
+      const spawnError = new Error('spawn rejected');
+      const sessionManager = makeSessionManager();
+      sessionManager.spawn.mockRejectedValueOnce(spawnError);
+      const { engine } = makeEngine({ sessionManager });
+
+      await expect(engine.resumeSuspendedSession(makeTask() as Parameters<typeof engine.resumeSuspendedSession>[0]))
+        .rejects.toBe(spawnError);
+
+      expect(cleanup.dispose).not.toHaveBeenCalled();
+      expect(mockAdapter.removeHooks).not.toHaveBeenCalled();
+    });
+
+    it('rethrows the original build error when preparation cleanup also throws', async () => {
+      const cleanupError = new Error('cleanup failed');
+      const cleanup = { dispose: vi.fn(() => { throw cleanupError; }) };
+      prepareInitialPrompt = vi.fn(() => ({ cleanup }));
+      mockAdapter.buildCommand.mockImplementationOnce(() => {
+        throw originalBuilderError;
+      });
+      const { engine, sessionManager } = makeEngine({});
+
+      await expect(engine.resumeSuspendedSession(makeTask() as Parameters<typeof engine.resumeSuspendedSession>[0]))
+        .rejects.toBe(originalBuilderError);
+
+      expect(cleanup.dispose).toHaveBeenCalledOnce();
+      expect(mockAdapter.removeHooks).toHaveBeenCalledOnce();
+      const commandOptions = mockAdapter.buildCommand.mock.calls[0]?.[0];
+      expect(commandOptions.hookOwnerId).toEqual(expect.any(String));
+      expect(mockAdapter.removeHooks).toHaveBeenCalledWith(
+        '/some/project',
+        'task-abc-1',
+        commandOptions.hookOwnerId,
+      );
+      expect(sessionManager.spawn).not.toHaveBeenCalled();
+    });
   });
-});
 
 describe('TransitionEngine - raw/sanitized description split', () => {
   beforeEach(() => {

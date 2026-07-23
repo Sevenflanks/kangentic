@@ -1,11 +1,11 @@
-import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
+import { describe, expect, it } from 'vitest';
 import {
   extractSessionEvent,
   extractToolDetail,
-  extractToolStartEvent,
   extractToolEndEvent,
+  extractToolStartEvent,
 } from '../../src/main/agent/adapters/opencode/plugin/kangentic-activity.mjs';
 
 const fixturePath = path.join(__dirname, '..', 'fixtures', 'opencode-plugin-events.json');
@@ -53,7 +53,6 @@ describe('opencode-plugin', () => {
       const event = { type: 'session.created', properties: {} };
       const result = extractSessionEvent(event, FIXED_TIMESTAMP);
 
-      // No sessionID anywhere -> session_start without hookContext
       expect(result).toEqual({ ts: FIXED_TIMESTAMP, type: 'session_start' });
     });
 

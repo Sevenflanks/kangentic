@@ -7,8 +7,21 @@ import { buildHooks, removeHooks } from '../../src/main/agent/adapters/opencode'
 
 let projectDir: string;
 
-function pluginPath(): string {
-  return path.join(projectDir, '.opencode', 'plugins', 'kangentic-activity.mjs');
+function pluginPath(directory = projectDir): string {
+  return path.join(directory, '.opencode', 'plugins', 'kangentic-activity.mjs');
+}
+
+function sourcePluginPath(): string {
+  return path.join(
+    process.cwd(),
+    'src',
+    'main',
+    'agent',
+    'adapters',
+    'opencode',
+    'plugin',
+    'kangentic-activity.mjs',
+  );
 }
 
 beforeEach(() => {
@@ -38,31 +51,30 @@ describe('opencode-hook-manager', () => {
     it('plugin source matches the resolved source file byte-for-byte', () => {
       buildHooks(projectDir);
 
-      const sourceFile = path.join(
-        process.cwd(),
-        'src',
-        'main',
-        'agent',
-        'adapters',
-        'opencode',
-        'plugin',
-        'kangentic-activity.mjs',
-      );
-      const sourceBytes = fs.readFileSync(sourceFile);
+      const sourceBytes = fs.readFileSync(sourcePluginPath());
       const installedBytes = fs.readFileSync(pluginPath());
       expect(installedBytes.equals(sourceBytes)).toBe(true);
     });
 
     it('is idempotent on repeated calls', () => {
-      buildHooks(projectDir);
-      const firstMtime = fs.statSync(pluginPath()).mtimeMs;
+      const copyFileSpy = vi.spyOn(fs, 'copyFileSync');
+      try {
+        buildHooks(projectDir);
+        const firstMtime = fs.statSync(pluginPath()).mtimeMs;
+        const firstContents = fs.readFileSync(pluginPath());
+        expect(copyFileSpy).toHaveBeenCalledOnce();
+        copyFileSpy.mockClear();
 
-      buildHooks(projectDir);
-      const secondMtime = fs.statSync(pluginPath()).mtimeMs;
+        buildHooks(projectDir);
+        const secondMtime = fs.statSync(pluginPath()).mtimeMs;
+        const secondContents = fs.readFileSync(pluginPath());
 
-      // The skip-when-identical guard means the file should not be
-      // overwritten on a no-op build.
-      expect(secondMtime).toBe(firstMtime);
+        expect(copyFileSpy).not.toHaveBeenCalled();
+        expect(secondContents.equals(firstContents)).toBe(true);
+        expect(secondMtime).toBe(firstMtime);
+      } finally {
+        copyFileSpy.mockRestore();
+      }
     });
 
     it('overwrites a stale plugin file with different contents', () => {
@@ -75,6 +87,131 @@ describe('opencode-hook-manager', () => {
       const contents = fs.readFileSync(pluginPath(), 'utf-8');
       expect(contents).not.toContain('outdated stub');
       expect(contents).toContain('export const KangenticActivity');
+      expect(fs.readFileSync(pluginPath()).equals(fs.readFileSync(sourcePluginPath()))).toBe(true);
+    });
+
+    it('fails without recreating a missing cwd', () => {
+      const missingCwd = path.join(projectDir, 'missing-cwd');
+
+      expect(() => buildHooks(missingCwd)).toThrow();
+      expect(fs.existsSync(missingCwd)).toBe(false);
+    });
+
+    it('fails without changing a file-valued cwd', () => {
+      const fileCwd = path.join(projectDir, 'cwd-file');
+      const originalBytes = Buffer.from('foreign cwd bytes');
+      fs.writeFileSync(fileCwd, originalBytes);
+
+      expect(() => buildHooks(fileCwd)).toThrow();
+      expect(fs.statSync(fileCwd).isFile()).toBe(true);
+      expect(fs.readFileSync(fileCwd).equals(originalBytes)).toBe(true);
+    });
+
+    it('creates only the .opencode and plugins children non-recursively', () => {
+      const mkdirSpy = vi.spyOn(fs, 'mkdirSync');
+
+      try {
+        buildHooks(projectDir);
+        expect(mkdirSpy.mock.calls).toEqual([
+          [path.join(projectDir, '.opencode')],
+          [path.join(projectDir, '.opencode', 'plugins')],
+        ]);
+      } finally {
+        mkdirSpy.mockRestore();
+      }
+    });
+
+    it.each([
+      ['.opencode', path.join('.opencode')],
+      ['plugins', path.join('.opencode', 'plugins')],
+    ])('accepts EEXIST only when the %s child is a directory', (_caseName, childPath) => {
+      const conflictPath = path.join(projectDir, childPath);
+      const parent = path.dirname(conflictPath);
+      if (parent !== projectDir) fs.mkdirSync(parent);
+      const originalBytes = Buffer.from('foreign child bytes');
+      fs.writeFileSync(conflictPath, originalBytes);
+
+      expect(() => buildHooks(projectDir)).toThrow();
+      expect(fs.statSync(conflictPath).isFile()).toBe(true);
+      expect(fs.readFileSync(conflictPath).equals(originalBytes)).toBe(true);
+    });
+
+    it('fails without recreating cwd when it disappears before child creation', () => {
+      const cwd = path.join(projectDir, 'vanishing-cwd');
+      fs.mkdirSync(cwd);
+      const mkdirSync = fs.mkdirSync.bind(fs);
+      let removed = false;
+      const mkdirSpy = vi.spyOn(fs, 'mkdirSync').mockImplementation((target, options) => {
+        if (!removed) {
+          removed = true;
+          fs.rmSync(cwd, { recursive: true, force: true });
+        }
+        return mkdirSync(target, options);
+      });
+
+      try {
+        expect(() => buildHooks(cwd)).toThrow();
+        expect(fs.existsSync(cwd)).toBe(false);
+      } finally {
+        mkdirSpy.mockRestore();
+      }
+    });
+
+    it('fails without changing a foreign destination file', () => {
+      const targetDir = path.dirname(pluginPath());
+      const foreignBytes = Buffer.from('// foreign plugin\nexport default {};\n');
+      fs.mkdirSync(targetDir, { recursive: true });
+      fs.writeFileSync(pluginPath(), foreignBytes);
+
+      expect(() => buildHooks(projectDir)).toThrow();
+      expect(fs.readFileSync(pluginPath()).equals(foreignBytes)).toBe(true);
+    });
+
+    it('propagates an unreadable destination without changing its bytes', () => {
+      const targetDir = path.dirname(pluginPath());
+      const foreignBytes = Buffer.from('// foreign unreadable plugin\n');
+      fs.mkdirSync(targetDir, { recursive: true });
+      fs.writeFileSync(pluginPath(), foreignBytes);
+      const readError = Object.assign(new Error('permission denied'), { code: 'EACCES' });
+      const sourceBytes = fs.readFileSync(sourcePluginPath());
+      const readSpy = vi.spyOn(fs, 'readFileSync')
+        .mockReturnValueOnce(sourceBytes)
+        .mockImplementationOnce(() => {
+          throw readError;
+        });
+
+      try {
+        expect(() => buildHooks(projectDir)).toThrow(readError);
+      } finally {
+        readSpy.mockRestore();
+      }
+      expect(fs.readFileSync(pluginPath()).equals(foreignBytes)).toBe(true);
+    });
+
+    it('throws when the packaged plugin source is missing', () => {
+      const existsSync = fs.existsSync.bind(fs);
+      const existsSpy = vi.spyOn(fs, 'existsSync').mockImplementation((file) => (
+        String(file).endsWith('kangentic-activity.mjs') ? false : existsSync(file)
+      ));
+
+      try {
+        expect(() => buildHooks(projectDir)).toThrow('Required OpenCode plugin source not found');
+      } finally {
+        existsSpy.mockRestore();
+      }
+    });
+
+    it('propagates plugin directory creation failures', () => {
+      const mkdirError = Object.assign(new Error('permission denied'), { code: 'EACCES' });
+      const mkdirSpy = vi.spyOn(fs, 'mkdirSync').mockImplementationOnce(() => {
+        throw mkdirError;
+      });
+
+      try {
+        expect(() => buildHooks(projectDir)).toThrow(mkdirError);
+      } finally {
+        mkdirSpy.mockRestore();
+      }
     });
   });
 
@@ -213,7 +350,31 @@ describe('opencode-hook-manager', () => {
       expect(occurrences).toHaveLength(1);
     });
 
-    it('does not write a .gitignore entry when copyFileSync fails', () => {
+    it.each(['readFileSync', 'writeFileSync'] as const)(
+      'keeps successful plugin installation when .gitignore %s fails',
+      (operation) => {
+        initGitRepo();
+        const gitignoreError = Object.assign(new Error('permission denied'), { code: 'EACCES' });
+        const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+        const fsSpy = operation === 'readFileSync'
+          ? vi.spyOn(fs, 'readFileSync').mockImplementationOnce(() => {
+              throw gitignoreError;
+            })
+          : vi.spyOn(fs, 'writeFileSync').mockImplementationOnce(() => {
+              throw gitignoreError;
+            });
+
+        try {
+          expect(() => buildHooks(projectDir)).not.toThrow();
+          expect(fs.existsSync(pluginPath())).toBe(true);
+        } finally {
+          fsSpy.mockRestore();
+          warnSpy.mockRestore();
+        }
+      },
+    );
+
+    it('propagates copyFileSync failure without writing a .gitignore entry', () => {
       // This test protects the ordering invariant that is the heart of the
       // "stop appending opencode" fix: ensurePluginGitignored is only called
       // when fs.existsSync(destinationFile) is true AFTER the copy attempt.
@@ -222,23 +383,21 @@ describe('opencode-hook-manager', () => {
       // add an entry pointing to a non-existent file.
       initGitRepo();
 
-      const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+      const copyError = Object.assign(new Error('permission denied'), { code: 'EACCES' });
       const copyFileSpy = vi.spyOn(fs, 'copyFileSync').mockImplementationOnce(() => {
-        throw new Error('EACCES: permission denied, open ...');
+        throw copyError;
       });
 
-      buildHooks(projectDir);
+      try {
+        expect(() => buildHooks(projectDir)).toThrow(copyError);
+      } finally {
+        copyFileSpy.mockRestore();
+      }
 
-      // Assert before restoring spies: mockRestore() resets call history.
       // The plugin file must not exist because the copy threw.
       expect(fs.existsSync(pluginPath())).toBe(false);
       // The gitignore entry must not have been written.
       expect(fs.existsSync(gitignorePath())).toBe(false);
-      // The copy failure must have been logged via console.error.
-      expect(errorSpy).toHaveBeenCalledOnce();
-
-      copyFileSpy.mockRestore();
-      errorSpy.mockRestore();
     });
   });
 });

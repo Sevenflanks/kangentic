@@ -39,6 +39,10 @@ const sessionRepoGetInterruptedExited = vi.fn(() => [] as SessionRecord[]);
 const sessionRepoMarkAllRunningAsOrphaned = vi.fn();
 const sessionRepoMarkRunningAsOrphanedExcluding = vi.fn();
 const sessionRepoInsert = vi.fn();
+const removeAdapterHooksMock = vi.fn();
+const { isShuttingDownMock } = vi.hoisted(() => ({
+  isShuttingDownMock: vi.fn(() => false),
+}));
 
 // The in-memory "DB" the resume-decision lookup reads from. Populated per-test
 // with every record the repo knows about; getLatestForTaskByTypeAndIsolation
@@ -78,7 +82,11 @@ vi.mock('../../src/main/db/database', () => ({
 }));
 
 vi.mock('../../src/main/shutdown-state', () => ({
-  isShuttingDown: vi.fn(() => false),
+  isShuttingDown: isShuttingDownMock,
+}));
+
+vi.mock('../../src/main/pty/lifecycle/adapter-lifecycle', () => ({
+  removeAdapterHooks: (...args: unknown[]) => removeAdapterHooksMock(...args),
 }));
 
 const markRecordSuspendedMock = vi.fn(() => true);
@@ -238,11 +246,12 @@ function makeConfigManager(autoResumeSessionsOnRestart = true) {
 
 /** prepareAgentSpawn that echoes the resume agent_session_id back through the
  *  spawn input, so spawn() receives the ORIGINAL id when resuming. */
-function wirePrepareAgentSpawnEcho() {
+function wirePrepareAgentSpawnEcho(getExitSequence = () => ['\x03']) {
+  const adapter = { name: 'claude', getExitSequence };
   vi.mocked(prepareAgentSpawn).mockImplementation(async (input) => ({
     ok: true,
     data: {
-      adapter: { name: 'claude', getExitSequence: () => ['\x03'] } as never,
+      adapter: adapter as never,
       agent: 'claude',
       command: `claude --resume ${input.resume?.agentSessionId ?? 'FRESH'}`,
       cwd: input.cwd,
@@ -254,6 +263,7 @@ function wirePrepareAgentSpawnEcho() {
       extraEnv: null,
     },
   }));
+  return adapter;
 }
 
 beforeEach(() => {
@@ -269,6 +279,9 @@ beforeEach(() => {
   sessionRepoMarkAllRunningAsOrphaned.mockClear();
   sessionRepoMarkRunningAsOrphanedExcluding.mockClear();
   sessionRepoInsert.mockClear();
+  removeAdapterHooksMock.mockClear();
+  isShuttingDownMock.mockReset();
+  isShuttingDownMock.mockReturnValue(false);
   taskRepoList.mockClear();
   taskRepoList.mockReturnValue([]);
   taskRepoUpdateMock.mockClear();
@@ -498,5 +511,103 @@ describe('resumeSuspendedSessions: OS-killed (interrupted-exited) recovery', () 
     expect(prepareAgentSpawn).toHaveBeenCalledTimes(1);
     expect(sessionManager.spawn).toHaveBeenCalledTimes(1);
     expect(sessionManager.spawn.mock.calls[0][0].agentSessionId).toBe('agent-orphan');
+  });
+
+  it('releases the prepared hook owner when shutdown begins before the resume spawn pass', async () => {
+    const record = makeExitedRecord();
+    sessionRepoGetInterruptedExited.mockReturnValue([record]);
+    dbRecords = [record];
+    taskRepoList.mockReturnValue([makeTask()]);
+    const adapter = wirePrepareAgentSpawnEcho();
+    isShuttingDownMock
+      .mockReturnValueOnce(false)
+      .mockReturnValueOnce(true);
+
+    const sessionManager = makeSessionManager();
+    await resumeSuspendedSessions(
+      'proj-1',
+      '/project',
+      sessionManager as never,
+      makeConfigManager(true) as never,
+    );
+
+    expect(sessionManager.spawn).not.toHaveBeenCalled();
+    expect(removeAdapterHooksMock).toHaveBeenCalledTimes(1);
+    expect(removeAdapterHooksMock).toHaveBeenCalledWith({
+      id: 'new-task-1',
+      taskId: 'task-1',
+      cwd: '/project/cwd',
+      agentParser: adapter,
+    });
+  });
+
+  it('releases the prepared hook owner when exit-sequence evaluation throws before resume spawn invocation', async () => {
+    const record = makeExitedRecord();
+    const exitSequenceError = new Error('exit sequence unavailable');
+    sessionRepoGetInterruptedExited.mockReturnValue([record]);
+    dbRecords = [record];
+    taskRepoList.mockReturnValue([makeTask()]);
+    const adapter = wirePrepareAgentSpawnEcho(() => {
+      throw exitSequenceError;
+    });
+
+    const sessionManager = makeSessionManager();
+    await resumeSuspendedSessions(
+      'proj-1',
+      '/project',
+      sessionManager as never,
+      makeConfigManager(true) as never,
+    );
+
+    expect(sessionManager.spawn).not.toHaveBeenCalled();
+    expect(removeAdapterHooksMock).toHaveBeenCalledTimes(1);
+    expect(removeAdapterHooksMock).toHaveBeenCalledWith({
+      id: 'new-task-1',
+      taskId: 'task-1',
+      cwd: '/project/cwd',
+      agentParser: adapter,
+    });
+    expect(retireRecordMock).toHaveBeenCalledWith(expect.anything(), 'rec-1');
+  });
+
+  it('leaves hook cleanup to SessionManager after resume spawn invocation rejects', async () => {
+    const record = makeExitedRecord();
+    sessionRepoGetInterruptedExited.mockReturnValue([record]);
+    dbRecords = [record];
+    taskRepoList.mockReturnValue([makeTask()]);
+    const adapter = wirePrepareAgentSpawnEcho();
+    const sessionManager = makeSessionManager();
+    const spawnError = new Error('spawn failed');
+    sessionManager.spawn.mockImplementationOnce(async (input: {
+      id: string;
+      taskId: string;
+      cwd: string;
+      agentParser: unknown;
+    }) => {
+      removeAdapterHooksMock({
+        id: input.id,
+        taskId: input.taskId,
+        cwd: input.cwd,
+        agentParser: input.agentParser,
+      });
+      throw spawnError;
+    });
+
+    await resumeSuspendedSessions(
+      'proj-1',
+      '/project',
+      sessionManager as never,
+      makeConfigManager(true) as never,
+    );
+
+    expect(sessionManager.spawn).toHaveBeenCalledOnce();
+    expect(removeAdapterHooksMock).toHaveBeenCalledTimes(1);
+    expect(removeAdapterHooksMock).toHaveBeenCalledWith({
+      id: 'new-task-1',
+      taskId: 'task-1',
+      cwd: '/project/cwd',
+      agentParser: adapter,
+    });
+    expect(retireRecordMock).toHaveBeenCalledWith(expect.anything(), 'rec-1');
   });
 });

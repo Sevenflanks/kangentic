@@ -58,8 +58,9 @@ describe('OpenCode Adapter', () => {
       expect(adapter.supportsCallerSessionId).toBe(false);
     });
 
-    it('declares terminal submission for the initial prompt', () => {
-      expect(adapter.initialPromptDelivery).toBe('terminal-submit');
+    it('owns initial prompt preparation without a special delivery mode', () => {
+      expect(adapter.initialPromptDelivery).toBeUndefined();
+      expect(adapter.prepareInitialPrompt).toBeTypeOf('function');
     });
 
     it('declares only OpenCode-native permission options (Plan and Build)', () => {
@@ -493,6 +494,214 @@ describe('OpenCode Adapter', () => {
     });
   });
 
+  describe('prepareInitialPrompt', () => {
+    let projectDir: string;
+
+    beforeEach(() => {
+      projectDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kangentic-opencode-payload-'));
+    });
+
+    afterEach(() => {
+      fs.rmSync(projectDir, { recursive: true, force: true });
+    });
+
+    function freshPreparationInput(overrides: Record<string, unknown> = {}) {
+      return {
+        prompt: 'adapter-owned prompt',
+        sessionDirectory: projectDir,
+        resume: false,
+        permissionMode: 'default' as PermissionMode,
+        ...overrides,
+      };
+    }
+
+    function payloadPathFrom(env: Record<string, string> | undefined): string {
+      const sourcePath = env?.KANGENTIC_OPENCODE_INITIAL_PROMPT_PATH;
+      expect(sourcePath).toEqual(expect.any(String));
+      if (typeof sourcePath !== 'string') throw new TypeError('Missing initial prompt payload path');
+      return sourcePath;
+    }
+
+    it('writes a private exclusive fresh payload and keeps its prompt out of command and environment values', () => {
+      const writeFileSync = vi.spyOn(fs, 'writeFileSync');
+      const chmodSync = vi.spyOn(fs, 'chmodSync');
+      const preparation = adapter.prepareInitialPrompt(freshPreparationInput({
+        permissionMode: 'plan',
+        model: 'anthropic/claude-sonnet',
+      }));
+      const sourcePath = payloadPathFrom(preparation.env);
+      const command = adapter.buildCommand(makeOptions({ prompt: preparation.commandPrompt }));
+      const env = {
+        ...(adapter.buildEnv(makeOptions({ mcpServerEnabled: false })) ?? {}),
+        ...(preparation.env ?? {}),
+      };
+
+      expect(path.isAbsolute(sourcePath)).toBe(true);
+      expect(command).not.toContain('adapter-owned prompt');
+      expect(command).not.toContain('--prompt');
+      expect(Object.values(env).join('\0')).not.toContain('adapter-owned prompt');
+      expect(JSON.parse(fs.readFileSync(sourcePath, 'utf8'))).toEqual({
+        version: 1,
+        mode: 'fresh',
+        prompt: 'adapter-owned prompt',
+        agent: 'plan',
+        model: { providerID: 'anthropic', modelID: 'claude-sonnet' },
+      });
+      expect(writeFileSync).toHaveBeenCalledWith(
+        sourcePath,
+        expect.any(String),
+        expect.objectContaining({ encoding: 'utf8', flag: 'wx', mode: 0o600 }),
+      );
+      expect(chmodSync).not.toHaveBeenCalled();
+    });
+
+    it('writes a resume payload with only the native session ID and current prompt', () => {
+      const preparation = adapter.prepareInitialPrompt({
+        prompt: 'resume prompt',
+        sessionDirectory: projectDir,
+        resume: true,
+        sessionId: 'ses_resume_123',
+        permissionMode: 'plan',
+        model: 'anthropic/claude-sonnet',
+      });
+      const sourcePath = payloadPathFrom(preparation.env);
+
+      expect(JSON.parse(fs.readFileSync(sourcePath, 'utf8'))).toEqual({
+        version: 1,
+        mode: 'resume',
+        prompt: 'resume prompt',
+        sessionId: 'ses_resume_123',
+      });
+    });
+
+    it('fails exclusively when a session payload source already exists', () => {
+      const input = freshPreparationInput();
+      adapter.prepareInitialPrompt(input);
+
+      expect(() => adapter.prepareInitialPrompt(input)).toThrowError(expect.objectContaining({ code: 'EEXIST' }));
+    });
+
+    it('returns the prompt-path environment independently from MCP environment', () => {
+      const preparation = adapter.prepareInitialPrompt(freshPreparationInput());
+      const mcpEnv = adapter.buildEnv(makeOptions({
+        mcpServerEnabled: true,
+        mcpServerUrl: 'http://127.0.0.1:51234/mcp/project',
+        mcpServerToken: 'token-deadbeef',
+      }));
+      expect(preparation.env).toHaveProperty('KANGENTIC_OPENCODE_INITIAL_PROMPT_PATH');
+      expect(mcpEnv).toHaveProperty('OPENCODE_CONFIG_CONTENT');
+
+      const secondProjectDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kangentic-opencode-payload-disabled-'));
+      try {
+        const disabledPreparation = adapter.prepareInitialPrompt(freshPreparationInput({
+          prompt: 'MCP disabled payload',
+          sessionDirectory: secondProjectDir,
+        }));
+        const disabledMcpEnv = adapter.buildEnv(makeOptions({ mcpServerEnabled: false }));
+        expect(disabledPreparation.env).toEqual({
+          KANGENTIC_OPENCODE_INITIAL_PROMPT_PATH: expect.any(String),
+        });
+        expect(disabledMcpEnv).toBeNull();
+      } finally {
+        fs.rmSync(secondProjectDir, { recursive: true, force: true });
+      }
+    });
+
+    it('keeps preparation cleanup isolated by session directory for the same task', () => {
+      const firstDirectory = path.join(projectDir, 'first-session');
+      const secondDirectory = path.join(projectDir, 'second-session');
+      fs.mkdirSync(firstDirectory);
+      fs.mkdirSync(secondDirectory);
+      const first = adapter.prepareInitialPrompt(freshPreparationInput({ sessionDirectory: firstDirectory }));
+      const second = adapter.prepareInitialPrompt(freshPreparationInput({ sessionDirectory: secondDirectory }));
+      const firstPath = payloadPathFrom(first.env);
+      const secondPath = payloadPathFrom(second.env);
+      const firstCleanup = first.cleanup;
+      if (!firstCleanup) throw new TypeError('Missing first preparation cleanup');
+
+      firstCleanup.dispose();
+
+      expect(fs.existsSync(firstPath)).toBe(false);
+      expect(fs.existsSync(secondPath)).toBe(true);
+    });
+
+    it('keeps cleanup idempotent and treats a plugin-claimed source as already cleaned', () => {
+      const preparation = adapter.prepareInitialPrompt(freshPreparationInput());
+      const sourcePath = payloadPathFrom(preparation.env);
+      const claimPath = `${sourcePath}.claim-plugin-owned`;
+      fs.renameSync(sourcePath, claimPath);
+      const cleanup = preparation.cleanup;
+      if (!cleanup) throw new TypeError('Missing preparation cleanup');
+
+      expect(() => cleanup.dispose()).not.toThrow();
+      expect(() => cleanup.dispose()).not.toThrow();
+
+      expect(fs.existsSync(claimPath)).toBe(true);
+      expect(fs.existsSync(sourcePath)).toBe(false);
+    });
+
+    it.each([
+      ['ENOENT', 'ENOENT'],
+      ['EPERM', 'EPERM'],
+      ['an arbitrary filesystem error', null],
+    ])('keeps cleanup non-throwing, idempotent, and silent for %s', (caseName, errorCode) => {
+      const secretPrompt = `PROMPT_SECRET_${caseName}_9f3d`;
+      const secretPathSegment = `PATH_SECRET_${caseName}_7a2c`;
+      const secretError = `ERROR_SECRET_${caseName}_4e1b`;
+      const sessionDirectory = path.join(projectDir, secretPathSegment);
+      fs.mkdirSync(sessionDirectory);
+      const preparation = adapter.prepareInitialPrompt(freshPreparationInput({
+        prompt: secretPrompt,
+        sessionDirectory,
+      }));
+      const sourcePath = payloadPathFrom(preparation.env);
+      const cleanup = preparation.cleanup;
+      if (!cleanup) throw new TypeError('Missing preparation cleanup');
+      const unlinkError = errorCode
+        ? Object.assign(new Error(secretError), { code: errorCode })
+        : new Error(secretError);
+      const unlinkSpy = vi.spyOn(fs, 'unlinkSync').mockImplementation((target) => {
+        expect(target).toBe(sourcePath);
+        throw unlinkError;
+      });
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+      const logSpy = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+
+      try {
+        expect(() => cleanup.dispose()).not.toThrow();
+        expect(() => cleanup.dispose()).not.toThrow();
+        expect(unlinkSpy).toHaveBeenCalledOnce();
+        expect(unlinkSpy).toHaveBeenCalledWith(sourcePath);
+        expect(warnSpy).not.toHaveBeenCalled();
+        expect(errorSpy).not.toHaveBeenCalled();
+        expect(logSpy).not.toHaveBeenCalled();
+
+        const renderedConsoleOutput = [warnSpy, errorSpy, logSpy]
+          .flatMap((spy) => spy.mock.calls.flat())
+          .map(String)
+          .join('\n');
+        for (const secret of [secretPrompt, sourcePath, secretError]) {
+          expect(renderedConsoleOutput).not.toContain(secret);
+        }
+      } finally {
+        unlinkSpy.mockRestore();
+        warnSpy.mockRestore();
+        errorSpy.mockRestore();
+        logSpy.mockRestore();
+      }
+    });
+
+    it('does not remove prepared prompt sources through removeHooks', () => {
+      const preparation = adapter.prepareInitialPrompt(freshPreparationInput());
+      const sourcePath = payloadPathFrom(preparation.env);
+
+      adapter.removeHooks(projectDir, 'payload-task');
+
+      expect(fs.existsSync(sourcePath)).toBe(true);
+    });
+  });
+
   describe('locateSessionHistoryFile', () => {
     it('returns null when no session file exists for the given ID', async () => {
       // No real OpenCode install in CI, so the scan finds nothing.
@@ -524,7 +733,7 @@ describe('OpenCodeAdapter - removeHooks refcount deferral', () => {
     return path.join(projectDir, '.opencode', 'plugins', 'kangentic-activity.mjs');
   }
 
-  function makeBuildOptions(taskId: string): SpawnCommandOptions {
+  function makeBuildOptions(taskId: string, hookOwnerId?: string): SpawnCommandOptions {
     return {
       agentPath: '/usr/bin/opencode',
       taskId,
@@ -532,6 +741,7 @@ describe('OpenCodeAdapter - removeHooks refcount deferral', () => {
       projectRoot: projectDir,
       permissionMode: 'default',
       eventsOutputPath: path.join(projectDir, 'events.jsonl'),
+      ...(hookOwnerId ? { hookOwnerId } : {}),
     };
   }
 
@@ -568,6 +778,78 @@ describe('OpenCodeAdapter - removeHooks refcount deferral', () => {
     concurrentAdapter.removeHooks(projectDir, 'task-beta');
     // Last holder released - plugin must be gone.
     expect(fs.existsSync(pluginPath())).toBe(false);
+  });
+
+  it('keeps overlapping same-task spawns until each hook owner releases', () => {
+    concurrentAdapter.buildCommand(makeBuildOptions('task-shared', 'owner-a'));
+    concurrentAdapter.buildCommand(makeBuildOptions('task-shared', 'owner-b'));
+
+    concurrentAdapter.removeHooks(projectDir, 'task-shared', 'owner-a');
+    concurrentAdapter.removeHooks(projectDir, 'task-shared', 'owner-a');
+    expect(fs.existsSync(pluginPath())).toBe(true);
+
+    concurrentAdapter.removeHooks(projectDir, 'task-shared', 'owner-b');
+    expect(fs.existsSync(pluginPath())).toBe(false);
+  });
+
+  it('clears forced-cleanup holders so a later owner can retain and release normally', () => {
+    concurrentAdapter.buildCommand(makeBuildOptions('task-shared', 'owner-a'));
+    concurrentAdapter.buildCommand(makeBuildOptions('task-shared', 'owner-b'));
+
+    concurrentAdapter.removeHooks(projectDir);
+    expect(fs.existsSync(pluginPath())).toBe(false);
+
+    concurrentAdapter.buildCommand(makeBuildOptions('task-successor', 'owner-c'));
+    expect(fs.existsSync(pluginPath())).toBe(true);
+
+    concurrentAdapter.removeHooks(projectDir, 'task-successor', 'owner-c');
+    expect(fs.existsSync(pluginPath())).toBe(false);
+  });
+
+  it('installs, retains, and removes the plugin by the PTY cwd when projectRoot differs', () => {
+    const cwd = path.join(projectDir, 'worktree');
+    const projectRoot = path.join(projectDir, 'main-project');
+    fs.mkdirSync(cwd);
+    fs.mkdirSync(projectRoot);
+    const cwdPluginPath = path.join(cwd, '.opencode', 'plugins', 'kangentic-activity.mjs');
+    const projectRootPluginPath = path.join(projectRoot, '.opencode', 'plugins', 'kangentic-activity.mjs');
+
+    const buildOptions = {
+      ...makeBuildOptions('task-worktree-alpha'),
+      cwd,
+      projectRoot,
+      eventsOutputPath: path.join(cwd, 'events.jsonl'),
+    };
+    concurrentAdapter.buildCommand(buildOptions);
+    concurrentAdapter.buildCommand({ ...buildOptions, taskId: 'task-worktree-beta' });
+
+    expect(fs.existsSync(cwdPluginPath)).toBe(true);
+    expect(fs.existsSync(projectRootPluginPath)).toBe(false);
+
+    concurrentAdapter.removeHooks(cwd, 'task-worktree-alpha');
+    expect(fs.existsSync(cwdPluginPath)).toBe(true);
+
+    concurrentAdapter.removeHooks(cwd, 'task-worktree-beta');
+    expect(fs.existsSync(cwdPluginPath)).toBe(false);
+  });
+
+  it('throws a plugin copy failure before retaining a holder', () => {
+    const copyError = Object.assign(new Error('permission denied'), { code: 'EACCES' });
+    const copyFileSpy = vi.spyOn(fs, 'copyFileSync').mockImplementationOnce(() => {
+      throw copyError;
+    });
+
+    try {
+      expect(() => concurrentAdapter.buildCommand(makeBuildOptions('task-copy-failure')))
+        .toThrow(copyError);
+    } finally {
+      copyFileSpy.mockRestore();
+    }
+
+    concurrentAdapter.buildCommand(makeBuildOptions('task-success'));
+    concurrentAdapter.removeHooks(projectDir, 'task-success');
+    expect(fs.existsSync(pluginPath())).toBe(false);
+    expect(() => concurrentAdapter.removeHooks(projectDir, 'task-copy-failure')).not.toThrow();
   });
 
   it('double removeHooks call for the same taskId is idempotent and does not throw', () => {

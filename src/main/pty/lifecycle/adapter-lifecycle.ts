@@ -6,10 +6,34 @@ import type { AgentParser, SessionAttachment, SessionContext } from '../../../sh
  * declares only the fields these helpers touch.
  */
 export interface AdapterAttachable {
+  id?: string;
   cwd: string;
   taskId: string;
   agentParser?: AgentParser;
   adapterAttachment?: SessionAttachment;
+  hooksRemoved?: boolean;
+}
+
+/** Mutable owner for generic cleanup prepared before a PTY can be spawned. */
+export interface SpawnCleanupOwner {
+  spawnCleanup?: SessionAttachment;
+}
+
+/**
+ * Release generic per-spawn cleanup without involving adapter attachments or
+ * shared hook files. Clear ownership before dispose so repeated terminal paths
+ * and re-entrant cleanup cannot invoke the same handle twice.
+ */
+export function disposeSpawnCleanup(owner: SpawnCleanupOwner): void {
+  const cleanup = owner.spawnCleanup;
+  owner.spawnCleanup = undefined;
+  if (!cleanup) return;
+
+  try {
+    cleanup.dispose();
+  } catch {
+    console.warn('[SessionManager] generic spawn cleanup disposal failed');
+  }
 }
 
 /**
@@ -53,11 +77,18 @@ export function disposeAdapterAttachment(session: AdapterAttachable): void {
  * hooks on exit. Without this they accumulate and the agent executes
  * N copies per event.
  *
- * Adapters key on `taskId`, which means this can be called safely from
- * both suspend() and the PTY exit handler for the same task - the
- * second call is a no-op for shared-file adapters and a no-op via the
- * optional chain for adapters that don't implement removeHooks.
+ * The session id is the opaque owner identity, so the same instance can
+ * safely release from both suspend() and its later PTY exit handler.
+ * Without it, cleanup would fall back to taskId and could release another
+ * concurrent spawn's hooks, so this helper does nothing.
  */
 export function removeAdapterHooks(session: AdapterAttachable): void {
-  session.agentParser?.removeHooks?.(session.cwd, session.taskId);
+  if (session.id === undefined || session.hooksRemoved) return;
+  session.hooksRemoved = true;
+
+  try {
+    session.agentParser?.removeHooks?.(session.cwd, session.taskId, session.id);
+  } catch {
+    console.warn('[SessionManager] adapter hook cleanup failed');
+  }
 }

@@ -54,6 +54,8 @@ export interface AgentInfo {
 export interface CommandOptions {
   cliPath: string;
   taskId: string;
+  /** Opaque identity for this spawn's shared-hook ownership. */
+  hookOwnerId?: string;
   prompt?: string;
   cwd: string;
   permissionMode: PermissionMode;
@@ -76,9 +78,32 @@ export interface CommandOptions {
 }
 
 /** Agent-agnostic spawn options - renames `cliPath` to `agentPath`. */
-export type SpawnCommandOptions = Omit<CommandOptions, 'cliPath'> & { agentPath: string };
+export type SpawnCommandOptions = Omit<CommandOptions, 'cliPath'> & {
+  agentPath: string;
+};
 
 export type InitialPromptDelivery = 'command-argument' | 'terminal-submit';
+
+export type InitialPromptInput = {
+  readonly prompt: string;
+  readonly sessionDirectory: string;
+  readonly permissionMode: PermissionMode;
+  readonly model?: string;
+} & (
+  | {
+      readonly resume: false;
+    }
+  | {
+      readonly resume: true;
+      readonly sessionId: string;
+    }
+);
+
+export interface InitialPromptPreparation {
+  readonly commandPrompt?: string;
+  readonly env?: Record<string, string>;
+  readonly cleanup?: SessionAttachment;
+}
 
 /** Interface that every agent adapter must implement. */
 export interface AgentAdapter {
@@ -144,6 +169,13 @@ export interface AgentAdapter {
   readonly initialPromptDelivery?: InitialPromptDelivery;
 
   /**
+   * Prepare an adapter-owned initial prompt transport after its private session
+   * directory exists. The returned cleanup transfers to SessionManager only
+   * when the PTY spawn is accepted.
+   */
+  prepareInitialPrompt?(input: InitialPromptInput): InitialPromptPreparation;
+
+  /**
    * Build adapter-specific environment variables to inject into the PTY
    * spawn. Returns `null` (or omits the method entirely) when the adapter
    * needs no env injection. Used by adapters whose CLI has no flag-based
@@ -160,14 +192,12 @@ export interface AgentAdapter {
   /**
    * Remove any monitoring hooks injected by this adapter (cleanup).
    *
-   * `taskId` identifies which spawn is releasing its hold on shared hook
-   * state. Adapters that write to a project-shared settings file (Codex,
-   * Gemini) use it for per-task reference counting so concurrent sessions
-   * do not clobber each other's hooks. Double-releases for the same taskId
-   * are idempotent. Adapters that use per-session settings files (Claude)
-   * ignore the parameter.
+   * `taskId` remains the backward-compatible shared-hook key for adapters that
+   * refcount per task. `hookOwnerId` identifies an individual spawn when an
+   * adapter needs concurrent replacements for the same task to retain
+   * independently. Adapters that do not need it ignore the third argument.
    */
-  removeHooks(directory: string, taskId?: string): void;
+  removeHooks(directory: string, taskId?: string, hookOwnerId?: string): void;
 
   /** Clear any cached settings (e.g. after project settings change). */
   clearSettingsCache(): void;

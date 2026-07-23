@@ -45,6 +45,7 @@ describe('killAllSessions', () => {
     return {
       id: 'sess-1',
       taskId: 'task-1',
+      cwd: '/project/cwd',
       pty: { write: vi.fn(), kill: vi.fn() } as unknown as pty.IPty,
       status: 'running',
       startedAt: '2026-01-01T00:00:00Z',
@@ -82,6 +83,48 @@ describe('killAllSessions', () => {
     expect(killPty).toHaveBeenCalledTimes(1);
     expect(dataDisposable.dispose).toHaveBeenCalledTimes(1);
     expect(exitDisposable.dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it('disposes generic spawn cleanup synchronously after clearing its owner field', () => {
+    const session = makeSession();
+    let cleanupCalls = 0;
+    let ownerClearedBeforeDispose = false;
+    const cleanup = {
+      dispose: () => {
+        cleanupCalls++;
+        ownerClearedBeforeDispose = session.spawnCleanup === undefined;
+      },
+    };
+    session.spawnCleanup = cleanup;
+    const { context } = makeContext([session]);
+
+    killAllSessions(context);
+
+    expect(cleanupCalls).toBe(1);
+    expect(ownerClearedBeforeDispose).toBe(true);
+  });
+
+  it('releases adapter hooks with the session identity before synchronous shutdown clears sessions', () => {
+    const removeHooks = vi.fn();
+    const session = Object.assign(makeSession(), {
+      cwd: '/project/cwd',
+      agentParser: { removeHooks },
+    });
+    const { context } = makeContext([session]);
+
+    killAllSessions(context);
+
+    expect(removeHooks).toHaveBeenCalledWith('/project/cwd', 'task-1', 'sess-1');
+  });
+
+  it('keeps synchronous shutdown non-throwing when generic spawn cleanup fails', () => {
+    const session = makeSession({
+      spawnCleanup: { dispose: () => { throw new Error('cleanup failed'); } },
+    });
+    const { context, detachAndDelete } = makeContext([session]);
+
+    expect(() => killAllSessions(context)).not.toThrow();
+    expect(detachAndDelete).toHaveBeenCalledWith('sess-1');
   });
 
   it('is a no-op for a session that never retained disposables', () => {
