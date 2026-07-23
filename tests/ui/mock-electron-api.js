@@ -1457,6 +1457,9 @@
       onLiveDeliveryStatus: function (callback) {
         if (!window.__mockLiveDeliveryStatusListeners) window.__mockLiveDeliveryStatusListeners = [];
         window.__mockLiveDeliveryStatusListeners.push(callback);
+        window.__mockGetLiveDeliveryStatusListenerCount = function () {
+          return (window.__mockLiveDeliveryStatusListeners || []).length;
+        };
         if (!window.__mockFireLiveDeliveryStatus) {
           window.__mockFireLiveDeliveryStatus = function (status) {
             var listeners = (window.__mockLiveDeliveryStatusListeners || []).slice();

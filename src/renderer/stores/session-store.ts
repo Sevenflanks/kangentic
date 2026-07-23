@@ -8,8 +8,30 @@ import { buildSessionByTaskId } from './session-store/session-index';
 import { createTaskChangesPanelSlice } from './session-store/task-changes-panel-slice';
 import { createTransientSessionSlice, transientKey, type TransientSessionEntry } from './session-store/transient-session-slice';
 import { mergeRateLimitSnapshot } from '../utils/rate-limit-window';
+import type { LiveDeliveryStatus } from '../../shared/live-delivery-status';
 
 const MAX_EVENTS_PER_SESSION = 500;
+
+function withoutLiveDeliveryTask(
+  statuses: Record<string, LiveDeliveryStatus>,
+  taskId: string,
+): Record<string, LiveDeliveryStatus> {
+  const { [taskId]: _removed, ...remaining } = statuses;
+  return remaining;
+}
+
+function withoutLiveDeliverySession(
+  statuses: Record<string, LiveDeliveryStatus>,
+  sessionId: string,
+): Record<string, LiveDeliveryStatus> {
+  return Object.fromEntries(
+    Object.entries(statuses).filter(([, status]) => status.sessionId !== sessionId),
+  );
+}
+
+function isSilentLiveDeliveryStatus(status: LiveDeliveryStatus): boolean {
+  return status.state === 'cancelled' && (status.reason === 'superseded' || status.reason === 'shutdown');
+}
 
 /**
  * Reconcile a per-session cache map fetched from main against the
@@ -242,6 +264,7 @@ export const useSessionStore = create<SessionStore>((set, get, api) => ({
   seenIdleSessions: {},
   pendingCommandLabel: preservedPendingCommandLabel,
   spawnProgress: preservedSpawnProgress,
+  liveDeliveryByTaskId: {},
   _pendingOpenTaskId: null,
   _pendingOpenCommandTerminal: false,
   setPendingOpenCommandTerminal: (value) => set({ _pendingOpenCommandTerminal: value }),
@@ -330,6 +353,10 @@ export const useSessionStore = create<SessionStore>((set, get, api) => ({
     const isLive = (s: Session) => s.status === 'running' || s.status === 'queued';
     const liveSessionIds = new Set(mergedSessions.filter(isLive).map((s) => s.id));
     const liveTaskIds = new Set(mergedSessions.filter(isLive).map((s) => s.taskId));
+    const nextLiveDeliveryByTaskId = Object.fromEntries(
+      Object.entries(currentState.liveDeliveryByTaskId).filter(([taskId, status]) =>
+        liveTaskIds.has(taskId) && liveSessionIds.has(status.sessionId)),
+    );
 
     // spawnProgress: reconcile against the queryable main map. Cleared for any
     // task that now has a live session (spawn done) and for any label the main
@@ -417,6 +444,7 @@ export const useSessionStore = create<SessionStore>((set, get, api) => ({
         : currentState.sessionFirstOutput,
       spawnProgress: nextSpawnProgress,
       pendingCommandLabel: nextPendingCommandLabel,
+      liveDeliveryByTaskId: nextLiveDeliveryByTaskId,
     });
 
     // Recover transient session entries after a full page reload. The main
@@ -474,7 +502,11 @@ export const useSessionStore = create<SessionStore>((set, get, api) => ({
       const sessions = s.sessions.map((sess) =>
         sess.id === id ? { ...sess, status: 'exited' as const, exitCode: -1 } : sess
       );
-      return { sessions, _sessionByTaskId: buildSessionByTaskId(sessions) };
+      return {
+        sessions,
+        _sessionByTaskId: buildSessionByTaskId(sessions),
+        liveDeliveryByTaskId: withoutLiveDeliverySession(s.liveDeliveryByTaskId, id),
+      };
     });
   },
 
@@ -482,7 +514,11 @@ export const useSessionStore = create<SessionStore>((set, get, api) => ({
     await window.electronAPI.sessions.reset(taskId, useProjectStore.getState().currentProject?.id ?? null);
     set((s) => {
       const sessions = s.sessions.filter((session) => session.taskId !== taskId);
-      return { sessions, _sessionByTaskId: buildSessionByTaskId(sessions) };
+      return {
+        sessions,
+        _sessionByTaskId: buildSessionByTaskId(sessions),
+        liveDeliveryByTaskId: withoutLiveDeliveryTask(s.liveDeliveryByTaskId, taskId),
+      };
     });
   },
 
@@ -492,7 +528,11 @@ export const useSessionStore = create<SessionStore>((set, get, api) => ({
       const sessions = s.sessions.map((sess) =>
         sess.taskId === taskId ? { ...sess, status: 'suspended' as const } : sess
       );
-      return { sessions, _sessionByTaskId: buildSessionByTaskId(sessions) };
+      return {
+        sessions,
+        _sessionByTaskId: buildSessionByTaskId(sessions),
+        liveDeliveryByTaskId: withoutLiveDeliveryTask(s.liveDeliveryByTaskId, taskId),
+      };
     });
     await window.electronAPI.sessions.suspend(taskId, useProjectStore.getState().currentProject?.id ?? null);
   },
@@ -609,7 +649,17 @@ export const useSessionStore = create<SessionStore>((set, get, api) => ({
       }
       // Clear spawn progress when a real session arrives (progress is done)
       const { [session.taskId]: _removed, ...remainingProgress } = state.spawnProgress;
-      return { sessions, _sessionByTaskId: buildSessionByTaskId(sessions), spawnProgress: remainingProgress };
+      const keepsLiveDelivery = (session.status === 'running' || session.status === 'queued')
+        && state.liveDeliveryByTaskId[session.taskId]?.sessionId === session.id;
+      const liveDeliveryByTaskId = keepsLiveDelivery
+        ? state.liveDeliveryByTaskId
+        : withoutLiveDeliveryTask(state.liveDeliveryByTaskId, session.taskId);
+      return {
+        sessions,
+        _sessionByTaskId: buildSessionByTaskId(sessions),
+        spawnProgress: remainingProgress,
+        liveDeliveryByTaskId,
+      };
     });
   },
 
@@ -618,7 +668,13 @@ export const useSessionStore = create<SessionStore>((set, get, api) => ({
       const sessions = s.sessions.map((sess) =>
         sess.id === id ? { ...sess, ...updates } : sess
       );
-      return { sessions, _sessionByTaskId: buildSessionByTaskId(sessions) };
+      return {
+        sessions,
+        _sessionByTaskId: buildSessionByTaskId(sessions),
+        liveDeliveryByTaskId: updates.status === 'exited' || updates.status === 'suspended'
+          ? withoutLiveDeliverySession(s.liveDeliveryByTaskId, id)
+          : s.liveDeliveryByTaskId,
+      };
     });
   },
 
@@ -748,6 +804,57 @@ export const useSessionStore = create<SessionStore>((set, get, api) => ({
       set((s) => ({ spawnProgress: { ...s.spawnProgress, [taskId]: label } }));
     }
   },
+
+  setLiveDeliveryStatus: (status) => {
+    if (status.projectId !== useProjectStore.getState().currentProject?.id) return;
+    set((state) => {
+      const current = state.liveDeliveryByTaskId[status.taskId];
+      if (
+        current
+        && (current.generation > status.generation
+          || (current.generation === status.generation && current.sessionId !== status.sessionId))
+      ) {
+        return state;
+      }
+      if (isSilentLiveDeliveryStatus(status)) {
+        return { liveDeliveryByTaskId: withoutLiveDeliveryTask(state.liveDeliveryByTaskId, status.taskId) };
+      }
+      return { liveDeliveryByTaskId: { ...state.liveDeliveryByTaskId, [status.taskId]: status } };
+    });
+  },
+
+  clearLiveDeliveryStatusForTask: (taskId) => {
+    set((state) => ({ liveDeliveryByTaskId: withoutLiveDeliveryTask(state.liveDeliveryByTaskId, taskId) }));
+  },
+
+  clearLiveDeliveryStatusesForTasks: (taskIds) => {
+    const taskIdSet = new Set(taskIds);
+    set((state) => ({
+      liveDeliveryByTaskId: Object.fromEntries(
+        Object.entries(state.liveDeliveryByTaskId).filter(([taskId]) => !taskIdSet.has(taskId)),
+      ),
+    }));
+  },
+
+  clearLiveDeliveryStatusForSession: (sessionId) => {
+    set((state) => ({ liveDeliveryByTaskId: withoutLiveDeliverySession(state.liveDeliveryByTaskId, sessionId) }));
+  },
+
+  clearDeliveredLiveDeliveryStatus: (status) => {
+    set((state) => {
+      const current = state.liveDeliveryByTaskId[status.taskId];
+      if (
+        current?.state !== 'delivered'
+        || current.sessionId !== status.sessionId
+        || current.generation !== status.generation
+      ) {
+        return state;
+      }
+      return { liveDeliveryByTaskId: withoutLiveDeliveryTask(state.liveDeliveryByTaskId, status.taskId) };
+    });
+  },
+
+  clearLiveDeliveryStatuses: () => set({ liveDeliveryByTaskId: {} }),
 
   markIdleSessionsSeen: (projectId) => {
     const { sessions, sessionActivity, seenIdleSessions } = get();

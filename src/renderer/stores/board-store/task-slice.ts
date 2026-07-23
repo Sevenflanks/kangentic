@@ -173,6 +173,7 @@ export const createTaskSlice: StateCreator<BoardStore, [], [], TaskSlice> = (set
     // Drop the in-memory record alongside the task. Sessions are NOT restored
     // on rollback - the PTY is gone either way; user can re-spawn if the task
     // pops back.
+    useSessionStore.getState().clearLiveDeliveryStatusForTask(id);
     useSessionStore.setState((s) => ({
       sessions: s.sessions.filter((session) => session.taskId !== id),
     }));
@@ -292,11 +293,12 @@ export const createTaskSlice: StateCreator<BoardStore, [], [], TaskSlice> = (set
 
     const thisGen = ++moveGeneration;
 
-    // If the task is changing columns and the target has an auto_command, set
-    // pendingCommandLabel so the overlay shows the command name instead of
-    // generic "Resuming agent...". Skip within-column reorders.
+    // 活躍 session 的 wait-policy delivery 只可由 LiveDeliveryStatus 顯示固定、
+    // 不含 command 的狀態；fresh/resume 仍沿用既有啟動 overlay。
     const isColumnChange = prevTask?.swimlane_id !== input.targetSwimlaneId;
-    if (isColumnChange && targetLane?.auto_spawn && targetLane.auto_command?.trim()) {
+    const existingSession = useSessionStore.getState()._sessionByTaskId.get(input.taskId);
+    const hasLiveSession = existingSession?.status === 'running' || existingSession?.status === 'queued';
+    if (isColumnChange && !hasLiveSession && targetLane?.auto_spawn && targetLane.auto_command?.trim()) {
       useSessionStore.getState().setPendingCommandLabel(input.taskId, targetLane.auto_command.trim());
     }
 
@@ -314,6 +316,7 @@ export const createTaskSlice: StateCreator<BoardStore, [], [], TaskSlice> = (set
     // spawn disappears the instant the card lands in To Do, without
     // waiting for the backend's clearSpawnProgress push to arrive.
     if (isColumnChange && targetLane?.role === 'todo') {
+      useSessionStore.getState().clearLiveDeliveryStatusForTask(input.taskId);
       useSessionStore.setState((state) => {
         const { [input.taskId]: _removedProgress, ...nextSpawnProgress } = state.spawnProgress;
         const { [input.taskId]: _removedLabel, ...nextPendingCommandLabel } = state.pendingCommandLabel;

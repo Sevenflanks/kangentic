@@ -9,6 +9,7 @@ import type {
 import type { TaskChangesPanelSlice } from './task-changes-panel-slice';
 import type { TransientSessionSlice } from './transient-session-slice';
 import type { RateLimitSnapshot } from '../../utils/rate-limit-window';
+import type { LiveDeliveryStatus } from '../../../shared/live-delivery-status';
 
 /** A one-shot capture of a task's terminal scrollback viewport at the moment
  *  its conversation viewer was opened. See `pendingTuiAnchor` below. */
@@ -123,6 +124,8 @@ export interface CoreSessionSlice {
   pendingCommandLabel: Record<string, string>;
   /** Spawn progress label from main process (e.g. "Fetching latest...") keyed by task ID. */
   spawnProgress: Record<string, string>;
+  /** Ephemeral, project-scoped delivery feedback keyed by task ID. */
+  liveDeliveryByTaskId: Record<string, LiveDeliveryStatus>;
   _pendingOpenTaskId: string | null;
   /** One-shot flag set by notification click for transient (Command Terminal) sessions. */
   _pendingOpenCommandTerminal: boolean;
@@ -182,6 +185,12 @@ export interface CoreSessionSlice {
   setPendingCommandLabel: (taskId: string, label: string) => void;
   clearPendingCommandLabel: (taskId: string) => void;
   setSpawnProgress: (taskId: string, label: string | null) => void;
+  setLiveDeliveryStatus: (status: LiveDeliveryStatus) => void;
+  clearLiveDeliveryStatusForTask: (taskId: string) => void;
+  clearLiveDeliveryStatusesForTasks: (taskIds: readonly string[]) => void;
+  clearLiveDeliveryStatusForSession: (sessionId: string) => void;
+  clearDeliveredLiveDeliveryStatus: (status: LiveDeliveryStatus) => void;
+  clearLiveDeliveryStatuses: () => void;
   markIdleSessionsSeen: (projectId: string) => void;
   markSingleIdleSessionSeen: (sessionId: string) => void;
 

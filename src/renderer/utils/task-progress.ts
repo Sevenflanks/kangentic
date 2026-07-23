@@ -2,6 +2,7 @@ import { useCallback, useMemo } from 'react';
 import { useSessionStore } from '../stores/session-store';
 import { useBoardStore } from '../stores/board-store';
 import type { Session, SessionUsage, ActivityState, SessionDisplayState } from '../../shared/types';
+import type { LiveDeliveryStatus } from '../../shared/live-delivery-status';
 
 // ---------------------------------------------------------------------------
 // Unified task progress derivation
@@ -139,6 +140,42 @@ export function useTaskProgress(taskId: string, sessionId: string | undefined): 
     }),
     [taskSession, usage, activity, spawnProgressLabel],
   );
+}
+
+export function useLiveDeliveryStatus(taskId: string): LiveDeliveryStatus | null {
+  return useSessionStore(
+    useCallback(
+      (state: ReturnType<typeof useSessionStore.getState>) => state.liveDeliveryByTaskId[taskId] ?? null,
+      [taskId],
+    ),
+  );
+}
+
+export function getLiveDeliveryLabel(status: LiveDeliveryStatus): string | null {
+  switch (status.state) {
+    case 'waiting':
+      return 'Waiting for agent input...';
+    case 'sending':
+      return 'Sending lane command...';
+    case 'delivered':
+      return 'Command bytes reached the terminal.';
+    case 'cancelled':
+      switch (status.reason) {
+        case 'user-input':
+          return 'Lane command was not sent because terminal input took priority.';
+        case 'timeout':
+          return 'Lane command was not sent because the agent did not become idle.';
+        case 'session-exit':
+          return 'Lane command was not sent because the session ended or changed.';
+        case 'turn-error':
+          return 'Lane command was not sent because the agent turn failed.';
+        case 'delivery-error':
+          return 'Lane command could not be delivered safely.';
+        case 'superseded':
+        case 'shutdown':
+          return null;
+      }
+  }
 }
 
 // ---------------------------------------------------------------------------
