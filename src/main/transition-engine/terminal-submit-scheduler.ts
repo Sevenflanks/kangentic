@@ -465,7 +465,14 @@ export class TerminalSubmitScheduler {
     this.cancelKeystrokeBurst(taskId, reason);
     if (!this.isTaskMutationCurrent(taskId, mutation)) return;
     const nativeEntry = this.nativeIdle.get(taskId);
-    if (nativeEntry) this.cancelNativeEntry(nativeEntry, reason);
+    if (nativeEntry) {
+      this.cancelNativeEntry(nativeEntry, reason);
+      if (nativeEntry.phase === 'committed'
+        && this.nativeIdle.get(taskId) === nativeEntry
+        && this.isTaskMutationCurrent(taskId, mutation)) {
+        this.taskMutations.set(taskId, nativeEntry.token);
+      }
+    }
   }
 
   private cancelContent(
@@ -536,7 +543,10 @@ export class TerminalSubmitScheduler {
   }
 
   private evaluateNativeEntry(entry: NativeIdleEntry): void {
-    if (!this.isNativeEntryOwned(entry) || entry.terminalStatus || entry.phase !== 'waiting') return;
+    if (!this.acceptingSubmissions
+      || !this.isNativeEntryOwned(entry)
+      || entry.terminalStatus
+      || entry.phase !== 'waiting') return;
     if (this.hasNativeDeadlineElapsed(entry)) {
       this.cancelNativeEntry(entry, 'timeout');
       return;
@@ -581,7 +591,10 @@ export class TerminalSubmitScheduler {
     entry.lease = lease;
     if (!lease) {
       entry.phase = 'waiting';
-      this.cancelNativeEntry(entry, this.classifyNativeAdmissionFailure(entry));
+      const reason = this.hasNativeDeadlineElapsed(entry)
+        ? 'timeout'
+        : this.classifyNativeAdmissionFailure(entry);
+      this.cancelNativeEntry(entry, reason);
       return;
     }
     if (this.hasNativeDeadlineElapsed(entry)) {
@@ -792,7 +805,7 @@ export class TerminalSubmitScheduler {
     };
 
     const startContent = (): void => {
-      if (started || this.content.get(taskId) !== entry) return;
+      if (!this.acceptingSubmissions || started || this.content.get(taskId) !== entry) return;
       started = true;
       // Readiness 結束後仍保留 exit listener；session ownership 必須持續到 submitContent() settle。
       cleanupReadiness();
