@@ -6,6 +6,19 @@ import type { SubmissionLease } from '../../src/main/pty/session-write-coordinat
 import { TerminalSubmitScheduler } from '../../src/main/transition-engine/terminal-submit-scheduler';
 import type { NativeIdleRequest } from '../../src/main/transition-engine/native-idle-waiter';
 
+const PRIVATE_COMMAND = '/private-review-command';
+const PUBLIC_STATUS_KEYS = ['at', 'generation', 'projectId', 'sessionId', 'state', 'taskId'];
+const CANCELLED_STATUS_KEYS = [...PUBLIC_STATUS_KEYS, 'reason'].sort();
+
+function expectPublicStatus(status: object, expectedKeys: readonly string[]): void {
+  expect(Object.keys(status).sort()).toEqual(expectedKeys);
+  expect(status).not.toHaveProperty('command');
+  expect(status).not.toHaveProperty('fingerprint');
+  expect(status).not.toHaveProperty('nativeSessionId');
+  expect(status).not.toHaveProperty('transcript');
+  expect(status).not.toHaveProperty('error');
+}
+
 function deferred() {
   let resolve = (): void => undefined;
   const promise = new Promise<void>((resolvePromise) => { resolve = resolvePromise; });
@@ -114,10 +127,11 @@ describe('TerminalSubmitScheduler native-idle lifecycle', () => {
   it('subscribes before snapshot and sends once across cached/racing duplicate idle notifications', async () => {
     const ready = manager.makeSnapshot({ cleanIdle: { nativeSessionId: 'root-1', occurredAt: 10 } });
     manager.snapshotRace = () => manager.updateSnapshot('s1', ready);
-    scheduler.scheduleNativeIdleSubmission(request()); manager.updateSnapshot('s1', ready); await tick();
+    scheduler.scheduleNativeIdleSubmission(request({ command: PRIVATE_COMMAND })); manager.updateSnapshot('s1', ready); await tick();
     expect(manager.order.slice(0, 2)).toEqual(['subscribe', 'snapshot']); expect(submit.calls).toHaveLength(1);
     const base = { projectId: 'p1', taskId: 't1', sessionId: 's1', generation: 1, at: '2026-07-22T00:00:00.000Z' };
     expect(statuses).toEqual(['waiting', 'sending', 'delivered'].map((state) => ({ ...base, state })));
+    for (const status of statuses) expectPublicStatus(status, PUBLIC_STATUS_KEYS);
     expect(submit.calls[0].options).toMatchObject({ sendCtrlC: false, verifier: null, verifiedPrefixLength: 0 }); expect(submit.calls[0].options.signal).toBeUndefined();
   });
 
@@ -146,8 +160,15 @@ describe('TerminalSubmitScheduler native-idle lifecycle', () => {
   it('reports valid-ready lease ownership conflict as delivery-error without retry', async () => {
     manager.leaseConflict = true;
     manager.updateSnapshot('s1', manager.makeSnapshot({ cleanIdle: { nativeSessionId: 'root-1', occurredAt: 10 } }));
-    scheduler.scheduleNativeIdleSubmission(request()); await tick();
-    expect(statuses.at(-1)).toMatchObject({ state: 'cancelled', reason: 'delivery-error' }); expect(submit.calls).toHaveLength(0);
+    scheduler.scheduleNativeIdleSubmission(request({ command: PRIVATE_COMMAND })); await tick();
+    const base = { projectId: 'p1', taskId: 't1', sessionId: 's1', generation: 1, at: '2026-07-22T00:00:00.000Z' };
+    expect(statuses).toEqual([
+      { ...base, state: 'waiting' },
+      { ...base, state: 'cancelled', reason: 'delivery-error' },
+    ]);
+    expectPublicStatus(statuses[0], PUBLIC_STATUS_KEYS);
+    expectPublicStatus(statuses[1], CANCELLED_STATUS_KEYS);
+    expect(submit.calls).toHaveLength(0);
   });
 
   it.each([
@@ -229,10 +250,16 @@ describe('TerminalSubmitScheduler native-idle lifecycle', () => {
   it('keeps committed delivery through user input and classifies rejection after evidence removal', async () => {
     submit.failure = new Error('private failure');
     manager.updateSnapshot('s1', manager.makeSnapshot({ cleanIdle: { nativeSessionId: 'root-1', occurredAt: 10 } }));
-    scheduler.scheduleNativeIdleSubmission(request());
+    scheduler.scheduleNativeIdleSubmission(request({ command: PRIVATE_COMMAND }));
     manager.updateSnapshot('s1', manager.makeSnapshot({ inputGeneration: 1 })); manager.updateSnapshot('s1', null); await tick();
-    expect(manager.writes).toEqual(['/review', '\x1b', '\r']);
-    expect(statuses.at(-1)).toMatchObject({ state: 'cancelled', reason: 'session-exit' });
+    expect(manager.writes).toEqual([PRIVATE_COMMAND, '\x1b', '\r']);
+    const terminalStatus = statuses.at(-1);
+    expect(terminalStatus).toEqual({
+      projectId: 'p1', taskId: 't1', sessionId: 's1', generation: 1,
+      at: '2026-07-22T00:00:00.000Z', state: 'cancelled', reason: 'session-exit',
+    });
+    if (!terminalStatus) throw new Error('terminal status was not emitted');
+    expectPublicStatus(terminalStatus, CANCELLED_STATUS_KEYS);
     expect(manager.releases).toEqual(['release']);
   });
 

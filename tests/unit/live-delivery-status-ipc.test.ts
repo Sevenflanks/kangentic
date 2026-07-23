@@ -1,9 +1,15 @@
 import { readFileSync } from 'node:fs';
+import { runInNewContext } from 'node:vm';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { LiveDeliveryStatus } from '../../src/shared/live-delivery-status';
 import type { ElectronAPI } from '../../src/shared/types';
 
 type StatusListener = (event: unknown, status: LiveDeliveryStatus) => void;
+type LiveStatusMockWindow = {
+  readonly electronAPI: {
+    readonly sessions: Pick<ElectronAPI['sessions'], 'onLiveDeliveryStatus'>;
+  };
+};
 
 const ipcOn = vi.fn();
 const ipcRemoveListener = vi.fn();
@@ -109,6 +115,26 @@ function requireSchedulerStatusCallback(): (status: LiveDeliveryStatus) => void 
   return schedulerStatusCallback;
 }
 
+function isLiveStatusMockWindow(
+  value: Record<string, unknown>,
+): value is Record<string, unknown> & LiveStatusMockWindow {
+  const electronApi = value.electronAPI;
+  if (typeof electronApi !== 'object' || electronApi === null || !('sessions' in electronApi)) return false;
+  const sessions = electronApi.sessions;
+  return typeof sessions === 'object'
+    && sessions !== null
+    && 'onLiveDeliveryStatus' in sessions
+    && typeof sessions.onLiveDeliveryStatus === 'function';
+}
+
+function requireLiveStatusFire(
+  value: Record<string, unknown>,
+): (status: LiveDeliveryStatus) => void {
+  const fire = value.__mockFireLiveDeliveryStatus;
+  if (typeof fire !== 'function') throw new Error('live status mock fire hook was not installed');
+  return fire;
+}
+
 const cancelledStatus = {
   projectId: 'project-1',
   taskId: 'task-1',
@@ -196,16 +222,40 @@ describe('project-scoped live delivery status IPC', () => {
     );
   });
 
-  it('keeps the channel push-only and the UI mock identity-based without renderer state', () => {
-    const registerAllSource = readFileSync('src/main/ipc/register-all.ts', 'utf8');
-    const preloadSource = readFileSync('src/preload/preload.ts', 'utf8');
+  it('dispatches copied UI mock listeners and removes only the unsubscribed identity', () => {
     const mockSource = readFileSync('tests/ui/mock-electron-api.js', 'utf8');
+    const windowObject: Record<string, unknown> = {};
+    runInNewContext(mockSource, { window: windowObject });
+    if (!isLiveStatusMockWindow(windowObject)) throw new Error('live status mock API was not installed');
 
-    expect(registerAllSource).not.toContain('ipcMain.handle(IPC.SESSION_LIVE_DELIVERY_STATUS');
-    expect(preloadSource).not.toContain('ipcRenderer.invoke(IPC.SESSION_LIVE_DELIVERY_STATUS');
-    expect(mockSource).toContain('window.__mockLiveDeliveryStatusListeners');
-    expect(mockSource).toContain('(window.__mockLiveDeliveryStatusListeners || []).slice()');
-    expect(mockSource).toContain('listeners.indexOf(callback)');
-    expect(mockSource).not.toMatch(/liveDelivery(Status)?(Snapshot|Replay|Cache|Store)/);
+    const firstStatuses: LiveDeliveryStatus[] = [];
+    const secondStatuses: LiveDeliveryStatus[] = [];
+    let unsubscribeFirst = (): void => { throw new Error('first listener was not registered'); };
+    unsubscribeFirst = windowObject.electronAPI.sessions.onLiveDeliveryStatus((status) => {
+      firstStatuses.push(status);
+      unsubscribeFirst();
+    });
+    const unsubscribeSecond = windowObject.electronAPI.sessions.onLiveDeliveryStatus((status) => {
+      secondStatuses.push(status);
+    });
+    const fireLiveStatus = requireLiveStatusFire(windowObject);
+
+    fireLiveStatus(cancelledStatus);
+    expect(firstStatuses).toEqual([cancelledStatus]);
+    expect(secondStatuses).toEqual([cancelledStatus]);
+
+    unsubscribeFirst();
+    const deliveredStatus = {
+      projectId: 'project-1', taskId: 'task-1', sessionId: 'session-1', generation: 3,
+      at: '2026-07-22T00:00:01.000Z', state: 'delivered',
+    } satisfies LiveDeliveryStatus;
+    fireLiveStatus(deliveredStatus);
+    expect(firstStatuses).toEqual([cancelledStatus]);
+    expect(secondStatuses).toEqual([cancelledStatus, deliveredStatus]);
+
+    unsubscribeSecond();
+    unsubscribeSecond();
+    fireLiveStatus(cancelledStatus);
+    expect(secondStatuses).toEqual([cancelledStatus, deliveredStatus]);
   });
 });
