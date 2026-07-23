@@ -35,6 +35,7 @@ import { emitSpawnProgress, emitSpawnWaiting, clearSpawnProgress, createProgress
 import { resolveTargetAgent } from '../../transition-engine/agent-resolver';
 import { agentRegistry } from '../../agent/agent-registry';
 import { prepareInjectionPlan } from '../../transition-engine/injection-plan';
+import { prepareLiveSubmission } from '../../transition-engine/live-submission-eligibility';
 import { resolveIsolatedSwimlaneId, resolveForceFresh } from '../../transition-engine/session-isolation';
 import type { Task, Swimlane, SessionRecord } from '../../../shared/types';
 
@@ -607,6 +608,11 @@ export async function handleTaskMove(
             project,
             autoCommand: interpolatedAuto,
           });
+          const sourceEffort = task.effort_override ?? activeRecord?.applied_effort ?? null;
+          const targetEffort = task.effort_override ?? toLane?.effort_override ?? project?.default_effort ?? null;
+          const restartNeededForEffort = targetEffort !== sourceEffort
+            && targetEffort !== null
+            && (plan?.verifiedPrefixLength ?? 0) === 0;
 
           // 1. Model change -> suspend + respawn. Checked BEFORE live injection
           // so a model change never live-swaps. Phase 3 re-applies the flags and
@@ -642,41 +648,9 @@ export async function handleTaskMove(
             };
           }
 
-          // 2a. Effort-only change (and/or auto_command) with a live-swap plan ->
-          // inject into the running PTY. With no model delta the sequence carries
-          // at most `/effort` + the auto_command.
-          if (plan) {
-            context.terminalSubmitScheduler.scheduleKeystrokes(task.id, task.session_id, plan.sequence, {
-              verifier: plan.verifier,
-              verifiedPrefixLength: plan.verifiedPrefixLength,
-            });
-            // Record what the burst applied so the NEXT move diffs against the
-            // session's new running value instead of re-injecting it.
-            if (plan.appliedSettings) {
-              sessionRepo.updateAppliedSettings(task.session_id, plan.appliedSettings);
-            }
-            console.log(
-              `[TASK_MOVE] Injecting ${plan.sequence.length} command(s) for task ${task.id.slice(0, 8)}`
-              + ` into running session${plan.verifier ? ' (with command verification)' : ''}: ${plan.sequence.join(' | ')}`,
-            );
-            return null;
-          }
-
-          // 2b. No live-swap plan, but an EFFORT delta to a concrete target on an
-          // adapter with no live `/effort` swap -> suspend + respawn to apply the
-          // new effort as a CLI flag. (Model deltas are handled in step 1 above; a
-          // null target is the "Default" column, which `--resume` preserves, so no
-          // respawn.) Source is the session's ACTUAL applied value (same ground
-          // truth prepareInjectionPlan uses), NOT the leaving column's config - a
-          // null/drifted `fromLane` would otherwise churn the PTY. Per-task
-          // overrides win (no respawn when the task pinned the field). The
-          // `!interpolatedAuto` guard is structurally redundant (an auto_command
-          // would have produced a non-null plan above) but kept for safety.
-          const sourceEffort = task.effort_override ?? activeRecord?.applied_effort ?? null;
-          const targetEffort = task.effort_override ?? toLane?.effort_override ?? project?.default_effort ?? null;
-          const restartNeededForEffort = targetEffort !== sourceEffort && targetEffort !== null;
-
-          if (restartNeededForEffort && !interpolatedAuto) {
+          // Unsupported concrete effort changes must restart before auto_command
+          // routing; otherwise an auto-only plan would hide the required launch flag.
+          if (restartNeededForEffort) {
             await suspendLiveSessionForRespawn({
               context,
               tasks,
@@ -693,7 +667,6 @@ export async function handleTaskMove(
               `[TASK_MOVE] Suspending session for task ${task.id.slice(0, 8)}`
               + ` (effort changed, adapter has no live swap). Will respawn with new settings.`,
             );
-            // Fall through to Phase 2/3 (spawn with new settings)
             return {
               task,
               fromSwimlaneId,
@@ -706,6 +679,136 @@ export async function handleTaskMove(
               continuationPrompt: options?.continuationPrompt,
               suppressAutoCommand,
             };
+          }
+
+          // wait-for-native-idle 只接手 trailing lane command；deterministic
+          // settings prefix 仍先走既有 verifier，兩者共用 task FIFO。
+          if (plan) {
+            const liveSubmission = plan.liveSubmissionPolicy
+              ? prepareLiveSubmission({
+                  destinationLaneId: toLane?.id ?? '',
+                  autoSpawn: toLane?.auto_spawn ?? false,
+                  interpolatedLaneCommand: interpolatedAuto,
+                  resolvedAgent: effectiveTargetAgent,
+                  currentAgent: task.agent ?? '',
+                  currentTrack: activeIsolatedSwimlaneId,
+                  destinationTrack: targetIsolatedSwimlaneId,
+                  forceFresh: targetForceFresh,
+                  restartNeededForModel: plan.needsRestartForModel,
+                  restartNeededForEffort,
+                  policy: plan.liveSubmissionPolicy,
+                  sequence: plan.sequence,
+                })
+              : null;
+
+            if (plan.liveSubmissionPolicy?.mode === 'wait-for-native-idle') {
+              const settingsPrefix = plan.sequence.slice(0, plan.verifiedPrefixLength);
+              const nativeSnapshot = context.sessionManager.snapshotNativeIdle(task.session_id);
+              if (settingsPrefix.length > 0) {
+                context.terminalSubmitScheduler.scheduleKeystrokes(task.id, task.session_id, settingsPrefix, {
+                  verifier: plan.verifier,
+                  verifiedPrefixLength: settingsPrefix.length,
+                });
+              }
+
+              if (liveSubmission && nativeSnapshot?.rootNativeSessionId) {
+                const capturedSessionId = task.session_id;
+                const capturedLaneId = toLane?.id ?? '';
+                const capturedFingerprint = liveSubmission.fingerprint;
+                const capturedNativeSessionId = nativeSnapshot.rootNativeSessionId;
+                const capturedSessionGeneration = nativeSnapshot.sessionGeneration;
+                const capturedInputGeneration = nativeSnapshot.inputGeneration;
+                context.terminalSubmitScheduler.scheduleNativeIdleSubmission({
+                  taskId: task.id,
+                  projectId: resolvedProjectId,
+                  sessionId: capturedSessionId,
+                  nativeSessionId: capturedNativeSessionId,
+                  sessionGeneration: capturedSessionGeneration,
+                  inputGeneration: capturedInputGeneration,
+                  command: interpolatedAuto,
+                  policy: liveSubmission.policy,
+                  validateCurrent: () => {
+                    const { tasks: currentTasks, swimlanes: currentSwimlanes } = getProjectRepos(context, resolvedProjectId);
+                    const currentTask = currentTasks.getById(task.id);
+                    if (!currentTask
+                      || currentTask.session_id !== capturedSessionId
+                      || !context.sessionManager.getSession(capturedSessionId)) return 'session-exit';
+
+                    const currentSnapshot = context.sessionManager.snapshotNativeIdle(capturedSessionId);
+                    if (!currentSnapshot
+                      || currentSnapshot.rootNativeSessionId !== capturedNativeSessionId
+                      || currentSnapshot.sessionGeneration !== capturedSessionGeneration
+                      || currentSnapshot.inputGeneration !== capturedInputGeneration) return 'session-exit';
+
+                    if (currentTask.swimlane_id !== capturedLaneId) return 'superseded';
+                    const currentLane = currentSwimlanes.getById(capturedLaneId);
+                    if (!currentLane) return 'superseded';
+                    const currentProject = context.projectRepo.getById(resolvedProjectId);
+                    const currentResolution = resolveTargetAgent({
+                      taskAgentOverride: currentTask.agent_override,
+                      columnAgent: currentLane.agent_override ?? null,
+                      taskAgent: currentTask.agent,
+                      projectDefaultAgent: currentProject?.default_agent ?? null,
+                    });
+                    const currentSessionRepo = new SessionRepository(getProjectDb(resolvedProjectId));
+                    const currentRecord = currentSessionRepo.getLatestForTask(currentTask.id);
+                    const currentAdapter = currentTask.agent ? agentRegistry.get(currentTask.agent) : undefined;
+                    const currentInterpolatedAuto = currentLane.auto_command?.trim()
+                      ? interpolateTemplate(currentLane.auto_command, buildAutoCommandVars(currentTask))
+                      : '';
+                    const currentPlan = prepareInjectionPlan({
+                      adapter: currentAdapter,
+                      sessionRepo: currentSessionRepo,
+                      task: currentTask,
+                      toLane: currentLane,
+                      project: currentProject,
+                      autoCommand: currentInterpolatedAuto,
+                    });
+                    if (!currentPlan?.liveSubmissionPolicy) return 'superseded';
+                    const currentSourceEffort = currentTask.effort_override ?? currentRecord?.applied_effort ?? null;
+                    const currentTargetEffort = currentTask.effort_override
+                      ?? currentLane.effort_override
+                      ?? currentProject?.default_effort
+                      ?? null;
+                    const currentRestartNeededForEffort = currentTargetEffort !== currentSourceEffort
+                      && currentTargetEffort !== null
+                      && currentPlan.verifiedPrefixLength === 0;
+                    const currentPrepared = prepareLiveSubmission({
+                      destinationLaneId: currentLane.id,
+                      autoSpawn: currentLane.auto_spawn,
+                      interpolatedLaneCommand: currentInterpolatedAuto,
+                      resolvedAgent: currentResolution.agent,
+                      currentAgent: currentTask.agent ?? '',
+                      currentTrack: currentRecord?.isolated_swimlane_id ?? null,
+                      destinationTrack: resolveIsolatedSwimlaneId(currentLane),
+                      forceFresh: resolveForceFresh(currentLane),
+                      restartNeededForModel: currentPlan.needsRestartForModel,
+                      restartNeededForEffort: currentRestartNeededForEffort,
+                      policy: currentPlan.liveSubmissionPolicy,
+                      sequence: currentPlan.sequence,
+                    });
+                    return currentPrepared?.fingerprint === capturedFingerprint ? 'valid' : 'superseded';
+                  },
+                });
+              }
+            } else {
+              context.terminalSubmitScheduler.scheduleKeystrokes(task.id, task.session_id, plan.sequence, {
+                verifier: plan.verifier,
+                verifiedPrefixLength: plan.verifiedPrefixLength,
+              });
+            }
+            // Record what the burst applied so the NEXT move diffs against the
+            // session's new running value instead of re-injecting it.
+            if (plan.appliedSettings) {
+              sessionRepo.updateAppliedSettings(task.session_id, plan.appliedSettings);
+            }
+            console.log(
+              `[TASK_MOVE] Scheduled ${plan.verifiedPrefixLength} setting command(s)`
+              + ` and ${plan.liveSubmissionPolicy ? '1 lane command' : 'no lane command'}`
+              + ` for task ${task.id.slice(0, 8)}`
+              + `${plan.verifier ? ' (with command verification)' : ''}.`,
+            );
+            return null;
           }
 
           // 3. Permission-only delta, or no delta -> keep the live session alive.
