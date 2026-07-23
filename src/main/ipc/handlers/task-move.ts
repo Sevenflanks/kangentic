@@ -600,10 +600,10 @@ export async function handleTaskMove(
           const interpolatedAuto = toLane?.auto_command?.trim()
             ? interpolateTemplate(toLane.auto_command, buildAutoCommandVars(task))
             : '';
-            const plan = prepareInjectionPlan({
-              adapter,
-              sessionRepo,
-              sessionRecord: activeRecord,
+          const plan = prepareInjectionPlan({
+            adapter,
+            sessionRepo,
+            sessionRecord: activeRecord,
             task,
             toLane: toLane ?? null,
             project,
@@ -747,6 +747,12 @@ export async function handleTaskMove(
                   throw new Error('live submission superseded before prefix persistence');
                 }
                 const currentAdapter = currentTask.agent ? agentRegistry.get(currentTask.agent) : undefined;
+                const currentResolution = resolveTargetAgent({
+                  taskAgentOverride: currentTask.agent_override,
+                  columnAgent: currentLane.agent_override ?? null,
+                  taskAgent: currentTask.agent,
+                  projectDefaultAgent: currentProject?.default_agent ?? null,
+                });
                 const currentInterpolatedAuto = currentLane.auto_command?.trim()
                   ? interpolateTemplate(currentLane.auto_command, buildAutoCommandVars(currentTask))
                   : '';
@@ -754,13 +760,21 @@ export async function handleTaskMove(
                   adapter: currentAdapter, sessionRepo: currentSessionRepo, sessionRecord: currentRecord,
                   task: currentTask, toLane: currentLane, project: currentProject, autoCommand: currentInterpolatedAuto,
                 });
+                const currentSourceEffort = currentTask.effort_override ?? currentRecord?.applied_effort ?? null;
+                const currentTargetEffort = currentTask.effort_override
+                  ?? currentLane.effort_override
+                  ?? currentProject?.default_effort
+                  ?? null;
+                const currentRestartNeededForEffort = currentTargetEffort !== currentSourceEffort
+                  && currentTargetEffort !== null
+                  && (currentPlan?.verifiedPrefixLength ?? 0) === 0;
                 const currentPrepared = currentPlan?.liveSubmissionPolicy
                   ? prepareLiveSubmission({
                       destinationLaneId: currentLane.id, autoSpawn: currentLane.auto_spawn,
-                      interpolatedLaneCommand: currentInterpolatedAuto, resolvedAgent: effectiveTargetAgent,
+                      interpolatedLaneCommand: currentInterpolatedAuto, resolvedAgent: currentResolution.agent,
                       currentAgent: currentTask.agent ?? '', currentTrack: currentRecord?.isolated_swimlane_id ?? null,
                       destinationTrack: resolveIsolatedSwimlaneId(currentLane), forceFresh: resolveForceFresh(currentLane),
-                      restartNeededForModel: currentPlan.needsRestartForModel, restartNeededForEffort,
+                      restartNeededForModel: currentPlan.needsRestartForModel, restartNeededForEffort: currentRestartNeededForEffort,
                       policy: currentPlan.liveSubmissionPolicy, sequence: currentPlan.sequence,
                     })
                   : null;
@@ -789,7 +803,7 @@ export async function handleTaskMove(
                 const persistedLiveSubmission = persistedPlan?.liveSubmissionPolicy
                   ? prepareLiveSubmission({
                       destinationLaneId: currentLane.id, autoSpawn: currentLane.auto_spawn,
-                      interpolatedLaneCommand: currentInterpolatedAuto, resolvedAgent: effectiveTargetAgent,
+                      interpolatedLaneCommand: currentInterpolatedAuto, resolvedAgent: currentResolution.agent,
                       currentAgent: currentTask.agent ?? '', currentTrack: persistedRecord?.isolated_swimlane_id ?? null,
                       destinationTrack: resolveIsolatedSwimlaneId(currentLane), forceFresh: resolveForceFresh(currentLane),
                       restartNeededForModel: persistedPlan.needsRestartForModel,

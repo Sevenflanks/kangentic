@@ -131,8 +131,8 @@ describe('handleTaskMove live lane submission', () => {
     expect(scheduler.scheduleNativeIdleSubmission).not.toHaveBeenCalled();
   });
 
-  it('keeps the captured record when a newer task record exists and rejects ownership drift', async () => {
-    state.latestRecord = makeRecord({ id: 'newer-other-track', isolated_swimlane_id: 'other-track' });
+  it('keeps the captured record when a newer task record differs in settings and verifier identity', async () => {
+    state.latestRecord = makeRecord({ id: 'newer-other-track', applied_model: 'latest-model', applied_effort: 'low', agent_session_id: 'latest-agent', cwd: '/latest' });
     await moveToDestination();
     const request = scheduler.scheduleNativeIdleSubmission.mock.calls[0]?.[0];
 
@@ -150,12 +150,13 @@ describe('handleTaskMove live lane submission', () => {
     expect(request?.validateCurrent()).toBe('session-exit');
   });
 
-  it('does not persist a delayed prefix after destination configuration drifts', async () => {
+  it('does not persist an old prefix after a newer runtime effort override wins', async () => {
     state.destinationLane = makeLane('lane-91', { auto_command: '/go', effort_override: 'high' });
     state.settingsSequence = ['/effort high'];
     await moveToDestination();
     const options = scheduler.scheduleKeystrokes.mock.calls[0]?.[3];
-    state.destinationLane = makeLane('lane-91', { auto_command: '/changed', effort_override: 'high' });
+    state.task = { ...state.task, effort_override: 'low' };
+    state.record = makeRecord({ applied_effort: 'low' });
 
     await expect(options?.onDelivered?.()).rejects.toThrow('superseded');
     expect(updateAppliedSettings).not.toHaveBeenCalled();
