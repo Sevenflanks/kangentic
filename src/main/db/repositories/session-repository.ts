@@ -255,6 +255,10 @@ export class SessionRepository {
     ).get(taskId) as SessionRecord | undefined;
   }
 
+  findById(id: string): SessionRecord | undefined {
+    return this.db.prepare('SELECT * FROM sessions WHERE id = ? LIMIT 1').get(id) as SessionRecord | undefined;
+  }
+
   /** All session records for a task, newest first. Used by index-based pickers (sessionIndex). */
   listForTaskNewestFirst(taskId: string): SessionRecord[] {
     return this.db.prepare(

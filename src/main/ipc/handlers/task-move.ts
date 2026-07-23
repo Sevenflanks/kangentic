@@ -446,7 +446,7 @@ export async function handleTaskMove(
         // The session record for the currently-live PTY. Read once here and
         // reused by the agent-change / respawn suspend paths below (one read,
         // not three).
-        const activeRecord = sessionRepo.getLatestForTask(task.id);
+        const activeRecord = sessionRepo.findById(task.session_id);
 
         // --- Session switch: suspend the live session and route to Phase 2/3,
         //     which resumes-or-spawns the TARGET session via spawnAgent(toLane)
@@ -704,21 +704,25 @@ export async function handleTaskMove(
 
             if (plan.liveSubmissionPolicy?.mode === 'wait-for-native-idle') {
               const settingsPrefix = plan.sequence.slice(0, plan.verifiedPrefixLength);
+              const capturedSessionId = task.session_id;
+              const capturedSession = context.sessionManager.getSession(capturedSessionId);
+              const ownsCapturedSession = (record: typeof activeRecord | undefined, session: typeof capturedSession | undefined): boolean => (
+                record?.id === capturedSessionId
+                && record.task_id === task.id
+                && record.status === 'running'
+                && record.session_type === `${task.agent}_agent`
+                && record.isolated_swimlane_id === activeIsolatedSwimlaneId
+                && session?.id === capturedSessionId
+                && session.taskId === task.id
+                && session.projectId === resolvedProjectId
+                && session.status === 'running'
+                && context.sessionManager.isWritable(capturedSessionId)
+              );
+              if (!ownsCapturedSession(activeRecord, capturedSession)) return null;
               const nativeSnapshot = context.sessionManager.snapshotNativeIdle(task.session_id);
-              if (settingsPrefix.length > 0) {
-                context.terminalSubmitScheduler.scheduleKeystrokes(task.id, task.session_id, settingsPrefix, {
-                  verifier: plan.verifier,
-                  verifiedPrefixLength: settingsPrefix.length,
-                });
-              }
-
-              if (plan.appliedSettings) {
-                sessionRepo.updateAppliedSettings(task.session_id, plan.appliedSettings);
-              }
-
-              if (liveSubmission && nativeSnapshot?.rootNativeSessionId) {
-                // prefix 的 appliedSettings 已同步寫回；captured fingerprint 必須用相同
-                // post-persistence plan，否則 first-byte fresh validation 會誤判為 superseded。
+              const capturedFingerprint: { value: string | null } = { value: liveSubmission?.fingerprint ?? null };
+              const persistVerifiedPrefix = (): void => {
+                if (plan.appliedSettings) sessionRepo.updateAppliedSettings(capturedSessionId, plan.appliedSettings);
                 const persistedPlan = prepareInjectionPlan({
                   adapter,
                   sessionRepo,
@@ -727,31 +731,38 @@ export async function handleTaskMove(
                   project,
                   autoCommand: interpolatedAuto,
                 });
-                const persistedRecord = sessionRepo.getLatestForTask(task.id);
+                const persistedRecord = sessionRepo.findById(capturedSessionId);
                 const persistedSourceEffort = task.effort_override ?? persistedRecord?.applied_effort ?? null;
                 const persistedRestartNeededForEffort = targetEffort !== persistedSourceEffort
                   && targetEffort !== null
                   && (persistedPlan?.verifiedPrefixLength ?? 0) === 0;
                 const persistedLiveSubmission = persistedPlan?.liveSubmissionPolicy
                   ? prepareLiveSubmission({
-                      destinationLaneId: toLane?.id ?? '',
-                      autoSpawn: toLane?.auto_spawn ?? false,
-                      interpolatedLaneCommand: interpolatedAuto,
-                      resolvedAgent: effectiveTargetAgent,
-                      currentAgent: task.agent ?? '',
-                      currentTrack: activeIsolatedSwimlaneId,
-                      destinationTrack: targetIsolatedSwimlaneId,
-                      forceFresh: targetForceFresh,
+                      destinationLaneId: toLane?.id ?? '', autoSpawn: toLane?.auto_spawn ?? false,
+                      interpolatedLaneCommand: interpolatedAuto, resolvedAgent: effectiveTargetAgent,
+                      currentAgent: task.agent ?? '', currentTrack: activeIsolatedSwimlaneId,
+                      destinationTrack: targetIsolatedSwimlaneId, forceFresh: targetForceFresh,
                       restartNeededForModel: persistedPlan.needsRestartForModel,
                       restartNeededForEffort: persistedRestartNeededForEffort,
-                      policy: persistedPlan.liveSubmissionPolicy,
-                      sequence: persistedPlan.sequence,
+                      policy: persistedPlan.liveSubmissionPolicy, sequence: persistedPlan.sequence,
                     })
                   : null;
-                if (!persistedLiveSubmission) return null;
-                const capturedSessionId = task.session_id;
+                if (!persistedLiveSubmission) throw new Error('live submission superseded after prefix');
+                capturedFingerprint.value = persistedLiveSubmission.fingerprint;
+              };
+              if (settingsPrefix.length > 0) {
+                context.terminalSubmitScheduler.scheduleKeystrokes(task.id, task.session_id, settingsPrefix, {
+                  verifier: plan.verifier,
+                  verifiedPrefixLength: settingsPrefix.length,
+                  strictVerification: true,
+                  onDelivered: persistVerifiedPrefix,
+                });
+              } else {
+                persistVerifiedPrefix();
+              }
+
+              if (liveSubmission && nativeSnapshot?.rootNativeSessionId) {
                 const capturedLaneId = toLane?.id ?? '';
-                const capturedFingerprint = persistedLiveSubmission.fingerprint;
                 const capturedNativeSessionId = nativeSnapshot.rootNativeSessionId;
                 const capturedSessionGeneration = nativeSnapshot.sessionGeneration;
                 const capturedInputGeneration = nativeSnapshot.inputGeneration;
@@ -763,7 +774,7 @@ export async function handleTaskMove(
                   sessionGeneration: capturedSessionGeneration,
                   inputGeneration: capturedInputGeneration,
                   command: interpolatedAuto,
-                  policy: persistedLiveSubmission.policy,
+                  policy: liveSubmission.policy,
                   validateCurrent: () => {
                     const { tasks: currentTasks, swimlanes: currentSwimlanes } = getProjectRepos(context, resolvedProjectId);
                     const currentTask = currentTasks.getById(task.id);
@@ -788,7 +799,9 @@ export async function handleTaskMove(
                       projectDefaultAgent: currentProject?.default_agent ?? null,
                     });
                     const currentSessionRepo = new SessionRepository(getProjectDb(resolvedProjectId));
-                    const currentRecord = currentSessionRepo.getLatestForTask(currentTask.id);
+                    const currentRecord = currentSessionRepo.findById(capturedSessionId);
+                    const currentSession = context.sessionManager.getSession(capturedSessionId);
+                    if (!ownsCapturedSession(currentRecord, currentSession)) return 'session-exit';
                     const currentAdapter = currentTask.agent ? agentRegistry.get(currentTask.agent) : undefined;
                     const currentInterpolatedAuto = currentLane.auto_command?.trim()
                       ? interpolateTemplate(currentLane.auto_command, buildAutoCommandVars(currentTask))
@@ -824,7 +837,7 @@ export async function handleTaskMove(
                       policy: currentPlan.liveSubmissionPolicy,
                       sequence: currentPlan.sequence,
                     });
-                    return currentPrepared?.fingerprint === capturedFingerprint ? 'valid' : 'superseded';
+                    return currentPrepared?.fingerprint === capturedFingerprint.value ? 'valid' : 'superseded';
                   },
                 });
                 scheduledLaneCommand = true;

@@ -18,6 +18,7 @@ export const scheduler = {
 
 export const sessionManager = {
   getSession: vi.fn(),
+  isWritable: vi.fn(),
   snapshotNativeIdle: vi.fn(),
   suspend: vi.fn(async () => undefined),
   removeByTaskId: vi.fn(),
@@ -82,7 +83,7 @@ export function makeLane(id: string, overrides: Partial<Swimlane> = {}): Swimlan
 
 export function makeRecord(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
-    id: 'record-live-1', task_id: 'task-live-1', isolated_swimlane_id: null,
+    id: 'pty-live-1', task_id: 'task-live-1', isolated_swimlane_id: null,
     agent_session_id: 'durable-agent-id', status: 'running',
     started_at: '2026-01-01T00:00:00.000Z', session_type: 'opencode_agent',
     applied_model: null, applied_effort: null, ...overrides,
@@ -107,7 +108,10 @@ export function resetHarness(): void {
   state.settingsSequence = [];
   state.project = { id: 'proj-test', default_agent: 'opencode', default_model: null, default_effort: null };
   sessionManager.getSession.mockImplementation((id: string) =>
-    state.sessionExists && id === state.task.session_id ? { status: 'running' } : undefined);
+    state.sessionExists && id === state.task.session_id
+      ? { id, taskId: state.task.id, projectId: 'proj-test', agentName: state.task.agent, status: 'running' }
+      : undefined);
+  sessionManager.isWritable.mockImplementation((id: string) => state.sessionExists && id === state.task.session_id);
   sessionManager.snapshotNativeIdle.mockImplementation(() => state.snapshot);
 }
 
@@ -130,8 +134,9 @@ vi.mock('electron', () => ({ ipcMain: { handle: vi.fn() } }));
 vi.mock('simple-git', () => ({ simpleGit: vi.fn(() => ({ diffSummary: vi.fn(async () => ({ insertions: 0, deletions: 0, changed: 0 })) })), default: vi.fn(() => ({})) }));
 vi.mock('../../../src/main/db/database', () => ({ getProjectDb: vi.fn(() => ({})) }));
 vi.mock('../../../src/main/db/repositories/session-repository', () => ({
-  SessionRepository: class {
-    getLatestForTask = vi.fn(() => state.record);
+    SessionRepository: class {
+      findById = vi.fn(() => state.record);
+      getLatestForTask = vi.fn(() => state.record);
     getLatestForTaskByTypeAndIsolation = vi.fn(() => state.record);
     updateAppliedSettings = updateAppliedSettings;
     updateGitStats = vi.fn();

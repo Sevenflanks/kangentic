@@ -11,6 +11,7 @@ import {
   sessionManager,
   spawnAgent,
   state,
+  updateAppliedSettings,
 } from './helpers/task-move-live-submission-harness';
 
 let handleTaskMove: typeof HandleTaskMove;
@@ -50,6 +51,12 @@ describe('handleTaskMove live lane submission', () => {
     expect(request?.nativeSessionId).toBe('private-native-id');
     expect(scheduler.scheduleKeystrokes.mock.invocationCallOrder[0])
       .toBeLessThan(scheduler.scheduleNativeIdleSubmission.mock.invocationCallOrder[0] ?? 0);
+    expect(request?.validateCurrent()).toBe('valid');
+    expect(updateAppliedSettings).not.toHaveBeenCalled();
+    const prefixOptions = scheduler.scheduleKeystrokes.mock.calls[0]?.[3];
+    expect(prefixOptions).toMatchObject({ strictVerification: true });
+    prefixOptions?.onDelivered?.();
+    expect(updateAppliedSettings).toHaveBeenCalledWith('pty-live-1', { effort: 'high' });
     expect(request?.validateCurrent()).toBe('valid');
   });
 
@@ -99,6 +106,15 @@ describe('handleTaskMove live lane submission', () => {
       expect.anything(), expect.anything(), expect.arrayContaining(['/go']), expect.anything(),
     );
     expect(log.mock.calls.flat().join(' ')).toContain('no lane command');
+  });
+
+  it('does not schedule live delivery when the captured record is not running', async () => {
+    state.record = makeRecord({ status: 'suspended' });
+
+    await moveToDestination();
+
+    expect(scheduler.scheduleKeystrokes).not.toHaveBeenCalled();
+    expect(scheduler.scheduleNativeIdleSubmission).not.toHaveBeenCalled();
   });
 
   it('revalidates ownership, evidence generation, and current configuration before first byte', async () => {
