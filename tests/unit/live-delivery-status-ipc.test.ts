@@ -1,15 +1,9 @@
-import { readFileSync } from 'node:fs';
-import { runInNewContext } from 'node:vm';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { LiveDeliveryStatus } from '../../src/shared/live-delivery-status';
 import type { ElectronAPI } from '../../src/shared/types';
+import { loadLiveDeliveryStatusMockHarness } from './helpers/live-delivery-status-mock-harness';
 
 type StatusListener = (event: unknown, status: LiveDeliveryStatus) => void;
-type LiveStatusMockWindow = {
-  readonly electronAPI: {
-    readonly sessions: Pick<ElectronAPI['sessions'], 'onLiveDeliveryStatus'>;
-  };
-};
 
 const ipcOn = vi.fn();
 const ipcRemoveListener = vi.fn();
@@ -115,26 +109,6 @@ function requireSchedulerStatusCallback(): (status: LiveDeliveryStatus) => void 
   return schedulerStatusCallback;
 }
 
-function isLiveStatusMockWindow(
-  value: Record<string, unknown>,
-): value is Record<string, unknown> & LiveStatusMockWindow {
-  const electronApi = value.electronAPI;
-  if (typeof electronApi !== 'object' || electronApi === null || !('sessions' in electronApi)) return false;
-  const sessions = electronApi.sessions;
-  return typeof sessions === 'object'
-    && sessions !== null
-    && 'onLiveDeliveryStatus' in sessions
-    && typeof sessions.onLiveDeliveryStatus === 'function';
-}
-
-function requireLiveStatusFire(
-  value: Record<string, unknown>,
-): (status: LiveDeliveryStatus) => void {
-  const fire = value.__mockFireLiveDeliveryStatus;
-  if (typeof fire !== 'function') throw new Error('live status mock fire hook was not installed');
-  return fire;
-}
-
 const cancelledStatus = {
   projectId: 'project-1',
   taskId: 'task-1',
@@ -223,10 +197,7 @@ describe('project-scoped live delivery status IPC', () => {
   });
 
   it('dispatches copied UI mock listeners and removes only the unsubscribed identity', () => {
-    const mockSource = readFileSync('tests/ui/mock-electron-api.js', 'utf8');
-    const windowObject: Record<string, unknown> = {};
-    runInNewContext(mockSource, { window: windowObject });
-    if (!isLiveStatusMockWindow(windowObject)) throw new Error('live status mock API was not installed');
+    const { window: windowObject, fire: fireLiveStatus } = loadLiveDeliveryStatusMockHarness();
 
     const firstStatuses: LiveDeliveryStatus[] = [];
     const secondStatuses: LiveDeliveryStatus[] = [];
@@ -242,8 +213,6 @@ describe('project-scoped live delivery status IPC', () => {
     const unsubscribeThird = windowObject.electronAPI.sessions.onLiveDeliveryStatus((status) => {
       thirdStatuses.push(status);
     });
-    const fireLiveStatus = requireLiveStatusFire(windowObject);
-
     fireLiveStatus(cancelledStatus);
     expect(firstStatuses).toEqual([cancelledStatus]);
     expect(secondStatuses).toEqual([cancelledStatus]);
@@ -261,9 +230,18 @@ describe('project-scoped live delivery status IPC', () => {
 
     unsubscribeFirst();
     unsubscribeThird();
+    const sendingStatus = {
+      projectId: 'project-1', taskId: 'task-1', sessionId: 'session-1', generation: 4,
+      at: '2026-07-22T00:00:02.000Z', state: 'sending',
+    } satisfies LiveDeliveryStatus;
+    fireLiveStatus(sendingStatus);
+    expect(firstStatuses).toEqual([cancelledStatus]);
+    expect(secondStatuses).toEqual([cancelledStatus, deliveredStatus, sendingStatus]);
+    expect(thirdStatuses).toEqual([cancelledStatus]);
+
     unsubscribeSecond();
     unsubscribeSecond();
     fireLiveStatus(cancelledStatus);
-    expect(secondStatuses).toEqual([cancelledStatus, deliveredStatus]);
+    expect(secondStatuses).toEqual([cancelledStatus, deliveredStatus, sendingStatus]);
   });
 });
