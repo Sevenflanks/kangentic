@@ -59,6 +59,7 @@ type SessionWriteState = {
   automation: AutomationOwnership | null;
   userSubmission: UserSubmissionOwnership | null;
   readonly deferredUserInput: string[];
+  deferredInputDraining: boolean;
 };
 
 type WriteQueueLookup = (sessionId: string) => WriteQueue | null;
@@ -83,6 +84,7 @@ export class SessionWriteCoordinator {
       automation: null,
       userSubmission: null,
       deferredUserInput: [],
+      deferredInputDraining: false,
     });
     return sessionGeneration;
   }
@@ -146,11 +148,15 @@ export class SessionWriteCoordinator {
       if (state.automation !== ownership) return;
       state.automation = null;
 
-      // Automation 一旦送出首 byte 就必須先完成 ownership；release 先把 deferred user input 接回同一條 FIFO，
-      // 再喚醒 user submission，避免 callback 越過較早到達的 user bytes。
+      // Automation 一旦送出首 byte 就必須先完成 ownership；release 把 deferred user input 接回同一條 FIFO，
+      // 並等 queue 完整 drained 才喚醒 user submission，避免 callback 越過尚未送完的較早 user bytes。
       const deferred = state.deferredUserInput.splice(0, state.deferredUserInput.length);
       for (const data of deferred) ownership.queue.enqueue(data);
-      state.userSubmission?.waiting?.start();
+      state.deferredInputDraining = true;
+      void ownership.queue.drained().then(() => {
+        state.deferredInputDraining = false;
+        if (!state.automation?.committed) state.userSubmission?.waiting?.start();
+      });
     };
 
     return {
@@ -242,7 +248,7 @@ export class SessionWriteCoordinator {
               );
           };
           ownership.waiting = { start, cancel };
-          if (!state.automation?.committed) start();
+          if (!state.automation?.committed && !state.deferredInputDraining) start();
         });
       },
       release,
