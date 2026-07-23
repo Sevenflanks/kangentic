@@ -68,6 +68,7 @@ vi.mock('../../src/main/pty/spawn/spawn-failure-handler', () => ({
 vi.mock('../../src/main/pty/lifecycle/adapter-lifecycle', () => ({
   attachAdapter: vi.fn(),
   disposeAdapterAttachment: vi.fn(),
+  disposeSpawnCleanup: vi.fn(),
   removeAdapterHooks: vi.fn(),
 }));
 
