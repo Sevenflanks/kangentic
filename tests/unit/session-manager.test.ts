@@ -2495,6 +2495,7 @@ describe('Input coordination', () => {
 
   afterEach(() => {
     manager.killAll();
+    vi.restoreAllMocks();
   });
 
   async function spawnCoordinatedSession(taskId: string) {
@@ -2503,6 +2504,68 @@ describe('Input coordination', () => {
     const session = await manager.spawn({ taskId, command: '', cwd: tmpDir });
     return { session, ...mock };
   }
+
+  function expectInputCoordinationRemoved(sessionId: string): void {
+    expect(manager.getSessionGeneration(sessionId)).toBeNull();
+    expect(manager.getInputGeneration(sessionId)).toBeNull();
+    expect(manager['nativeIdleEvidence'].snapshot(sessionId)).toBeNull();
+  }
+
+  it('uses Date.now for the two-argument writeUserInput shape', async () => {
+    // Given
+    const { session, writes } = await spawnCoordinatedSession('task-coordination-default-time');
+    vi.spyOn(Date, 'now').mockReturnValue(123_456);
+    const evidenceWrite = vi.spyOn(manager['nativeIdleEvidence'], 'recordUserInput');
+
+    // When
+    manager.writeUserInput(session.id, 'user');
+
+    // Then
+    expect(evidenceWrite).toHaveBeenCalledWith(session.id, 1, 123_456);
+    expect(writes).toEqual(['user']);
+  });
+
+  it('updates native idle evidence before user bytes reach the PTY', async () => {
+    // Given
+    const { session, pty: ptyProcess, writes } = await spawnCoordinatedSession('task-coordination-evidence-order');
+    const order: string[] = [];
+    const evidence = manager['nativeIdleEvidence'];
+    const recordEvidence = evidence.recordUserInput.bind(evidence);
+    vi.spyOn(evidence, 'recordUserInput').mockImplementation((sessionId, generation, occurredAt) => {
+      order.push('evidence');
+      recordEvidence(sessionId, generation, occurredAt);
+    });
+    vi.mocked(ptyProcess.write).mockImplementation((data: string | Buffer) => {
+      order.push('pty-write');
+      writes.push(typeof data === 'string' ? data : data.toString());
+    });
+
+    // When
+    manager.writeUserInput(session.id, 'user', 20);
+
+    // Then
+    expect(order).toEqual(['evidence', 'pty-write']);
+    expect(writes).toEqual(['user']);
+  });
+
+  it('advances user-submission generation and evidence before acquisition returns', async () => {
+    // Given
+    const { session } = await spawnCoordinatedSession('task-coordination-user-marker');
+    vi.spyOn(Date, 'now').mockReturnValue(654_321);
+    const evidenceWrite = vi.spyOn(manager['nativeIdleEvidence'], 'recordUserInput');
+
+    // When
+    const lease = manager.acquireUserSubmission(session.id);
+
+    // Then
+    expect(lease).not.toBeNull();
+    expect(manager.getInputGeneration(session.id)).toBe(1);
+    expect(evidenceWrite).toHaveBeenCalledWith(session.id, 1, 654_321);
+    expect(manager['nativeIdleEvidence'].snapshot(session.id)).toMatchObject({
+      inputGeneration: 1,
+    });
+    lease?.release();
+  });
 
   it('exposes generations after spawn and advances input generation through writeUserInput', async () => {
     // Given
@@ -2562,12 +2625,54 @@ describe('Input coordination', () => {
       : null;
     await userSubmission?.run(async () => Promise.resolve());
     const releasedAutomation = expectation
-      ? manager.acquireAutomation(session.id, expectation, vi.fn())
+      ? manager.acquireAutomation(
+          session.id,
+          { ...expectation, inputGeneration: expectation.inputGeneration + 1 },
+          vi.fn(),
+        )
       : null;
 
     // Then
     expect(blockedAutomation).toBeNull();
     expect(releasedAutomation).not.toBeNull();
+  });
+
+  it('uses one shared queue for legacy, multi-chunk automation, and deferred user writes', async () => {
+    vi.useFakeTimers();
+    try {
+      // Given
+      const { session, writes } = await spawnCoordinatedSession('task-coordination-shared-queue');
+      const legacy = 'L'.repeat(5_000);
+      const automation = 'A'.repeat(5_000);
+      manager.write(session.id, legacy);
+      await vi.runAllTimersAsync();
+      await manager.drain(session.id);
+      const sessionGeneration = manager.getSessionGeneration(session.id);
+      const inputGeneration = manager.getInputGeneration(session.id);
+      const lease = sessionGeneration === null || inputGeneration === null
+        ? null
+        : manager.acquireAutomation(
+            session.id,
+            { sessionGeneration, inputGeneration },
+            vi.fn(),
+          );
+
+      // When
+      const automationWrite = lease?.write(automation);
+      await vi.runAllTimersAsync();
+      await automationWrite;
+      manager.writeUserInput(session.id, 'user-1', 20);
+      manager.writeUserInput(session.id, 'user-2', 21);
+      lease?.release();
+      await vi.runAllTimersAsync();
+      await manager.drain(session.id);
+
+      // Then
+      expect(manager['writeQueues'].size).toBe(1);
+      expect(writes.join('')).toBe(`${legacy}${automation}user-1user-2`);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('clears generations immediately on suspend and on explicit kill', async () => {
@@ -2578,13 +2683,13 @@ describe('Input coordination', () => {
     const suspension = manager.suspend(first.session.id);
 
     // Then
-    expect(manager.getSessionGeneration(first.session.id)).toBeNull();
+    expectInputCoordinationRemoved(first.session.id);
     first.triggerExit(0);
     await suspension;
 
     const second = await spawnCoordinatedSession('task-coordination-kill');
     manager.kill(second.session.id);
-    expect(manager.getSessionGeneration(second.session.id)).toBeNull();
+    expectInputCoordinationRemoved(second.session.id);
   });
 
   it('clears generations on natural exit and synchronous killAll', async () => {
@@ -2595,10 +2700,33 @@ describe('Input coordination', () => {
     natural.triggerExit(0);
 
     // Then
-    expect(manager.getSessionGeneration(natural.session.id)).toBeNull();
+    expectInputCoordinationRemoved(natural.session.id);
 
     const shutdown = await spawnCoordinatedSession('task-coordination-kill-all');
     manager.killAll();
-    expect(manager.getSessionGeneration(shutdown.session.id)).toBeNull();
+    expectInputCoordinationRemoved(shutdown.session.id);
+  });
+
+  it('clears coordinator and evidence together on remove', async () => {
+    // Given
+    const { session } = await spawnCoordinatedSession('task-coordination-remove');
+
+    // When
+    manager.remove(session.id);
+
+    // Then
+    expectInputCoordinationRemoved(session.id);
+  });
+
+  it('clears coordinator and evidence synchronously when suspendAll starts', async () => {
+    // Given
+    const { session } = await spawnCoordinatedSession('task-coordination-suspend-all');
+
+    // When
+    const suspension = manager.suspendAll(0);
+
+    // Then
+    expectInputCoordinationRemoved(session.id);
+    await suspension;
   });
 });

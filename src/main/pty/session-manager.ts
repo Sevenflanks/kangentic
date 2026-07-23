@@ -129,6 +129,13 @@ export class SessionManager extends EventEmitter {
   private readonly nativeIdleEvidence = new NativeIdleEvidence();
   private readonly writeCoordinator = new SessionWriteCoordinator(
     (sessionId) => this.getOrCreateWriteQueue(sessionId),
+    (sessionId, marker) => {
+      this.nativeIdleEvidence.recordUserInput(
+        sessionId,
+        marker.inputGeneration,
+        marker.occurredAt,
+      );
+    },
   );
   private sessionFiles: SessionFileManager;
   private sessionIdManager: SessionIdManager;
@@ -566,10 +573,9 @@ export class SessionManager extends EventEmitter {
     return this.writeCoordinator.acquireAutomation(sessionId, expected, onFirstWrite);
   }
 
-  writeUserInput(sessionId: string, data: string, occurredAt: number): void {
+  writeUserInput(sessionId: string, data: string, occurredAt = Date.now()): void {
     if (data.length === 0 || this.writeCoordinator.getSessionGeneration(sessionId) === null) return;
-    const marker = this.writeCoordinator.recordUserInput(sessionId, data, occurredAt);
-    this.nativeIdleEvidence.recordUserInput(sessionId, marker.inputGeneration, marker.occurredAt);
+    this.writeCoordinator.recordUserInput(sessionId, data, occurredAt);
   }
 
   acquireUserSubmission(sessionId: string): UserSubmissionLease | null {
