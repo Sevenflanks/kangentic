@@ -1,21 +1,19 @@
-/**
- * Unit tests for src/main/pty/terminal-submit.ts.
- *
- * `TerminalSubmit` exposes two methods:
- *
- *  - `submitContent(sessionId, text, opts)` — bracketed-paste delivery for
- *    free-form content (browser-pane Send). Thin wrapper around the
- *    `PasteEngine.pasteAndSubmit` instance passed in the constructor; tests
- *    here just confirm the forwarding contract (paste-engine internals are
- *    covered by `paste-engine.test.ts`).
- *
- *  - `submitKeystrokes(sessionId, commands[], opts)` — manual `Ctrl+C? →
- *    text → Esc → Enter` keystroke sequence for slash commands. Tests pin
- *    the byte-level contract: ESCAPE is always between text and Enter so
- *    Enter resolves to "submit" (not "select picker item"); commands are
- *    sanitized; aborts stop the next write/wait; verifier integration
- *    works for chained sequences.
- */
+// Unit tests for src/main/pty/terminal-submit.ts.
+//
+// `TerminalSubmit` exposes two methods:
+//
+//  - `submitContent(sessionId, text, opts)` — bracketed-paste delivery for
+//    free-form content (browser-pane Send). Thin wrapper around the
+//    `PasteEngine.pasteAndSubmit` instance passed in the constructor; tests
+//    here just confirm the forwarding contract (paste-engine internals are
+//    covered by `paste-engine.test.ts`).
+//
+//  - `submitKeystrokes(sessionId, commands[], opts)` — manual `Ctrl+C? →
+//    text → Esc → Enter` keystroke sequence for slash commands. Tests pin
+//    the byte-level contract: ESCAPE is always between text and Enter so
+//    Enter resolves to "submit" (not "select picker item"); commands are
+//    sanitized; aborts stop the next write/wait; verifier integration
+//    works for chained sequences.
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { TerminalSubmit, type CommandVerifier, type TerminalKeystrokeWriter } from '../../src/main/pty/terminal-submit';
@@ -52,12 +50,11 @@ async function tick(): Promise<void> {
   await Promise.resolve();
 }
 
-/** Drive the timer chain in submitKeystrokes: each wait() in the sequence
- *  resolves at a different timer boundary, and each needs a microtask flush
- *  before the next-loop wait gets registered. Use small step sizes so every
- *  intervening setTimeout (40ms keypress delays, 100ms Ctrl+C settle,
- *  500ms COMMAND_SETTLE) lands inside a flush window rather than getting
- *  jumped over in a single big advance. */
+// Drive the timer chain in submitKeystrokes: each wait() in the sequence
+// resolves at a different timer boundary, and each needs a microtask flush
+// before the next-loop wait gets registered. Use small step sizes so every
+// intervening setTimeout lands inside a flush window rather than getting
+// jumped over in a single big advance.
 async function advanceAndTick(ms: number, iterations = 30): Promise<void> {
   const stepSize = Math.max(1, Math.ceil(ms / iterations));
   for (let i = 0; i < iterations; i++) {
@@ -171,8 +168,35 @@ describe('TerminalSubmit', () => {
       await promise;
     });
 
+    it('keeps the original writer when caller options change during delivery', async () => {
+      const originalWrites: string[] = [];
+      let releaseFirstWrite = (): void => undefined;
+      const originalWriter: TerminalKeystrokeWriter = {
+        write: vi.fn((data: string) => {
+          originalWrites.push(data);
+          if (originalWrites.length > 1) return Promise.resolve();
+          return new Promise<void>((resolve) => { releaseFirstWrite = resolve; });
+        }),
+      };
+      const replacementWriter: TerminalKeystrokeWriter = { write: vi.fn(async () => undefined) };
+      const options = {
+        writer: originalWriter, sendCtrlC: false, verifier: null, verifiedPrefixLength: 0,
+      };
+      const promise = submit.submitKeystrokes('s1', ['/safe'], options);
+      await tick();
+
+      options.writer = replacementWriter;
+      releaseFirstWrite();
+      await advanceAndTick(1000);
+      await promise;
+
+      expect(originalWrites).toEqual(['/safe', '\x1b', '\r']);
+      expect(replacementWriter.write).not.toHaveBeenCalled();
+      expect(sessionManager.writes).toHaveLength(0);
+    });
+
     it('rethrows writer failure without sending later bytes or logging its message', async () => {
-      const failure = new Error('aborted /failure-secret command');
+      const failure = new Error('aborted writer-error-private-marker');
       const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
       const writer: TerminalKeystrokeWriter = { write: vi.fn(() => Promise.reject(failure)) };
 
@@ -183,6 +207,7 @@ describe('TerminalSubmit', () => {
       expect(writer.write).toHaveBeenCalledTimes(1);
       expect(sessionManager.writes).toHaveLength(0);
       expect(errorSpy.mock.calls.flat().join(' ')).not.toContain('/failure-secret');
+      expect(errorSpy.mock.calls.flat().join(' ')).not.toContain('writer-error-private-marker');
     });
 
     it('writes each command in a chained sequence with Esc between', async () => {

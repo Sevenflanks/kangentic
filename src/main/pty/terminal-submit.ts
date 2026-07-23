@@ -144,14 +144,15 @@ export class TerminalSubmit {
    *     commands settle on a fixed 500ms window (intentionally unverified -
    *     a `/`-prefixed user command may not produce a matching JSONL entry).
    *
-   * Aborting via `opts.signal` stops the next write/wait. Already-queued
-   * writes still flush through `sessionManager.write`.
+   * Aborting via `opts.signal` stops the next write/wait. Writes already
+   * accepted by the selected sink cannot be undone.
    */
   async submitKeystrokes(
     sessionId: string,
     commands: string[],
     opts: SubmitKeystrokesOptions = {},
   ): Promise<void> {
+    const writer = opts.writer;
     const sanitized = commands.map((cmd) => sanitizeForPty(cmd)).filter((cmd) => cmd.length > 0);
     if (sanitized.length === 0) return;
 
@@ -167,9 +168,9 @@ export class TerminalSubmit {
       : 0;
     const source = opts.source ?? 'unknown';
     const write = async (data: string): Promise<void> => {
-      if (opts.writer) {
+      if (writer) {
         // 第一個成功的 lease write 會提交 sink ownership；之後取消已無法安全歸還 lease。
-        await opts.writer.write(data);
+        await writer.write(data);
         return;
       }
       this.sessionManager.write(sessionId, data);
