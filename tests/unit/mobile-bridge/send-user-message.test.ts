@@ -21,8 +21,15 @@ describe('handleSendUserMessage', () => {
 
   it('delivers via the bracketed-paste submit path, not a raw PTY write', async () => {
     const submitContent = vi.fn(() => Promise.resolve());
+    const release = vi.fn();
     const context = {
-      sessionManager: { getSession: vi.fn(() => ({ id: 'sess-1' })) },
+      sessionManager: {
+        acquireUserSubmission: vi.fn(() => ({
+          release,
+          run: vi.fn((submit: () => Promise<unknown>) => submit()),
+        })),
+        getSession: vi.fn(() => ({ id: 'sess-1' })),
+      },
       terminalSubmit: { submitContent },
     } as unknown as IpcContext;
 

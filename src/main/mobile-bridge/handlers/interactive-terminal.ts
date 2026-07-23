@@ -35,8 +35,8 @@ export function handleInteractiveTerminal(
   }
 
   // A suspended/queued/exited session stays in the registry but has no live
-  // PTY, so write() silently drops the bytes (and a resize would only stash) -
-  // report that rather than a false written/resized:true.
+  // PTY, so user-input delivery silently drops the bytes (and a resize would
+  // only stash) - report that rather than a false written/resized:true.
   if (!context.sessionManager.isWritable(payload.sessionId)) {
     return { type: 'capability-response', requestId: request.requestId, ok: false, error: `Session is not accepting input (not running): ${payload.sessionId}` };
   }
@@ -56,7 +56,7 @@ export function handleInteractiveTerminal(
     return { type: 'capability-response', requestId: request.requestId, ok: true, payload: toWireJson(responsePayload) };
   }
 
-  context.sessionManager.write(payload.sessionId, payload.data);
+  context.sessionManager.writeUserInput(payload.sessionId, payload.data);
 
   const responsePayload: InteractiveTerminalResponsePayload = { written: true };
   return { type: 'capability-response', requestId: request.requestId, ok: true, payload: toWireJson(responsePayload) };

@@ -92,16 +92,22 @@ export function registerBrowserHandlers(context: IpcContext): void {
     const agentName = context.sessionManager.getSessionAgentName(input.sessionId);
     const adapter = agentName ? agentRegistry.get(agentName) : undefined;
     const verifier = adapter?.getSubmissionVerifier?.('paste') ?? undefined;
+    const lease = context.sessionManager.acquireUserSubmission(input.sessionId);
+    if (!lease) throw new Error('Session is not accepting input');
 
     // TerminalSubmit.submitContent handles bracketed-paste wrap, drain,
-    // paste-to-Enter gap, and atomic submit. Translate engine errors to
-    // renderer-facing toasts.
+    // paste-to-Enter gap, and atomic submit. Capture preparation is complete
+    // before ownership starts; only terminal delivery belongs inside the lease.
     try {
-      await context.terminalSubmit.submitContent(input.sessionId, payload, {
-        bracketed: true,
-        source: 'browser-capture',
-        verifier,
-      });
+      await lease.run(() => context.terminalSubmit.submitContent(
+        input.sessionId,
+        payload,
+        {
+          bracketed: true,
+          source: 'browser-capture',
+          verifier,
+        },
+      ));
     } catch (caught) {
       if (caught instanceof PasteSubmitError) {
         const userMessage = caught.code === 'timeout'
@@ -116,6 +122,8 @@ export function registerBrowserHandlers(context: IpcContext): void {
         throw error;
       }
       throw caught;
+    } finally {
+      lease.release();
     }
 
     return { filePath: absolutePngPath };

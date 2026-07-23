@@ -16,16 +16,16 @@ function fakeRequest(payload: Record<string, unknown>): CapabilityRequestMessage
 function fakeContext(overrides: {
   session?: unknown;
   snapshot?: { permissionPending: boolean; permissionAwaitedToolId: string | null } | null;
-  write?: ReturnType<typeof vi.fn>;
+  writeUserInput?: ReturnType<typeof vi.fn>;
   writable?: boolean;
 } = {}): IpcContext {
-  const write = overrides.write ?? vi.fn();
+  const writeUserInput = overrides.writeUserInput ?? vi.fn();
   return {
     sessionManager: {
       getSession: vi.fn(() => (overrides.session === undefined ? { id: 'sess-1' } : overrides.session)),
       getActivityStatsSnapshot: vi.fn(() => (overrides.snapshot === undefined ? null : overrides.snapshot)),
       isWritable: vi.fn(() => overrides.writable ?? true),
-      write,
+      writeUserInput,
     },
   } as unknown as IpcContext;
 }
@@ -55,7 +55,7 @@ describe('handleAnswerPermissionPrompt', () => {
     const write = vi.fn();
     const context = fakeContext({
       snapshot: { permissionPending: true, permissionAwaitedToolId: 'tool-CURRENT' },
-      write,
+      writeUserInput: write,
     });
     const response = handleAnswerPermissionPrompt(
       fakeRequest({ sessionId: 'sess-1', promptId: 'sess-1:tool-STALE', keystrokes: '1\r' }),
@@ -70,7 +70,7 @@ describe('handleAnswerPermissionPrompt', () => {
     const write = vi.fn();
     const context = fakeContext({
       snapshot: { permissionPending: true, permissionAwaitedToolId: 'tool-9' },
-      write,
+      writeUserInput: write,
     });
     const response = handleAnswerPermissionPrompt(
       fakeRequest({ sessionId: 'sess-1', promptId: 'sess-1:tool-9', keystrokes: '1\r' }),
@@ -86,7 +86,7 @@ describe('handleAnswerPermissionPrompt', () => {
     const context = fakeContext({
       snapshot: { permissionPending: true, permissionAwaitedToolId: 'tool-9' },
       writable: false,
-      write,
+      writeUserInput: write,
     });
     const response = handleAnswerPermissionPrompt(
       fakeRequest({ sessionId: 'sess-1', promptId: 'sess-1:tool-9', keystrokes: '1\r' }),
@@ -103,7 +103,7 @@ describe('handleAnswerPermissionPrompt', () => {
     const write = vi.fn();
     const context = fakeContext({
       snapshot: { permissionPending: true, permissionAwaitedToolId: 'tool-9' },
-      write,
+      writeUserInput: write,
     });
     const response = handleAnswerPermissionPrompt(
       fakeRequest({ sessionId: 'sess-1', promptId: 'sess-OTHER:tool-9', keystrokes: '1\r' }),
