@@ -600,9 +600,10 @@ export async function handleTaskMove(
           const interpolatedAuto = toLane?.auto_command?.trim()
             ? interpolateTemplate(toLane.auto_command, buildAutoCommandVars(task))
             : '';
-          const plan = prepareInjectionPlan({
-            adapter,
-            sessionRepo,
+            const plan = prepareInjectionPlan({
+              adapter,
+              sessionRepo,
+              sessionRecord: activeRecord,
             task,
             toLane: toLane ?? null,
             project,
@@ -720,28 +721,77 @@ export async function handleTaskMove(
               );
               if (!ownsCapturedSession(activeRecord, capturedSession)) return null;
               const nativeSnapshot = context.sessionManager.snapshotNativeIdle(task.session_id);
+              const capturedLaneId = toLane?.id ?? '';
+              const capturedNativeSessionId = nativeSnapshot?.rootNativeSessionId ?? null;
+              const capturedSessionGeneration = nativeSnapshot?.sessionGeneration ?? null;
+              const capturedInputGeneration = nativeSnapshot?.inputGeneration ?? null;
               const capturedFingerprint: { value: string | null } = { value: liveSubmission?.fingerprint ?? null };
-              const persistVerifiedPrefix = (): void => {
-                if (plan.appliedSettings) sessionRepo.updateAppliedSettings(capturedSessionId, plan.appliedSettings);
-                const persistedPlan = prepareInjectionPlan({
-                  adapter,
-                  sessionRepo,
-                  task,
-                  toLane: toLane ?? null,
-                  project,
-                  autoCommand: interpolatedAuto,
+              const persistVerifiedPrefix = async (): Promise<void> => withTaskLock(task.id, async () => {
+                const { tasks: currentTasks, swimlanes: currentSwimlanes } = getProjectRepos(context, resolvedProjectId);
+                const currentTask = currentTasks.getById(task.id);
+                const currentLane = currentTask ? currentSwimlanes.getById(capturedLaneId) : null;
+                const currentProject = context.projectRepo.getById(resolvedProjectId);
+                const currentSessionRepo = new SessionRepository(getProjectDb(resolvedProjectId));
+                const currentRecord = currentSessionRepo.findById(capturedSessionId);
+                const currentSession = context.sessionManager.getSession(capturedSessionId);
+                const currentSnapshot = context.sessionManager.snapshotNativeIdle(capturedSessionId);
+                if (!currentTask
+                  || currentTask.session_id !== capturedSessionId
+                  || currentTask.swimlane_id !== capturedLaneId
+                  || !currentLane
+                  || !ownsCapturedSession(currentRecord, currentSession)
+                  || !currentSnapshot
+                  || currentSnapshot.rootNativeSessionId !== capturedNativeSessionId
+                  || currentSnapshot.sessionGeneration !== capturedSessionGeneration
+                  || currentSnapshot.inputGeneration !== capturedInputGeneration) {
+                  throw new Error('live submission superseded before prefix persistence');
+                }
+                const currentAdapter = currentTask.agent ? agentRegistry.get(currentTask.agent) : undefined;
+                const currentInterpolatedAuto = currentLane.auto_command?.trim()
+                  ? interpolateTemplate(currentLane.auto_command, buildAutoCommandVars(currentTask))
+                  : '';
+                const currentPlan = prepareInjectionPlan({
+                  adapter: currentAdapter, sessionRepo: currentSessionRepo, sessionRecord: currentRecord,
+                  task: currentTask, toLane: currentLane, project: currentProject, autoCommand: currentInterpolatedAuto,
                 });
-                const persistedRecord = sessionRepo.findById(capturedSessionId);
-                const persistedSourceEffort = task.effort_override ?? persistedRecord?.applied_effort ?? null;
-                const persistedRestartNeededForEffort = targetEffort !== persistedSourceEffort
-                  && targetEffort !== null
+                const currentPrepared = currentPlan?.liveSubmissionPolicy
+                  ? prepareLiveSubmission({
+                      destinationLaneId: currentLane.id, autoSpawn: currentLane.auto_spawn,
+                      interpolatedLaneCommand: currentInterpolatedAuto, resolvedAgent: effectiveTargetAgent,
+                      currentAgent: currentTask.agent ?? '', currentTrack: currentRecord?.isolated_swimlane_id ?? null,
+                      destinationTrack: resolveIsolatedSwimlaneId(currentLane), forceFresh: resolveForceFresh(currentLane),
+                      restartNeededForModel: currentPlan.needsRestartForModel, restartNeededForEffort,
+                      policy: currentPlan.liveSubmissionPolicy, sequence: currentPlan.sequence,
+                    })
+                  : null;
+                if (!currentPrepared || currentPrepared.fingerprint !== capturedFingerprint.value) {
+                  throw new Error('live submission superseded before prefix persistence');
+                }
+                if (plan.appliedSettings) currentSessionRepo.updateAppliedSettings(capturedSessionId, plan.appliedSettings);
+                const persistedRecord = currentSessionRepo.findById(capturedSessionId);
+                const persistedPlan = prepareInjectionPlan({
+                  adapter: currentAdapter,
+                  sessionRepo: currentSessionRepo,
+                  sessionRecord: persistedRecord,
+                  task: currentTask,
+                  toLane: currentLane,
+                  project: currentProject,
+                  autoCommand: currentInterpolatedAuto,
+                });
+                const persistedSourceEffort = currentTask.effort_override ?? persistedRecord?.applied_effort ?? null;
+                const persistedTargetEffort = currentTask.effort_override
+                  ?? currentLane.effort_override
+                  ?? currentProject?.default_effort
+                  ?? null;
+                const persistedRestartNeededForEffort = persistedTargetEffort !== persistedSourceEffort
+                  && persistedTargetEffort !== null
                   && (persistedPlan?.verifiedPrefixLength ?? 0) === 0;
                 const persistedLiveSubmission = persistedPlan?.liveSubmissionPolicy
                   ? prepareLiveSubmission({
-                      destinationLaneId: toLane?.id ?? '', autoSpawn: toLane?.auto_spawn ?? false,
-                      interpolatedLaneCommand: interpolatedAuto, resolvedAgent: effectiveTargetAgent,
-                      currentAgent: task.agent ?? '', currentTrack: activeIsolatedSwimlaneId,
-                      destinationTrack: targetIsolatedSwimlaneId, forceFresh: targetForceFresh,
+                      destinationLaneId: currentLane.id, autoSpawn: currentLane.auto_spawn,
+                      interpolatedLaneCommand: currentInterpolatedAuto, resolvedAgent: effectiveTargetAgent,
+                      currentAgent: currentTask.agent ?? '', currentTrack: persistedRecord?.isolated_swimlane_id ?? null,
+                      destinationTrack: resolveIsolatedSwimlaneId(currentLane), forceFresh: resolveForceFresh(currentLane),
                       restartNeededForModel: persistedPlan.needsRestartForModel,
                       restartNeededForEffort: persistedRestartNeededForEffort,
                       policy: persistedPlan.liveSubmissionPolicy, sequence: persistedPlan.sequence,
@@ -749,7 +799,7 @@ export async function handleTaskMove(
                   : null;
                 if (!persistedLiveSubmission) throw new Error('live submission superseded after prefix');
                 capturedFingerprint.value = persistedLiveSubmission.fingerprint;
-              };
+              });
               if (settingsPrefix.length > 0) {
                 context.terminalSubmitScheduler.scheduleKeystrokes(task.id, task.session_id, settingsPrefix, {
                   verifier: plan.verifier,
@@ -757,22 +807,16 @@ export async function handleTaskMove(
                   strictVerification: true,
                   onDelivered: persistVerifiedPrefix,
                 });
-              } else {
-                persistVerifiedPrefix();
               }
 
               if (liveSubmission && nativeSnapshot?.rootNativeSessionId) {
-                const capturedLaneId = toLane?.id ?? '';
-                const capturedNativeSessionId = nativeSnapshot.rootNativeSessionId;
-                const capturedSessionGeneration = nativeSnapshot.sessionGeneration;
-                const capturedInputGeneration = nativeSnapshot.inputGeneration;
                 context.terminalSubmitScheduler.scheduleNativeIdleSubmission({
                   taskId: task.id,
                   projectId: resolvedProjectId,
                   sessionId: capturedSessionId,
-                  nativeSessionId: capturedNativeSessionId,
-                  sessionGeneration: capturedSessionGeneration,
-                  inputGeneration: capturedInputGeneration,
+                  nativeSessionId: nativeSnapshot.rootNativeSessionId,
+                  sessionGeneration: nativeSnapshot.sessionGeneration,
+                  inputGeneration: nativeSnapshot.inputGeneration,
                   command: interpolatedAuto,
                   policy: liveSubmission.policy,
                   validateCurrent: () => {
@@ -809,6 +853,7 @@ export async function handleTaskMove(
                     const currentPlan = prepareInjectionPlan({
                       adapter: currentAdapter,
                       sessionRepo: currentSessionRepo,
+                      sessionRecord: currentRecord,
                       task: currentTask,
                       toLane: currentLane,
                       project: currentProject,

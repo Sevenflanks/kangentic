@@ -55,7 +55,7 @@ describe('handleTaskMove live lane submission', () => {
     expect(updateAppliedSettings).not.toHaveBeenCalled();
     const prefixOptions = scheduler.scheduleKeystrokes.mock.calls[0]?.[3];
     expect(prefixOptions).toMatchObject({ strictVerification: true });
-    prefixOptions?.onDelivered?.();
+    await prefixOptions?.onDelivered?.();
     expect(updateAppliedSettings).toHaveBeenCalledWith('pty-live-1', { effort: 'high' });
     expect(request?.validateCurrent()).toBe('valid');
   });
@@ -148,6 +148,28 @@ describe('handleTaskMove live lane submission', () => {
     state.sessionStatus = 'running';
     state.writable = false;
     expect(request?.validateCurrent()).toBe('session-exit');
+  });
+
+  it('does not persist a delayed prefix after destination configuration drifts', async () => {
+    state.destinationLane = makeLane('lane-91', { auto_command: '/go', effort_override: 'high' });
+    state.settingsSequence = ['/effort high'];
+    await moveToDestination();
+    const options = scheduler.scheduleKeystrokes.mock.calls[0]?.[3];
+    state.destinationLane = makeLane('lane-91', { auto_command: '/changed', effort_override: 'high' });
+
+    await expect(options?.onDelivered?.()).rejects.toThrow('superseded');
+    expect(updateAppliedSettings).not.toHaveBeenCalled();
+  });
+
+  it('does not persist a delayed prefix after captured PTY ownership is lost', async () => {
+    state.destinationLane = makeLane('lane-91', { auto_command: '/go', effort_override: 'high' });
+    state.settingsSequence = ['/effort high'];
+    await moveToDestination();
+    const options = scheduler.scheduleKeystrokes.mock.calls[0]?.[3];
+    state.writable = false;
+
+    await expect(options?.onDelivered?.()).rejects.toThrow('superseded');
+    expect(updateAppliedSettings).not.toHaveBeenCalled();
   });
 
   it.each([
