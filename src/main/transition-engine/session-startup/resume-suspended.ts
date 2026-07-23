@@ -10,6 +10,7 @@ import { isResumeEligible } from '../spawn-intent';
 import { resolveIsolatedSwimlaneId } from '../session-isolation';
 import { retireRecord, markRecordSuspended } from '../session-lifecycle';
 import { isShuttingDown } from '../../shutdown-state';
+import { removeAdapterHooks } from '../../pty/lifecycle/adapter-lifecycle';
 import { prepareAgentSpawn, type PreparedSpawn } from './prepare-spawn';
 import { startStartupTimer } from './timing';
 
@@ -323,35 +324,58 @@ export async function resumeSuspendedSessions(
   // adapter.detect and shell resolution). Avoids firing N spawns that
   // would each individually throw and log errors against a closing DB.
   if (isShuttingDown()) {
+    for (const input of spawnInputs) {
+      removeAdapterHooks({
+        id: input.sessionRecordId,
+        taskId: input.task.id,
+        cwd: input.cwd,
+        agentParser: input.adapter,
+      });
+    }
     done(0);
     return;
   }
 
   const spawnResults = await Promise.allSettled(
     spawnInputs.map(async (input) => {
-      const newSession = await sessionManager.spawn({
-        id: input.sessionRecordId,
-        taskId: input.task.id,
-        projectId,
-        command: input.command,
-        cwd: input.cwd,
-        env: input.extraEnv ?? undefined,
-        statusOutputPath: input.statusOutputPath,
-        eventsOutputPath: input.eventsOutputPath,
-        agentParser: input.adapter,
-        agentName: input.adapter.name,
-        agentSessionId: input.agentSessionId,
-        isolatedSwimlaneId: input.record.isolated_swimlane_id,
-        // Recovery spawns carry no initial prompt (prompt: undefined in
-        // prepare-spawn), so the agent comes up waiting for the user: a resume
-        // sits at a quiet prompt, a fresh spawn at a blank one. Mark resuming so
-        // the activity engine seeds idle, not 'thinking' (the documented
-        // orphan-recovery contract). The command is already built, so this flag
-        // does not alter it - it only drives the seed and the resume overlay.
-        resuming: true,
-        exitSequence: input.adapter.getExitSequence?.() ?? ['\x03'],
-      });
-      return { input, newSession };
+      let sessionManagerOwnsHooks = false;
+      try {
+        const spawnInput = {
+          id: input.sessionRecordId,
+          taskId: input.task.id,
+          projectId,
+          command: input.command,
+          cwd: input.cwd,
+          env: input.extraEnv ?? undefined,
+          statusOutputPath: input.statusOutputPath,
+          eventsOutputPath: input.eventsOutputPath,
+          agentParser: input.adapter,
+          agentName: input.adapter.name,
+          agentSessionId: input.agentSessionId,
+          isolatedSwimlaneId: input.record.isolated_swimlane_id,
+          // Recovery spawns carry no initial prompt (prompt: undefined in
+          // prepare-spawn), so the agent comes up waiting for the user: a resume
+          // sits at a quiet prompt, a fresh spawn at a blank one. Mark resuming so
+          // the activity engine seeds idle, not 'thinking' (the documented
+          // orphan-recovery contract). The command is already built, so this flag
+          // does not alter it - it only drives the seed and the resume overlay.
+          resuming: true,
+          exitSequence: input.adapter.getExitSequence?.() ?? ['\x03'],
+        };
+        // 只有 SessionManager.spawn 實際被呼叫後才移交 hook owner；建立參數時失敗仍由這裡釋放。
+        sessionManagerOwnsHooks = true;
+        const newSession = await sessionManager.spawn(spawnInput);
+        return { input, newSession };
+      } finally {
+        if (!sessionManagerOwnsHooks) {
+          removeAdapterHooks({
+            id: input.sessionRecordId,
+            taskId: input.task.id,
+            cwd: input.cwd,
+            agentParser: input.adapter,
+          });
+        }
+      }
     }),
   );
 

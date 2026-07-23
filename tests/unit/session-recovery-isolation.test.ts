@@ -454,6 +454,7 @@ describe('resumeSuspendedSessions: spawn carries correct isolated_swimlane_id', 
     // Assert: spawn was called with isolatedSwimlaneId = null (the main track).
     expect(sessionManager.spawn).toHaveBeenCalledTimes(1);
     const spawnArg = (sessionManager.spawn as ReturnType<typeof vi.fn>).mock.calls[0][0];
+    expect(spawnArg.id).toBe('new-record-id');
     expect(spawnArg.isolatedSwimlaneId).toBeNull();
   });
 
