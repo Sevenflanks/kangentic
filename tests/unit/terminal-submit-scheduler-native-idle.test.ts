@@ -247,6 +247,22 @@ describe('TerminalSubmitScheduler native-idle lifecycle', () => {
     expect(genericSubmit).toHaveBeenCalledTimes(2);
   });
 
+  it('terminalizes a queued native successor when a strict prefix fails', async () => {
+    submit.submitKeystrokes = vi.fn(async (_id, _commands, options) => {
+      if (options.strictVerification) throw new Error('verification failed');
+    });
+    manager.updateSnapshot('s1', manager.makeSnapshot({ cleanIdle: { nativeSessionId: 'root-1', occurredAt: 10 } }));
+
+    scheduler.scheduleKeystrokes('t1', 's1', ['/effort high'], { strictVerification: true });
+    scheduler.scheduleNativeIdleSubmission(request());
+    await tick();
+
+    expect(submit.submitKeystrokes).toHaveBeenCalledTimes(1);
+    expect(statuses).toContainEqual(expect.objectContaining({ state: 'cancelled', reason: 'delivery-error' }));
+    expect([...manager.listeners.values()].every((listeners) => listeners.size === 0)).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it('serializes native delivery behind in-flight content', async () => {
     scheduler.scheduleContent('t1', 's1', 'content'); manager.emit('first-output', 's1'); await tick();
     manager.updateSnapshot('s1', manager.makeSnapshot({ cleanIdle: { nativeSessionId: 'root-1', occurredAt: 10 } })); scheduler.scheduleNativeIdleSubmission(request());

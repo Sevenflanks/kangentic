@@ -84,6 +84,8 @@ export interface ScheduleKeystrokesOptions {
   verifier?: CommandVerifier | null;
   /** Verifies leading prefix only; trailing commands fire-and-forget. */
   verifiedPrefixLength?: number;
+  strictVerification?: boolean;
+  onDelivered?: () => void;
   /**
    * Hard timeout for the fresh-spawn wait. When the CLI never emits
    * `'thinking'` (e.g. agent hung at startup), we cancel this task's
@@ -327,12 +329,13 @@ export class TerminalSubmitScheduler {
 
     const activeBurst = this.active.get(request.taskId);
     if (activeBurst) {
-      if (this.replaceActiveSuccessor(
+      if (!this.replaceActiveSuccessor(
         request.taskId,
         activeBurst,
         { kind: 'native-idle', entry },
-      )) this.watchNativeEntry(entry);
-      else this.cancelNativeEntry(entry, 'superseded');
+      )) {
+        this.cancelNativeEntry(entry, 'superseded');
+      }
       return;
     }
 
@@ -940,6 +943,7 @@ export class TerminalSubmitScheduler {
     opts: ScheduleKeystrokesOptions,
     entry: ActiveBurst,
   ): Promise<void> {
+    let delivered = true;
     try {
       await this.terminalSubmit.submitKeystrokes(sessionId, commands, {
         // Fresh-spawn paths just consumed the CLI prompt arg and have nothing
@@ -952,13 +956,30 @@ export class TerminalSubmitScheduler {
         sendCtrlC: !opts.freshlySpawned,
         verifier: opts.verifier,
         verifiedPrefixLength: opts.verifiedPrefixLength,
+        strictVerification: opts.strictVerification,
         signal: entry.controller.signal,
         source: `task:${taskId.slice(0, 8)}`,
       });
     } catch (caughtError) {
+      delivered = false;
       const message = caughtError instanceof Error ? caughtError.message : String(caughtError);
       if (!message.includes('abort')) {
         console.error(`[TerminalSubmitScheduler] Burst failed for task ${taskId.slice(0, 8)}: ${message}`);
+      }
+      if (opts.strictVerification) {
+        this.cancelScheduledNative(entry.next, 'delivery-error');
+        entry.next = null;
+      }
+    }
+
+    if (delivered && this.active.get(taskId) === entry && !entry.controller.signal.aborted) {
+      try {
+        opts.onDelivered?.();
+      } catch (caughtError) {
+        const message = caughtError instanceof Error ? caughtError.message : String(caughtError);
+        console.error(`[TerminalSubmitScheduler] Burst completion failed for task ${taskId.slice(0, 8)}: ${message}`);
+        this.cancelScheduledNative(entry.next, 'delivery-error');
+        entry.next = null;
       }
     }
 
