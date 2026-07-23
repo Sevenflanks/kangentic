@@ -36,6 +36,7 @@ export const updateAppliedSettings = vi.fn((
   };
 });
 export const spawnAgent = vi.fn(async () => undefined);
+export const getLatestForTask = vi.fn(() => state.latestRecord);
 
 export const state: {
   task: Task;
@@ -43,6 +44,7 @@ export const state: {
   destinationLane: Swimlane;
   record: Record<string, unknown>;
   latestRecord: Record<string, unknown>;
+  exactRecordExists: boolean;
   snapshot: NativeIdleSnapshot | null;
   sessionExists: boolean;
   sessionTaskId: string;
@@ -57,6 +59,7 @@ export const state: {
   destinationLane: makeLane('lane-91', { name: 'Finalize', auto_command: '/go' }),
   record: makeRecord(),
   latestRecord: makeRecord(),
+  exactRecordExists: true,
   snapshot: makeSnapshot(),
   sessionExists: true,
   sessionTaskId: 'task-live-1',
@@ -114,6 +117,7 @@ export function resetHarness(): void {
   state.destinationLane = makeLane('lane-91', { name: 'Finalize', auto_command: '/go' });
   state.record = makeRecord();
   state.latestRecord = state.record;
+  state.exactRecordExists = true;
   state.snapshot = makeSnapshot();
   state.sessionExists = true;
   state.sessionTaskId = state.task.id;
@@ -150,8 +154,8 @@ vi.mock('simple-git', () => ({ simpleGit: vi.fn(() => ({ diffSummary: vi.fn(asyn
 vi.mock('../../../src/main/db/database', () => ({ getProjectDb: vi.fn(() => ({})) }));
 vi.mock('../../../src/main/db/repositories/session-repository', () => ({
     SessionRepository: class {
-      findById = vi.fn((id: string) => id === state.task.session_id ? state.record : undefined);
-      getLatestForTask = vi.fn(() => state.latestRecord);
+      findById = vi.fn((id: string) => state.exactRecordExists && id === state.task.session_id ? state.record : undefined);
+      getLatestForTask = getLatestForTask;
     getLatestForTaskByTypeAndIsolation = vi.fn(() => state.record);
     updateAppliedSettings = updateAppliedSettings;
     updateGitStats = vi.fn();

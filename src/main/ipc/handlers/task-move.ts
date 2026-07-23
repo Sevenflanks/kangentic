@@ -603,7 +603,7 @@ export async function handleTaskMove(
           const plan = prepareInjectionPlan({
             adapter,
             sessionRepo,
-            sessionRecord: activeRecord,
+            sessionRecord: activeRecord ?? null,
             task,
             toLane: toLane ?? null,
             project,

@@ -2,6 +2,7 @@ import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { handleTaskMove as HandleTaskMove } from '../../src/main/ipc/handlers/task-move';
 import {
   context,
+  getLatestForTask,
   makeLane,
   makeRecord,
   makeSnapshot,
@@ -113,6 +114,22 @@ describe('handleTaskMove live lane submission', () => {
 
     await moveToDestination();
 
+    expect(scheduler.scheduleKeystrokes).not.toHaveBeenCalled();
+    expect(scheduler.scheduleNativeIdleSubmission).not.toHaveBeenCalled();
+  });
+
+  it('does not fall back to an unrelated latest record when the exact PTY record is absent', async () => {
+    state.exactRecordExists = false;
+    state.latestRecord = makeRecord({
+      id: 'unrelated-latest', applied_model: 'latest-model', applied_effort: 'low',
+      agent_session_id: 'latest-agent', cwd: '/latest',
+    });
+    state.destinationLane = makeLane('lane-91', { auto_command: '/go', effort_override: 'high' });
+    state.settingsSequence = ['/effort high'];
+
+    await moveToDestination();
+
+    expect(getLatestForTask).not.toHaveBeenCalled();
     expect(scheduler.scheduleKeystrokes).not.toHaveBeenCalled();
     expect(scheduler.scheduleNativeIdleSubmission).not.toHaveBeenCalled();
   });
