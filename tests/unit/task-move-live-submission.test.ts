@@ -117,6 +117,52 @@ describe('handleTaskMove live lane submission', () => {
     expect(scheduler.scheduleNativeIdleSubmission).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ['wrong task', () => { state.sessionTaskId = 'other-task'; }],
+    ['wrong project', () => { state.sessionProjectId = 'other-project'; }],
+    ['non-running session', () => { state.sessionStatus = 'suspended'; }],
+    ['non-writable PTY', () => { state.writable = false; }],
+  ])('does not route live delivery for a %s captured session', async (_name, mutate) => {
+    mutate();
+
+    await moveToDestination();
+
+    expect(scheduler.scheduleKeystrokes).not.toHaveBeenCalled();
+    expect(scheduler.scheduleNativeIdleSubmission).not.toHaveBeenCalled();
+  });
+
+  it('keeps the captured record when a newer task record exists and rejects ownership drift', async () => {
+    state.latestRecord = makeRecord({ id: 'newer-other-track', isolated_swimlane_id: 'other-track' });
+    await moveToDestination();
+    const request = scheduler.scheduleNativeIdleSubmission.mock.calls[0]?.[0];
+
+    expect(request?.validateCurrent()).toBe('valid');
+    state.sessionTaskId = 'other-task';
+    expect(request?.validateCurrent()).toBe('session-exit');
+    state.sessionTaskId = state.task.id;
+    state.sessionProjectId = 'other-project';
+    expect(request?.validateCurrent()).toBe('session-exit');
+    state.sessionProjectId = 'proj-test';
+    state.sessionStatus = 'suspended';
+    expect(request?.validateCurrent()).toBe('session-exit');
+    state.sessionStatus = 'running';
+    state.writable = false;
+    expect(request?.validateCurrent()).toBe('session-exit');
+  });
+
+  it.each([
+    ['id', () => { state.record = makeRecord({ id: 'other-pty' }); }],
+    ['task', () => { state.record = makeRecord({ task_id: 'other-task' }); }],
+    ['session type', () => { state.record = makeRecord({ session_type: 'claude_agent' }); }],
+    ['isolation', () => { state.record = makeRecord({ isolated_swimlane_id: 'other-track' }); }],
+  ])('rejects a mismatched captured record %s', async (_name, mutate) => {
+    mutate();
+
+    await moveToDestination();
+
+    expect(scheduler.scheduleNativeIdleSubmission).not.toHaveBeenCalled();
+  });
+
   it('revalidates ownership, evidence generation, and current configuration before first byte', async () => {
     await moveToDestination();
     const request = scheduler.scheduleNativeIdleSubmission.mock.calls[0]?.[0];

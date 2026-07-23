@@ -43,6 +43,7 @@ vi.mock('../../src/main/db/database', () => ({ getProjectDb: vi.fn(() => ({})) }
 vi.mock('../../src/main/db/repositories/task-repository', () => ({ TaskRepository: class {} }));
 vi.mock('../../src/main/db/repositories/session-repository', () => ({
   SessionRepository: class {
+    findById = vi.fn((sessionId: string) => hoisted.activeRecord?.id === sessionId ? hoisted.activeRecord : undefined);
     getLatestForTask = vi.fn(() => hoisted.activeRecord);
     getLatestForTaskByTypeAndIsolation = vi.fn(() => hoisted.activeRecord);
     updateGitStats = vi.fn();
@@ -219,7 +220,7 @@ describe('handleTaskMove session switch', () => {
 
     // Live main session on the exec lane.
     hoisted.activeRecord = {
-      id: 'rec-main', task_id: 'task-aaa00001', isolated_swimlane_id: null,
+      id: 'active-session-1', task_id: 'task-aaa00001', isolated_swimlane_id: null,
       agent_session_id: 'agent-A', status: 'running',
       started_at: '2026-01-01T00:00:00Z', session_type: 'claude_agent',
     };
@@ -241,7 +242,7 @@ describe('handleTaskMove session switch', () => {
     });
 
     // Suspended the live (main) line.
-    expect(markRecordSuspended).toHaveBeenCalledWith(expect.anything(), 'rec-main', 'system');
+    expect(markRecordSuspended).toHaveBeenCalledWith(expect.anything(), 'active-session-1', 'system');
     expect(context.sessionManager.suspend).toHaveBeenCalledWith('active-session-1');
     expect(taskRepo.update).toHaveBeenCalledWith({ id: 'task-aaa00001', session_id: null });
 
@@ -262,7 +263,7 @@ describe('handleTaskMove session switch', () => {
 
     // Live ISOLATED session (line = the review lane id).
     hoisted.activeRecord = {
-      id: 'rec-isolated', task_id: 'task-aaa00001', isolated_swimlane_id: REVIEW_ISOLATED_LANE_ID,
+      id: 'active-session-1', task_id: 'task-aaa00001', isolated_swimlane_id: REVIEW_ISOLATED_LANE_ID,
       agent_session_id: 'agent-B', status: 'running',
       started_at: '2026-01-02T00:00:00Z', session_type: 'claude_agent',
     };
@@ -284,7 +285,7 @@ describe('handleTaskMove session switch', () => {
     });
 
     // Suspended the live isolated line (not kept alive).
-    expect(markRecordSuspended).toHaveBeenCalledWith(expect.anything(), 'rec-isolated', 'system');
+    expect(markRecordSuspended).toHaveBeenCalledWith(expect.anything(), 'active-session-1', 'system');
     expect(context.sessionManager.suspend).toHaveBeenCalledWith('active-session-1');
 
     // Phase 3 spawned with the NORMAL column (which resumes main).
@@ -304,7 +305,7 @@ describe('handleTaskMove session switch', () => {
 
     // Live main session; target is another normal column, no auto_command.
     hoisted.activeRecord = {
-      id: 'rec-main', task_id: 'task-aaa00001', isolated_swimlane_id: null,
+      id: 'active-session-1', task_id: 'task-aaa00001', isolated_swimlane_id: null,
       agent_session_id: 'agent-A', status: 'running',
       started_at: '2026-01-01T00:00:00Z', session_type: 'claude_agent',
     };
@@ -345,7 +346,7 @@ describe('handleTaskMove session switch', () => {
 
     // Live MAIN session (isolation null on both the active record and the target).
     hoisted.activeRecord = {
-      id: 'rec-main', task_id: 'task-aaa00001', isolated_swimlane_id: null,
+      id: 'active-session-1', task_id: 'task-aaa00001', isolated_swimlane_id: null,
       agent_session_id: 'agent-A', status: 'running',
       started_at: '2026-01-01T00:00:00Z', session_type: 'claude_agent',
     };
@@ -367,7 +368,7 @@ describe('handleTaskMove session switch', () => {
     });
 
     // Suspended the live main session and routed to Phase 3 to spawn fresh.
-    expect(markRecordSuspended).toHaveBeenCalledWith(expect.anything(), 'rec-main', 'system');
+    expect(markRecordSuspended).toHaveBeenCalledWith(expect.anything(), 'active-session-1', 'system');
     expect(context.sessionManager.suspend).toHaveBeenCalledWith('active-session-1');
     expect(mockSpawnAgent).toHaveBeenCalledTimes(1);
     const spawnArg = mockSpawnAgent.mock.calls[0][0] as { toLane: Swimlane };

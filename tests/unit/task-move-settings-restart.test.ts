@@ -55,6 +55,7 @@ vi.mock('../../src/main/db/database', () => ({ getProjectDb: vi.fn(() => ({})) }
 vi.mock('../../src/main/db/repositories/task-repository', () => ({ TaskRepository: class {} }));
 vi.mock('../../src/main/db/repositories/session-repository', () => ({
   SessionRepository: class {
+    findById = vi.fn((sessionId: string) => hoisted.activeRecord?.id === sessionId ? hoisted.activeRecord : undefined);
     getLatestForTask = vi.fn(() => hoisted.activeRecord);
     getLatestForTaskByTypeAndIsolation = vi.fn(() => hoisted.activeRecord);
     updateGitStats = vi.fn();
@@ -243,7 +244,7 @@ function setActiveRecord(
   appliedEffort: string | null = null,
 ) {
   hoisted.activeRecord = {
-    id: 'rec-main',
+    id: 'active-session-1',
     task_id: 'task-aaa00001',
     isolated_swimlane_id: null,
     agent_session_id: 'agent-A',
@@ -360,7 +361,7 @@ describe('handleTaskMove model/effort restart and live-injection', () => {
       targetPosition: 0,
     });
 
-    expect(markRecordSuspended).toHaveBeenCalledWith(expect.anything(), 'rec-main', 'system');
+    expect(markRecordSuspended).toHaveBeenCalledWith(expect.anything(), 'active-session-1', 'system');
     expect(context.sessionManager.suspend).toHaveBeenCalledWith('active-session-1');
     expect(taskRepo.update).toHaveBeenCalledWith({ id: 'task-aaa00001', session_id: null });
     // Phase 3 spawns into the executing lane.

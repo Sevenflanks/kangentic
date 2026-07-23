@@ -42,8 +42,13 @@ export const state: {
   sourceLane: Swimlane;
   destinationLane: Swimlane;
   record: Record<string, unknown>;
+  latestRecord: Record<string, unknown>;
   snapshot: NativeIdleSnapshot | null;
   sessionExists: boolean;
+  sessionTaskId: string;
+  sessionProjectId: string;
+  sessionStatus: 'running' | 'queued' | 'suspended';
+  writable: boolean;
   settingsSequence: string[];
   project: Record<string, unknown>;
 } = {
@@ -51,8 +56,13 @@ export const state: {
   sourceLane: makeLane('lane-source'),
   destinationLane: makeLane('lane-91', { name: 'Finalize', auto_command: '/go' }),
   record: makeRecord(),
+  latestRecord: makeRecord(),
   snapshot: makeSnapshot(),
   sessionExists: true,
+  sessionTaskId: 'task-live-1',
+  sessionProjectId: 'proj-test',
+  sessionStatus: 'running',
+  writable: true,
   settingsSequence: [],
   project: { id: 'proj-test', default_agent: 'opencode', default_model: null, default_effort: null },
 };
@@ -103,15 +113,20 @@ export function resetHarness(): void {
   state.sourceLane = makeLane('lane-source');
   state.destinationLane = makeLane('lane-91', { name: 'Finalize', auto_command: '/go' });
   state.record = makeRecord();
+  state.latestRecord = state.record;
   state.snapshot = makeSnapshot();
   state.sessionExists = true;
+  state.sessionTaskId = state.task.id;
+  state.sessionProjectId = 'proj-test';
+  state.sessionStatus = 'running';
+  state.writable = true;
   state.settingsSequence = [];
   state.project = { id: 'proj-test', default_agent: 'opencode', default_model: null, default_effort: null };
   sessionManager.getSession.mockImplementation((id: string) =>
     state.sessionExists && id === state.task.session_id
-      ? { id, taskId: state.task.id, projectId: 'proj-test', agentName: state.task.agent, status: 'running' }
+      ? { id, taskId: state.sessionTaskId, projectId: state.sessionProjectId, agentName: state.task.agent, status: state.sessionStatus }
       : undefined);
-  sessionManager.isWritable.mockImplementation((id: string) => state.sessionExists && id === state.task.session_id);
+  sessionManager.isWritable.mockImplementation((id: string) => state.writable && state.sessionExists && id === state.task.session_id);
   sessionManager.snapshotNativeIdle.mockImplementation(() => state.snapshot);
 }
 
@@ -135,8 +150,8 @@ vi.mock('simple-git', () => ({ simpleGit: vi.fn(() => ({ diffSummary: vi.fn(asyn
 vi.mock('../../../src/main/db/database', () => ({ getProjectDb: vi.fn(() => ({})) }));
 vi.mock('../../../src/main/db/repositories/session-repository', () => ({
     SessionRepository: class {
-      findById = vi.fn(() => state.record);
-      getLatestForTask = vi.fn(() => state.record);
+      findById = vi.fn((id: string) => id === state.task.session_id ? state.record : undefined);
+      getLatestForTask = vi.fn(() => state.latestRecord);
     getLatestForTaskByTypeAndIsolation = vi.fn(() => state.record);
     updateAppliedSettings = updateAppliedSettings;
     updateGitStats = vi.fn();
