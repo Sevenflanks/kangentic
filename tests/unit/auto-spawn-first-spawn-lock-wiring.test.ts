@@ -28,6 +28,12 @@ const mockTaskUpdate = vi.fn();
 const mockGetLatestForTask = vi.fn();
 const mockGetUserPausedTaskIds = vi.fn(() => new Set<string>());
 const mockSwimlaneList = vi.fn();
+const mockSessionRepoInsert = vi.fn();
+const mockUpdateAppliedSettings = vi.fn();
+const mockRemoveAdapterHooks = vi.fn();
+const { mockIsShuttingDown } = vi.hoisted(() => ({
+  mockIsShuttingDown: vi.fn(() => false),
+}));
 
 vi.mock('node:fs', () => ({
   default: { existsSync: vi.fn(() => true) },
@@ -46,6 +52,8 @@ vi.mock('../../src/main/db/repositories/session-repository', () => ({
   SessionRepository: class {
     getLatestForTask = (...args: unknown[]) => mockGetLatestForTask(...args);
     getUserPausedTaskIds = (...args: unknown[]) => mockGetUserPausedTaskIds(...args);
+    insert = (...args: unknown[]) => mockSessionRepoInsert(...args);
+    updateAppliedSettings = (...args: unknown[]) => mockUpdateAppliedSettings(...args);
   },
 }));
 
@@ -57,7 +65,11 @@ vi.mock('../../src/main/db/repositories/swimlane-repository', () => ({
 
 vi.mock('../../src/main/pty/session-manager', () => ({ SessionManager: class {} }));
 vi.mock('../../src/main/config/config-manager', () => ({ ConfigManager: class {} }));
-vi.mock('../../src/main/shutdown-state', () => ({ isShuttingDown: vi.fn(() => false) }));
+vi.mock('../../src/main/shutdown-state', () => ({ isShuttingDown: mockIsShuttingDown }));
+
+vi.mock('../../src/main/pty/lifecycle/adapter-lifecycle', () => ({
+  removeAdapterHooks: (...args: unknown[]) => mockRemoveAdapterHooks(...args),
+}));
 
 vi.mock('../../src/main/transition-engine/session-startup/timing', () => ({
   startStartupTimer: vi.fn(() => vi.fn()),
@@ -77,7 +89,7 @@ function makeSessionManager() {
     hasSessionForTask: vi.fn(() => false),
     getShell: vi.fn(async () => 'powershell'),
     registerSuspendedPlaceholder: vi.fn(),
-    spawn: vi.fn(),
+    spawn: vi.fn(async (input: { id: string }) => ({ id: input.id })),
   };
 }
 
@@ -87,17 +99,39 @@ function makeConfigManager() {
   };
 }
 
-async function runAutoSpawn() {
+async function runAutoSpawn(sessionManager = makeSessionManager()) {
   await autoSpawnTasks(
     'proj-123',
     '/mock/project',
-    makeSessionManager() as never,
+    sessionManager as never,
     makeConfigManager() as never,
     'claude',
     null,
     'claude-opus-4-8',
     'xhigh',
   );
+  return sessionManager;
+}
+
+function makePreparedSpawn(sessionRecordId: string, getExitSequence = () => ['\x03']) {
+  const adapter = { name: 'claude', sessionType: 'claude', getExitSequence };
+  return {
+    ok: true as const,
+    data: {
+      adapter,
+      agent: 'claude',
+      command: 'claude',
+      cwd: '/mock/project',
+      sessionRecordId,
+      agentSessionId: null,
+      permissionMode: 'default',
+      statusOutputPath: `/mock/project/.kangentic/sessions/${sessionRecordId}/status.json`,
+      eventsOutputPath: `/mock/project/.kangentic/sessions/${sessionRecordId}/events.jsonl`,
+      extraEnv: null,
+      appliedModel: null,
+      appliedEffort: null,
+    },
+  };
 }
 
 type PreparedSpawnInput = {
@@ -109,6 +143,8 @@ type PreparedSpawnInput = {
 describe('autoSpawnTasks first-spawn lock wiring', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockIsShuttingDown.mockReset();
+    mockIsShuttingDown.mockReturnValue(false);
     mockSwimlaneList.mockReturnValue([
       { id: LANE_ID, auto_spawn: true, session_target: 'main', session_spawn_strategy: 'create_or_resume' },
     ]);
@@ -142,5 +178,89 @@ describe('autoSpawnTasks first-spawn lock wiring', () => {
     expect(mockPrepareAgentSpawn).toHaveBeenCalledTimes(1);
     const prepareInput = mockPrepareAgentSpawn.mock.calls[0][0] as unknown as PreparedSpawnInput;
     expect(prepareInput.hasSessionRecord).toBe(true);
+  });
+
+  it('releases every prepared hook owner when shutdown begins before the spawn pass', async () => {
+    const secondTaskId = 'task-auto-spawn-002';
+    mockTaskList.mockReturnValue([
+      { id: TASK_ID, swimlane_id: LANE_ID, worktree_path: null, branch_name: null },
+      { id: secondTaskId, swimlane_id: LANE_ID, worktree_path: null, branch_name: null },
+    ]);
+    const firstPrepared = makePreparedSpawn('prepared-owner-001');
+    const secondPrepared = makePreparedSpawn('prepared-owner-002');
+    mockPrepareAgentSpawn
+      .mockResolvedValueOnce(firstPrepared)
+      .mockResolvedValueOnce(secondPrepared);
+    mockIsShuttingDown
+      .mockReturnValueOnce(false)
+      .mockReturnValueOnce(true);
+
+    const sessionManager = await runAutoSpawn();
+
+    expect(sessionManager.spawn).not.toHaveBeenCalled();
+    expect(mockRemoveAdapterHooks).toHaveBeenCalledTimes(2);
+    expect(mockRemoveAdapterHooks).toHaveBeenCalledWith({
+      id: 'prepared-owner-001',
+      taskId: TASK_ID,
+      cwd: '/mock/project',
+      agentParser: firstPrepared.data.adapter,
+    });
+    expect(mockRemoveAdapterHooks).toHaveBeenCalledWith({
+      id: 'prepared-owner-002',
+      taskId: secondTaskId,
+      cwd: '/mock/project',
+      agentParser: secondPrepared.data.adapter,
+    });
+  });
+
+  it('releases the prepared hook owner when exit-sequence evaluation throws before spawn invocation', async () => {
+    const exitSequenceError = new Error('exit sequence unavailable');
+    const prepared = makePreparedSpawn('prepared-owner-003', () => {
+      throw exitSequenceError;
+    });
+    mockPrepareAgentSpawn.mockResolvedValueOnce(prepared);
+
+    const sessionManager = await runAutoSpawn();
+
+    expect(sessionManager.spawn).not.toHaveBeenCalled();
+    expect(mockRemoveAdapterHooks).toHaveBeenCalledTimes(1);
+    expect(mockRemoveAdapterHooks).toHaveBeenCalledWith({
+      id: 'prepared-owner-003',
+      taskId: TASK_ID,
+      cwd: '/mock/project',
+      agentParser: prepared.data.adapter,
+    });
+  });
+
+  it('leaves hook cleanup to SessionManager after spawn invocation rejects', async () => {
+    const prepared = makePreparedSpawn('prepared-owner-004');
+    mockPrepareAgentSpawn.mockResolvedValueOnce(prepared);
+    const sessionManager = makeSessionManager();
+    const spawnError = new Error('spawn failed');
+    sessionManager.spawn.mockImplementationOnce(async (input: {
+      id: string;
+      taskId: string;
+      cwd: string;
+      agentParser: unknown;
+    }) => {
+      mockRemoveAdapterHooks({
+        id: input.id,
+        taskId: input.taskId,
+        cwd: input.cwd,
+        agentParser: input.agentParser,
+      });
+      throw spawnError;
+    });
+
+    await runAutoSpawn(sessionManager);
+
+    expect(sessionManager.spawn).toHaveBeenCalledOnce();
+    expect(mockRemoveAdapterHooks).toHaveBeenCalledTimes(1);
+    expect(mockRemoveAdapterHooks).toHaveBeenCalledWith({
+      id: 'prepared-owner-004',
+      taskId: TASK_ID,
+      cwd: '/mock/project',
+      agentParser: prepared.data.adapter,
+    });
   });
 });

@@ -7,6 +7,7 @@ import { SessionManager } from '../../pty/session-manager';
 import { ConfigManager } from '../../config/config-manager';
 import type { Swimlane, Task } from '../../../shared/types';
 import { isShuttingDown } from '../../shutdown-state';
+import { removeAdapterHooks } from '../../pty/lifecycle/adapter-lifecycle';
 import { resolveIsolatedSwimlaneId } from '../session-isolation';
 import { prepareAgentSpawn, type PreparedSpawn } from './prepare-spawn';
 import { startStartupTimer } from './timing';
@@ -155,28 +156,51 @@ export async function autoSpawnTasks(
 
   // --- Spawn pass (parallel): fire all spawns concurrently ---
   if (isShuttingDown()) {
+    for (const input of spawnInputs) {
+      removeAdapterHooks({
+        id: input.sessionRecordId,
+        taskId: input.task.id,
+        cwd: input.cwd,
+        agentParser: input.adapter,
+      });
+    }
     done(0);
     return;
   }
 
   const spawnResults = await Promise.allSettled(
     spawnInputs.map(async (input) => {
-      const newSession = await sessionManager.spawn({
-        id: input.sessionRecordId,
-        taskId: input.task.id,
-        projectId,
-        command: input.command,
-        cwd: input.cwd,
-        env: input.extraEnv ?? undefined,
-        statusOutputPath: input.statusOutputPath,
-        eventsOutputPath: input.eventsOutputPath,
-        agentParser: input.adapter,
-        agentName: input.adapter.name,
-        agentSessionId: input.agentSessionId,
-        isolatedSwimlaneId: input.isolatedSwimlaneId,
-        exitSequence: input.adapter.getExitSequence?.() ?? ['\x03'],
-      });
-      return { input, newSession };
+      let sessionManagerOwnsHooks = false;
+      try {
+        const spawnInput = {
+          id: input.sessionRecordId,
+          taskId: input.task.id,
+          projectId,
+          command: input.command,
+          cwd: input.cwd,
+          env: input.extraEnv ?? undefined,
+          statusOutputPath: input.statusOutputPath,
+          eventsOutputPath: input.eventsOutputPath,
+          agentParser: input.adapter,
+          agentName: input.adapter.name,
+          agentSessionId: input.agentSessionId,
+          isolatedSwimlaneId: input.isolatedSwimlaneId,
+          exitSequence: input.adapter.getExitSequence?.() ?? ['\x03'],
+        };
+        // 只有 SessionManager.spawn 實際被呼叫後才移交 hook owner；建立參數時失敗仍由這裡釋放。
+        sessionManagerOwnsHooks = true;
+        const newSession = await sessionManager.spawn(spawnInput);
+        return { input, newSession };
+      } finally {
+        if (!sessionManagerOwnsHooks) {
+          removeAdapterHooks({
+            id: input.sessionRecordId,
+            taskId: input.task.id,
+            cwd: input.cwd,
+            agentParser: input.adapter,
+          });
+        }
+      }
     }),
   );
 
