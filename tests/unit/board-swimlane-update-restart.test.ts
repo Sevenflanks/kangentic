@@ -130,7 +130,10 @@ interface MockContext {
   sessionManager: {
     getSession: ReturnType<typeof vi.fn>;
   };
-  terminalSubmitScheduler: { scheduleKeystrokes: ReturnType<typeof vi.fn> };
+  terminalSubmitScheduler: {
+    cancel: ReturnType<typeof vi.fn>;
+    scheduleKeystrokes: ReturnType<typeof vi.fn>;
+  };
   boardConfigManager: {
     writeBack: ReturnType<typeof vi.fn>;
     exists: ReturnType<typeof vi.fn>;
@@ -156,7 +159,7 @@ function createMockContext(overrides: Partial<MockContext> = {}): MockContext {
     sessionManager: {
       getSession: vi.fn(() => ({ status: 'running' })),
     },
-    terminalSubmitScheduler: { scheduleKeystrokes: vi.fn() },
+    terminalSubmitScheduler: { cancel: vi.fn(), scheduleKeystrokes: vi.fn() },
     boardConfigManager: {
       writeBack: vi.fn(),
       exists: vi.fn(() => false),
