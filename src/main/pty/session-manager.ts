@@ -21,6 +21,12 @@ import { safeKillPty } from './lifecycle/pty-kill';
 import { DEFAULT_PTY_COLS, DEFAULT_PTY_ROWS, performSpawn } from './lifecycle/session-spawn-flow';
 import { SessionRegistry, toSession, filterCacheByProject, type ManagedSession } from './session-registry';
 import { createWriteQueue, type WriteQueue } from './write-queue';
+import {
+  SessionWriteCoordinator,
+  type OwnershipExpectation,
+  type SubmissionLease,
+  type UserSubmissionLease,
+} from './session-write-coordinator';
 import { BackpressureController } from './buffer/backpressure-controller';
 import { isShuttingDown } from '../shutdown-state';
 import type { TranscriptRepository } from '../db/repositories/transcript-repository';
@@ -121,6 +127,9 @@ export class SessionManager extends EventEmitter {
   private sessionHistoryReader!: SessionHistoryReader;
   private statusFileReader: StatusFileReader;
   private readonly nativeIdleEvidence = new NativeIdleEvidence();
+  private readonly writeCoordinator = new SessionWriteCoordinator(
+    (sessionId) => this.getOrCreateWriteQueue(sessionId),
+  );
   private sessionFiles: SessionFileManager;
   private sessionIdManager: SessionIdManager;
   private activityEngineOptions: ActivityEngineOptions | undefined;
@@ -512,6 +521,8 @@ export class SessionManager extends EventEmitter {
       sessionHistoryReader: this.sessionHistoryReader,
       sessionQueue: this.sessionQueue,
       firstOutputTracker: this.firstOutputTracker,
+      writeCoordinator: this.writeCoordinator,
+      nativeIdleEvidence: this.nativeIdleEvidence,
       getTranscriptWriter: () => this.transcriptWriter,
       getShell: () => this.getShell(),
       takePendingResize: (sessionId) => {
@@ -535,19 +546,34 @@ export class SessionManager extends EventEmitter {
   }
 
   write(sessionId: string, data: string): void {
-    const session = this.registry.get(sessionId);
-    if (!session?.pty || data.length === 0) return;
+    if (data.length === 0) return;
+    this.getOrCreateWriteQueue(sessionId)?.enqueue(data);
+  }
 
-    let queue = this.writeQueues.get(sessionId);
-    if (!queue) {
-      queue = createWriteQueue(
-        () => this.registry.get(sessionId)?.pty ?? null,
-        undefined,
-        { onAutoDispose: () => this.writeQueues.delete(sessionId) },
-      );
-      this.writeQueues.set(sessionId, queue);
-    }
-    queue.enqueue(data);
+  getSessionGeneration(sessionId: string): number | null {
+    return this.writeCoordinator.getSessionGeneration(sessionId);
+  }
+
+  getInputGeneration(sessionId: string): number | null {
+    return this.writeCoordinator.getInputGeneration(sessionId);
+  }
+
+  acquireAutomation(
+    sessionId: string,
+    expected: OwnershipExpectation,
+    onFirstWrite: () => void,
+  ): SubmissionLease | null {
+    return this.writeCoordinator.acquireAutomation(sessionId, expected, onFirstWrite);
+  }
+
+  writeUserInput(sessionId: string, data: string, occurredAt: number): void {
+    if (data.length === 0 || this.writeCoordinator.getSessionGeneration(sessionId) === null) return;
+    const marker = this.writeCoordinator.recordUserInput(sessionId, data, occurredAt);
+    this.nativeIdleEvidence.recordUserInput(sessionId, marker.inputGeneration, marker.occurredAt);
+  }
+
+  acquireUserSubmission(sessionId: string): UserSubmissionLease | null {
+    return this.writeCoordinator.acquireUserSubmission(sessionId);
   }
 
   /**
@@ -562,6 +588,19 @@ export class SessionManager extends EventEmitter {
     const queue = this.writeQueues.get(sessionId);
     if (!queue) return Promise.resolve();
     return queue.drained();
+  }
+
+  private getOrCreateWriteQueue(sessionId: string): WriteQueue | null {
+    if (!this.registry.get(sessionId)?.pty) return null;
+    let queue = this.writeQueues.get(sessionId);
+    if (queue) return queue;
+    queue = createWriteQueue(
+      () => this.registry.get(sessionId)?.pty ?? null,
+      undefined,
+      { onAutoDispose: () => this.writeQueues.delete(sessionId) },
+    );
+    this.writeQueues.set(sessionId, queue);
+    return queue;
   }
 
   /**

@@ -15,6 +15,8 @@ import type { SessionHistoryReader } from '../readers/session-history-reader';
 import type { SessionQueue } from '../session-queue';
 import type { TranscriptWriter } from '../buffer/transcript-writer';
 import type { FirstOutputTracker } from './first-output-tracker';
+import type { SessionWriteCoordinator } from '../session-write-coordinator';
+import type { NativeIdleEvidence } from '../../activity-engine/native-idle-evidence';
 import { attachAdapter, disposeAdapterAttachment, removeAdapterHooks } from './adapter-lifecycle';
 import { safeKillPty } from './pty-kill';
 import { resolveShellArgs, buildSpawnEnv, resolveSpawnCwd } from '../spawn/pty-spawn';
@@ -53,6 +55,8 @@ export interface SpawnFlowContext {
   sessionHistoryReader: SessionHistoryReader;
   sessionQueue: SessionQueue;
   firstOutputTracker: FirstOutputTracker;
+  readonly writeCoordinator: SessionWriteCoordinator;
+  readonly nativeIdleEvidence: NativeIdleEvidence;
   getTranscriptWriter: () => TranscriptWriter | null;
   getShell: () => Promise<string>;
   /**
@@ -221,6 +225,10 @@ export async function performSpawn(
   };
 
   context.registry.set(id, session);
+
+  // Coordinator 是唯一 generation owner；任何 reader 啟動前，evidence 必須使用它回傳的同一個 generation。
+  const sessionGeneration = context.writeCoordinator.initialize(id);
+  context.nativeIdleEvidence.initializeSession(id, sessionGeneration);
 
   // Initialize extracted modules for this session. Seed the buffer manager with
   // the ACTUAL spawn cols so the first renderer resize reports colsChanged

@@ -2451,3 +2451,122 @@ describe('findLiveSessionByTaskId delegate', () => {
     expect(result).toBeUndefined();
   });
 });
+
+function createCoordinationPty(): {
+  readonly pty: pty.IPty;
+  readonly writes: string[];
+  readonly triggerExit: (exitCode?: number) => void;
+} {
+  const writes: string[] = [];
+  let exitHandler: ((event: { exitCode: number; signal?: number }) => void) | null = null;
+  const ptyProcess: pty.IPty = {
+    pid: 54321,
+    cols: 120,
+    rows: 30,
+    process: 'mock-shell',
+    handleFlowControl: false,
+    onData: vi.fn((_listener: (data: string) => void) => ({ dispose: vi.fn() })),
+    onExit: vi.fn((listener: (event: { exitCode: number; signal?: number }) => void) => {
+      exitHandler = listener;
+      return { dispose: vi.fn() };
+    }),
+    resize: vi.fn(),
+    clear: vi.fn(),
+    write: vi.fn((data: string | Buffer) => {
+      writes.push(typeof data === 'string' ? data : data.toString());
+    }),
+    kill: vi.fn(() => exitHandler?.({ exitCode: 0 })),
+    pause: vi.fn(),
+    resume: vi.fn(),
+  };
+  return {
+    pty: ptyProcess,
+    writes,
+    triggerExit: (exitCode = 0) => exitHandler?.({ exitCode }),
+  };
+}
+
+describe('Input coordination', () => {
+  let manager: SessionManager;
+
+  beforeEach(() => {
+    manager = new SessionManager();
+  });
+
+  afterEach(() => {
+    manager.killAll();
+  });
+
+  async function spawnCoordinatedSession(taskId: string) {
+    const mock = createCoordinationPty();
+    vi.mocked(pty.spawn).mockReturnValue(mock.pty);
+    const session = await manager.spawn({ taskId, command: '', cwd: tmpDir });
+    return { session, ...mock };
+  }
+
+  it('exposes generations after spawn and advances input generation through writeUserInput', async () => {
+    // Given
+    const { session, writes } = await spawnCoordinatedSession('task-coordination-write');
+    const sessionGeneration = manager.getSessionGeneration(session.id);
+
+    // When
+    manager.write(session.id, 'legacy');
+    manager.writeUserInput(session.id, 'user', 20);
+
+    // Then
+    expect(sessionGeneration).toBe(1);
+    expect(manager.getInputGeneration(session.id)).toBe(1);
+    expect(writes).toEqual(['legacy', 'user']);
+    expect(manager['nativeIdleEvidence'].snapshot(session.id)).toMatchObject({
+      sessionGeneration,
+      inputGeneration: 1,
+    });
+  });
+
+  it('buffers manager user input behind committed automation until release', async () => {
+    // Given
+    const { session, writes } = await spawnCoordinatedSession('task-coordination-automation');
+    const sessionGeneration = manager.getSessionGeneration(session.id);
+    const inputGeneration = manager.getInputGeneration(session.id);
+    const lease = sessionGeneration === null || inputGeneration === null
+      ? null
+      : manager.acquireAutomation(
+          session.id,
+          { sessionGeneration, inputGeneration },
+          vi.fn(),
+        );
+    await lease?.write('automation');
+
+    // When
+    manager.writeUserInput(session.id, 'user', 20);
+
+    // Then
+    expect(writes).toEqual(['automation']);
+    lease?.release();
+    expect(writes).toEqual(['automation', 'user']);
+  });
+
+  it('blocks automation while a user submission lease is active', async () => {
+    // Given
+    const { session } = await spawnCoordinatedSession('task-coordination-user-submission');
+    const sessionGeneration = manager.getSessionGeneration(session.id);
+    const inputGeneration = manager.getInputGeneration(session.id);
+    const expectation = sessionGeneration === null || inputGeneration === null
+      ? null
+      : { sessionGeneration, inputGeneration };
+
+    // When
+    const userSubmission = manager.acquireUserSubmission(session.id);
+    const blockedAutomation = expectation
+      ? manager.acquireAutomation(session.id, expectation, vi.fn())
+      : null;
+    await userSubmission?.run(async () => Promise.resolve());
+    const releasedAutomation = expectation
+      ? manager.acquireAutomation(session.id, expectation, vi.fn())
+      : null;
+
+    // Then
+    expect(blockedAutomation).toBeNull();
+    expect(releasedAutomation).not.toBeNull();
+  });
+});

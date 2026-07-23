@@ -177,6 +177,15 @@ function makeContext(): SpawnFlowContext {
     firstOutputTracker: {
       removeSession: vi.fn(),
     },
+    writeCoordinator: {
+      initialize: vi.fn(() => 41),
+      getSessionGeneration: vi.fn(() => 41),
+      disposeSession: vi.fn(),
+    },
+    nativeIdleEvidence: {
+      initializeSession: vi.fn(),
+      removeSession: vi.fn(),
+    },
     getTranscriptWriter: vi.fn(() => null),
     getShell: vi.fn().mockResolvedValue('/bin/bash'),
     takePendingResize: vi.fn(() => undefined),
@@ -221,6 +230,35 @@ describe('performSpawn - same-task replacement cleanup', () => {
     // Then
     expect(context.firstOutputTracker.removeSession).toHaveBeenCalledOnce();
     expect(context.firstOutputTracker.removeSession).toHaveBeenCalledWith(existing.id);
+  });
+});
+
+describe('performSpawn - input coordination lifecycle', () => {
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('initializes coordinator and evidence immediately after registry insertion and before readers', async () => {
+    // Given
+    const context = makeContext();
+    context.writeCoordinator.initialize.mockImplementation((sessionId: string) => {
+      expect(context.registry.has(sessionId)).toBe(true);
+      return 41;
+    });
+
+    // When
+    await performSpawn(makeInput(), context);
+
+    // Then
+    expect(context.writeCoordinator.initialize).toHaveBeenCalledWith('input-session-id-0000-000000000000');
+    expect(context.nativeIdleEvidence.initializeSession).toHaveBeenCalledWith(
+      'input-session-id-0000-000000000000',
+      41,
+    );
+    expect(context.writeCoordinator.initialize).toHaveBeenCalledBefore(context.nativeIdleEvidence.initializeSession);
+    expect(context.nativeIdleEvidence.initializeSession).toHaveBeenCalledBefore(context.bufferManager.initSession);
+    expect(context.nativeIdleEvidence.initializeSession).toHaveBeenCalledBefore(context.sessionFiles.register);
+    expect(context.nativeIdleEvidence.initializeSession).toHaveBeenCalledBefore(context.telemetry.initSession);
   });
 });
 
