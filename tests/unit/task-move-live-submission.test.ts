@@ -131,23 +131,27 @@ describe('handleTaskMove live lane submission', () => {
     expect(scheduler.scheduleNativeIdleSubmission).not.toHaveBeenCalled();
   });
 
-  it('keeps the captured record when a newer task record differs in settings and verifier identity', async () => {
-    state.latestRecord = makeRecord({ id: 'newer-other-track', applied_model: 'latest-model', applied_effort: 'low', agent_session_id: 'latest-agent', cwd: '/latest' });
+  it('keeps exact captured model and effort routing when a newer task record differs', async () => {
+    state.destinationLane = makeLane('lane-91', {
+      auto_command: '/go', model_override: 'destination-model', effort_override: 'high',
+    });
+    state.record = makeRecord({
+      applied_model: 'destination-model', applied_effort: 'high',
+      agent_session_id: 'captured-agent', cwd: '/captured',
+    });
+    state.latestRecord = makeRecord({
+      id: 'newer-other-track', applied_model: 'latest-model', applied_effort: 'low',
+      agent_session_id: 'latest-agent', cwd: '/latest',
+    });
     await moveToDestination();
     const request = scheduler.scheduleNativeIdleSubmission.mock.calls[0]?.[0];
 
+    expect(sessionManager.suspend).not.toHaveBeenCalled();
+    expect(spawnAgent).not.toHaveBeenCalled();
+    expect(scheduler.scheduleKeystrokes).not.toHaveBeenCalled();
+    expect(scheduler.scheduleNativeIdleSubmission).toHaveBeenCalledTimes(1);
+    expect(request?.command).toBe('/go');
     expect(request?.validateCurrent()).toBe('valid');
-    state.sessionTaskId = 'other-task';
-    expect(request?.validateCurrent()).toBe('session-exit');
-    state.sessionTaskId = state.task.id;
-    state.sessionProjectId = 'other-project';
-    expect(request?.validateCurrent()).toBe('session-exit');
-    state.sessionProjectId = 'proj-test';
-    state.sessionStatus = 'suspended';
-    expect(request?.validateCurrent()).toBe('session-exit');
-    state.sessionStatus = 'running';
-    state.writable = false;
-    expect(request?.validateCurrent()).toBe('session-exit');
   });
 
   it('does not persist an old prefix after a newer runtime effort override wins', async () => {
