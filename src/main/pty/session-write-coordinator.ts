@@ -24,6 +24,20 @@ export interface UserInputMarker {
   readonly occurredAt: number;
 }
 
+export type SessionWriteOwnershipErrorCode =
+  | 'inactive-automation-lease'
+  | 'inactive-user-submission-lease'
+  | 'user-submission-already-run'
+  | 'uninitialized-session';
+
+export class SessionWriteOwnershipError extends Error {
+  readonly name = 'SessionWriteOwnershipError';
+
+  constructor(readonly code: SessionWriteOwnershipErrorCode) {
+    super(code);
+  }
+}
+
 type AutomationOwnership = {
   active: boolean;
   committed: boolean;
@@ -32,6 +46,11 @@ type AutomationOwnership = {
 
 type UserSubmissionOwnership = {
   active: boolean;
+  runStarted: boolean;
+  waiting: {
+    readonly start: () => void;
+    readonly cancel: () => void;
+  } | null;
 };
 
 type SessionWriteState = {
@@ -43,12 +62,16 @@ type SessionWriteState = {
 };
 
 type WriteQueueLookup = (sessionId: string) => WriteQueue | null;
+type UserInputRecorded = (sessionId: string, marker: UserInputMarker) => void;
 
 export class SessionWriteCoordinator {
   private readonly states = new Map<string, SessionWriteState>();
   private nextSessionGeneration = 1;
 
-  constructor(private readonly getWriteQueue: WriteQueueLookup) {}
+  constructor(
+    private readonly getWriteQueue: WriteQueueLookup,
+    private readonly onUserInputRecorded: UserInputRecorded = () => {},
+  ) {}
 
   initialize(sessionId: string): number {
     this.disposeSession(sessionId);
@@ -66,18 +89,13 @@ export class SessionWriteCoordinator {
 
   recordUserInput(sessionId: string, data: string, occurredAt: number): UserInputMarker {
     const state = this.requireState(sessionId);
-    state.inputGeneration += 1;
-    const marker: UserInputMarker = {
-      sessionGeneration: state.sessionGeneration,
-      inputGeneration: state.inputGeneration,
-      occurredAt,
-    };
-
     const automation = state.automation;
     if (automation && !automation.committed) {
       automation.active = false;
       state.automation = null;
     }
+
+    const marker = this.recordInputMarker(sessionId, state, occurredAt);
 
     if (automation?.committed) {
       state.deferredUserInput.push(data);
@@ -118,15 +136,21 @@ export class SessionWriteCoordinator {
     };
     state.automation = ownership;
 
+    const isActive = (): boolean => ownership.active
+      && this.states.get(sessionId) === state
+      && state.automation === ownership;
+
     const release = (): void => {
       if (!ownership.active) return;
       ownership.active = false;
       if (state.automation !== ownership) return;
       state.automation = null;
 
-      // Automation 一旦送出首 byte 就必須先完成 ownership；user input 到 release 才接回同一條 FIFO，避免兩邊 byte 交錯。
+      // Automation 一旦送出首 byte 就必須先完成 ownership；release 先把 deferred user input 接回同一條 FIFO，
+      // 再喚醒 user submission，避免 callback 越過較早到達的 user bytes。
       const deferred = state.deferredUserInput.splice(0, state.deferredUserInput.length);
       for (const data of deferred) ownership.queue.enqueue(data);
+      state.userSubmission?.waiting?.start();
     };
 
     return {
@@ -134,7 +158,10 @@ export class SessionWriteCoordinator {
       sessionGeneration: state.sessionGeneration,
       inputGeneration: state.inputGeneration,
       write(data: string): Promise<void> {
-        if (!ownership.active) return Promise.resolve();
+        if (!isActive()) {
+          return Promise.reject(new SessionWriteOwnershipError('inactive-automation-lease'));
+        }
+        if (data.length === 0) return Promise.resolve();
         if (!ownership.committed) {
           ownership.committed = true;
           onFirstWrite();
@@ -154,21 +181,69 @@ export class SessionWriteCoordinator {
       state.automation = null;
     }
 
-    const ownership: UserSubmissionOwnership = { active: true };
+    const ownership: UserSubmissionOwnership = {
+      active: true,
+      runStarted: false,
+      waiting: null,
+    };
     state.userSubmission = ownership;
+    this.recordInputMarker(sessionId, state, Date.now());
+
+    const isActive = (): boolean => ownership.active
+      && this.states.get(sessionId) === state
+      && state.userSubmission === ownership;
+
     const release = (): void => {
       if (!ownership.active) return;
       ownership.active = false;
+      const waiting = ownership.waiting;
+      ownership.waiting = null;
+      waiting?.cancel();
       if (state.userSubmission === ownership) state.userSubmission = null;
     };
 
     return {
-      async run<T>(submit: () => Promise<T>): Promise<T> {
-        try {
-          return await submit();
-        } finally {
-          release();
+      run<T>(submit: () => Promise<T>): Promise<T> {
+        if (!isActive()) {
+          return Promise.reject(new SessionWriteOwnershipError('inactive-user-submission-lease'));
         }
+        if (ownership.runStarted) {
+          return Promise.reject(new SessionWriteOwnershipError('user-submission-already-run'));
+        }
+        ownership.runStarted = true;
+
+        return new Promise<T>((resolve, reject) => {
+          let settled = false;
+          const cancel = (): void => {
+            if (settled) return;
+            settled = true;
+            reject(new SessionWriteOwnershipError('inactive-user-submission-lease'));
+          };
+          const start = (): void => {
+            if (settled) return;
+            settled = true;
+            ownership.waiting = null;
+            Promise.resolve()
+              .then(() => {
+                if (!isActive()) {
+                  throw new SessionWriteOwnershipError('inactive-user-submission-lease');
+                }
+                return submit();
+              })
+              .then(
+                (value) => {
+                  release();
+                  resolve(value);
+                },
+                (error) => {
+                  release();
+                  reject(error);
+                },
+              );
+          };
+          ownership.waiting = { start, cancel };
+          if (!state.automation?.committed) start();
+        });
       },
       release,
     };
@@ -178,14 +253,31 @@ export class SessionWriteCoordinator {
     const state = this.states.get(sessionId);
     if (!state) return;
     if (state.automation) state.automation.active = false;
+    state.userSubmission?.waiting?.cancel();
     if (state.userSubmission) state.userSubmission.active = false;
     state.deferredUserInput.length = 0;
     this.states.delete(sessionId);
   }
 
+  private recordInputMarker(
+    sessionId: string,
+    state: SessionWriteState,
+    occurredAt: number,
+  ): UserInputMarker {
+    state.inputGeneration += 1;
+    const marker: UserInputMarker = {
+      sessionGeneration: state.sessionGeneration,
+      inputGeneration: state.inputGeneration,
+      occurredAt,
+    };
+    // WriteQueue 會同步送出第一個 chunk；marker 必須先進 evidence，才可讓同一筆 user bytes admission。
+    this.onUserInputRecorded(sessionId, marker);
+    return marker;
+  }
+
   private requireState(sessionId: string): SessionWriteState {
     const state = this.states.get(sessionId);
-    if (!state) throw new Error(`Session write coordination is not initialized: ${sessionId}`);
+    if (!state) throw new SessionWriteOwnershipError('uninitialized-session');
     return state;
   }
 }
