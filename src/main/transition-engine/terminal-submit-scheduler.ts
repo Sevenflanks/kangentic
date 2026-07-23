@@ -335,6 +335,8 @@ export class TerminalSubmitScheduler {
         { kind: 'native-idle', entry },
       )) {
         this.cancelNativeEntry(entry, 'superseded');
+      } else {
+        this.watchNativeEntry(entry);
       }
       return;
     }
