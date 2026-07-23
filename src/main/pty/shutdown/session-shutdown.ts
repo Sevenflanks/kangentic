@@ -1,8 +1,9 @@
 import type * as pty from 'node-pty';
-import type { SessionStatus } from '../../../shared/types';
+import type { AgentParser, SessionAttachment, SessionStatus } from '../../../shared/types';
 import type { SessionQueue } from '../session-queue';
 import type { SessionFileManager } from '../lifecycle/session-file-manager';
 import type { FirstOutputTracker } from '../lifecycle/first-output-tracker';
+import { disposeSpawnCleanup, removeAdapterHooks } from '../lifecycle/adapter-lifecycle';
 
 /**
  * Error-tolerant write of an agent exit sequence to a PTY.
@@ -26,10 +27,13 @@ export function writeExitSequence(ptyRef: pty.IPty, exitSequence: string[]): voi
 export interface ShutdownSession {
   id: string;
   taskId: string;
+  cwd: string;
+  agentParser?: AgentParser;
   pty: pty.IPty | null;
   status: SessionStatus;
   startedAt: string;
   exitSequence: string[];
+  spawnCleanup?: SessionAttachment;
   /** onData / onExit listener disposables, detached at kill so node-pty
    *  stops invoking our callbacks after the session dir is deleted. See
    *  ManagedSession.ptyDisposables for the full contract: only set on the
@@ -83,6 +87,8 @@ export async function suspendAllSessions<S extends ShutdownSession>(
       writeExitSequence(session.pty, session.exitSequence);
       ptysToKill.push(session.pty);
       session.status = 'exited';
+      disposeSpawnCleanup(session);
+      removeAdapterHooks(session);
     }
   }
 
@@ -92,6 +98,8 @@ export async function suspendAllSessions<S extends ShutdownSession>(
     if (session.status === 'queued') {
       taskIds.push(session.taskId);
       session.status = 'exited';
+      disposeSpawnCleanup(session);
+      removeAdapterHooks(session);
     }
   }
   context.sessionQueue.clear();
@@ -136,6 +144,8 @@ export function killAllSessions<S extends ShutdownSession>(
   context: ShutdownContext<S>,
 ): void {
   for (const session of context.sessions.values()) {
+    disposeSpawnCleanup(session);
+    removeAdapterHooks(session);
     if (session.pty) {
       writeExitSequence(session.pty, session.exitSequence);
       const ptyRef = session.pty;
