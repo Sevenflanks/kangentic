@@ -6,6 +6,7 @@ import type { AgentAdapter } from '../../agent/agent-adapter';
 import type { McpHttpServerHandle } from '../../agent/mcp-http-server';
 import type { AppConfig, Swimlane, Task } from '../../../shared/types';
 import type { TaskRepository } from '../../db/repositories/task-repository';
+import { removeAdapterHooks } from '../../pty/lifecycle/adapter-lifecycle';
 import { runSpawnPreamble, resolveEffectivePermissionMode } from '../spawn-preamble';
 import { sessionOutputPaths } from '../session-paths';
 
@@ -131,8 +132,8 @@ export async function prepareAgentSpawn(input: {
 
   let agentSessionId: string | null;
   const canResume = input.resume !== null;
-  if (canResume) {
-    agentSessionId = input.resume!.agentSessionId;
+  if (input.resume) {
+    agentSessionId = input.resume.agentSessionId;
   } else {
     // Only Claude accepts caller-specified session IDs. Others capture
     // their real ID from hooks / PTY output later and come back here as null.
@@ -147,6 +148,7 @@ export async function prepareAgentSpawn(input: {
   const commandOptions = {
     agentPath: detection.path,
     taskId: task.id,
+    hookOwnerId: sessionRecordId,
     prompt: undefined,
     cwd,
     permissionMode,
@@ -168,23 +170,33 @@ export async function prepareAgentSpawn(input: {
   };
 
   const command = adapter.buildCommand(commandOptions);
-  const extraEnv = adapter.buildEnv?.(commandOptions) ?? null;
+  try {
+    const extraEnv = adapter.buildEnv?.(commandOptions) ?? null;
 
-  return {
-    ok: true,
-    data: {
-      adapter,
-      agent,
-      command,
+    return {
+      ok: true,
+      data: {
+        adapter,
+        agent,
+        command,
+        cwd,
+        sessionRecordId,
+        agentSessionId,
+        permissionMode,
+        statusOutputPath,
+        eventsOutputPath,
+        extraEnv,
+        appliedModel: commandOptions.model ?? null,
+        appliedEffort: commandOptions.effort ?? null,
+      },
+    };
+  } catch (error) {
+    removeAdapterHooks({
+      id: sessionRecordId,
+      taskId: task.id,
       cwd,
-      sessionRecordId,
-      agentSessionId,
-      permissionMode,
-      statusOutputPath,
-      eventsOutputPath,
-      extraEnv,
-      appliedModel: commandOptions.model ?? null,
-      appliedEffort: commandOptions.effort ?? null,
-    },
-  };
+      agentParser: adapter,
+    });
+    throw error;
+  }
 }

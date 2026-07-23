@@ -457,6 +457,65 @@ describe('prepareAgentSpawn - permission_mode resolution', () => {
 });
 
 describe('prepareAgentSpawn - extraEnv field', () => {
+  it('uses its generated sessionRecordId as the command hook owner', async () => {
+    const { adapter, capturedCommandOptions } = makeCaptureAdapter();
+    agentRegistryGetMock.mockReturnValue(adapter);
+
+    const result = await prepareAgentSpawn(makeSpawnInput());
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error('Expected ok:true');
+    expect(capturedCommandOptions).toHaveLength(1);
+    expect(capturedCommandOptions[0].hookOwnerId).toBe(result.data.sessionRecordId);
+  });
+
+  it('releases the exact hook owner when buildEnv fails after buildCommand retains it', async () => {
+    const environmentConstructionError = new Error('environment construction failed');
+    const removeHooks = vi.fn();
+    const buildCommand = vi.fn(() => '/usr/bin/opencode');
+    const adapter: AgentAdapter = {
+      ...makeAdapter({ buildEnvResult: 'omit' }),
+      buildCommand,
+      buildEnv() {
+        throw environmentConstructionError;
+      },
+      removeHooks,
+    };
+    agentRegistryGetMock.mockReturnValue(adapter);
+
+    const preparation = prepareAgentSpawn(makeSpawnInput());
+
+    await expect(preparation).rejects.toBe(environmentConstructionError);
+    expect(buildCommand).toHaveBeenCalledOnce();
+    expect(removeHooks).toHaveBeenCalledOnce();
+    expect(removeHooks).toHaveBeenCalledWith(
+      '/home/dev/project',
+      'task-001',
+      FAKE_SESSION_RECORD_ID,
+    );
+  });
+
+  it('does not release a hook owner when buildCommand fails before retaining it', async () => {
+    const commandConstructionError = new Error('command construction failed');
+    const removeHooks = vi.fn();
+    const buildEnv = vi.fn(() => null);
+    const adapter: AgentAdapter = {
+      ...makeAdapter({ buildEnvResult: 'omit' }),
+      buildCommand() {
+        throw commandConstructionError;
+      },
+      buildEnv,
+      removeHooks,
+    };
+    agentRegistryGetMock.mockReturnValue(adapter);
+
+    const preparation = prepareAgentSpawn(makeSpawnInput());
+
+    await expect(preparation).rejects.toBe(commandConstructionError);
+    expect(buildEnv).not.toHaveBeenCalled();
+    expect(removeHooks).not.toHaveBeenCalled();
+  });
+
   it('returns extraEnv=null when adapter does not implement buildEnv', async () => {
     const adapterWithoutBuildEnv = makeAdapter({ buildEnvResult: 'omit' });
     agentRegistryGetMock.mockReturnValue(adapterWithoutBuildEnv);
