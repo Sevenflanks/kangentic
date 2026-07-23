@@ -230,6 +230,7 @@ describe('project-scoped live delivery status IPC', () => {
 
     const firstStatuses: LiveDeliveryStatus[] = [];
     const secondStatuses: LiveDeliveryStatus[] = [];
+    const thirdStatuses: LiveDeliveryStatus[] = [];
     let unsubscribeFirst = (): void => { throw new Error('first listener was not registered'); };
     unsubscribeFirst = windowObject.electronAPI.sessions.onLiveDeliveryStatus((status) => {
       firstStatuses.push(status);
@@ -238,13 +239,17 @@ describe('project-scoped live delivery status IPC', () => {
     const unsubscribeSecond = windowObject.electronAPI.sessions.onLiveDeliveryStatus((status) => {
       secondStatuses.push(status);
     });
+    const unsubscribeThird = windowObject.electronAPI.sessions.onLiveDeliveryStatus((status) => {
+      thirdStatuses.push(status);
+    });
     const fireLiveStatus = requireLiveStatusFire(windowObject);
 
     fireLiveStatus(cancelledStatus);
     expect(firstStatuses).toEqual([cancelledStatus]);
     expect(secondStatuses).toEqual([cancelledStatus]);
+    expect(thirdStatuses).toEqual([cancelledStatus]);
 
-    unsubscribeFirst();
+    unsubscribeThird();
     const deliveredStatus = {
       projectId: 'project-1', taskId: 'task-1', sessionId: 'session-1', generation: 3,
       at: '2026-07-22T00:00:01.000Z', state: 'delivered',
@@ -252,7 +257,10 @@ describe('project-scoped live delivery status IPC', () => {
     fireLiveStatus(deliveredStatus);
     expect(firstStatuses).toEqual([cancelledStatus]);
     expect(secondStatuses).toEqual([cancelledStatus, deliveredStatus]);
+    expect(thirdStatuses).toEqual([cancelledStatus]);
 
+    unsubscribeFirst();
+    unsubscribeThird();
     unsubscribeSecond();
     unsubscribeSecond();
     fireLiveStatus(cancelledStatus);
