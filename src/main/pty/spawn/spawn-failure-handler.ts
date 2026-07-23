@@ -3,6 +3,7 @@ import type { SessionRegistry, ManagedSession } from '../session-registry';
 import type { PtyBufferManager } from '../buffer/pty-buffer-manager';
 import { toSession } from '../session-registry';
 import { diagnoseSpawnFailure, recordSpawnFailure } from './pty-spawn';
+import { disposeSpawnCleanup, removeAdapterHooks } from '../lifecycle/adapter-lifecycle';
 
 /**
  * Snapshot of the inputs that went into a spawn attempt - everything
@@ -56,6 +57,13 @@ export function handleSpawnFailure(
     shellExe,
     effectiveCwd,
     originalCwd: input.cwd,
+  });
+  disposeSpawnCleanup(input);
+  removeAdapterHooks({
+    id,
+    cwd: input.cwd,
+    taskId: input.taskId,
+    agentParser: input.agentParser,
   });
   console.error(`[PTY] spawn failed session=${id.slice(0, 8)} task=${input.taskId.slice(0, 8)} shell=${shellExe} error=${diagnostic.errorMessage} errno=${diagnostic.errno} cwdExists=${diagnostic.cwdExists} shellExists=${diagnostic.shellExists}`);
   recordSpawnFailure({ diagnostic, shellExe, shellArgs });

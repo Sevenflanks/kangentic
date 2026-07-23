@@ -222,6 +222,16 @@ describe('performSpawn - same-task replacement cleanup', () => {
     expect(context.firstOutputTracker.removeSession).toHaveBeenCalledOnce();
     expect(context.firstOutputTracker.removeSession).toHaveBeenCalledWith(existing.id);
   });
+
+  it('transfers generic spawn cleanup to the running managed session', async () => {
+    const context = makeContext();
+    const cleanup = { dispose: vi.fn() };
+    const input = makeInput({ spawnCleanup: cleanup });
+
+    const session = await performSpawn(input, context);
+
+    expect(context.registry.get(session.id)?.spawnCleanup).toBe(cleanup);
+  });
 });
 
 describe('performSpawn - KANGENTIC_EVENTS_PATH env injection', () => {
