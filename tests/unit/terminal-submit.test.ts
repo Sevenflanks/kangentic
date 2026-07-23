@@ -312,6 +312,20 @@ describe('TerminalSubmit', () => {
       expect(warnSpy.mock.calls.flat().join(' ')).not.toContain('/verify-secret');
     });
 
+    it('rejects strict verification without delivering a trailing command', async () => {
+      const promise = submit.submitKeystrokes('s1', ['/effort high', '/lane-command'], {
+        sendCtrlC: false,
+        verifier: vi.fn().mockResolvedValue(false),
+        verifiedPrefixLength: 1,
+        strictVerification: true,
+      });
+      const rejection = expect(promise).rejects.toThrow('strict command verification failed');
+      await advanceAndTick(3000, 300);
+      await rejection;
+
+      expect(sessionManager.writes.map((write) => write.data)).not.toContain('/lane-command');
+    });
+
     it('time-settles trailing commands beyond verifiedPrefixLength', async () => {
       const verifier: CommandVerifier = vi.fn().mockResolvedValue(true);
 

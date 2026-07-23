@@ -77,6 +77,7 @@ export interface SubmitKeystrokesOptions {
    * entry, so attempting to verify it risks dropping the user's intent.
    */
   verifiedPrefixLength?: number;
+  strictVerification?: boolean;
   /**
    * Caller cancellation. The current wait stops; writes already accepted by
    * the selected sink cannot be undone. Aborting between commands is the
@@ -234,6 +235,9 @@ export class TerminalSubmit {
             console.warn(`[terminal-submit] ${source}: verification failed after ${MAX_RETRIES} retries -- clearing prompt and continuing`);
             await write('\x03');
             await wait(50);
+            if (opts.strictVerification) {
+              throw new Error('strict command verification failed');
+            }
           }
         } else {
           await wait(COMMAND_SETTLE);
