@@ -748,6 +748,7 @@ export class SessionManager extends EventEmitter {
 
   kill(sessionId: string): void {
     const session = this.registry.get(sessionId);
+    this.disposeInputCoordination(sessionId);
     // Every kill() is a deliberate Kangentic-initiated teardown (user kill,
     // session reset, task delete, worktree cleanup, move-to-To-Do/Backlog,
     // project relocate, shutdown), never a crash. Mark the session BEFORE the
@@ -856,6 +857,7 @@ export class SessionManager extends EventEmitter {
   async suspend(sessionId: string): Promise<void> {
     const session = this.registry.get(sessionId);
     if (!session) return;
+    this.disposeInputCoordination(sessionId);
 
     // Strip agent hooks from the project's settings file before
     // closing down. Prevents hook accumulation across sessions. Both
@@ -1181,6 +1183,9 @@ export class SessionManager extends EventEmitter {
    * Returns task IDs so the caller can mark them as 'suspended' in the DB.
    */
   async suspendAll(timeoutMs = 2000): Promise<string[]> {
+    for (const session of this.registry.values()) {
+      this.disposeInputCoordination(session.id);
+    }
     return suspendAllSessions(this.shutdownContext(), timeoutMs);
   }
 
@@ -1191,7 +1196,16 @@ export class SessionManager extends EventEmitter {
    * .claude/rules/synchronous-shutdown.md.
    */
   killAll(): void {
+    for (const session of this.registry.values()) {
+      this.disposeInputCoordination(session.id);
+    }
     killAllSessions(this.shutdownContext());
+  }
+
+  private disposeInputCoordination(sessionId: string): void {
+    // Coordinator 與 evidence 必須同時退場，避免舊 generation 留在任一邊而授權下一次 automation。
+    this.writeCoordinator.disposeSession(sessionId);
+    this.nativeIdleEvidence.removeSession(sessionId);
   }
 
   private shutdownContext() {

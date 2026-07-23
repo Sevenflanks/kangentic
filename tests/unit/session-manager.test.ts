@@ -2569,4 +2569,36 @@ describe('Input coordination', () => {
     expect(blockedAutomation).toBeNull();
     expect(releasedAutomation).not.toBeNull();
   });
+
+  it('clears generations immediately on suspend and on explicit kill', async () => {
+    // Given
+    const first = await spawnCoordinatedSession('task-coordination-suspend');
+
+    // When
+    const suspension = manager.suspend(first.session.id);
+
+    // Then
+    expect(manager.getSessionGeneration(first.session.id)).toBeNull();
+    first.triggerExit(0);
+    await suspension;
+
+    const second = await spawnCoordinatedSession('task-coordination-kill');
+    manager.kill(second.session.id);
+    expect(manager.getSessionGeneration(second.session.id)).toBeNull();
+  });
+
+  it('clears generations on natural exit and synchronous killAll', async () => {
+    // Given
+    const natural = await spawnCoordinatedSession('task-coordination-exit');
+
+    // When
+    natural.triggerExit(0);
+
+    // Then
+    expect(manager.getSessionGeneration(natural.session.id)).toBeNull();
+
+    const shutdown = await spawnCoordinatedSession('task-coordination-kill-all');
+    manager.killAll();
+    expect(manager.getSessionGeneration(shutdown.session.id)).toBeNull();
+  });
 });

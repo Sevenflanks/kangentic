@@ -130,6 +130,8 @@ export async function performSpawn(
     // 30s after respawn.
     context.sessionIdManager.removeSession(existing.id);
     context.firstOutputTracker.removeSession(existing.id);
+    context.writeCoordinator.disposeSession(existing.id);
+    context.nativeIdleEvidence.removeSession(existing.id);
     // Tear down any adapter-attached work from the previous spawn.
     disposeAdapterAttachment(existing);
   }
@@ -441,6 +443,11 @@ export async function performSpawn(
     // The flag rides the 'exit' event so App.tsx can suppress the false crash
     // notification without depending on cross-channel store-status ordering.
     const intentional = session.status === 'suspended' || session.intentionalExit === true;
+    // 舊 PTY 的 onExit 可能晚於同 ID respawn；只有建立時的 generation 仍有效，才可清掉新一輪的 ownership。
+    if (context.writeCoordinator.getSessionGeneration(id) === sessionGeneration) {
+      context.writeCoordinator.disposeSession(id);
+      context.nativeIdleEvidence.removeSession(id);
+    }
     if (session.status !== 'suspended') {
       session.status = 'exited';
       // Synthetic session_end - Claude Code's hook won't fire on kill
