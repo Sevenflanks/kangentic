@@ -82,6 +82,53 @@ test.describe('Live delivery status', () => {
     }
   });
 
+  test('shows the full user-input warning without ellipsis', async () => {
+    const { browser, page } = await launchPage();
+    const card = page.locator(`[data-task-id="${TASK_ID}"]`);
+    const warning = 'Lane command was not sent because terminal input took priority.';
+
+    try {
+      await fireStatus(page, status('cancelled', 2, 'user-input'));
+      const liveDeliveryStatus = card.locator('[data-testid="live-delivery-status"]');
+      await expect(liveDeliveryStatus).toHaveText(warning);
+      await expect(card).not.toContainText(COMMAND_CANARY);
+
+      const layout = await liveDeliveryStatus.evaluate((statusElement) => {
+        const warningRow = statusElement.querySelector(':scope > span');
+        const warningIcon = warningRow?.querySelector('svg');
+        const warningText = warningRow?.querySelector('span');
+        if (!warningRow || !warningIcon || !warningText) throw new Error('Expected warning layout');
+
+        const rowStyle = getComputedStyle(warningRow);
+        const textStyle = getComputedStyle(warningText);
+        const iconRect = warningIcon.getBoundingClientRect();
+        const textRect = warningText.getBoundingClientRect();
+        return {
+          alignItems: rowStyle.alignItems,
+          whiteSpace: textStyle.whiteSpace,
+          textOverflow: textStyle.textOverflow,
+          overflowX: textStyle.overflowX,
+          scrollWidth: warningText.scrollWidth,
+          clientWidth: warningText.clientWidth,
+          scrollHeight: warningText.scrollHeight,
+          lineHeight: Number.parseFloat(textStyle.lineHeight),
+          iconTop: iconRect.top,
+          textTop: textRect.top,
+        };
+      });
+
+      expect(layout.alignItems).toBe('flex-start');
+      expect(layout.whiteSpace).toBe('normal');
+      expect(layout.textOverflow).not.toBe('ellipsis');
+      expect(layout.overflowX).not.toBe('hidden');
+      expect(layout.scrollWidth).toBeLessThanOrEqual(layout.clientWidth);
+      expect(layout.scrollHeight).toBeGreaterThan(layout.lineHeight);
+      expect(Math.abs(layout.iconTop - layout.textTop)).toBeLessThanOrEqual(0.5);
+    } finally {
+      await browser.close();
+    }
+  });
+
   for (const [reason, warning] of [
     ['user-input', 'Lane command was not sent because terminal input took priority.'],
     ['timeout', 'Lane command was not sent because the agent did not become idle.'],

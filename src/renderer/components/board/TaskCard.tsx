@@ -337,9 +337,9 @@ const TaskCardInner = function TaskCard({ task, isDragOverlay, compact, onDelete
                 role="status"
                 aria-live="polite"
               >
-                <span className={`text-xs flex items-center gap-1 min-w-0 ${isWarning ? 'text-attention' : 'text-fg-faint'}`}>
+                <span className={`text-xs flex gap-1 min-w-0 ${isWarning ? 'items-start text-attention' : 'items-center text-fg-faint'}`}>
                   {isWarning ? <CircleAlert size={12} className="shrink-0" /> : isDelivered ? <Check size={12} className="shrink-0" /> : <Loader2 size={12} className="animate-spin shrink-0" />}
-                  <span className="truncate">{liveDeliveryLabel}</span>
+                  <span className={isWarning ? 'min-w-0 whitespace-normal' : 'truncate'}>{liveDeliveryLabel}</span>
                 </span>
               </div>
             );
