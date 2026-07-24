@@ -525,11 +525,13 @@ Template variables available: `{{title}}`, `{{description}}`, `{{task_xml}}`, `{
 
 ### OpenCode Prompt Delivery
 
-OpenCode uses **TUI-ready terminal submission**, not `--prompt` or shell argument parsing. Kangentic launches a fresh OpenCode TUI, or resumes with `--session <id>`, then waits for the OpenCode adapter's observed `ESC[?1049h` alternate-screen takeover before `TerminalSubmit.submitContent()` sends bracketed paste. Shell or OpenCode cursor-hide and generic bracketed-paste mode are insufficient readiness signals, and this `1049h` rule applies only to OpenCode.
+OpenCode 的初始 prompt 由 adapter 私有 payload 與 `.opencode/plugins/kangentic-activity.mjs` 交付。plugin 會 claim payload、建立或取得 native session、呼叫 `promptAsync`，並產生只供 main process 使用的 root native-session evidence，不會退回 PTY bracketed-paste。Fresh session 帶完整 Task XML；resume session 只帶目前的 `resumePrompt`；沒有 prompt 的 resume 不會重送 Task XML。
 
-A fresh OpenCode session receives the full Task XML. A resumed session receives only the current `resumePrompt`; a promptless resume restores the native session without content submission or Task XML replay. The session queue wait sits outside the 120-second readiness limit, which starts only after the session reaches `running`. There is no pre-readiness content-delivery fallback.
+同一 session track、同一 agent 的 live `auto_command` 與初始 prompt 是兩條獨立路徑。它必須等待預期 root native session 的 clean idle，以及相符的 session 與 input generations；公開 activity 的 generic idle 不能授權交付。Child idle、使用者輸入、native error、session exit、supersession、timeout 與 shutdown 都不能授權交付。
 
-After the initial free-form content job completes, the scheduler sends only the latest queued fresh-spawn auto-command directly as a keystroke burst with `sendCtrlC: false`. Paste acceptance evidence is collected after Enter and is separate from readiness. Session records retain the intended prompt for lifecycle and audit display, while error logs contain metadata only and never prompt content.
+交付使用既有本機 PTY writer，依序送出 `text`、`Esc`、`Enter`。acknowledgement 只表示最後一個 chunk 已通過本機 `pty.write` 呼叫。公開的 `LiveDeliveryStatus` 使用 `state` discriminant，`delivered` 表示 command bytes 已到達本機 terminal write path，不表示 OpenCode 已執行命令或產生 transcript receipt。
+
+這些 status 是暫時性的 project-scoped IPC state，不是 DB schema。lane auto-command 沒有 retry、persistence、recovery、reconnect、respawn 或 exactly-once guarantee。native identity、generations、clean-idle evidence 與 error latch 保留在 main process，不會出現在公開 event DTO。
 
 ### Output Streaming
 
