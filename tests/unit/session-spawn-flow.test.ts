@@ -62,6 +62,11 @@ vi.mock('../../src/main/pty/spawn/spawn-failure-handler', () => ({
 vi.mock('../../src/main/pty/lifecycle/adapter-lifecycle', () => ({
   attachAdapter: vi.fn(),
   disposeAdapterAttachment: vi.fn(),
+  disposeSpawnCleanup: vi.fn((owner: { spawnCleanup?: { dispose(): void } }) => {
+    const cleanup = owner.spawnCleanup;
+    owner.spawnCleanup = undefined;
+    cleanup?.dispose();
+  }),
   removeAdapterHooks: vi.fn(),
 }));
 
@@ -317,6 +322,9 @@ describe('performSpawn - input coordination lifecycle', () => {
     await performSpawn(input, context);
     context.writeCoordinator.disposeSession.mockClear();
     context.nativeIdleEvidence.removeSession.mockClear();
+    context.statusFileReader.flushPendingEvents.mockClear();
+    context.sessionFiles.detachOnPtyExit.mockClear();
+    context.emit.mockClear();
 
     // When
     firstExitListener?.({ exitCode: 0 });
@@ -324,6 +332,25 @@ describe('performSpawn - input coordination lifecycle', () => {
     // Then
     expect(context.writeCoordinator.disposeSession).not.toHaveBeenCalled();
     expect(context.nativeIdleEvidence.removeSession).not.toHaveBeenCalled();
+    expect(context.statusFileReader.flushPendingEvents).not.toHaveBeenCalled();
+    expect(context.sessionFiles.detachOnPtyExit).not.toHaveBeenCalled();
+    expect(context.emit).not.toHaveBeenCalled();
+  });
+});
+
+describe('performSpawn - generic spawn cleanup transfer', () => {
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('transfers generic spawn cleanup to the running managed session', async () => {
+    const context = makeContext();
+    const cleanup = { dispose: vi.fn() };
+    const input = makeInput({ spawnCleanup: cleanup });
+
+    const session = await performSpawn(input, context);
+
+    expect(context.registry.get(session.id)?.spawnCleanup).toBe(cleanup);
   });
 });
 

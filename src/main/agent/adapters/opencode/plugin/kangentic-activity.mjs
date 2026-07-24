@@ -1,7 +1,7 @@
 // kangentic-activity
 // OpenCode plugin that emits structured activity events into the
 // Kangentic events.jsonl pipeline. Discovered automatically by
-// OpenCode via the project-shared `.opencode/plugins/` directory.
+// OpenCode via the PTY working directory's `.opencode/plugins/` directory.
 //
 // The plugin runs inline in the OpenCode process and writes JSONL
 // entries that match the shape produced by Kangentic's other agent
@@ -18,6 +18,8 @@
 // can be unit-tested against captured OpenCode event fixtures
 // (tests/fixtures/opencode-plugin-events.json).
 import fs from 'node:fs';
+
+const INITIAL_PROMPT_PATH_ENV = 'KANGENTIC_OPENCODE_INITIAL_PROMPT_PATH';
 
 function nativeSessionIdFrom(properties) {
   const value = properties?.sessionID ?? properties?.info?.id ?? null;
@@ -130,25 +132,147 @@ export function extractToolEndEvent(input, now = Date.now()) {
   };
 }
 
-const eventsPath = process.env.KANGENTIC_EVENTS_PATH;
-
-function appendEvent(event) {
-  if (!eventsPath || !event) return;
+function appendEvent(eventsPath, event) {
+  if (!eventsPath || !event) return false;
   try {
     fs.appendFileSync(eventsPath, JSON.stringify(event) + '\n');
+    return true;
   } catch {
-    // Best effort. The file may have been removed when the session ended.
+    return false;
   }
 }
 
-export const KangenticActivity = async () => ({
-  event: async ({ event }) => {
-    appendEvent(extractSessionEvent(event));
-  },
-  'tool.execute.before': async (input, output) => {
-    appendEvent(extractToolStartEvent(input, output));
-  },
-  'tool.execute.after': async (input) => {
-    appendEvent(extractToolEndEvent(input));
-  },
-});
+function claimInitialPromptSource() {
+  const sourcePath = process.env[INITIAL_PROMPT_PATH_ENV];
+  if (!sourcePath) return null;
+  const claimPath = `${sourcePath}.claim-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  try {
+    fs.renameSync(sourcePath, claimPath);
+    return claimPath;
+  } catch (error) {
+    if (error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+function readInitialPromptPayload(rawText) {
+  let payload;
+  try {
+    payload = JSON.parse(rawText);
+  } catch {
+    return null;
+  }
+  if (!payload || typeof payload !== 'object' || payload.version !== 1 || typeof payload.prompt !== 'string' || payload.prompt.length === 0) {
+    return null;
+  }
+  if (payload.mode === 'fresh') {
+    const validAgent = payload.agent === undefined || typeof payload.agent === 'string';
+    const validModel = payload.model === undefined || (
+      payload.model
+      && typeof payload.model === 'object'
+      && typeof payload.model.providerID === 'string'
+      && typeof payload.model.modelID === 'string'
+    );
+    return validAgent && validModel ? payload : null;
+  }
+  if (payload.mode === 'resume' && typeof payload.sessionId === 'string' && payload.sessionId.length > 0 && payload.agent === undefined && payload.model === undefined) {
+    return payload;
+  }
+  return null;
+}
+
+function removeClaimPath(claimPath) {
+  try {
+    fs.unlinkSync(claimPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function appendSanitizedError(eventsPath) {
+  appendEvent(eventsPath, { ts: Date.now(), type: 'idle', detail: 'error' });
+}
+
+export const KangenticActivity = async ({ client, directory } = {}) => {
+  const eventsPath = process.env.KANGENTIC_EVENTS_PATH;
+  let bootstrapSessionID;
+  let bootstrapSessionStartWritten = false;
+  let claimPath;
+  try {
+    claimPath = claimInitialPromptSource();
+  } catch {
+    appendSanitizedError(eventsPath);
+    claimPath = null;
+  }
+  if (claimPath) {
+    try {
+      const rawText = fs.readFileSync(claimPath, 'utf8');
+      if (!removeClaimPath(claimPath)) {
+        appendSanitizedError(eventsPath);
+      } else {
+        claimPath = null;
+        const payload = readInitialPromptPayload(rawText);
+        if (!payload) {
+          appendSanitizedError(eventsPath);
+        } else {
+          let sessionID;
+          if (payload.mode === 'fresh') {
+            sessionID = (await client.session.create({ query: { directory }, body: {} })).id;
+          } else {
+            await client.session.get({ path: { id: payload.sessionId }, query: { directory } });
+            sessionID = payload.sessionId;
+          }
+          bootstrapSessionID = sessionID;
+          rootSessionId = sessionID;
+          const bootstrapStartedAt = Date.now();
+          bootstrapSessionStartWritten = appendEvent(eventsPath, {
+            ts: bootstrapStartedAt,
+            type: 'session_start',
+            hookContext: JSON.stringify({ sessionID }),
+            privateNativeBoundary: privateBoundary('created', sessionID, bootstrapStartedAt),
+          });
+          await client.session.promptAsync({
+            path: { id: sessionID },
+            query: { directory },
+            body: {
+              parts: [{ type: 'text', text: payload.prompt }],
+              ...(payload.mode === 'fresh' && payload.agent ? { agent: payload.agent } : {}),
+              ...(payload.mode === 'fresh' && payload.model ? { model: payload.model } : {}),
+            },
+          });
+        }
+      }
+    } catch {
+      if (claimPath) removeClaimPath(claimPath);
+      appendSanitizedError(eventsPath);
+    }
+  }
+
+  return {
+    event: async ({ event }) => {
+      const extracted = extractSessionEvent(event);
+      if (extracted?.type === 'session_start' && extracted.hookContext) {
+        try {
+          const context = JSON.parse(extracted.hookContext);
+          if (typeof context.sessionID === 'string') {
+            if (context.sessionID === bootstrapSessionID) {
+              if (bootstrapSessionStartWritten) return;
+              bootstrapSessionStartWritten = appendEvent(eventsPath, extracted);
+              return;
+            }
+          }
+        } catch {
+          return;
+        }
+      }
+      appendEvent(eventsPath, extracted);
+    },
+    'tool.execute.before': async (input, output) => {
+      appendEvent(eventsPath, extractToolStartEvent(input, output));
+    },
+    'tool.execute.after': async (input) => {
+      appendEvent(eventsPath, extractToolEndEvent(input));
+    },
+  };
+};

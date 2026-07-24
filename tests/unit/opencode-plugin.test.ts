@@ -4,8 +4,8 @@ import path from 'node:path';
 import {
   extractSessionEvent,
   extractToolDetail,
-  extractToolStartEvent,
   extractToolEndEvent,
+  extractToolStartEvent,
 } from '../../src/main/agent/adapters/opencode/plugin/kangentic-activity.mjs';
 
 const fixturePath = path.join(__dirname, '..', 'fixtures', 'opencode-plugin-events.json');

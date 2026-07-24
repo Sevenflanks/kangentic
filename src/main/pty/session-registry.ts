@@ -59,6 +59,9 @@ export interface ManagedSession {
    *  orchestration through this; SessionManager never inspects the
    *  attachment. */
   adapterAttachment?: SessionAttachment;
+  /** Generic cleanup transferred from the accepted spawn input. Unlike
+   * adapterAttachment, this exists before the PTY starts and survives queueing. */
+  spawnCleanup?: SessionAttachment;
   /** Disposables for the PTY's onData / onExit listeners. Disposed by
    *  killAllSessions (the synchronous shutdown path) so node-pty stops
    *  invoking our callbacks on a later tick - a final ConPTY chunk would

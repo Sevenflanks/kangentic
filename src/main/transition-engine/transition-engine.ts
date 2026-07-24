@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import type { Task, Action, ActionConfig, AppConfig, PermissionMode } from '../../shared/types';
+import type { Task, Action, ActionConfig, AppConfig, PermissionMode, SpawnSessionInput } from '../../shared/types';
 import { sanitizeForPty } from '../../shared/paths';
 import { SessionManager } from '../pty/session-manager';
 import type { TerminalSubmit } from '../pty/terminal-submit';
@@ -9,6 +9,7 @@ import type { TerminalSubmitScheduler } from './terminal-submit-scheduler';
 import { interpolateTemplate, buildTaskXml } from '../agent/shared';
 import { WorktreeManager, prepareWorktreeForRemoval, GitQueuePriority } from '../git/worktree-manager';
 import { agentRegistry } from '../agent/agent-registry';
+import { disposeSpawnCleanup, removeAdapterHooks } from '../pty/lifecycle/adapter-lifecycle';
 import { retireRecord, markRecordSuspended } from './session-lifecycle';
 import { resolveEffectivePermissionMode } from './spawn-preamble';
 import { resolveSpawnIntent } from './spawn-intent';
@@ -18,6 +19,7 @@ import type { ActionRepository } from '../db/repositories/action-repository';
 import type { TaskRepository } from '../db/repositories/task-repository';
 import type { SessionRepository } from '../db/repositories/session-repository';
 import type { AttachmentRepository } from '../db/repositories/attachment-repository';
+import type { InitialPromptInput, InitialPromptPreparation } from '../agent/agent-adapter';
 
 interface TransitionEngineConfig {
   permissionMode: string;
@@ -273,14 +275,12 @@ export class TransitionEngine {
         : handoffPromptPrefix;
     }
     const intendedPrompt = prompt;
-    const commandPrompt = (adapter.initialPromptDelivery ?? 'command-argument') === 'terminal-submit'
-      ? undefined
-      : intendedPrompt;
+    const initialPromptDelivery = adapter.initialPromptDelivery ?? 'command-argument';
 
     // Ensure the per-session directory exists and compute output paths.
     // Directory is named by ptySessionId (internal), NOT agentSessionId (CLI-specific).
     const projectRoot = appConfig.projectPath || cwd;
-    const sessionDir = path.join(projectRoot, '.kangentic', 'sessions', ptySessionId);
+    const sessionDir = path.resolve(projectRoot, '.kangentic', 'sessions', ptySessionId);
     try {
       fs.mkdirSync(sessionDir, { recursive: true });
     } catch (err) {
@@ -293,7 +293,7 @@ export class TransitionEngine {
     const commandOptions = {
       agentPath: detection.path,
       taskId: task.id,
-      prompt: commandPrompt,
+      hookOwnerId: ptySessionId,
       cwd,
       permissionMode,
       projectRoot: appConfig.projectPath || undefined,
@@ -309,31 +309,83 @@ export class TransitionEngine {
       model: spawnOverrides?.model ?? undefined,
       effort: spawnOverrides?.effort ?? undefined,
     };
-    const command = adapter.buildCommand(commandOptions);
-    const extraEnv = adapter.buildEnv?.(commandOptions) ?? null;
+    let preparation: InitialPromptPreparation | undefined;
+    const preparationCleanupOwner: { spawnCleanup?: InitialPromptPreparation['cleanup'] } = {};
+    let command: string;
+    let extraEnv: Record<string, string> | null;
+    let spawnInput: SpawnSessionInput;
+    try {
+      if (intendedPrompt) {
+        let preparationInput: InitialPromptInput;
+        if (canResume) {
+          const nativeSessionId = agentSessionId;
+          if (!nativeSessionId) {
+            throw new Error('Resume prompt preparation requires a native agent session ID');
+          }
+          preparationInput = {
+            prompt: intendedPrompt,
+            sessionDirectory: sessionDir,
+            permissionMode,
+            ...(spawnOverrides?.model ? { model: spawnOverrides.model } : {}),
+            resume: true,
+            sessionId: nativeSessionId,
+          };
+        } else {
+          preparationInput = {
+            prompt: intendedPrompt,
+            sessionDirectory: sessionDir,
+            permissionMode,
+            ...(spawnOverrides?.model ? { model: spawnOverrides.model } : {}),
+            resume: false,
+          };
+        }
 
-    console.log(`[spawnAgent] agent=${agentName} Command: ${command.slice(0, 120)}...`);
+        preparation = adapter.prepareInitialPrompt?.(preparationInput)
+          ?? (initialPromptDelivery === 'terminal-submit'
+            ? undefined
+            : { commandPrompt: intendedPrompt });
+        preparationCleanupOwner.spawnCleanup = preparation?.cleanup;
+      }
 
-    // Last chance to abort before creating a PTY process
-    signal?.throwIfAborted();
+      const preparedCommandOptions = {
+        ...commandOptions,
+        prompt: preparation?.commandPrompt,
+      };
+      command = adapter.buildCommand(preparedCommandOptions);
+      const adapterEnv = adapter.buildEnv?.(preparedCommandOptions) ?? null;
+      extraEnv = adapterEnv || preparation?.env
+        ? { ...(adapterEnv ?? {}), ...(preparation?.env ?? {}) }
+        : null;
 
-    console.log(`[spawnAgent] Spawning PTY session for ${agentName}...`);
-    const session = await this.sessionManager.spawn({
-      id: ptySessionId,
-      taskId: task.id,
-      projectId: appConfig.projectId,
-      command,
-      cwd,
-      env: extraEnv ?? undefined,
-      statusOutputPath,
-      eventsOutputPath,
-      resuming: canResume,
-      agentParser: adapter,
-      agentName: adapter.name,
-      agentSessionId,
-      isolatedSwimlaneId,
-      exitSequence: adapter.getExitSequence?.() ?? ['\x03'],
-    });
+      console.log(`[spawnAgent] agent=${agentName} Command: ${command.slice(0, 120)}...`);
+
+      // Last chance to abort before creating a PTY process
+      signal?.throwIfAborted();
+      console.log(`[spawnAgent] Spawning PTY session for ${agentName}...`);
+      spawnInput = {
+        id: ptySessionId,
+        taskId: task.id,
+        projectId: appConfig.projectId,
+        command,
+        cwd,
+        env: extraEnv ?? undefined,
+        statusOutputPath,
+        eventsOutputPath,
+        resuming: canResume,
+        agentParser: adapter,
+        agentName: adapter.name,
+        agentSessionId,
+        isolatedSwimlaneId,
+        exitSequence: adapter.getExitSequence?.() ?? ['\x03'],
+        spawnCleanup: preparationCleanupOwner.spawnCleanup,
+      };
+    } catch (error) {
+      disposeSpawnCleanup(preparationCleanupOwner);
+      removeAdapterHooks({ id: ptySessionId, taskId: task.id, cwd, agentParser: adapter });
+      throw error;
+    }
+
+    const session = await this.sessionManager.spawn(spawnInput);
 
     console.log(`[spawnAgent] PTY session created: id=${session.id.slice(0, 8)} status=${session.status}`);
 
@@ -358,7 +410,7 @@ export class TransitionEngine {
         session_type: adapter.sessionType,
         isolated_swimlane_id: isolatedSwimlaneId,
         agent_session_id: agentSessionId ?? null,
-        command,
+        command: spawnInput.command,
         cwd,
         permission_mode: permissionMode,
         prompt: intendedPrompt ?? null,
@@ -381,7 +433,7 @@ export class TransitionEngine {
       });
     }
 
-    if ((adapter.initialPromptDelivery ?? 'command-argument') === 'terminal-submit' && intendedPrompt) {
+    if (initialPromptDelivery === 'terminal-submit' && intendedPrompt) {
       this.terminalSubmitScheduler.scheduleContent(task.id, session.id, intendedPrompt, {
         verifier: adapter.getSubmissionVerifier?.('paste') ?? null,
       });

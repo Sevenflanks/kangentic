@@ -8,6 +8,7 @@ import { resolveProjectRoot } from '../../../shared/git-utils';
 import { fetchIfStale } from '../../git/fetch-throttle';
 import { trackEvent } from '../../analytics/analytics';
 import { agentRegistry } from '../../agent/agent-registry';
+import { removeAdapterHooks } from '../../pty/lifecycle/adapter-lifecycle';
 import { DEFAULT_AGENT } from '../../../shared/types';
 import type {
   SpawnTransientSessionInput,
@@ -40,7 +41,7 @@ export function registerTransientSessionHandlers(context: IpcContext): void {
     const detection = await adapter.detect(cliPathOverride);
     if (!detection.found || !detection.path) throw new Error(`${adapter.displayName} CLI not found. Please install it first.`);
     const permissionMode = config.agent.permissionMode as PermissionMode;
-    const transientTaskId = uuidv4();
+    const transientSessionId = uuidv4();
 
     // Fetch latest from origin and checkout the requested branch before spawning.
     // This ensures Claude Code loads up-to-date commands/skills from the remote.
@@ -81,14 +82,15 @@ export function registerTransientSessionHandlers(context: IpcContext): void {
 
     // Create session directory for status/events bridge files so the
     // shimmer overlay can detect when Claude Code is ready.
-    const sessionDirectory = path.join(projectRoot, '.kangentic', 'sessions', transientTaskId);
+    const sessionDirectory = path.join(projectRoot, '.kangentic', 'sessions', transientSessionId);
     fs.mkdirSync(sessionDirectory, { recursive: true });
     const statusOutputPath = path.join(sessionDirectory, 'status.json');
     const eventsOutputPath = path.join(sessionDirectory, 'activity.json');
 
     const commandOptions = {
       agentPath: detection.path,
-      taskId: transientTaskId,
+      taskId: transientSessionId,
+      hookOwnerId: transientSessionId,
       cwd: projectRoot,
       permissionMode,
       projectRoot,
@@ -104,10 +106,26 @@ export function registerTransientSessionHandlers(context: IpcContext): void {
       effort: project.default_effort ?? undefined,
     };
     const command = adapter.buildCommand(commandOptions);
-    const extraEnv = adapter.buildEnv?.(commandOptions) ?? null;
+    const localHookOwner = {
+      id: transientSessionId,
+      cwd: projectRoot,
+      taskId: transientSessionId,
+      agentParser: adapter,
+    };
+    let extraEnv: Record<string, string> | null;
+    let exitSequence: string[];
+    try {
+      extraEnv = adapter.buildEnv?.(commandOptions) ?? null;
+      exitSequence = adapter.getExitSequence?.() ?? ['\x03'];
+    } catch (error) {
+      // buildCommand 可能已保留 shared hooks；只有 spawn() 尚未被呼叫時由 handler 釋放。呼叫後一律交由 SessionManager，避免 rejected promise 被重複釋放。
+      removeAdapterHooks(localHookOwner);
+      throw error;
+    }
 
     const session = await context.sessionManager.spawn({
-      taskId: transientTaskId,
+      id: transientSessionId,
+      taskId: transientSessionId,
       projectId: input.projectId,
       command,
       cwd: projectRoot,
@@ -117,7 +135,7 @@ export function registerTransientSessionHandlers(context: IpcContext): void {
       transient: true,
       agentParser: adapter,
       agentName: adapter.name,
-      exitSequence: adapter.getExitSequence?.() ?? ['\x03'],
+      exitSequence,
     });
 
     trackEvent('transient_session_spawn', { agent: adapter.name });

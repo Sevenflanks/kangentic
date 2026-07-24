@@ -38,13 +38,48 @@ const PLUGIN_FILENAME = 'kangentic-activity.mjs';
 const PLUGIN_SENTINEL = '// kangentic-activity';
 const PLUGIN_GITIGNORE_ENTRY = '.opencode/plugins/kangentic-activity.mjs';
 
-/** Directory under a project root where OpenCode auto-loads plugins. */
-function pluginsDir(projectRoot: string): string {
-  return path.join(projectRoot, '.opencode', 'plugins');
+class RequiredOpenCodePluginMissingError extends Error {
+  readonly name = 'RequiredOpenCodePluginMissingError';
+
+  constructor() {
+    super('Required OpenCode plugin source not found');
+  }
 }
 
-function pluginPath(projectRoot: string): string {
-  return path.join(pluginsDir(projectRoot), PLUGIN_FILENAME);
+class OpenCodePluginInstallConflictError extends Error {
+  readonly name = 'OpenCodePluginInstallConflictError';
+
+  constructor(readonly reason: 'cwd-not-directory' | 'foreign-destination') {
+    super(`OpenCode plugin installation conflict: ${reason}`);
+  }
+}
+
+/** Directory under a PTY working directory where OpenCode auto-loads plugins. */
+function pluginsDir(directory: string): string {
+  return path.join(directory, '.opencode', 'plugins');
+}
+
+function pluginPath(directory: string): string {
+  return path.join(pluginsDir(directory), PLUGIN_FILENAME);
+}
+
+function createDirectory(directory: string): void {
+  try {
+    fs.mkdirSync(directory);
+  } catch (error) {
+    const isExisting = typeof error === 'object'
+      && error !== null
+      && 'code' in error
+      && error.code === 'EEXIST';
+    if (isExisting && fs.statSync(directory).isDirectory()) return;
+    throw error;
+  }
+}
+
+function hasPluginSentinel(contents: Buffer | string): boolean {
+  const text = typeof contents === 'string' ? contents : contents.toString('utf8');
+  const firstLine = text.split('\n', 1)[0] ?? '';
+  return firstLine.includes(PLUGIN_SENTINEL);
 }
 
 /**
@@ -55,10 +90,10 @@ function pluginPath(projectRoot: string): string {
  * if the entry is already present. Wrapped in try/catch so a read-only
  * directory cannot break the spawn path.
  */
-function ensurePluginGitignored(projectRoot: string): void {
-  if (!isGitRepo(projectRoot)) return;
+function ensurePluginGitignored(directory: string): void {
+  if (!isGitRepo(directory)) return;
   try {
-    const gitignorePath = path.join(projectRoot, '.gitignore');
+    const gitignorePath = path.join(directory, '.gitignore');
     let content = '';
     try {
       content = fs.readFileSync(gitignorePath, 'utf-8');
@@ -74,12 +109,12 @@ function ensurePluginGitignored(projectRoot: string): void {
     const separator = content.length > 0 && !content.endsWith('\n') ? '\n' : '';
     fs.writeFileSync(gitignorePath, content + separator + PLUGIN_GITIGNORE_ENTRY + '\n');
   } catch (error) {
-    console.warn(`[opencode-hooks] Could not update .gitignore at ${projectRoot}:`, error);
+    console.warn(`[opencode-hooks] Could not update .gitignore at ${directory}:`, error);
   }
 }
 
 /**
- * Copy the Kangentic OpenCode plugin into `<projectRoot>/.opencode/plugins/`.
+ * Copy the Kangentic OpenCode plugin into `<cwd>/.opencode/plugins/`.
  * OpenCode auto-discovers plugins in this directory at TUI startup, so no
  * mutation of `opencode.json` is required.
  *
@@ -87,58 +122,53 @@ function ensurePluginGitignored(projectRoot: string): void {
  * env var (exported by the PTY spawn flow); the path is therefore not a
  * parameter of this function. Idempotent: skips the copy when the
  * destination file is byte-identical to the packaged source. Concurrent
- * OpenCode sessions in the same project share one plugin file (refcount
- * in `OpenCodeAdapter.hookHolders`).
+ * OpenCode sessions in the same working directory share one plugin file
+ * (refcount in `OpenCodeAdapter.hookHolders`).
+ * Installation is required because this plugin transports the initial prompt;
+ * source, directory, or copy failures must abort command construction.
  */
-export function buildHooks(projectRoot: string): void {
+export function buildHooks(cwd: string): void {
   const sourcePath = resolvePluginScript('opencode', 'kangentic-activity');
   if (!fs.existsSync(sourcePath)) {
-    console.warn(`[opencode-hooks] Plugin source not found at ${sourcePath}; skipping install.`);
-    return;
+    throw new RequiredOpenCodePluginMissingError();
   }
 
-  const destinationDir = pluginsDir(projectRoot);
-  const destinationFile = pluginPath(projectRoot);
+  const destinationDir = pluginsDir(cwd);
+  const destinationFile = pluginPath(cwd);
 
-  try {
-    fs.mkdirSync(destinationDir, { recursive: true });
-  } catch (error) {
-    console.error(`[opencode-hooks] Failed to create ${destinationDir}:`, error);
-    return;
+  const cwdStats = fs.statSync(cwd);
+  if (!cwdStats.isDirectory()) {
+    throw new OpenCodePluginInstallConflictError('cwd-not-directory');
   }
+
+  // cwd 由 spawn flow 持有；只建立直接 child，避免 cwd 消失後被 recursive mkdir 重建。
+  createDirectory(path.join(cwd, '.opencode'));
+  createDirectory(destinationDir);
 
   let needsCopy = true;
   if (fs.existsSync(destinationFile)) {
-    try {
-      const sourceContents = fs.readFileSync(sourcePath);
-      const destinationContents = fs.readFileSync(destinationFile);
-      if (sourceContents.equals(destinationContents)) {
-        needsCopy = false;
-      }
-    } catch {
-      // Fall through to overwrite.
+    const sourceContents = fs.readFileSync(sourcePath);
+    const destinationContents = fs.readFileSync(destinationFile);
+    if (sourceContents.equals(destinationContents)) {
+      needsCopy = false;
+    } else if (!hasPluginSentinel(destinationContents)) {
+      throw new OpenCodePluginInstallConflictError('foreign-destination');
     }
   }
 
   if (needsCopy) {
-    try {
-      fs.copyFileSync(sourcePath, destinationFile);
-    } catch (error) {
-      console.error(`[opencode-hooks] Failed to copy plugin to ${destinationFile}:`, error);
-    }
+    fs.copyFileSync(sourcePath, destinationFile);
   }
 
-  // Only ignore the plugin file once it actually exists at the destination.
-  // This covers both "we just copied it" and "it was already there from a
-  // previous spawn", and skips cleanly when the copy/mkdir failed - so the
-  // gitignore entry is never written ahead of the file it ignores.
+  // Update `.gitignore` only after required installation succeeds. The update
+  // remains best-effort and must not make an otherwise valid install fail.
   if (fs.existsSync(destinationFile)) {
-    ensurePluginGitignored(projectRoot);
+    ensurePluginGitignored(cwd);
   }
 }
 
 /**
- * Remove the Kangentic-authored plugin file from a project's
+ * Remove the Kangentic-authored plugin file from a PTY working directory's
  * `.opencode/plugins/` directory. Verifies the sentinel comment on
  * line 1 before deletion so user-authored plugins are never touched.
  *
@@ -151,8 +181,7 @@ export function removeHooks(directory: string): void {
 
   try {
     const contents = fs.readFileSync(file, 'utf-8');
-    const firstLine = contents.split('\n', 1)[0] ?? '';
-    if (!firstLine.includes(PLUGIN_SENTINEL)) {
+    if (!hasPluginSentinel(contents)) {
       // Not our file. Leave it alone.
       return;
     }

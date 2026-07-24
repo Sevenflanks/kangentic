@@ -33,10 +33,16 @@ vi.mock('../../src/main/analytics/analytics', () => ({
   sanitizeErrorMessage: (message: string) => message,
 }));
 
+vi.mock('../../src/main/shutdown-state', () => ({
+  isShuttingDown: vi.fn(() => false),
+}));
+
 import * as pty from 'node-pty';
 import { SessionManager } from '../../src/main/pty/session-manager';
 import { ClaudeAdapter } from '../../src/main/agent/adapters/claude/claude-adapter';
+import { OpenCodeAdapter } from '../../src/main/agent/adapters/opencode';
 import { ClaudeSessionHistoryParser } from '../../src/main/agent/adapters/claude/session-history-parser';
+import { isShuttingDown } from '../../src/main/shutdown-state';
 
 const claudeAdapter = new ClaudeAdapter();
 import { EventType } from '../../src/shared/types';
@@ -80,6 +86,7 @@ function createMockPty() {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  vi.mocked(isShuttingDown).mockReturnValue(false);
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kangentic-session-'));
 });
 
@@ -490,6 +497,34 @@ describe('SuspendAll', () => {
 
     expect(manager.queuedCount).toBe(0);
   });
+
+  it('disposes generic spawn cleanup for running and queued sessions', async () => {
+    manager.setMaxConcurrent(1);
+    let runningCleanupCalls = 0;
+    let queuedCleanupCalls = 0;
+    const runningCleanup = { dispose: () => { runningCleanupCalls++; } };
+    const queuedCleanup = { dispose: () => { queuedCleanupCalls++; } };
+
+    const runningMock = createMockPty();
+    vi.mocked(pty.spawn).mockReturnValue(runningMock.mockPty as unknown as pty.IPty);
+    await manager.spawn({
+      taskId: 'task-sa-cleanup-running',
+      command: '',
+      cwd: tmpDir,
+      spawnCleanup: runningCleanup,
+    });
+    await manager.spawn({
+      taskId: 'task-sa-cleanup-queued',
+      command: '',
+      cwd: tmpDir,
+      spawnCleanup: queuedCleanup,
+    });
+
+    await manager.suspendAll(0);
+
+    expect(runningCleanupCalls).toBe(1);
+    expect(queuedCleanupCalls).toBe(1);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -549,6 +584,34 @@ describe('KillAll', () => {
 
     expect(manager.queuedCount).toBe(0);
   });
+
+  it('synchronously disposes generic spawn cleanup for running and queued sessions', async () => {
+    manager.setMaxConcurrent(1);
+    let runningCleanupCalls = 0;
+    let queuedCleanupCalls = 0;
+    const runningCleanup = { dispose: () => { runningCleanupCalls++; } };
+    const queuedCleanup = { dispose: () => { queuedCleanupCalls++; } };
+
+    const runningMock = createMockPty();
+    vi.mocked(pty.spawn).mockReturnValue(runningMock.mockPty as unknown as pty.IPty);
+    await manager.spawn({
+      taskId: 'task-ka-cleanup-running',
+      command: '',
+      cwd: tmpDir,
+      spawnCleanup: runningCleanup,
+    });
+    await manager.spawn({
+      taskId: 'task-ka-cleanup-queued',
+      command: '',
+      cwd: tmpDir,
+      spawnCleanup: queuedCleanup,
+    });
+
+    manager.killAll();
+
+    expect(runningCleanupCalls).toBe(1);
+    expect(queuedCleanupCalls).toBe(1);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -593,10 +656,225 @@ describe('kill() marks deliberate teardown intentional', () => {
     // Positional args: (sessionId, exitCode, intentional).
     expect(exitCall![2]).toBe(true);
   });
+
+  it('disposes generic spawn cleanup once before the PTY exit callback', async () => {
+    const mock = createMockPty();
+    vi.mocked(pty.spawn).mockReturnValue(mock.mockPty as unknown as pty.IPty);
+    let cleanupCalls = 0;
+    const session = await manager.spawn({
+      taskId: 'task-kill-generic-cleanup',
+      command: '',
+      cwd: tmpDir,
+      spawnCleanup: { dispose: () => { cleanupCalls++; } },
+    });
+
+    manager.kill(session.id);
+    expect(cleanupCalls).toBe(1);
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    expect(cleanupCalls).toBe(1);
+  });
+
+  it('disposes generic spawn cleanup once when suspending a session', async () => {
+    const mock = createMockPty();
+    vi.mocked(pty.spawn).mockReturnValue(mock.mockPty as unknown as pty.IPty);
+    let cleanupCalls = 0;
+    const session = await manager.spawn({
+      taskId: 'task-suspend-generic-cleanup',
+      command: '',
+      cwd: tmpDir,
+      spawnCleanup: { dispose: () => { cleanupCalls++; } },
+    });
+
+    const suspendPromise = manager.suspend(session.id);
+    expect(cleanupCalls).toBe(1);
+
+    await suspendPromise;
+
+    expect(cleanupCalls).toBe(1);
+  });
 });
 
 // ---------------------------------------------------------------------------
-// 6. PTY Spawn Failure
+// 6. Pre-registration spawn cleanup
+// ---------------------------------------------------------------------------
+
+describe('Pre-registration spawn cleanup', () => {
+  it('releases invocation-owned cleanup and exact hooks during shutdown before creating a session', async () => {
+    // Given
+    const manager = new SessionManager();
+    const adapter = new OpenCodeAdapter();
+    const removeHooks = vi.spyOn(adapter, 'removeHooks').mockImplementation(() => {});
+    let cleanupCalls = 0;
+    const input = {
+      id: 'shutdown-owner-id',
+      taskId: 'task-shutdown-owner',
+      projectId: 'project-shutdown-owner',
+      command: '',
+      cwd: tmpDir,
+      agentParser: adapter,
+      spawnCleanup: { dispose: () => { cleanupCalls++; } },
+    };
+    vi.mocked(isShuttingDown).mockReturnValue(true);
+
+    // When
+    await expect(manager.spawn(input)).rejects.toThrow('Cannot spawn session during shutdown');
+
+    // Then
+    expect(cleanupCalls).toBe(1);
+    expect(removeHooks).toHaveBeenCalledOnce();
+    expect(removeHooks).toHaveBeenCalledWith(tmpDir, input.taskId, input.id);
+    expect(manager.getSession(input.id)).toBeUndefined();
+    expect(pty.spawn).not.toHaveBeenCalled();
+  });
+
+  it('releases invocation-owned hooks before registration for explicit input shapes', async () => {
+    // Given
+    const adapter = new OpenCodeAdapter();
+    const removeHooks = vi.spyOn(adapter, 'removeHooks').mockImplementation(() => {});
+    const inputShapes = [
+      { id: 'startup-owner-id', taskId: 'task-startup-owner' },
+      { id: 'recovery-owner-id', taskId: 'task-recovery-owner', resuming: true, agentSessionId: 'agent-recovery-id' },
+      { id: 'transient-owner-id', taskId: 'task-transient-owner', transient: true },
+    ];
+
+    for (const [index, shape] of inputShapes.entries()) {
+      const manager = new SessionManager();
+      const shellError = new Error(`shell lookup failed ${index}`);
+      const cleanup = { dispose: vi.fn() };
+      vi.spyOn(manager, 'getShell').mockRejectedValue(shellError);
+      const input = {
+        ...shape,
+        projectId: 'project-pre-registration-owner',
+        command: '',
+        cwd: tmpDir,
+        agentParser: adapter,
+        spawnCleanup: cleanup,
+      };
+
+      // When
+      await expect(manager.spawn(input)).rejects.toBe(shellError);
+
+      // Then
+      expect(cleanup.dispose).toHaveBeenCalledOnce();
+      expect(manager.getSession(input.id)).toBeUndefined();
+    }
+
+    expect(removeHooks).toHaveBeenCalledTimes(inputShapes.length);
+    for (const [index, shape] of inputShapes.entries()) {
+      expect(removeHooks).toHaveBeenNthCalledWith(index + 1, tmpDir, shape.taskId, shape.id);
+    }
+    expect(pty.spawn).not.toHaveBeenCalled();
+  });
+
+  it('preserves the original getShell error when exact hook cleanup throws', async () => {
+    // Given
+    const manager = new SessionManager();
+    const adapter = new OpenCodeAdapter();
+    const shellError = new Error('shell lookup failed');
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(adapter, 'removeHooks').mockImplementation(() => {
+      throw new Error('hook cleanup failed with private details');
+    });
+    vi.spyOn(manager, 'getShell').mockRejectedValue(shellError);
+    const input = {
+      id: 'throwing-hook-owner-id',
+      taskId: 'task-throwing-hook-owner',
+      projectId: 'project-throwing-hook-owner',
+      command: '',
+      cwd: tmpDir,
+      agentParser: adapter,
+      spawnCleanup: { dispose: vi.fn() },
+    };
+
+    // When
+    await expect(manager.spawn(input)).rejects.toBe(shellError);
+
+    // Then
+    expect(warning).toHaveBeenCalledWith('[SessionManager] adapter hook cleanup failed');
+    warning.mockRestore();
+  });
+
+  it('leaves the registered lifecycle as the hook owner when a replacement rejects before spawning', async () => {
+    // Given
+    const manager = new SessionManager();
+    const adapter = new OpenCodeAdapter();
+    const removeHooks = vi.spyOn(adapter, 'removeHooks').mockImplementation(() => {});
+    const firstPty = createMockPty();
+    vi.mocked(pty.spawn).mockReturnValue(firstPty.mockPty as unknown as pty.IPty);
+    const registeredSession = await manager.spawn({
+      id: 'registered-owner-id',
+      taskId: 'task-registered-owner',
+      projectId: 'project-registered-owner',
+      command: '',
+      cwd: tmpDir,
+      agentParser: adapter,
+    });
+    removeHooks.mockClear();
+    const shellError = new Error('replacement shell lookup failed');
+    vi.spyOn(manager, 'getShell').mockRejectedValue(shellError);
+
+    // When
+    await expect(manager.spawn({
+      id: registeredSession.id,
+      taskId: registeredSession.taskId,
+      projectId: registeredSession.projectId,
+      command: '',
+      cwd: tmpDir,
+      agentParser: adapter,
+      spawnCleanup: { dispose: vi.fn() },
+    })).rejects.toBe(shellError);
+
+    // Then
+    expect(removeHooks).not.toHaveBeenCalled();
+    expect(manager.getSession(registeredSession.id)).toMatchObject({ id: registeredSession.id, status: 'running' });
+    expect(pty.spawn).toHaveBeenCalledOnce();
+  });
+
+  it('disposes successor cleanup without releasing predecessor hooks when same-ID replacement teardown throws', async () => {
+    const manager = new SessionManager();
+    const predecessorDisposeError = new Error('predecessor attachment disposal failed');
+    const predecessorDispose = vi.fn(() => { throw predecessorDisposeError; });
+    const adapter = Object.assign(new OpenCodeAdapter(), {
+      attachSession: () => ({ dispose: predecessorDispose }),
+    });
+    const removeHooks = vi.spyOn(adapter, 'removeHooks').mockImplementation(() => {});
+    const firstPty = createMockPty();
+    firstPty.mockPty.kill.mockImplementation(() => {});
+    vi.mocked(pty.spawn).mockReturnValue(firstPty.mockPty as unknown as pty.IPty);
+    const sessionId = 'same-id-throwing-predecessor';
+    const taskId = 'task-same-id-throwing-predecessor';
+    await manager.spawn({
+      id: sessionId,
+      taskId,
+      projectId: 'project-same-id-throwing-predecessor',
+      command: '',
+      cwd: tmpDir,
+      agentParser: adapter,
+    });
+    const registeredOwner = manager['registry'].get(sessionId);
+    removeHooks.mockClear();
+    const successorCleanup = { dispose: vi.fn() };
+
+    await expect(manager.spawn({
+      id: sessionId,
+      taskId,
+      projectId: 'project-same-id-throwing-predecessor',
+      command: '',
+      cwd: tmpDir,
+      agentParser: adapter,
+      spawnCleanup: successorCleanup,
+    })).rejects.toBe(predecessorDisposeError);
+
+    expect(successorCleanup.dispose).toHaveBeenCalledOnce();
+    expect(manager['registry'].get(sessionId)).toBe(registeredOwner);
+    expect(removeHooks).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 7. PTY Spawn Failure
 // ---------------------------------------------------------------------------
 
 describe('PTY spawn failure', () => {
@@ -619,6 +897,59 @@ describe('PTY spawn failure', () => {
 
     expect(session.status).toBe('exited');
     expect(session.exitCode).toBe(-1);
+  });
+
+  it('releases adapter resources when PTY spawn throws before onExit is attached', async () => {
+    const adapter = new OpenCodeAdapter();
+    const removeHooks = vi.spyOn(adapter, 'removeHooks');
+    vi.mocked(pty.spawn).mockImplementation(() => {
+      throw new Error('spawn ENOENT');
+    });
+
+    await manager.spawn({
+      id: 'failed-pty-spawn-id',
+      taskId: 'task-fail-cleanup',
+      command: '',
+      cwd: tmpDir,
+      agentParser: adapter,
+    });
+
+    expect(removeHooks).toHaveBeenCalledWith(tmpDir, 'task-fail-cleanup', 'failed-pty-spawn-id');
+  });
+
+  it('releases adapter resources with the session identity on normal PTY exit', async () => {
+    const adapter = new OpenCodeAdapter();
+    const removeHooks = vi.spyOn(adapter, 'removeHooks');
+    const mock = createMockPty();
+    vi.mocked(pty.spawn).mockReturnValue(mock.mockPty as unknown as pty.IPty);
+
+    await manager.spawn({
+      id: 'normal-pty-exit-id',
+      taskId: 'task-normal-cleanup',
+      command: '',
+      cwd: tmpDir,
+      agentParser: adapter,
+    });
+
+    mock.triggerExit(0);
+
+    expect(removeHooks).toHaveBeenCalledWith(tmpDir, 'task-normal-cleanup', 'normal-pty-exit-id');
+  });
+
+  it('disposes generic spawn cleanup exactly once when PTY spawn throws', async () => {
+    let cleanupCalls = 0;
+    vi.mocked(pty.spawn).mockImplementation(() => {
+      throw new Error('spawn ENOENT');
+    });
+
+    await manager.spawn({
+      taskId: 'task-fail-generic-cleanup',
+      command: '',
+      cwd: tmpDir,
+      spawnCleanup: { dispose: () => { cleanupCalls++; } },
+    });
+
+    expect(cleanupCalls).toBe(1);
   });
 
   it('emits exit event with code -1 on spawn failure', async () => {
@@ -2155,6 +2486,30 @@ describe('attachSession dispatch contract', () => {
     expect(disposeSpy).toHaveBeenCalledTimes(1);
   });
 
+  it('releases generic cleanup and exact hooks once when the PTY exit callback repeats', async () => {
+    const mock = createMockPty();
+    vi.mocked(pty.spawn).mockReturnValue(mock.mockPty as unknown as pty.IPty);
+    const adapter = new OpenCodeAdapter();
+    const removeHooks = vi.spyOn(adapter, 'removeHooks').mockImplementation(() => {});
+    let cleanupCalls = 0;
+    await manager.spawn({
+      id: 'generic-cleanup-exit-id',
+      taskId: 'task-generic-cleanup-exit',
+      projectId: 'project-attach-test',
+      command: '',
+      cwd: tmpDir,
+      agentParser: adapter,
+      spawnCleanup: { dispose: () => { cleanupCalls++; } },
+    });
+
+    mock.triggerExit(0);
+    mock.triggerExit(0);
+
+    expect(cleanupCalls).toBe(1);
+    expect(removeHooks).toHaveBeenCalledOnce();
+    expect(removeHooks).toHaveBeenCalledWith(tmpDir, 'task-generic-cleanup-exit', 'generic-cleanup-exit-id');
+  });
+
   it('applyUsage inside the context calls usageTracker.setSessionUsage and emits usage event', async () => {
     let capturedContext: import('../../src/shared/types').SessionContext | null = null;
 
@@ -2267,6 +2622,37 @@ describe('attachSession dispatch contract', () => {
     const attachSecondIdx = callOrder.indexOf('attach-second');
     expect(disposeFirstSpy).toHaveBeenCalledTimes(1);
     expect(disposeIdx).toBeLessThan(attachSecondIdx);
+  });
+
+  it('disposes only the predecessor generic spawn cleanup when a task is superseded', async () => {
+    const firstMock = createMockPty();
+    vi.mocked(pty.spawn).mockReturnValue(firstMock.mockPty as unknown as pty.IPty);
+    let predecessorCleanupCalls = 0;
+    let successorCleanupCalls = 0;
+    await manager.spawn({
+      taskId: 'task-generic-cleanup-superseded',
+      projectId: 'project-attach-test',
+      command: '',
+      cwd: tmpDir,
+      spawnCleanup: { dispose: () => { predecessorCleanupCalls++; } },
+    });
+
+    const successorMock = createMockPty();
+    vi.mocked(pty.spawn).mockReturnValue(successorMock.mockPty as unknown as pty.IPty);
+    await manager.spawn({
+      taskId: 'task-generic-cleanup-superseded',
+      projectId: 'project-attach-test',
+      command: '',
+      cwd: tmpDir,
+      spawnCleanup: { dispose: () => { successorCleanupCalls++; } },
+    });
+
+    expect(predecessorCleanupCalls).toBe(1);
+    expect(successorCleanupCalls).toBe(0);
+
+    successorMock.triggerExit(0);
+
+    expect(successorCleanupCalls).toBe(1);
   });
 
   it('adapter WITHOUT attachSession method spawns without error (optional-chain regression guard)', async () => {

@@ -57,23 +57,20 @@ export class OpenCodeCommandBuilder {
   buildOpenCodeCommand(options: OpenCodeCommandOptions): string {
     const { shell } = options;
 
-    // Install the activity-stream plugin into the project's
+    // Install the activity-stream plugin into the PTY working directory's
     // `.opencode/plugins/` directory before the CLI launches. OpenCode
     // auto-discovers plugins from that directory at TUI startup, so no
     // CLI flag or `opencode.json` mutation is required. Mirrors the
     // `buildHooks` side effect in CodexCommandBuilder.buildCodexCommand.
     if (options.eventsOutputPath) {
-      const projectRoot = options.projectRoot || options.cwd;
-      buildHooks(projectRoot);
+      buildHooks(options.cwd);
     }
 
     const parts: string[] = [quoteArg(options.opencodePath, shell)];
 
     if (options.resume && options.sessionId) {
       parts.push('--session', quoteArg(options.sessionId, shell));
-      // Resume carries no prompt in the command. `initialPromptDelivery`
-      // routes current prompt content through terminal submission after
-      // the TUI is ready. We also omit --agent because the saved session
+      // Resume carries no prompt in the command. We also omit --agent because the saved session
       // may have a user-selected agent that this command must not shadow.
       return parts.join(' ');
     }
@@ -153,7 +150,7 @@ export class OpenCodeCommandBuilder {
  * pick. See `runtime.activity.kind = 'hooks_and_pty'` in the adapter
  * for the broader OpenCode integration model.
  */
-function mapPermissionModeToAgent(mode: PermissionMode): string | null {
+export function mapPermissionModeToAgent(mode: PermissionMode): string | null {
   switch (mode) {
     case 'plan':
       return 'plan';

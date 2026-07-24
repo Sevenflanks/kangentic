@@ -2,20 +2,50 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { OpenCodeDetector } from './detector';
-import { OpenCodeCommandBuilder } from './command-builder';
+import { OpenCodeCommandBuilder, mapPermissionModeToAgent } from './command-builder';
 import { OpenCodeSessionHistoryParser } from './session-history-parser';
 import { parseOpenCodeTranscript, openCodeTranscriptSourcePath } from './transcript-parser';
 import { migrateOpenCodeProjectData } from './project-relocation';
 import { removeHooks as removeOpenCodeHooks } from './hook-manager';
 import { discoverOpenCodeCapabilities } from './capability-discovery';
 import { runCliPrintSummarize, buildSummarizePrompt } from '../../shared/auto-name';
-import type { AgentAdapter, AgentInfo, SpawnCommandOptions, SettingsChangeSpec, ParsedTranscript } from '../../agent-adapter';
+import type {
+  AgentAdapter,
+  AgentInfo,
+  InitialPromptInput,
+  InitialPromptPreparation,
+  SpawnCommandOptions,
+  SettingsChangeSpec,
+  ParsedTranscript,
+} from '../../agent-adapter';
 import type { AgentPermissionEntry, PermissionMode, AdapterRuntimeStrategy, SessionEvent, SubmissionContextType, SubmissionVerifier, AgentCapabilities } from '../../../../shared/types';
 import { ActivityDetection } from '../../../../shared/types';
 import { EventTypeActivity } from '../../../../shared/types';
 import { parseOpenCodeNativeBoundary } from './native-boundary';
 import type { EventType as SessionEventType } from '../../../../shared/types';
 import type { PrivateEventLinesInput } from '../../agent-adapter';
+
+const INITIAL_PROMPT_PAYLOAD_FILENAME = 'opencode-initial-prompt.json';
+const INITIAL_PROMPT_PAYLOAD_PATH_ENV = 'KANGENTIC_OPENCODE_INITIAL_PROMPT_PATH';
+
+type OpenCodeInitialPromptPayload =
+  | {
+      readonly version: 1;
+      readonly mode: 'fresh';
+      readonly prompt: string;
+      readonly agent?: string;
+      readonly model?: { readonly providerID: string; readonly modelID: string };
+    }
+  | {
+      readonly version: 1;
+      readonly mode: 'resume';
+      readonly prompt: string;
+      readonly sessionId: string;
+    };
+
+type ParsedOpenCodeModel = {
+  readonly model?: { readonly providerID: string; readonly modelID: string };
+};
 
 // Session-ID regexes hoisted to module scope so they compile once.
 // `fromOutput` is invoked on every PTY chunk during the pre-capture
@@ -106,7 +136,7 @@ function parsePublicSessionEvent(line: string): SessionEvent | null {
  *    `OPENCODE_CONFIG_CONTENT` env var for inline overrides. The
  *    Kangentic MCP entry is injected via `buildEnv()` so the user's
  *    checked-in `opencode.json` is never touched. The activity-stream
- *    plugin is a separate file, copied into the project-shared
+ *    plugin is a separate file, copied into the PTY working directory's
  *    `.opencode/plugins/` directory at spawn (refcounted via
  *    `hookHolders` since concurrent sessions share the file).
  *  - No trust dialog and no per-mode permission flags. The
@@ -121,7 +151,6 @@ export class OpenCodeAdapter implements AgentAdapter {
   readonly displayName = 'OpenCode';
   readonly sessionType = 'opencode_agent';
   readonly supportsCallerSessionId = false;
-  readonly initialPromptDelivery = 'terminal-submit' as const;
   readonly liveSubmissionPolicy = {
     mode: 'wait-for-native-idle',
     timeoutMs: 120_000,
@@ -157,10 +186,10 @@ export class OpenCodeAdapter implements AgentAdapter {
 
   private readonly detector = new OpenCodeDetector();
   private readonly commandBuilder = new OpenCodeCommandBuilder();
-  // Per-project taskId set tracking which spawns currently hold the
-  // activity plugin. OpenCode auto-loads plugins from a project-shared
+  // Per-directory spawn-owner set tracking which spawns currently hold the
+  // activity plugin. OpenCode auto-loads plugins from the PTY cwd's
   // `.opencode/plugins/` directory, so concurrent sessions in the same
-  // project share one plugin file. Refcount prevents premature deletion
+  // working directory share one plugin file. Refcount prevents premature deletion
   // when the first task ends while a second is still active. Mirrors
   // CodexAdapter.hookHolders.
   private readonly hookHolders = new Map<string, Set<string>>();
@@ -216,28 +245,67 @@ export class OpenCodeAdapter implements AgentAdapter {
       ...rest,
     });
     // buildOpenCodeCommand copies the activity plugin into
-    // `<projectRoot>/.opencode/plugins/` whenever eventsOutputPath is set.
-    // Retain a reference keyed by the project root so concurrent sessions
-    // serialize their cleanup in `removeHooks`.
+    // `<cwd>/.opencode/plugins/` whenever eventsOutputPath is set.
+    // Retain a reference keyed by that exact cwd so concurrent sessions
+    // coordinate cleanup in `removeHooks`.
     if (options.eventsOutputPath) {
-      const projectRoot = options.projectRoot || options.cwd;
-      this.retainHooks(projectRoot, options.taskId);
+      this.retainHooks(options.cwd, options.hookOwnerId ?? options.taskId);
     }
     return command;
   }
 
-  private retainHooks(directory: string, taskId: string): void {
+  private retainHooks(directory: string, hookOwnerId: string): void {
     let holders = this.hookHolders.get(directory);
     if (!holders) {
       holders = new Set<string>();
       this.hookHolders.set(directory, holders);
     }
-    holders.add(taskId);
+    holders.add(hookOwnerId);
   }
 
   buildEnv(options: SpawnCommandOptions): Record<string, string> | null {
     const { agentPath, ...rest } = options;
     return this.commandBuilder.buildOpenCodeEnv({ opencodePath: agentPath, ...rest });
+  }
+
+  prepareInitialPrompt(input: InitialPromptInput): InitialPromptPreparation {
+    const sourcePath = path.join(input.sessionDirectory, INITIAL_PROMPT_PAYLOAD_FILENAME);
+    const mappedAgent = mapPermissionModeToAgent(input.permissionMode);
+    const payload: OpenCodeInitialPromptPayload = input.resume
+      ? {
+          version: 1,
+          mode: 'resume',
+          prompt: input.prompt,
+          sessionId: input.sessionId,
+        }
+      : {
+          version: 1,
+          mode: 'fresh',
+          prompt: input.prompt,
+          ...(mappedAgent ? { agent: mappedAgent } : {}),
+          ...parseOpenCodeModel(input.model),
+        };
+
+    fs.writeFileSync(sourcePath, JSON.stringify(payload), {
+      encoding: 'utf8',
+      mode: 0o600,
+      flag: 'wx',
+    });
+    let disposed = false;
+    return {
+      env: { [INITIAL_PROMPT_PAYLOAD_PATH_ENV]: sourcePath },
+      cleanup: {
+        dispose: () => {
+          if (disposed) return;
+          disposed = true;
+          try {
+            fs.unlinkSync(sourcePath);
+          } catch {
+            // Cleanup must not replace the original spawn failure; disposed prevents retries.
+          }
+        },
+      },
+    };
   }
 
   interpolateTemplate(template: string, variables: Record<string, string>): string {
@@ -319,22 +387,21 @@ export class OpenCodeAdapter implements AgentAdapter {
   /**
    * Remove the activity plugin from a project's `.opencode/plugins/`.
    *
-   * `taskId` is required when concurrent OpenCode sessions on the same
-   * project are possible (it identifies which spawn is releasing). When
-   * supplied, the call decrements the refcount and only deletes the
-   * plugin file once the last holder releases. When omitted, the call
-   * skips the refcount path and unconditionally deletes the file -
-   * intended only for shutdown / forced cleanup paths where every
-   * pending session is being torn down anyway.
+   * `hookOwnerId` distinguishes overlapping spawns for one task. Older callers
+   * retain taskId-based ownership. With neither value this is forced cleanup:
+   * discard every holder before sentinel-safe plugin removal.
    */
-  removeHooks(directory: string, taskId?: string): void {
+  removeHooks(directory: string, taskId?: string, hookOwnerId?: string): void {
+    const holderKey = hookOwnerId ?? taskId;
     const holders = this.hookHolders.get(directory);
-    if (holders && taskId) {
-      holders.delete(taskId);
+    if (holders && holderKey) {
+      holders.delete(holderKey);
       if (holders.size > 0) {
         // Another concurrent session in this project still needs the plugin.
         return;
       }
+      this.hookHolders.delete(directory);
+    } else if (!holderKey) {
       this.hookHolders.delete(directory);
     }
     removeOpenCodeHooks(directory);
@@ -361,7 +428,7 @@ export class OpenCodeAdapter implements AgentAdapter {
   }
 
   detectFirstOutput(data: string): boolean {
-    // 只接受實測發生於 OpenCode child TUI 接管 PTY 後的 alternate screen；Windows shell 也會 hide cursor，bracketed paste 也可能由 shell 啟用。
+    // Alternate screen 只證明 TUI 接管 PTY，不能證明 Prompt 已取得焦點；初始提示改由 plugin API 交付，不能改回 PTY paste。
     return data.includes('\x1b[?1049h');
   }
 
@@ -408,4 +475,14 @@ export class OpenCodeAdapter implements AgentAdapter {
   async onProjectRelocated(oldPath: string, newPath: string): Promise<void> {
     await migrateOpenCodeProjectData(oldPath, newPath);
   }
+}
+
+function parseOpenCodeModel(model: string | undefined): ParsedOpenCodeModel {
+  if (!model) return {};
+  const separator = model.indexOf('/');
+  if (separator <= 0 || separator === model.length - 1) return {};
+  const providerID = model.slice(0, separator).trim();
+  const modelID = model.slice(separator + 1).trim();
+  if (!providerID || !modelID) return {};
+  return { model: { providerID, modelID } };
 }

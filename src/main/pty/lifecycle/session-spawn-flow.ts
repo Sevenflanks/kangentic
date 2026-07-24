@@ -17,7 +17,7 @@ import type { TranscriptWriter } from '../buffer/transcript-writer';
 import type { FirstOutputTracker } from './first-output-tracker';
 import type { SessionWriteCoordinator } from '../session-write-coordinator';
 import type { NativeIdleEvidence } from '../../activity-engine/native-idle-evidence';
-import { attachAdapter, disposeAdapterAttachment, removeAdapterHooks } from './adapter-lifecycle';
+import { attachAdapter, disposeAdapterAttachment, disposeSpawnCleanup, removeAdapterHooks } from './adapter-lifecycle';
 import { safeKillPty } from './pty-kill';
 import { resolveShellArgs, buildSpawnEnv, resolveSpawnCwd } from '../spawn/pty-spawn';
 import { handleSpawnFailure } from '../spawn/spawn-failure-handler';
@@ -98,11 +98,44 @@ export async function performSpawn(
   context: SpawnFlowContext,
 ): Promise<Session> {
   if (isShuttingDown()) {
+    disposeSpawnCleanup(input);
     throw new Error('Cannot spawn session during shutdown');
   }
 
-  const shell = await context.getShell();
   const existing = input.taskId ? context.registry.findByTaskId(input.taskId) : null;
+  const promotingQueuedSession = existing?.status === 'queued'
+    && existing.id === input.id
+    && input.spawnCleanup === undefined;
+  const shell = await context.getShell().catch((error: unknown) => {
+    if (promotingQueuedSession && existing) {
+      const current = context.registry.get(existing.id);
+      // queue entry 在 await 前已 shift；只有原 placeholder 仍是 registry owner 時才完成終態，避免 stale rejection 釋放同 ID replacement。
+      if (current === existing && current.status === 'queued') {
+        disposeSpawnCleanup(current);
+        removeAdapterHooks(current);
+        current.status = 'exited';
+        current.exitCode = -1;
+        context.emit('exit', current.id, -1);
+      }
+    } else {
+      disposeSpawnCleanup(input);
+    }
+    throw error;
+  });
+
+  if (promotingQueuedSession && existing) {
+    const current = context.registry.get(existing.id);
+    // getShell() 期間可能有同 ID replacement 寫入 registry；只有原 placeholder 仍是目前 owner 時才能繼續，避免 stale promotion 刪掉 replacement 並孤立它的 PTY。
+    if (current !== existing) {
+      return toSession(current ?? existing);
+    }
+    if (current.status !== 'queued') {
+      return toSession(current);
+    }
+    // queue input 不持有 cleanup；在 getShell() await 期間由 placeholder 單獨持有，讓 kill/suspend 可同步終止 promotion。
+    input.spawnCleanup = existing.spawnCleanup;
+    existing.spawnCleanup = undefined;
+  }
 
   // Use the caller-provided ID, or generate a fresh one as fallback.
   // For queue promotions, the ID was set on the input when the placeholder
@@ -110,6 +143,12 @@ export async function performSpawn(
   // For respawns without a caller ID, a fresh UUID forces the renderer to
   // remount (TerminalTab is keyed by session ID).
   const id = input.id ?? uuidv4();
+
+  if (existing && existing.spawnCleanup === input.spawnCleanup) {
+    existing.spawnCleanup = undefined;
+  } else if (existing) {
+    disposeSpawnCleanup(existing);
+  }
 
   // Kill any existing PTY for this task to prevent orphaned processes
   // that would emit data with the same session ID (double output).
@@ -208,6 +247,9 @@ export async function performSpawn(
     });
   }
 
+  const spawnCleanup = input.spawnCleanup;
+  input.spawnCleanup = undefined;
+
   const session: ManagedSession = {
     id,
     taskId: input.taskId,
@@ -224,6 +266,7 @@ export async function performSpawn(
     exitSequence: input.exitSequence ?? ['\x03'],
     agentParser: input.agentParser,
     agentName: input.agentName ?? 'agent',
+    spawnCleanup,
   };
 
   context.registry.set(id, session);
@@ -431,6 +474,10 @@ export async function performSpawn(
   // PTY exit cleanup sequence. Don't overwrite 'suspended' - suspend()
   // sets that before killing the PTY, and the new status must survive.
   const ptyExitDisposable = ptyProcess.onExit(({ exitCode }: { exitCode: number }) => {
+    const registeredSession = context.registry.get(id);
+    // 同 ID replacement 已成為 registry owner 時，舊 PTY 不可再清理新一輪資源或送出它的 exit。
+    if (registeredSession && registeredSession !== session) return;
+
     // Captured BEFORE the status mutation below. `intentional` means Kangentic
     // ended this session deliberately, so a non-zero force-kill exit must not be
     // misclassified as a crash. Two deliberate-end mechanisms set it:
@@ -459,6 +506,7 @@ export async function performSpawn(
     // Cancel the session-ID diagnostic timer but keep the scanner so
     // the scrollback fallback in suspend() can still use its buffer.
     context.sessionIdManager.clearDiagnostic(id);
+    disposeSpawnCleanup(session);
     disposeAdapterAttachment(session);
 
     // Flush transcript to DB before closing out the session

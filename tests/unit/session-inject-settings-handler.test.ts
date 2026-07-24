@@ -23,6 +23,9 @@
  *   - happy path with effort only changed
  */
 
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // ---------------------------------------------------------------------------
@@ -30,6 +33,10 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 // ---------------------------------------------------------------------------
 
 const capturedHandlers = new Map<string, (...args: unknown[]) => unknown>();
+const { mockTrackEvent, mockUuidV4 } = vi.hoisted(() => ({
+  mockTrackEvent: vi.fn(),
+  mockUuidV4: vi.fn(() => 'mock-uuid'),
+}));
 
 vi.mock('electron', () => ({
   ipcMain: {
@@ -42,13 +49,13 @@ vi.mock('electron', () => ({
 // transient-sessions.ts imports these at module level; mock them to prevent
 // side effects from non-IPC code paths (spawn/kill handlers) loading real
 // node modules.
-vi.mock('uuid', () => ({ v4: vi.fn(() => 'mock-uuid') }));
+vi.mock('uuid', () => ({ v4: mockUuidV4 }));
 vi.mock('simple-git', () => ({ default: vi.fn(() => ({})) }));
 vi.mock('../../src/main/git/fetch-throttle', () => ({
   fetchIfStale: vi.fn(async () => 'origin/main'),
 }));
 vi.mock('../../src/main/analytics/analytics', () => ({
-  trackEvent: vi.fn(),
+  trackEvent: mockTrackEvent,
 }));
 vi.mock('../../src/main/git/git-utils', () => ({
   resolveProjectRoot: vi.fn((p: string) => p),
@@ -58,10 +65,11 @@ vi.mock('../../src/shared/git-utils', () => ({
 }));
 
 const mockAgentRegistryGet = vi.fn();
+const mockAgentRegistryGetOrThrow = vi.fn();
 vi.mock('../../src/main/agent/agent-registry', () => ({
   agentRegistry: {
     get: (name: string) => mockAgentRegistryGet(name),
-    getOrThrow: vi.fn(() => { throw new Error('should not be called in these tests'); }),
+    getOrThrow: (name: string) => mockAgentRegistryGetOrThrow(name),
   },
 }));
 
@@ -128,6 +136,28 @@ function createMockContext(overrides: Partial<MockContext> = {}): MockContext {
   };
 }
 
+function prepareTransientSpawn(context: MockContext) {
+  const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'kangentic-transient-owner-'));
+  const adapter = {
+    name: 'opencode',
+    displayName: 'OpenCode',
+    detect: vi.fn(async () => ({ found: true, path: '/usr/bin/opencode', version: '1.0.0' })),
+    buildCommand: vi.fn((_options: Record<string, unknown>) => 'opencode'),
+    buildEnv: vi.fn((): Record<string, string> | null => null),
+    getExitSequence: vi.fn(() => ['\x03']),
+    removeHooks: vi.fn(),
+  };
+  mockAgentRegistryGetOrThrow.mockReturnValue(adapter);
+  context.projectRepo.getById.mockReturnValue({
+    id: 'proj-1',
+    path: projectRoot,
+    default_agent: 'opencode',
+    default_model: null,
+    default_effort: null,
+  });
+  return { projectRoot, adapter };
+}
+
 async function callHandler(
   context: MockContext,
   input: SessionInjectSettingsInput,
@@ -150,6 +180,105 @@ describe('SESSION_INJECT_SETTINGS handler', () => {
 
     context = createMockContext();
     registerTransientSessionHandlers(context as never);
+  });
+
+  it('uses one transient UUID for command hook ownership and the explicit PTY spawn id', async () => {
+    const { projectRoot, adapter } = prepareTransientSpawn(context);
+    context.sessionManager.spawn.mockImplementation(async (input: { id?: string }) => ({ id: input.id }));
+
+    try {
+      const handler = capturedHandlers.get(IPC.SESSION_SPAWN_TRANSIENT);
+      if (!handler) throw new Error('Transient spawn handler was not registered');
+      await handler(null, { projectId: 'proj-1' });
+
+      const commandOptions = adapter.buildCommand.mock.calls[0]?.[0];
+      const spawnInput = context.sessionManager.spawn.mock.calls[0]?.[0];
+      expect(mockUuidV4).toHaveBeenCalledOnce();
+      expect(commandOptions.taskId).toBe('mock-uuid');
+      expect(commandOptions.hookOwnerId).toBe('mock-uuid');
+      expect(spawnInput.id).toBe('mock-uuid');
+      expect(spawnInput.taskId).toBe('mock-uuid');
+      expect(mockTrackEvent).toHaveBeenCalledOnce();
+    } finally {
+      fs.rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('releases the exact transient owner once and preserves buildEnv error identity before spawn invocation', async () => {
+    // Given
+    const { projectRoot, adapter } = prepareTransientSpawn(context);
+    const buildEnvError = new Error('buildEnv failed');
+    adapter.buildEnv.mockImplementationOnce(() => {
+      throw buildEnvError;
+    });
+
+    try {
+      const handler = capturedHandlers.get(IPC.SESSION_SPAWN_TRANSIENT);
+      if (!handler) throw new Error('Transient spawn handler was not registered');
+
+      // When
+      const result = Promise.resolve(handler(null, { projectId: 'proj-1' }));
+
+      // Then
+      await expect(result).rejects.toBe(buildEnvError);
+      expect(adapter.removeHooks).toHaveBeenCalledOnce();
+      expect(adapter.removeHooks).toHaveBeenCalledWith(projectRoot, 'mock-uuid', 'mock-uuid');
+      expect(context.sessionManager.spawn).not.toHaveBeenCalled();
+      expect(mockTrackEvent).not.toHaveBeenCalled();
+    } finally {
+      fs.rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('releases the exact transient owner once and preserves getExitSequence error identity before spawn invocation', async () => {
+    // Given
+    const { projectRoot, adapter } = prepareTransientSpawn(context);
+    const exitSequenceError = new Error('getExitSequence failed');
+    adapter.getExitSequence.mockImplementationOnce(() => {
+      throw exitSequenceError;
+    });
+
+    try {
+      const handler = capturedHandlers.get(IPC.SESSION_SPAWN_TRANSIENT);
+      if (!handler) throw new Error('Transient spawn handler was not registered');
+
+      // When
+      const result = Promise.resolve(handler(null, { projectId: 'proj-1' }));
+
+      // Then
+      await expect(result).rejects.toBe(exitSequenceError);
+      expect(adapter.removeHooks).toHaveBeenCalledOnce();
+      expect(adapter.removeHooks).toHaveBeenCalledWith(projectRoot, 'mock-uuid', 'mock-uuid');
+      expect(context.sessionManager.spawn).not.toHaveBeenCalled();
+      expect(mockTrackEvent).not.toHaveBeenCalled();
+    } finally {
+      fs.rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves rejected spawn error identity without locally releasing manager-owned hooks', async () => {
+    // Given
+    const { projectRoot, adapter } = prepareTransientSpawn(context);
+    const spawnError = new Error('spawn failed');
+    context.sessionManager.spawn.mockRejectedValueOnce(spawnError);
+
+    try {
+      const handler = capturedHandlers.get(IPC.SESSION_SPAWN_TRANSIENT);
+      if (!handler) throw new Error('Transient spawn handler was not registered');
+
+      // When
+      const result = Promise.resolve(handler(null, { projectId: 'proj-1' }));
+
+      // Then
+      await expect(result).rejects.toBe(spawnError);
+      const spawnInput = context.sessionManager.spawn.mock.calls[0]?.[0];
+      expect(spawnInput.id).toBe('mock-uuid');
+      expect(spawnInput.taskId).toBe('mock-uuid');
+      expect(adapter.removeHooks).not.toHaveBeenCalled();
+      expect(mockTrackEvent).not.toHaveBeenCalled();
+    } finally {
+      fs.rmSync(projectRoot, { recursive: true, force: true });
+    }
   });
 
   // =========================================================================

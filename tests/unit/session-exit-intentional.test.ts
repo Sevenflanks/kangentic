@@ -68,6 +68,7 @@ vi.mock('../../src/main/pty/spawn/spawn-failure-handler', () => ({
 vi.mock('../../src/main/pty/lifecycle/adapter-lifecycle', () => ({
   attachAdapter: vi.fn(),
   disposeAdapterAttachment: vi.fn(),
+  disposeSpawnCleanup: vi.fn(),
   removeAdapterHooks: vi.fn(),
 }));
 
@@ -145,6 +146,15 @@ function makeContext(): SpawnFlowContext {
     },
     sessionQueue: {
       notifySlotFreed: vi.fn(),
+    },
+    writeCoordinator: {
+      initialize: vi.fn(() => 1),
+      getSessionGeneration: vi.fn(() => 1),
+      disposeSession: vi.fn(),
+    },
+    nativeIdleEvidence: {
+      initializeSession: vi.fn(),
+      removeSession: vi.fn(),
     },
     getTranscriptWriter: vi.fn(() => null),
     getShell: vi.fn().mockResolvedValue('/bin/bash'),
