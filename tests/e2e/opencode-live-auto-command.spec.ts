@@ -8,10 +8,8 @@ import {
   cleanupTestDataDir,
   closeApp,
   createProject,
-  createTask,
   createTempProject,
   getTestDataDir,
-  getTaskIdByTitle,
   launchApp,
   mockAgentPath,
   moveTaskIpc,
@@ -19,6 +17,7 @@ import {
   waitForAgentSessionId,
 } from './helpers';
 
+const BOOTSTRAP_PROMPT_CANARY = '/bootstrap-prompt-canary';
 const LIVE_COMMAND_CANARY = 'live-command-canary';
 const INTERACTIVE_PROBE_CANARY = 'interactive-probe-canary';
 const USER_INPUT_CANARY = 'user-input-canary';
@@ -38,6 +37,24 @@ async function emitTrigger(pathname: string): Promise<void> {
     intervals: [POLL_INTERVAL_MS],
     timeout: 5_000,
   }).toBe(false);
+}
+
+function readPromptCaptures(capturePath: string): readonly string[] {
+  return fs.readFileSync(capturePath, 'utf8')
+    .split('\n')
+    .filter((line) => line.length > 0)
+    .flatMap((line) => {
+      const event: unknown = JSON.parse(line);
+      if (typeof event !== 'object' || event === null || !('kind' in event) || !('text' in event)) return [];
+      return event.kind === 'prompt' && typeof event.text === 'string' ? [event.text] : [];
+    });
+}
+
+async function idleEventCount(page: Page, sessionId: string): Promise<number> {
+  return page.evaluate(async (id) => {
+    const events = await window.electronAPI.sessions.getEvents(id);
+    return events.filter((event) => event.type === 'idle').length;
+  }, sessionId);
 }
 
 async function waitForLiveStatus(
@@ -64,19 +81,22 @@ test.describe('OpenCode live lane command delivery', () => {
     const testName = `opencode-live-auto-command-${runId}`;
     const paths = {
       receipt: path.join(testInfo.outputDir, 'live-receipt.txt'),
-      initialReceipt: path.join(testInfo.outputDir, 'initial-receipt.txt'),
       probeReceipt: path.join(testInfo.outputDir, 'probe-receipt.txt'),
       rootIdleTrigger: path.join(testInfo.outputDir, 'emit-root-idle'),
       childIdleTrigger: path.join(testInfo.outputDir, 'emit-child-idle'),
       errorTrigger: path.join(testInfo.outputDir, 'emit-error'),
-      launchCount: path.join(testInfo.outputDir, 'launch-count.txt'),
+      launchMarkers: path.join(testInfo.outputDir, 'launch-count.txt'),
       inputCapture: path.join(testInfo.outputDir, 'input-capture.bin'),
+      capture: path.join(testInfo.outputDir, 'opencode-capture.jsonl'),
     } as const;
     const tmpDir = createTempProject(testName);
     const dataDir = getTestDataDir(testName);
     let app: ElectronApplication | undefined;
 
     fs.mkdirSync(testInfo.outputDir, { recursive: true });
+    fs.writeFileSync(paths.launchMarkers, '', 'utf8');
+    fs.writeFileSync(paths.inputCapture, Buffer.from([0x7f]));
+    fs.writeFileSync(paths.capture, '', 'utf8');
     fs.writeFileSync(path.join(dataDir, 'config.json'), JSON.stringify({
       agent: {
         cliPaths: { opencode: mockAgentPath('opencode') },
@@ -93,6 +113,7 @@ test.describe('OpenCode live lane command delivery', () => {
         extraEnv: {
           MOCK_OPENCODE_LIVE_DELIVERY: '1',
           MOCK_OPENCODE_LIVE_DELIVERY_DIR: testInfo.outputDir,
+          MOCK_OPENCODE_CAPTURE_PATH: paths.capture,
         },
       });
       app = launched.app;
@@ -114,27 +135,43 @@ test.describe('OpenCode live lane command delivery', () => {
         const swimlanes = await window.electronAPI.swimlanes.list();
         const byName = (name: string) => swimlanes.find((lane) => lane.name === name)?.id ?? null;
         return {
-          planning: byName('Planning'),
           executing: byName('Executing'),
           review: byName('Code Review'),
           tests: byName('Tests'),
+          shipping: byName('Ship It'),
         };
       });
-      if (!lanes.planning || !lanes.executing || !lanes.review || !lanes.tests) {
-        throw new Error('OpenCode live delivery E2E requires Planning, Executing, Code Review, and Tests lanes');
+      if (!lanes.executing || !lanes.review || !lanes.tests || !lanes.shipping) {
+        throw new Error('OpenCode live delivery E2E requires Executing, Code Review, Tests, and Ship It lanes');
       }
-      await page.evaluate(async ({ executing, review, tests, command }) => {
-        await window.electronAPI.swimlanes.update({ id: executing, auto_command: command });
+      const taskId = await page.evaluate(async ({ executing, review, tests, shipping, bootstrap, command }) => {
+        const project = await window.electronAPI.projects.getCurrent();
+        const holding = await window.electronAPI.swimlanes.create({
+          name: 'Live Delivery Holding',
+          auto_spawn: false,
+        });
+        await window.electronAPI.swimlanes.update({ id: executing, auto_command: bootstrap });
         await window.electronAPI.swimlanes.update({ id: review, auto_command: command });
         await window.electronAPI.swimlanes.update({ id: tests, auto_command: command });
-      }, { executing: lanes.executing, review: lanes.review, tests: lanes.tests, command: LIVE_COMMAND_CANARY });
-
-      const title = `OpenCode Live Delivery ${runId}`;
-      await createTask(page, title, 'Exercise root-native idle authorization');
-      const taskId = await getTaskIdByTitle(page, title);
-      await moveTaskIpc(page, taskId, lanes.planning);
-      await waitForFile(paths.initialReceipt, 'received');
-      await waitForFile(paths.launchCount, '1');
+        await window.electronAPI.swimlanes.update({ id: shipping, auto_command: command });
+        if (!project) return null;
+        const task = await window.electronAPI.tasks.create({
+          title: `OpenCode Live Delivery ${Date.now()}`,
+          description: 'Exercise root-native idle authorization',
+          swimlane_id: holding.id,
+        }, project.id);
+        return task.id;
+      }, {
+        executing: lanes.executing,
+        review: lanes.review,
+        tests: lanes.tests,
+        shipping: lanes.shipping,
+        bootstrap: BOOTSTRAP_PROMPT_CANARY,
+        command: LIVE_COMMAND_CANARY,
+      });
+      if (!taskId) throw new Error('OpenCode live delivery E2E requires a current project');
+      await moveTaskIpc(page, taskId, lanes.executing);
+      await expect.poll(() => readPromptCaptures(paths.capture)).toEqual([BOOTSTRAP_PROMPT_CANARY]);
       await waitForAgentSessionId(page, taskId, 'ses_2349b5c91ffeKd6qajuUTR4clq');
 
       const readSessionId = async (): Promise<string | null> => page.evaluate(async (id) => {
@@ -152,7 +189,7 @@ test.describe('OpenCode live lane command delivery', () => {
         return events.some((event) => event.type === 'session_start');
       }, sessionId), { intervals: [POLL_INTERVAL_MS], timeout: 15_000 }).toBe(true);
 
-      await moveTaskIpc(page, taskId, lanes.executing);
+      await moveTaskIpc(page, taskId, lanes.review);
       await expect.poll(async () => page.evaluate(async ({ id, captureId }) => {
         const tasks = await window.electronAPI.tasks.list();
         const sessions = await window.electronAPI.sessions.list();
@@ -164,11 +201,18 @@ test.describe('OpenCode live lane command delivery', () => {
           hasCapture: document.getElementById(captureId) !== null,
         };
       }, { id: taskId, captureId: STATUS_CAPTURE_ID }))
-        .toEqual({ laneId: lanes.executing, sessionId, hasCapture: true });
+        .toEqual({ laneId: lanes.review, sessionId, hasCapture: true });
+      await waitForLiveStatus(page, taskId, { state: 'waiting' });
+      await expect.poll(async () => page.evaluate(async (id) => {
+        const activity = await window.electronAPI.sessions.getActivity();
+        return activity[id] ?? null;
+      }, sessionId), { timeout: 15_000 }).toBe('idle');
       await waitForLiveStatus(page, taskId, { state: 'waiting' });
       expect(fs.existsSync(paths.receipt)).toBe(false);
 
+      const childIdleCount = await idleEventCount(page, sessionId);
       await emitTrigger(paths.childIdleTrigger);
+      await expect.poll(() => idleEventCount(page, sessionId)).toBeGreaterThan(childIdleCount);
       await waitForLiveStatus(page, taskId, { state: 'waiting' });
       expect(fs.existsSync(paths.receipt)).toBe(false);
 
@@ -179,22 +223,28 @@ test.describe('OpenCode live lane command delivery', () => {
       await page.evaluate(async ({ id }) => window.electronAPI.sessions.write(id, 'readiness-reset-canary\r'), {
         id: sessionId,
       });
-      await moveTaskIpc(page, taskId, lanes.review);
+      await moveTaskIpc(page, taskId, lanes.tests);
       await waitForLiveStatus(page, taskId, { state: 'waiting' });
       await page.evaluate(async ({ id, text }) => window.electronAPI.sessions.write(id, text), {
         id: sessionId,
         text: USER_INPUT_CANARY,
       });
       await waitForLiveStatus(page, taskId, { state: 'cancelled', reason: 'user-input' });
+      const postInputIdleCount = await idleEventCount(page, sessionId);
       await emitTrigger(paths.rootIdleTrigger);
+      await expect.poll(() => idleEventCount(page, sessionId)).toBeGreaterThan(postInputIdleCount);
       expect(await fs.promises.readFile(paths.receipt, 'utf8')).toBe('received\n');
       await page.evaluate(async ({ id }) => window.electronAPI.sessions.write(id, '\r'), { id: sessionId });
 
-      await moveTaskIpc(page, taskId, lanes.tests);
+      await moveTaskIpc(page, taskId, lanes.shipping);
       await waitForLiveStatus(page, taskId, { state: 'waiting' });
+      const errorIdleCount = await idleEventCount(page, sessionId);
       await emitTrigger(paths.errorTrigger);
+      await expect.poll(() => idleEventCount(page, sessionId)).toBeGreaterThan(errorIdleCount);
       await waitForLiveStatus(page, taskId, { state: 'cancelled', reason: 'turn-error' });
+      const postErrorIdleCount = await idleEventCount(page, sessionId);
       await emitTrigger(paths.rootIdleTrigger);
+      await expect.poll(() => idleEventCount(page, sessionId)).toBeGreaterThan(postErrorIdleCount);
       expect(await fs.promises.readFile(paths.receipt, 'utf8')).toBe('received\n');
 
       await page.evaluate(async ({ id, text }) => window.electronAPI.sessions.write(id, `${text}\r`), {
@@ -202,8 +252,11 @@ test.describe('OpenCode live lane command delivery', () => {
         text: INTERACTIVE_PROBE_CANARY,
       });
       await waitForFile(paths.probeReceipt, 'received');
-      expect(Number(await fs.promises.readFile(paths.launchCount, 'utf8'))).toBe(1);
+      expect(await fs.promises.readFile(paths.receipt, 'utf8')).toBe('received\n');
+      expect(readPromptCaptures(paths.capture)).toEqual([BOOTSTRAP_PROMPT_CANARY]);
+      expect(await fs.promises.readFile(paths.launchMarkers, 'utf8')).toBe('launch\n');
       const inputBytes = await fs.promises.readFile(paths.inputCapture);
+      expect(inputBytes[0]).toBe(0x7f);
       expect(inputBytes.includes(0x03)).toBe(false);
     } finally {
       await closeApp(app);

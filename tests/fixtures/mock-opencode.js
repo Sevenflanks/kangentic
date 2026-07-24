@@ -50,16 +50,12 @@ const livePaths = liveDeliveryDir ? {
   rootIdleTrigger: path.join(liveDeliveryDir, 'emit-root-idle'),
   childIdleTrigger: path.join(liveDeliveryDir, 'emit-child-idle'),
   errorTrigger: path.join(liveDeliveryDir, 'emit-error'),
-  launchCount: path.join(liveDeliveryDir, 'launch-count.txt'),
+  launchMarkers: path.join(liveDeliveryDir, 'launch-count.txt'),
   inputCapture: path.join(liveDeliveryDir, 'input-capture.bin'),
 } : null;
 
 if (livePaths) {
-  const priorLaunches = fs.existsSync(livePaths.launchCount)
-    ? Number(fs.readFileSync(livePaths.launchCount, 'utf8'))
-    : 0;
-  fs.writeFileSync(livePaths.launchCount, String(priorLaunches + 1), 'utf8');
-  fs.writeFileSync(livePaths.inputCapture, Buffer.alloc(0));
+  fs.appendFileSync(livePaths.launchMarkers, 'launch\n', 'utf8');
 }
 
 function appendCapture(event) {
