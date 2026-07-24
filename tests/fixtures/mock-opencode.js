@@ -40,6 +40,27 @@ if (args.includes('--help') || args.includes('-h')) {
 }
 
 const capturePath = process.env.MOCK_OPENCODE_CAPTURE_PATH;
+const liveDeliveryDir = process.env.MOCK_OPENCODE_LIVE_DELIVERY === '1'
+  ? process.env.MOCK_OPENCODE_LIVE_DELIVERY_DIR
+  : null;
+const livePaths = liveDeliveryDir ? {
+  receipt: path.join(liveDeliveryDir, 'live-receipt.txt'),
+  initialReceipt: path.join(liveDeliveryDir, 'initial-receipt.txt'),
+  probeReceipt: path.join(liveDeliveryDir, 'probe-receipt.txt'),
+  rootIdleTrigger: path.join(liveDeliveryDir, 'emit-root-idle'),
+  childIdleTrigger: path.join(liveDeliveryDir, 'emit-child-idle'),
+  errorTrigger: path.join(liveDeliveryDir, 'emit-error'),
+  launchCount: path.join(liveDeliveryDir, 'launch-count.txt'),
+  inputCapture: path.join(liveDeliveryDir, 'input-capture.bin'),
+} : null;
+
+if (livePaths) {
+  const priorLaunches = fs.existsSync(livePaths.launchCount)
+    ? Number(fs.readFileSync(livePaths.launchCount, 'utf8'))
+    : 0;
+  fs.writeFileSync(livePaths.launchCount, String(priorLaunches + 1), 'utf8');
+  fs.writeFileSync(livePaths.inputCapture, Buffer.alloc(0));
+}
 
 function appendCapture(event) {
   if (!capturePath) return;
@@ -63,6 +84,7 @@ async function activateInstalledPlugin() {
         promptAsync: async ({ body }) => {
           const textPart = body.parts.find((part) => part.type === 'text');
           if (textPart) appendCapture({ kind: 'prompt', text: textPart.text });
+          if (livePaths) fs.writeFileSync(livePaths.initialReceipt, 'received\n', 'utf8');
         },
       },
     },
@@ -118,7 +140,51 @@ process.stdout.write('\x1b[?25l\x1b[?2004h');
 setImmediate(() => process.stdout.write('\x1b[?1049h'));
 
 // Stay alive to simulate a running session (30s gives tests time to interact)
-const timeout = setTimeout(() => { process.exit(0); }, 30000);
+const timeout = setTimeout(() => { process.exit(0); }, livePaths ? 120000 : 30000);
+
+function appendLiveEvent(event) {
+  const eventsPath = process.env.KANGENTIC_EVENTS_PATH;
+  if (!eventsPath) return;
+  fs.appendFileSync(eventsPath, `${JSON.stringify(event)}\n`, 'utf8');
+}
+
+function consumeTrigger(triggerPath, event) {
+  if (!fs.existsSync(triggerPath)) return;
+  appendLiveEvent(event);
+  fs.unlinkSync(triggerPath);
+}
+
+const triggerInterval = livePaths ? setInterval(() => {
+  const occurredAt = Date.now();
+  consumeTrigger(livePaths.childIdleTrigger, {
+    ts: occurredAt,
+    type: 'idle',
+    privateNativeBoundary: {
+      kind: 'idle',
+      nativeSessionId: 'ses_child2349b5c91ffeKd6qajuUT',
+      occurredAt,
+    },
+  });
+  consumeTrigger(livePaths.errorTrigger, {
+    ts: occurredAt,
+    type: 'idle',
+    detail: 'error',
+    privateNativeBoundary: {
+      kind: 'error',
+      nativeSessionId: sessionId,
+      occurredAt,
+    },
+  });
+  consumeTrigger(livePaths.rootIdleTrigger, {
+    ts: occurredAt,
+    type: 'idle',
+    privateNativeBoundary: {
+      kind: 'idle',
+      nativeSessionId: sessionId,
+      occurredAt,
+    },
+  });
+}, 25) : null;
 
 activateInstalledPlugin().catch((error) => {
   console.error('MOCK_OPENCODE_PLUGIN_ERROR:', error);
@@ -127,16 +193,43 @@ activateInstalledPlugin().catch((error) => {
 });
 
 // Exit cleanly on SIGTERM/SIGINT
-process.on('SIGTERM', () => { clearTimeout(timeout); process.exit(0); });
-process.on('SIGINT', () => { clearTimeout(timeout); process.exit(0); });
+function stop() {
+  clearTimeout(timeout);
+  if (triggerInterval) clearInterval(triggerInterval);
+}
+
+process.on('SIGTERM', () => { stop(); process.exit(0); });
+process.on('SIGINT', () => { stop(); process.exit(0); });
 
 // Keep stdin open so PTY doesn't close.
 if (process.stdin.isTTY) process.stdin.setRawMode(true);
-process.stdin.setEncoding('utf8');
-process.stdin.on('data', (chunk) => {
-  if (chunk.includes('\x03')) {
-    clearTimeout(timeout);
-    process.exit(0);
-  }
-});
+if (livePaths) {
+  let pendingInput = '';
+  process.stdin.on('data', (chunk) => {
+    const input = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    fs.appendFileSync(livePaths.inputCapture, input);
+    if (input.includes(0x03)) {
+      stop();
+      process.exit(0);
+    }
+    pendingInput += input.toString('utf8').replaceAll('\x1b', '');
+    const lines = pendingInput.split('\r');
+    pendingInput = lines.pop() ?? '';
+    for (const line of lines) {
+      if (line === 'live-command-canary') {
+        fs.appendFileSync(livePaths.receipt, 'received\n', 'utf8');
+      } else if (line === 'interactive-probe-canary') {
+        fs.appendFileSync(livePaths.probeReceipt, 'received\n', 'utf8');
+      }
+    }
+  });
+} else {
+  process.stdin.setEncoding('utf8');
+  process.stdin.on('data', (chunk) => {
+    if (chunk.includes('\x03')) {
+      clearTimeout(timeout);
+      process.exit(0);
+    }
+  });
+}
 process.stdin.resume();
