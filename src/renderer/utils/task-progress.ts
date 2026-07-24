@@ -1,6 +1,5 @@
 import { useCallback, useMemo } from 'react';
 import { useSessionStore } from '../stores/session-store';
-import { useBoardStore } from '../stores/board-store';
 import type { Session, SessionUsage, ActivityState, SessionDisplayState } from '../../shared/types';
 import type { LiveDeliveryStatus } from '../../shared/live-delivery-status';
 
@@ -10,7 +9,7 @@ import type { LiveDeliveryStatus } from '../../shared/live-delivery-status';
 // Single system that answers "what is this task doing right now?" for both
 // the board card and the terminal overlay. Replaces the previously scattered
 // logic across session-display-state.ts, TaskCard.tsx (deriveInitializingLabel),
-// and TerminalTab.tsx (deriveOverlayLabel).
+// and TerminalTab.tsx (terminal overlay label derivation).
 //
 // Display lifecycle:
 //   preparing → running → exited
@@ -25,22 +24,19 @@ import type { LiveDeliveryStatus } from '../../shared/live-delivery-status';
 // ---------------------------------------------------------------------------
 
 /**
- * Derive the terminal overlay label. Extends the initializing label with
- * swimlane auto_command support (shows the command text instead of generic).
+ * Terminal overlay label 只讀 renderer 管理的啟動狀態。
+ * 不讀 swimlane command，避免 terminal overlay 洩漏 command 文字。
  * Priority chain (highest first):
  *   1. Pending command label (explicit invocation text)
  *   2. Resuming session ("Resuming agent...")
- *   3. Swimlane auto_command (shows the command itself)
- *   4. Default ("Starting agent...")
+ *   3. Default ("Starting agent...")
  */
-function deriveOverlayLabel(
+export function deriveTerminalOverlayLabel(
   pendingCommandLabel: string | null | undefined,
   isResuming: boolean,
-  autoCommand: string | null | undefined,
 ): string {
   if (pendingCommandLabel) return pendingCommandLabel;
   if (isResuming) return 'Resuming agent...';
-  if (autoCommand) return autoCommand;
   return 'Starting agent...';
 }
 
@@ -189,7 +185,7 @@ export interface TerminalOverlayState {
 
 /**
  * React hook for TerminalTab overlay label. Consolidates the overlay label
- * derivation that was previously in TerminalTab.tsx (deriveOverlayLabel).
+ * derivation that was previously in TerminalTab.tsx.
  *
  * Does NOT manage terminalReady state - that's a component-level lifecycle
  * concern (xterm init, firstOutput/usage gating) that stays local.
@@ -209,21 +205,9 @@ export function useTerminalOverlay(taskId: string, sessionId: string): TerminalO
       [taskId],
     ),
   );
-  const autoCommand = useBoardStore(
-    useCallback(
-      (s: ReturnType<typeof useBoardStore.getState>) => {
-        const task = s.tasks.find((t) => t.session_id === sessionId);
-        if (!task) return null;
-        const swimlane = s.swimlanes.find((lane) => lane.id === task.swimlane_id);
-        return swimlane?.auto_command ?? null;
-      },
-      [sessionId],
-    ),
-  );
-
   const overlayLabel = useMemo(
-    () => deriveOverlayLabel(pendingCommandLabel, isResuming, autoCommand),
-    [pendingCommandLabel, isResuming, autoCommand],
+    () => deriveTerminalOverlayLabel(pendingCommandLabel, isResuming),
+    [pendingCommandLabel, isResuming],
   );
 
   return { overlayLabel };

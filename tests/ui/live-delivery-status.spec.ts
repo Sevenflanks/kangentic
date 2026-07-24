@@ -22,7 +22,12 @@ async function launchPage(): Promise<{ browser: Browser; page: Page }> {
       var ts = new Date().toISOString();
       state.projects.push({ id: '${PROJECT_ID}', name: 'Live delivery', path: '/mock/live-delivery', default_agent: 'opencode', last_opened: ts, created_at: ts });
       state.DEFAULT_SWIMLANES.forEach(function (lane, index) {
-        state.swimlanes.push(Object.assign({}, lane, { id: 'lane-' + index, position: index, created_at: ts }));
+        state.swimlanes.push(Object.assign({}, lane, {
+          id: 'lane-' + index,
+          position: index,
+          created_at: ts,
+          auto_command: index === 1 ? '${COMMAND_CANARY}' : lane.auto_command,
+        }));
       });
       state.sessions.push({ id: '${SESSION_ID}', taskId: '${TASK_ID}', projectId: '${PROJECT_ID}', pid: 1, status: 'running', shell: 'bash', cwd: '/mock/live-delivery', startedAt: ts, exitCode: null });
       state.tasks.push({ id: '${TASK_ID}', title: 'Live delivery task', description: '', swimlane_id: 'lane-1', position: 0, agent: 'opencode', session_id: '${SESSION_ID}', worktree_path: null, branch_name: null, pr_number: null, pr_url: null, pr_state: null, base_branch: null, labels: [], priority: 0, attachment_count: 0, archived_at: null, created_at: ts, updated_at: ts });
@@ -69,6 +74,9 @@ test.describe('Live delivery status', () => {
       await expect(card).toContainText('Command bytes reached the terminal.');
       await expect(page.locator('[role="alert"]')).toHaveCount(0);
       await expect(card).not.toContainText(COMMAND_CANARY);
+      const launchOverlay = page.locator('[data-testid="launch-overlay"]');
+      await expect(launchOverlay).toBeVisible();
+      await expect(launchOverlay).not.toContainText(COMMAND_CANARY);
     } finally {
       await browser.close();
     }
