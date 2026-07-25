@@ -186,7 +186,9 @@ The transition engine receives that resolved agent and uses its `AgentAdapter` c
 
 When a task moves to a column with `auto_command` set, the command delivery depends on how the session was started:
 
-OpenCode uses **TUI-ready terminal submission** for initial content. A fresh session receives the full Task XML after its TUI reports the adapter-defined `ESC[?1049h` alternate-screen takeover. A resumed session starts with `--session <id>` and receives only the current `resumePrompt`; a promptless resume restores the native session without submitting content or replaying Task XML. Cursor-hide and generic bracketed-paste mode are not valid OpenCode readiness signals.
+OpenCode uses an adapter-prepared private payload for initial content, locally source-verified against OpenCode v1.18.4. `prepareInitialPrompt` writes the payload; the activity plugin, running in the same OpenCode process, claims it before using the generated SDK. A fresh payload creates a session, selects it through the TUI SDK, and prompts it. A resumed payload validates the known session and prompts it without a new selection. This is not alternate-screen terminal paste, and fresh real OpenCode QA remains pending.
+
+Later OpenCode live lane commands keep the approved delivery invariants: private same-process native-idle evidence admits delivery, user input takes priority and cancels a pending delivery, and the delivery neither sends `Ctrl+C` nor respawns the session. PTY is an allowed transport for those later commands; native API transport is not required.
 
 **Resumed sessions** (priority 3 suspend-and-resume, or priority 4 resume from suspended):
 - The `auto_command` is interpolated and passed as the resume prompt to `claude --resume <id>`
@@ -198,8 +200,8 @@ OpenCode uses **TUI-ready terminal submission** for initial content. A fresh ses
 
 **Fresh spawns with a task prompt template on the normal `spawnAgent` fallback path** (no suspended destination session to resume):
 - On the normal `spawnAgent` fallback path, a templated fresh spawn schedules `auto_command` through `TerminalSubmitScheduler.scheduleKeystrokes` with `sendCtrlC: false`.
-- For an OpenCode fresh spawn, the initial free-form content job completes before the scheduler sends the latest queued fresh-spawn `auto_command` directly as a keystroke burst. The burst uses `sendCtrlC: false`.
-- The scheduler interpolates the command, waits for the CLI's first `'thinking'` activity event, then writes text → Esc → Enter via `TerminalSubmit.submitKeystrokes`.
+- For an OpenCode fresh spawn, the plugin-delivered initial prompt completes before the scheduler sends the latest queued fresh-spawn `auto_command` as a PTY keystroke burst. The burst uses `sendCtrlC: false`.
+- The scheduler interpolates the command, admits it only after same-process native-idle evidence, then writes text → Esc → Enter via `TerminalSubmit.submitKeystrokes` unless user input cancels the pending delivery.
 
 This enables workflows like moving a task from "Running" to "Code Review" to automatically send a review prompt to the agent.
 
