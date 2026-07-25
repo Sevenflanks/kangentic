@@ -38,7 +38,7 @@ describe('opencode-plugin', () => {
       root.create.mockImplementation(async () => {
         expect(fs.existsSync(sourcePath)).toBe(false);
         expect(fs.readdirSync(directory).some((entry) => entry.includes('.claim-'))).toBe(false);
-        return { id: 'ses_fresh_123' };
+        return { data: { id: 'ses_fresh_123' } };
       });
       root.promptAsync.mockImplementation(async () => {
         const turnStart = pluginModule.extractToolStartEvent(
@@ -58,7 +58,19 @@ describe('opencode-plugin', () => {
       await plugin({ client: root.client, directory });
 
       expect(renameSpy).toHaveBeenCalledWith(sourcePath, expect.stringContaining('.claim-'));
-      expect(root.create).toHaveBeenCalledWith({ query: { directory }, body: {} });
+      expect(root.create).toHaveBeenCalledWith({
+        query: { directory },
+        body: {},
+        throwOnError: true,
+      });
+      expect(root.publish).toHaveBeenCalledWith({
+        query: { directory },
+        body: {
+          type: 'tui.session.select',
+          properties: { sessionID: 'ses_fresh_123' },
+        },
+        throwOnError: true,
+      });
       expect(root.promptAsync).toHaveBeenCalledWith({
         path: { id: 'ses_fresh_123' },
         query: { directory },
@@ -67,6 +79,7 @@ describe('opencode-plugin', () => {
           agent: 'plan',
           model: { providerID: 'anthropic', modelID: 'claude-sonnet' },
         },
+        throwOnError: true,
       });
       expect(root.command).not.toHaveBeenCalled();
       expect(readEvents(eventsPath)).toEqual([{
@@ -206,11 +219,14 @@ describe('opencode-plugin', () => {
       expect(root.get).toHaveBeenCalledWith({
         path: { id: 'ses_resume_123' },
         query: { directory },
+        throwOnError: true,
       });
+      expect(root.publish).not.toHaveBeenCalled();
       expect(root.promptAsync).toHaveBeenCalledWith({
         path: { id: 'ses_resume_123' },
         query: { directory },
         body: { parts: [{ type: 'text', text: 'resume payload text' }] },
+        throwOnError: true,
       });
       expect(readEvents(eventsPath)).toEqual([{
         ts: expect.any(Number),
@@ -251,6 +267,7 @@ describe('opencode-plugin', () => {
         path: { id: 'ses_command_123' },
         query: { directory },
         body: { parts: [{ type: 'text', text: '/compact retain task context' }] },
+        throwOnError: true,
       });
     });
 
@@ -272,6 +289,7 @@ describe('opencode-plugin', () => {
         path: { id: 'ses_created_123' },
         query: { directory },
         body: { parts: [{ type: 'text', text: '/   ' }] },
+        throwOnError: true,
       });
       expect(root.command).not.toHaveBeenCalled();
     });

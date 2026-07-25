@@ -75,13 +75,16 @@ async function activateInstalledPlugin() {
   await KangenticActivity({
     client: {
       session: {
-        create: async () => ({ id: MOCK_SESSION_ID }),
-        get: async ({ path: requestPath }) => ({ id: requestPath.id }),
+        create: async () => ({ data: { id: MOCK_SESSION_ID } }),
+        get: async ({ path: requestPath }) => ({ data: { id: requestPath.id } }),
         promptAsync: async ({ body }) => {
           const textPart = body.parts.find((part) => part.type === 'text');
           if (textPart) appendCapture({ kind: 'prompt', text: textPart.text });
           if (livePaths) fs.writeFileSync(livePaths.initialReceipt, 'received\n', 'utf8');
         },
+      },
+      tui: {
+        publish: async () => ({ data: true }),
       },
     },
     directory: process.cwd(),

@@ -5,6 +5,27 @@ import { createOpenCodePluginFixture, EVENTS_PATH_ENV, INITIAL_PROMPT_PATH_ENV }
 
 const { cleanup, loadPlugin, makeRootClient, makeTemporaryDirectory, readEvents, writePayload } = createOpenCodePluginFixture();
 
+const expectCombinedError = (
+  event: ReturnType<typeof readEvents>[number],
+  nativeSessionId: string | null,
+) => {
+  const boundary = event.privateNativeBoundary;
+  expect(event).toEqual({
+    ts: expect.any(Number),
+    type: 'idle',
+    detail: 'error',
+    privateNativeBoundary: {
+      kind: 'error',
+      nativeSessionId,
+      occurredAt: expect.any(Number),
+    },
+  });
+  if (typeof boundary !== 'object' || boundary === null || !('occurredAt' in boundary)) {
+    throw new TypeError('combined error is missing privateNativeBoundary.occurredAt');
+  }
+  expect(event.ts).toBe(boundary.occurredAt);
+};
+
 afterEach(cleanup);
 
 describe('opencode-plugin', () => {
@@ -56,14 +77,20 @@ describe('opencode-plugin', () => {
         }
         return originalParse(rawText, reviver);
       });
-      root.create.mockImplementation(async () => ({ id: 'ses_order_123' }));
+      root.create.mockImplementation(async () => ({
+        data: { id: 'ses_order_123' },
+      }));
       process.env[INITIAL_PROMPT_PATH_ENV] = sourcePath;
 
       await plugin({ client: root.client, directory });
 
       expect(payloadParseCount).toBe(1);
       expect(renameSpy).toHaveBeenCalledWith(sourcePath, expect.stringContaining('.claim-'));
-      expect(root.create).toHaveBeenCalledWith({ query: { directory }, body: {} });
+      expect(root.create).toHaveBeenCalledWith({
+        query: { directory },
+        body: {},
+        throwOnError: true,
+      });
       expect(root.promptAsync).toHaveBeenCalledWith(expect.objectContaining({
         body: { parts: [{ type: 'text', text: uniquePrompt }] },
       }));
@@ -110,7 +137,12 @@ describe('opencode-plugin', () => {
       expect(root.get).not.toHaveBeenCalled();
       expect(root.promptAsync).not.toHaveBeenCalled();
       expect(root.command).not.toHaveBeenCalled();
-      expect(readEvents(eventsPath)).toEqual([{ ts: expect.any(Number), type: 'idle', detail: 'error' }]);
+      const events = readEvents(eventsPath);
+      expect(events).toHaveLength(1);
+      const errorEvent = events.at(-1);
+      expect(errorEvent).toBeDefined();
+      if (!errorEvent) throw new TypeError('missing unlink failure event');
+      expectCombinedError(errorEvent, null);
 
       const rendered = appendSpy.mock.calls.map(([, payload]) => String(payload)).join('\n');
       expect(rendered).toContain('"type":"idle"');
@@ -156,7 +188,12 @@ describe('opencode-plugin', () => {
       expect(root.create).not.toHaveBeenCalled();
       expect(root.promptAsync).not.toHaveBeenCalled();
       expect(root.command).not.toHaveBeenCalled();
-      expect(readEvents(eventsPath)).toEqual([{ ts: expect.any(Number), type: 'idle', detail: 'error' }]);
+      const events = readEvents(eventsPath);
+      expect(events).toHaveLength(1);
+      const errorEvent = events.at(-1);
+      expect(errorEvent).toBeDefined();
+      if (!errorEvent) throw new TypeError('missing validation failure event');
+      expectCombinedError(errorEvent, null);
     });
 
     it('deletes the exact claim before validation and API requests when validation fails', async () => {
@@ -184,15 +221,17 @@ describe('opencode-plugin', () => {
       const { KangenticActivity: plugin } = await loadPlugin();
       const directory = makeTemporaryDirectory();
       const eventsPath = path.join(directory, 'events.jsonl');
+      const promptCanary = `prompt-${Date.now()}`;
+      const sdkErrorCanary = `sdk-error-${Date.now()}`;
       const sourcePath = writePayload(directory, {
         version: 1,
         mode: 'fresh',
-        prompt: 'api failure prompt',
+        prompt: promptCanary,
       });
       const root = makeRootClient();
       const renameSpy = vi.spyOn(fs, 'renameSync');
       const unlinkSpy = vi.spyOn(fs, 'unlinkSync');
-      root.create.mockRejectedValueOnce(new Error('network exploded'));
+      root.create.mockRejectedValueOnce(new Error(sdkErrorCanary));
       process.env[INITIAL_PROMPT_PATH_ENV] = sourcePath;
       process.env[EVENTS_PATH_ENV] = eventsPath;
 
@@ -200,12 +239,120 @@ describe('opencode-plugin', () => {
 
       expect(fs.existsSync(sourcePath)).toBe(false);
       expect(fs.readdirSync(directory).some((entry) => entry.includes('.claim-'))).toBe(false);
+      expect(root.publish).not.toHaveBeenCalled();
       expect(root.promptAsync).not.toHaveBeenCalled();
       expect(root.command).not.toHaveBeenCalled();
-      expect(readEvents(eventsPath)).toEqual([{ ts: expect.any(Number), type: 'idle', detail: 'error' }]);
+      const events = readEvents(eventsPath);
+      expect(events).toHaveLength(1);
+      const errorEvent = events.at(-1);
+      expect(errorEvent).toBeDefined();
+      if (!errorEvent) throw new TypeError('missing create failure event');
+      expectCombinedError(errorEvent, null);
+      const rendered = fs.readFileSync(eventsPath, 'utf8');
+      expect(rendered).not.toContain(promptCanary);
+      expect(rendered).not.toContain(sdkErrorCanary);
       const claimPath = renameSpy.mock.calls.find(([from]) => from === sourcePath)?.[1];
       expect(unlinkSpy).toHaveBeenCalledOnce();
       expect(unlinkSpy).toHaveBeenCalledWith(claimPath);
+    });
+
+    it('emits one known-identity combined error after fresh prompt rejection', async () => {
+      const { KangenticActivity: plugin } = await loadPlugin();
+      const directory = makeTemporaryDirectory();
+      const eventsPath = path.join(directory, 'events.jsonl');
+      const root = makeRootClient('ses_prompt_123');
+      const promptCanary = `prompt-${Date.now()}`;
+      const sdkErrorCanary = `sdk-error-${Date.now()}`;
+      const sourcePath = writePayload(directory, {
+        version: 1,
+        mode: 'fresh',
+        prompt: promptCanary,
+      });
+      root.promptAsync.mockRejectedValueOnce(new Error(sdkErrorCanary));
+      process.env[INITIAL_PROMPT_PATH_ENV] = sourcePath;
+      process.env[EVENTS_PATH_ENV] = eventsPath;
+
+      await plugin({ client: root.client, directory });
+
+      const events = readEvents(eventsPath);
+      expect(events).toHaveLength(2);
+      expect(events[0]).toEqual(expect.objectContaining({
+        type: 'session_start',
+        hookContext: JSON.stringify({ sessionID: 'ses_prompt_123' }),
+      }));
+      const errorEvent = events.at(-1);
+      expect(errorEvent).toBeDefined();
+      if (!errorEvent) throw new TypeError('missing prompt failure event');
+      expectCombinedError(errorEvent, 'ses_prompt_123');
+      const rendered = fs.readFileSync(eventsPath, 'utf8');
+      expect(rendered).not.toContain(promptCanary);
+      expect(rendered).not.toContain(sdkErrorCanary);
+    });
+
+    it('emits one known-identity combined error after fresh publish rejection', async () => {
+      const { KangenticActivity: plugin } = await loadPlugin();
+      const directory = makeTemporaryDirectory();
+      const eventsPath = path.join(directory, 'events.jsonl');
+      const root = makeRootClient('ses_publish_123');
+      const promptCanary = `prompt-${Date.now()}`;
+      const sdkErrorCanary = `sdk-error-${Date.now()}`;
+      const sourcePath = writePayload(directory, {
+        version: 1,
+        mode: 'fresh',
+        prompt: promptCanary,
+      });
+      root.publish.mockRejectedValueOnce(new Error(sdkErrorCanary));
+      process.env[INITIAL_PROMPT_PATH_ENV] = sourcePath;
+      process.env[EVENTS_PATH_ENV] = eventsPath;
+
+      await plugin({ client: root.client, directory });
+
+      expect(root.promptAsync).not.toHaveBeenCalled();
+      const events = readEvents(eventsPath);
+      expect(events).toHaveLength(2);
+      expect(events[0]).toEqual(expect.objectContaining({
+        type: 'session_start',
+        hookContext: JSON.stringify({ sessionID: 'ses_publish_123' }),
+      }));
+      const errorEvent = events.at(-1);
+      expect(errorEvent).toBeDefined();
+      if (!errorEvent) throw new TypeError('missing publish failure event');
+      expectCombinedError(errorEvent, 'ses_publish_123');
+      const rendered = fs.readFileSync(eventsPath, 'utf8');
+      expect(rendered).not.toContain(promptCanary);
+      expect(rendered).not.toContain(sdkErrorCanary);
+    });
+
+    it('emits one known-identity combined error after resume get rejection', async () => {
+      const { KangenticActivity: plugin } = await loadPlugin();
+      const directory = makeTemporaryDirectory();
+      const eventsPath = path.join(directory, 'events.jsonl');
+      const root = makeRootClient();
+      const promptCanary = `prompt-${Date.now()}`;
+      const sdkErrorCanary = `sdk-error-${Date.now()}`;
+      const sourcePath = writePayload(directory, {
+        version: 1,
+        mode: 'resume',
+        sessionId: 'ses_resume_failure_123',
+        prompt: promptCanary,
+      });
+      root.get.mockRejectedValueOnce(new Error(sdkErrorCanary));
+      process.env[INITIAL_PROMPT_PATH_ENV] = sourcePath;
+      process.env[EVENTS_PATH_ENV] = eventsPath;
+
+      await plugin({ client: root.client, directory });
+
+      expect(root.publish).not.toHaveBeenCalled();
+      expect(root.promptAsync).not.toHaveBeenCalled();
+      const events = readEvents(eventsPath);
+      expect(events).toHaveLength(1);
+      const errorEvent = events.at(-1);
+      expect(errorEvent).toBeDefined();
+      if (!errorEvent) throw new TypeError('missing resume get failure event');
+      expectCombinedError(errorEvent, 'ses_resume_failure_123');
+      const rendered = fs.readFileSync(eventsPath, 'utf8');
+      expect(rendered).not.toContain(promptCanary);
+      expect(rendered).not.toContain(sdkErrorCanary);
     });
 
     it('keeps concurrent payloads independent and routes later events to each instance file', async () => {

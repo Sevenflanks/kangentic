@@ -27,6 +27,7 @@ import {
   OpenCodeDetector,
   OpenCodeCommandBuilder,
 } from '../../src/main/agent/adapters/opencode';
+import { parseOpenCodeNativeBoundary } from '../../src/main/agent/adapters/opencode/native-boundary';
 import type { SpawnCommandOptions } from '../../src/main/agent/agent-adapter';
 import type { PermissionMode } from '../../src/shared/types';
 
@@ -183,6 +184,30 @@ describe('OpenCode Adapter', () => {
       const sample = JSON.stringify({ ts: 123, type: 'tool_start', tool: 'bash' });
       expect(parseEvent?.(sample)).toEqual({ ts: 123, type: 'tool_start', tool: 'bash' });
       expect(parseEvent?.('not json')).toBeNull();
+    });
+
+    it('keeps the private native boundary separate from the public session event', () => {
+      const rawLine = JSON.stringify({
+        ts: 123,
+        type: 'idle',
+        detail: 'error',
+        privateNativeBoundary: {
+          kind: 'error',
+          nativeSessionId: 'ses_private_123',
+          occurredAt: 123,
+        },
+      });
+
+      expect(adapter.runtime.statusFile?.parseEvent?.(rawLine)).toEqual({
+        ts: 123,
+        type: 'idle',
+        detail: 'error',
+      });
+      expect(parseOpenCodeNativeBoundary(rawLine)).toEqual({
+        kind: 'error',
+        nativeSessionId: 'ses_private_123',
+        occurredAt: 123,
+      });
     });
 
     it('extracts sessionID from hookContext via runtime.sessionId.fromHook', () => {

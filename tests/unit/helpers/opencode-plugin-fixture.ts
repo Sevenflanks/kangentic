@@ -42,15 +42,21 @@ export function createOpenCodePluginFixture() {
   }
 
   function makeRootClient(createdSessionId = 'ses_created_123') {
-    const create = vi.fn(async () => ({ id: createdSessionId }));
-    const get = vi.fn(async () => ({ id: createdSessionId }));
+    const create = vi.fn(async () => ({ data: { id: createdSessionId } }));
+    const get = vi.fn(async () => ({ data: { id: createdSessionId } }));
     const promptAsync = vi.fn(async () => undefined);
+    const publish = vi.fn(async () => ({ data: true }));
     const command = vi.fn(async () => undefined);
+
     return {
-      client: { session: { create, get, promptAsync, command } },
+      client: {
+        session: { create, get, promptAsync, command },
+        tui: { publish },
+      },
       create,
       get,
       promptAsync,
+      publish,
       command,
     };
   }

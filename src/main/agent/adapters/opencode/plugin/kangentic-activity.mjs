@@ -190,8 +190,14 @@ function removeClaimPath(claimPath) {
   }
 }
 
-function appendSanitizedError(eventsPath) {
-  appendEvent(eventsPath, { ts: Date.now(), type: 'idle', detail: 'error' });
+function appendSanitizedError(eventsPath, nativeSessionId = null) {
+  const occurredAt = Date.now();
+  appendEvent(eventsPath, {
+    ts: occurredAt,
+    type: 'idle',
+    detail: 'error',
+    privateNativeBoundary: privateBoundary('error', nativeSessionId, occurredAt),
+  });
 }
 
 export const KangenticActivity = async ({ client, directory } = {}) => {
@@ -218,12 +224,22 @@ export const KangenticActivity = async ({ client, directory } = {}) => {
         } else {
           let sessionID;
           if (payload.mode === 'fresh') {
-            sessionID = (await client.session.create({ query: { directory }, body: {} })).id;
+            const result = await client.session.create({
+              query: { directory },
+              body: {},
+              throwOnError: true,
+            });
+            sessionID = result.data.id;
+            bootstrapSessionID = sessionID;
           } else {
-            await client.session.get({ path: { id: payload.sessionId }, query: { directory } });
             sessionID = payload.sessionId;
+            bootstrapSessionID = sessionID;
+            await client.session.get({
+              path: { id: sessionID },
+              query: { directory },
+              throwOnError: true,
+            });
           }
-          bootstrapSessionID = sessionID;
           rootSessionId = sessionID;
           const bootstrapStartedAt = Date.now();
           bootstrapSessionStartWritten = appendEvent(eventsPath, {
@@ -232,6 +248,16 @@ export const KangenticActivity = async ({ client, directory } = {}) => {
             hookContext: JSON.stringify({ sessionID }),
             privateNativeBoundary: privateBoundary('created', sessionID, bootstrapStartedAt),
           });
+          if (payload.mode === 'fresh') {
+            await client.tui.publish({
+              query: { directory },
+              body: {
+                type: 'tui.session.select',
+                properties: { sessionID },
+              },
+              throwOnError: true,
+            });
+          }
           await client.session.promptAsync({
             path: { id: sessionID },
             query: { directory },
@@ -240,12 +266,13 @@ export const KangenticActivity = async ({ client, directory } = {}) => {
               ...(payload.mode === 'fresh' && payload.agent ? { agent: payload.agent } : {}),
               ...(payload.mode === 'fresh' && payload.model ? { model: payload.model } : {}),
             },
+            throwOnError: true,
           });
         }
       }
     } catch {
       if (claimPath) removeClaimPath(claimPath);
-      appendSanitizedError(eventsPath);
+      appendSanitizedError(eventsPath, bootstrapSessionID ?? null);
     }
   }
 
