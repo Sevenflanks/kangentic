@@ -181,6 +181,7 @@ export function registerBoardHandlers(context: IpcContext): void {
           continue;
         }
 
+        if (!context.sessionManager.isWritable(task.session_id)) continue;
         context.terminalSubmitScheduler.scheduleKeystrokes(task.id, task.session_id, plan.sequence, {
           verifier: plan.verifier,
           verifiedPrefixLength: plan.verifiedPrefixLength,
