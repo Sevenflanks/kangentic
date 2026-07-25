@@ -1,5 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import fs from 'node:fs';
+import path from 'node:path';
 import { IPC } from '../../src/shared/ipc-channels';
+import { agentRegistry } from '../../src/main/agent/agent-registry';
 
 const { events, handlers } = vi.hoisted(() => {
   const events: string[] = [];
@@ -55,8 +58,14 @@ function captureHandler(): (...args: unknown[]) => unknown {
   return handler;
 }
 
-function captureInput(): object {
+function captureInput(): {
+  projectId: string;
+  cwd: string;
+  pngBase64: string;
+  sessionId: string;
+} {
   return {
+    projectId: 'project-b',
     cwd: '/project',
     pngBase64: 'cG5n',
     sessionId: '00000000-0000-4000-8000-000000000001',
@@ -67,6 +76,7 @@ describe('browser capture user submission', () => {
   beforeEach(() => {
     events.length = 0;
     handlers.clear();
+    vi.clearAllMocks();
   });
 
   it('prepares the capture before running one submit through one lease', async () => {
@@ -81,8 +91,10 @@ describe('browser capture user submission', () => {
       events.push('acquire');
       return { release, run };
     });
+    const projectRepo = { getById: vi.fn(() => ({ path: '/project' })) };
     Reflect.apply(registerBrowserHandlers, undefined, [{
       currentProjectPath: '/project',
+      projectRepo,
       sessionManager: {
         acquireUserSubmission,
         getSessionAgentName: vi.fn(() => 'opencode'),
@@ -114,8 +126,10 @@ describe('browser capture user submission', () => {
       events.push('acquire');
       return null;
     });
+    const projectRepo = { getById: vi.fn(() => ({ path: '/project' })) };
     Reflect.apply(registerBrowserHandlers, undefined, [{
       currentProjectPath: '/project',
+      projectRepo,
       sessionManager: {
         acquireUserSubmission,
         getSessionAgentName: vi.fn(() => 'opencode'),
@@ -137,8 +151,10 @@ describe('browser capture user submission', () => {
     const submitError = new Error('submit failed');
     const release = vi.fn();
     const run = vi.fn((submit: () => Promise<unknown>) => submit());
+    const projectRepo = { getById: vi.fn(() => ({ path: '/project' })) };
     Reflect.apply(registerBrowserHandlers, undefined, [{
       currentProjectPath: '/project',
+      projectRepo,
       sessionManager: {
         acquireUserSubmission: vi.fn(() => ({ release, run })),
         getSessionAgentName: vi.fn(() => 'opencode'),
@@ -152,5 +168,102 @@ describe('browser capture user submission', () => {
     // Then
     await expect(submission).rejects.toBe(submitError);
     expect(release).toHaveBeenCalledOnce();
+  });
+
+  it('rejects a missing projectId before capture preparation', async () => {
+    // Given
+    const getSessionAgentName = vi.fn(() => 'opencode');
+    const acquireUserSubmission = vi.fn();
+    const submitContent = vi.fn();
+    const projectRepo = { getById: vi.fn(() => ({ path: '/project' })) };
+    Reflect.apply(registerBrowserHandlers, undefined, [{
+      currentProjectPath: '/project',
+      projectRepo,
+      sessionManager: { acquireUserSubmission, getSessionAgentName },
+      terminalSubmit: { submitContent },
+    }]);
+    const { projectId: _projectId, ...inputWithoutProjectId } = captureInput();
+
+    // When
+    const submission = captureHandler()(undefined, inputWithoutProjectId);
+
+    // Then
+    await expect(submission).rejects.toThrow('captureAndSend requires projectId');
+    expect(fs.promises.mkdir).not.toHaveBeenCalled();
+    expect(fs.promises.writeFile).not.toHaveBeenCalled();
+    expect(getSessionAgentName).not.toHaveBeenCalled();
+    expect(agentRegistry.get).not.toHaveBeenCalled();
+    expect(acquireUserSubmission).not.toHaveBeenCalled();
+    expect(submitContent).not.toHaveBeenCalled();
+  });
+
+  it('rejects an unknown projectId before capture preparation', async () => {
+    // Given
+    const getSessionAgentName = vi.fn(() => 'opencode');
+    const acquireUserSubmission = vi.fn();
+    const submitContent = vi.fn();
+    const projectRepo = { getById: vi.fn(() => null) };
+    Reflect.apply(registerBrowserHandlers, undefined, [{
+      currentProjectPath: '/project',
+      projectRepo,
+      sessionManager: { acquireUserSubmission, getSessionAgentName },
+      terminalSubmit: { submitContent },
+    }]);
+
+    // When
+    const submission = captureHandler()(undefined, { ...captureInput(), projectId: 'project-missing' });
+
+    // Then
+    await expect(submission).rejects.toThrow('captureAndSend project not found');
+    expect(fs.promises.mkdir).not.toHaveBeenCalled();
+    expect(fs.promises.writeFile).not.toHaveBeenCalled();
+    expect(getSessionAgentName).not.toHaveBeenCalled();
+    expect(agentRegistry.get).not.toHaveBeenCalled();
+    expect(acquireUserSubmission).not.toHaveBeenCalled();
+    expect(submitContent).not.toHaveBeenCalled();
+  });
+
+  it('stores captures under the explicit project root', async () => {
+    // Given
+    const projectB = { path: '/project-b' };
+    const getById = vi.fn((projectId: string) => projectId === 'project-b' ? projectB : null);
+    const projectRepo = { getById };
+    const submitContent = vi.fn(async () => events.push('submit'));
+    const release = vi.fn(() => events.push('release'));
+    const run = vi.fn(async (submit: () => Promise<unknown>) => {
+      events.push('run');
+      return submit();
+    });
+    const acquireUserSubmission = vi.fn(() => {
+      events.push('acquire');
+      return { release, run };
+    });
+    Reflect.apply(registerBrowserHandlers, undefined, [{
+      currentProjectPath: '/project-a',
+      projectRepo,
+      sessionManager: {
+        acquireUserSubmission,
+        getSessionAgentName: vi.fn(() => 'opencode'),
+      },
+      terminalSubmit: { submitContent },
+    }]);
+    const input = { ...captureInput(), cwd: '/third-root' };
+    const expectedCaptureDir = path.join(
+      projectB.path,
+      '.kangentic',
+      'sessions',
+      '00000000-0000-4000-8000-000000000001',
+      'captures',
+    );
+
+    // When
+    await captureHandler()(undefined, input);
+
+    // Then
+    expect(projectRepo.getById).toHaveBeenCalledWith('project-b');
+    expect(fs.promises.mkdir).toHaveBeenCalledWith(
+      expectedCaptureDir,
+      { recursive: true },
+    );
   });
 });

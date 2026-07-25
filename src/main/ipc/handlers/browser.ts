@@ -48,6 +48,12 @@ export function registerBrowserHandlers(context: IpcContext): void {
     if (!input.sessionId) throw new Error('captureAndSend requires a sessionId');
     if (!input.pngBase64) throw new Error('captureAndSend requires pngBase64');
     if (!input.cwd) throw new Error('captureAndSend requires cwd');
+    if (!input.projectId) throw new Error('captureAndSend requires projectId');
+
+    const project = context.projectRepo.getById(input.projectId);
+    if (!project) throw new Error('captureAndSend project not found');
+
+    const projectRoot = project.path;
 
     // Defensive: sessionId is interpolated into a filesystem path. Reject
     // anything that isn't a UUID so a malformed IPC payload can't escape
@@ -56,10 +62,8 @@ export function registerBrowserHandlers(context: IpcContext): void {
       throw new Error('captureAndSend received malformed sessionId');
     }
 
-    // Always anchor at the project root so this directory lines up with
-    // the session dir that resource-cleanup / cleanupTaskSession already
-    // manage. Falls back to cwd when no project is open (transient case).
-    const projectRoot = context.currentProjectPath ?? input.cwd;
+    // Capture storage follows the project selected when Send was pressed;
+    // cwd remains only the agent-visible base for the relative @-mention.
     const captureDir = path.join(projectRoot, '.kangentic', 'sessions', input.sessionId, 'captures');
     await fs.promises.mkdir(captureDir, { recursive: true });
 

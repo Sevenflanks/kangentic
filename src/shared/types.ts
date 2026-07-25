@@ -3918,12 +3918,13 @@ export interface BrowserPickedElement {
 }
 
 export interface BrowserCaptureInput {
+  projectId: string;
   sessionId: string;
   taskId: string;
   /**
    * The agent's working directory (task.worktree_path ?? project.path).
-   * Captures are written under this path so any agent's sandboxed file
-   * tools can reach them via a relative path in the @-mention.
+   * Capture storage is rooted at the project resolved from required projectId.
+   * This path is only the base for the relative PNG path exposed to the agent.
    */
   cwd: string;
   url: string;

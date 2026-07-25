@@ -49,10 +49,45 @@ const MOCK_SCRIPT = path.join(__dirname, 'mock-electron-api.js');
 const VITE_URL = `http://localhost:${process.env.PLAYWRIGHT_VITE_PORT || '5173'}`;
 
 const PROJECT_ID = 'proj-browser-active';
+const PROJECT_ID_AT_SEND = 'proj-browser-send-time';
 const TASK_ID = 'task-browser-active';
 const SESSION_ID = 'sess-browser-active';
 const PROJECT_PATH = '/mock/browser-active-test';
+const PROJECT_PATH_AT_SEND = '/mock/browser-send-time-project';
 const TASK_URL = 'http://localhost:5173/';
+
+type ProjectForTest = {
+  id: string;
+  name: string;
+  path: string;
+  github_url: string | null;
+  default_agent: string;
+  default_model: string | null;
+  default_effort: string | null;
+  group_id: string | null;
+  position: number;
+  last_opened: string;
+  created_at: string;
+};
+
+type ProjectStoreForTest = {
+  getState: () => {
+    currentProject: ProjectForTest | null;
+    projects: ProjectForTest[];
+  };
+  setState: (state: { currentProject: ProjectForTest | null }) => void;
+};
+
+type BrowserTestWindow = Window & {
+  __zustandStores: { project: ProjectStoreForTest };
+  __mockBrowser: {
+    getCaptureCalls: () => Array<Record<string, unknown>>;
+  };
+  __resolveBrowserCapture?: () => void;
+};
+
+const ONE_PIXEL_PNG =
+  'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScL9WQAAAABJRU5ErkJggg==';
 
 function makePreConfig(browserDefaultUrl: string | null = null): string {
   const browserOverrides = browserDefaultUrl
@@ -68,6 +103,19 @@ function makePreConfig(browserDefaultUrl: string | null = null): string {
         path: '${PROJECT_PATH}',
         github_url: null,
         default_agent: 'claude',
+        last_opened: ts,
+        created_at: ts,
+      });
+      state.projects.push({
+        id: '${PROJECT_ID_AT_SEND}',
+        name: 'Browser Send-Time Project',
+        path: '${PROJECT_PATH_AT_SEND}',
+        github_url: null,
+        default_agent: 'claude',
+        default_model: null,
+        default_effort: null,
+        group_id: null,
+        position: 1,
         last_opened: ts,
         created_at: ts,
       });
@@ -321,5 +369,78 @@ test.describe('BrowserPaneActive - send button', () => {
     await sendButton.click();
     // Pane must remain mounted (no React crash from the click).
     await expect(sharedPage.locator('[data-testid="browser-pane"]')).toBeVisible();
+  });
+
+  test('captures the active project ID when Send is clicked', async () => {
+    await openBrowserPane(sharedPage);
+
+    await sharedPage.evaluate(({ activeProjectId, url, pngDataUrl }) => {
+      const pageWindow = window as unknown as BrowserTestWindow;
+      const sendProject = pageWindow.__zustandStores.project
+        .getState()
+        .projects
+        .find((project) => project.id === activeProjectId);
+      if (!sendProject) throw new Error('send-time project fixture was not loaded');
+      pageWindow.__zustandStores.project.setState({
+        currentProject: sendProject,
+      });
+
+      const webview = document.querySelector('[data-testid="browser-webview"]') as HTMLElement & {
+        capturePage: () => Promise<{ toDataURL: () => string; getSize: () => { width: number; height: number } }>;
+        executeJavaScript: <T>(script: string) => Promise<T>;
+        getURL: () => string;
+      };
+      if (!webview) throw new Error('browser webview was not rendered');
+      webview.capturePage = () => new Promise<{
+        toDataURL: () => string;
+        getSize: () => { width: number; height: number };
+      }>((resolve) => {
+        pageWindow.__resolveBrowserCapture = () => resolve({
+          toDataURL: () => pngDataUrl,
+          getSize: () => ({ width: 1, height: 1 }),
+        });
+      });
+      webview.executeJavaScript = async <T>() => '' as T;
+      webview.getURL = () => url;
+    }, {
+      activeProjectId: PROJECT_ID_AT_SEND,
+      url: TASK_URL,
+      pngDataUrl: ONE_PIXEL_PNG,
+    });
+
+    await sharedPage.locator('[data-testid="browser-send"]').click();
+
+    await sharedPage.waitForFunction(() => {
+      const pageWindow = window as unknown as BrowserTestWindow;
+      return typeof pageWindow.__resolveBrowserCapture === 'function';
+    });
+
+    await sharedPage.evaluate((renderProjectId) => {
+      const pageWindow = window as unknown as BrowserTestWindow;
+      const renderProject = pageWindow.__zustandStores.project
+        .getState()
+        .projects
+        .find((project) => project.id === renderProjectId);
+      if (!renderProject || !pageWindow.__resolveBrowserCapture) {
+        throw new Error('browser capture temporal fixture was not armed');
+      }
+      pageWindow.__zustandStores.project.setState({ currentProject: renderProject });
+      pageWindow.__resolveBrowserCapture();
+    }, PROJECT_ID);
+
+    await expect.poll(async () => sharedPage.evaluate(() => {
+      const pageWindow = window as unknown as BrowserTestWindow;
+      return pageWindow.__mockBrowser.getCaptureCalls();
+    })).toHaveLength(1);
+
+    const calls = await sharedPage.evaluate(() => {
+      const pageWindow = window as unknown as BrowserTestWindow;
+      return pageWindow.__mockBrowser.getCaptureCalls();
+    });
+    expect(calls[0]).toMatchObject({
+      projectId: PROJECT_ID_AT_SEND,
+      taskId: TASK_ID,
+      sessionId: SESSION_ID,
+    });
   });
 });
