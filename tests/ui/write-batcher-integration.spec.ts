@@ -166,6 +166,43 @@ async function openCommandBarWithTerminal(page: Page): Promise<void> {
 }
 
 test.describe('WriteBatcher - useTerminal IPC wiring', () => {
+  test('DECSET focus reporting sends xterm FocusIn through focus-report IPC', async () => {
+    const { browser, page } = await launchWithState(deterministicSpawnScript);
+    try {
+      await page.locator('[data-swimlane-name="To Do"]').waitFor({ state: 'visible', timeout: 15000 });
+      await openCommandBarWithTerminal(page);
+
+      await page.evaluate(() => {
+        window.electronAPI.sessions.__writeCalls.length = 0;
+        window.electronAPI.sessions.__focusReportCalls.length = 0;
+        window.__mockFireSessionData('sess-write-batcher-transient-1', '\x1b[?1004h');
+      });
+
+      const textarea = page
+        .getByTestId('command-terminal-window')
+        .locator('.xterm-helper-textarea')
+        .first();
+      await textarea.evaluate((element) => (element as HTMLTextAreaElement).blur());
+      await textarea.focus();
+
+      await expect.poll(() => page.evaluate(() =>
+        window.electronAPI.sessions.__focusReportCalls.length,
+      )).toBeGreaterThan(0);
+      const focusReportCalls = await page.evaluate(() =>
+        window.electronAPI.sessions.__focusReportCalls,
+      );
+      expect(focusReportCalls).toEqual(expect.arrayContaining([
+        { sessionId: TRANSIENT_SESSION_ID, report: '\x1b[I' },
+      ]));
+      expect(focusReportCalls).toEqual(expect.arrayOf(
+        { sessionId: TRANSIENT_SESSION_ID, report: expect.stringMatching(/^\x1b\[[IO]$/) },
+      ));
+      expect(await page.evaluate(() => window.electronAPI.sessions.__writeCalls)).toEqual([]);
+    } finally {
+      await browser.close();
+    }
+  });
+
   test('burst of characters produces one batched sessions.write call', async () => {
     const { browser, page } = await launchWithState(deterministicSpawnScript);
     try {
