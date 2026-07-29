@@ -34,10 +34,16 @@ import { runWithProjectLogContext } from '../../diagnostics/project-log-context'
 import { emitSpawnProgress, emitSpawnWaiting, clearSpawnProgress, createProgressCallback, getInFlightSpawnProgress } from '../../transition-engine/spawn-progress';
 import { resolveTargetAgent } from '../../transition-engine/agent-resolver';
 import { agentRegistry } from '../../agent/agent-registry';
+import {
+  evaluateAutoCommandDisposition,
+  finalizeAutoCommandGate,
+  type AutoCommandLifecycle,
+} from '../../agent/auto-command-disposition';
 import { prepareInjectionPlan } from '../../transition-engine/injection-plan';
 import { prepareLiveSubmission } from '../../transition-engine/live-submission-eligibility';
 import { resolveIsolatedSwimlaneId, resolveForceFresh } from '../../transition-engine/session-isolation';
-import type { Task, Swimlane, SessionRecord } from '../../../shared/types';
+import type { AutoCommandImmediateOutcome, TaskMoveResult } from '../../../shared/auto-command-outcome';
+import type { Task, Swimlane, SessionRecord, TaskMoveInput } from '../../../shared/types';
 
 /**
  * Guard: before checking out a branch in the main repo, verify no other
@@ -178,18 +184,58 @@ type MoveSpawnPlan = {
    * restore. See spawnAgent's `suppressAutoCommand`.
    */
   suppressAutoCommand: boolean;
+  autoCommandLifecycle?: AutoCommandLifecycle;
 };
+
+function shouldConsumeTaskAutoCommand(outcome: AutoCommandImmediateOutcome): boolean {
+  switch (outcome.kind) {
+    case 'scheduled':
+      return outcome.transport === 'native-idle';
+    case 'skipped':
+      return true;
+    case 'not-applicable':
+      return false;
+    default: {
+      const exhaustiveOutcome: never = outcome;
+      return exhaustiveOutcome;
+    }
+  }
+}
+
+// Phase 1 與 Phase 3 已持有 task lock。不可在此再次 withTaskLock，否則會 deadlock；
+// 也不可延後已接受的一次性決定，避免後續 move 搶先改寫 task state。
+function consumeFinalizedTaskAutoCommand(
+  tasks: ReturnType<typeof getProjectRepos>['tasks'],
+  task: Task,
+  outcome: AutoCommandImmediateOutcome,
+): void {
+  if (task.auto_command === null || !shouldConsumeTaskAutoCommand(outcome)) return;
+  tasks.clearAutoCommand(task.id);
+}
+
+// native registration 在 task override 已消費後仍會驗證。保留當時捕捉的 command，
+// 避免 fallback 到 lane command 而取消已接受且仍由 registration 擁有的 command。
+function resolveRevalidatedAutoCommand(
+  task: Task,
+  lane: Swimlane,
+  capturedTaskAutoCommand: string | null,
+): string | null {
+  if (capturedTaskAutoCommand !== null && task.auto_command === null) {
+    return capturedTaskAutoCommand;
+  }
+  return task.auto_command ?? lane.auto_command;
+}
 
 export async function handleTaskMove(
   context: IpcContext,
-  input: { taskId: string; targetSwimlaneId: string; targetPosition: number },
+  input: TaskMoveInput,
   projectId?: string | null,
   projectPath?: string | null,
   // Kept out of `input` (which flows raw from the renderer over IPC) so the
   // renderer cannot inject prompts; only main-process callers (the plan-exit
   // listener) can pass a continuation.
-  options?: { continuationPrompt?: string },
-): Promise<void> {
+  options?: { readonly continuationPrompt?: string },
+): Promise<TaskMoveResult> {
   // Abort any in-flight move or promotion BEFORE queueing on the lock - the
   // existing holder must see its abort and return so we can acquire the lock.
   taskMoveControllers.get(input.taskId)?.abort();
@@ -207,7 +253,8 @@ export async function handleTaskMove(
   const logProjectName = logProjectId
     ? context.projectRepo.getById(logProjectId)?.name ?? null
     : null;
-  const runMove = async (): Promise<void> => {
+  const runMove = async (): Promise<TaskMoveResult> => {
+  let phaseOneAutoCommand: AutoCommandImmediateOutcome = { kind: 'not-applicable' };
   try {
     // === Phase 1 (locked, short) ===
     // All DB mutations and PTY kill/suspend dispatch for priorities 1-3.
@@ -471,8 +518,10 @@ export async function handleTaskMove(
         const targetIsolatedSwimlaneId = resolveIsolatedSwimlaneId(toLane);
         const activeIsolatedSwimlaneId = activeRecord?.isolated_swimlane_id ?? null;
         const targetForceFresh = resolveForceFresh(toLane);
+        const trackChanged = activeIsolatedSwimlaneId !== targetIsolatedSwimlaneId;
+        const sameTrackForceFresh = !trackChanged && targetForceFresh;
         const needsSessionSwitch = toLane !== undefined
-          && (activeIsolatedSwimlaneId !== targetIsolatedSwimlaneId || targetForceFresh);
+          && (trackChanged || sameTrackForceFresh);
         if (needsSessionSwitch && toLane) {
           if (activeRecord && activeRecord.agent_session_id
               && (activeRecord.status === 'running' || activeRecord.status === 'exited')) {
@@ -511,6 +560,9 @@ export async function handleTaskMove(
             resolvedProjectPath,
             continuationPrompt: options?.continuationPrompt,
             suppressAutoCommand,
+            ...(sameTrackForceFresh
+              ? { autoCommandLifecycle: { kind: 'restart' } satisfies AutoCommandLifecycle }
+              : {}),
           };
         }
 
@@ -597,9 +649,11 @@ export async function handleTaskMove(
           // prepareInjectionPlan so adapters own their slash syntax and the
           // model-restart policy stays in one place (agent-agnostic here).
           const adapter = task.agent ? agentRegistry.get(task.agent) : undefined;
-          const interpolatedAuto = toLane?.auto_command?.trim()
-            ? interpolateTemplate(toLane.auto_command, buildAutoCommandVars(task))
+          const effectiveAutoCommand = task.auto_command ?? toLane?.auto_command;
+          const interpolatedAuto = effectiveAutoCommand?.trim()
+            ? interpolateTemplate(effectiveAutoCommand, buildAutoCommandVars(task))
             : '';
+          const capturedTaskAutoCommand = task.auto_command;
           const plan = prepareInjectionPlan({
             adapter,
             sessionRepo,
@@ -646,6 +700,7 @@ export async function handleTaskMove(
               resolvedProjectPath,
               continuationPrompt: options?.continuationPrompt,
               suppressAutoCommand,
+              autoCommandLifecycle: { kind: 'restart' },
             };
           }
 
@@ -679,48 +734,63 @@ export async function handleTaskMove(
               resolvedProjectPath,
               continuationPrompt: options?.continuationPrompt,
               suppressAutoCommand,
+              autoCommandLifecycle: { kind: 'restart' },
             };
           }
 
-          // wait-for-native-idle 只接手 trailing lane command；deterministic
+          // wait-for-native-idle 只接手 trailing Auto-command；deterministic
           // settings prefix 仍先走既有 verifier，兩者共用 task FIFO。
           if (plan) {
-            const liveSubmission = plan.liveSubmissionPolicy
-              ? prepareLiveSubmission({
-                  destinationLaneId: toLane?.id ?? '',
-                  autoSpawn: toLane?.auto_spawn ?? false,
-                  interpolatedLaneCommand: interpolatedAuto,
-                  resolvedAgent: effectiveTargetAgent,
-                  currentAgent: task.agent ?? '',
-                  currentTrack: activeIsolatedSwimlaneId,
-                  destinationTrack: targetIsolatedSwimlaneId,
-                  forceFresh: targetForceFresh,
-                  restartNeededForModel: plan.needsRestartForModel,
-                  restartNeededForEffort,
-                  policy: plan.liveSubmissionPolicy,
-                  sequence: plan.sequence,
-                })
-              : null;
             let scheduledLaneCommand = false;
 
-            if (plan.liveSubmissionPolicy?.mode === 'wait-for-native-idle') {
+            const capturedSessionId = task.session_id;
+            const capturedSession = context.sessionManager.getSession(capturedSessionId);
+            const ownsCapturedSession = (record: typeof activeRecord | undefined, session: typeof capturedSession | undefined): boolean => (
+              record?.id === capturedSessionId
+              && record.task_id === task.id
+              && record.status === 'running'
+              && record.session_type === `${task.agent}_agent`
+              && record.isolated_swimlane_id === activeIsolatedSwimlaneId
+              && session?.id === capturedSessionId
+              && session.taskId === task.id
+              && session.projectId === resolvedProjectId
+              && session.status === 'running'
+              && context.sessionManager.isWritable(capturedSessionId)
+            );
+            const nativeSnapshot = context.sessionManager.snapshotNativeIdle(capturedSessionId);
+            const currentSessionOwned = ownsCapturedSession(activeRecord, capturedSession);
+            const autoCommandDisposition = evaluateAutoCommandDisposition(adapter, {
+              hasCommand: interpolatedAuto !== '',
+              destinationAutoSpawn: toLane?.auto_spawn ?? false,
+              lifecycle: { kind: 'active-live' },
+              currentSessionRunning: currentSessionOwned,
+              currentSessionWritable: currentSessionOwned,
+              currentAgent: task.agent,
+              destinationAgent: effectiveTargetAgent,
+              currentTrack: activeIsolatedSwimlaneId,
+              destinationTrack: targetIsolatedSwimlaneId,
+              liveSubmissionPolicy: plan.liveSubmissionPolicy,
+              rootNativeSessionId: nativeSnapshot?.rootNativeSessionId ?? null,
+              sessionGeneration: nativeSnapshot?.sessionGeneration ?? null,
+              inputGeneration: nativeSnapshot?.inputGeneration ?? null,
+              destinationLaneId: toLane?.id ?? '',
+              sequence: plan.sequence,
+            });
+            const liveSubmission = prepareLiveSubmission(autoCommandDisposition);
+            let autoCommandGateResult = finalizeAutoCommandGate({
+              kind: 'not-dispatched',
+              disposition: autoCommandDisposition,
+            });
+
+            if (plan.liveSubmissionPolicy?.mode === 'wait-for-native-idle'
+              && autoCommandDisposition !== null) {
+              if (!currentSessionOwned) {
+                const immediateAutoCommand = autoCommandGateResult?.immediateOutcome ?? { kind: 'not-applicable' };
+                consumeFinalizedTaskAutoCommand(tasks, task, immediateAutoCommand);
+                phaseOneAutoCommand = immediateAutoCommand;
+                return null;
+              }
               const settingsPrefix = plan.sequence.slice(0, plan.verifiedPrefixLength);
-              const capturedSessionId = task.session_id;
-              const capturedSession = context.sessionManager.getSession(capturedSessionId);
-              const ownsCapturedSession = (record: typeof activeRecord | undefined, session: typeof capturedSession | undefined): boolean => (
-                record?.id === capturedSessionId
-                && record.task_id === task.id
-                && record.status === 'running'
-                && record.session_type === `${task.agent}_agent`
-                && record.isolated_swimlane_id === activeIsolatedSwimlaneId
-                && session?.id === capturedSessionId
-                && session.taskId === task.id
-                && session.projectId === resolvedProjectId
-                && session.status === 'running'
-                && context.sessionManager.isWritable(capturedSessionId)
-              );
-              if (!ownsCapturedSession(activeRecord, capturedSession)) return null;
-              const nativeSnapshot = context.sessionManager.snapshotNativeIdle(task.session_id);
               const capturedLaneId = toLane?.id ?? '';
               const capturedNativeSessionId = nativeSnapshot?.rootNativeSessionId ?? null;
               const capturedSessionGeneration = nativeSnapshot?.sessionGeneration ?? null;
@@ -753,32 +823,42 @@ export async function handleTaskMove(
                   taskAgent: currentTask.agent,
                   projectDefaultAgent: currentProject?.default_agent ?? null,
                 });
-                const currentInterpolatedAuto = currentLane.auto_command?.trim()
-                  ? interpolateTemplate(currentLane.auto_command, buildAutoCommandVars(currentTask))
+                const currentEffectiveAutoCommand = resolveRevalidatedAutoCommand(
+                  currentTask,
+                  currentLane,
+                  capturedTaskAutoCommand,
+                );
+                const currentInterpolatedAuto = currentEffectiveAutoCommand?.trim()
+                  ? interpolateTemplate(currentEffectiveAutoCommand, buildAutoCommandVars(currentTask))
                   : '';
                 const currentPlan = prepareInjectionPlan({
                   adapter: currentAdapter, sessionRepo: currentSessionRepo, sessionRecord: currentRecord,
                   task: currentTask, toLane: currentLane, project: currentProject, autoCommand: currentInterpolatedAuto,
                 });
-                const currentSourceEffort = currentTask.effort_override ?? currentRecord?.applied_effort ?? null;
-                const currentTargetEffort = currentTask.effort_override
-                  ?? currentLane.effort_override
-                  ?? currentProject?.default_effort
-                  ?? null;
-                const currentRestartNeededForEffort = currentTargetEffort !== currentSourceEffort
-                  && currentTargetEffort !== null
-                  && (currentPlan?.verifiedPrefixLength ?? 0) === 0;
-                const currentPrepared = currentPlan?.liveSubmissionPolicy
-                  ? prepareLiveSubmission({
-                      destinationLaneId: currentLane.id, autoSpawn: currentLane.auto_spawn,
-                      interpolatedLaneCommand: currentInterpolatedAuto, resolvedAgent: currentResolution.agent,
-                      currentAgent: currentTask.agent ?? '', currentTrack: currentRecord?.isolated_swimlane_id ?? null,
-                      destinationTrack: resolveIsolatedSwimlaneId(currentLane), forceFresh: resolveForceFresh(currentLane),
-                      restartNeededForModel: currentPlan.needsRestartForModel, restartNeededForEffort: currentRestartNeededForEffort,
-                      policy: currentPlan.liveSubmissionPolicy, sequence: currentPlan.sequence,
-                    })
-                  : null;
-                if (!currentPrepared || currentPrepared.fingerprint !== capturedFingerprint.value) {
+                const currentDisposition = evaluateAutoCommandDisposition(
+                  agentRegistry.get(currentResolution.agent),
+                  {
+                    hasCommand: currentInterpolatedAuto !== '',
+                    destinationAutoSpawn: currentLane.auto_spawn,
+                    lifecycle: { kind: 'active-live' },
+                    currentSessionRunning: ownsCapturedSession(currentRecord, currentSession),
+                    currentSessionWritable: ownsCapturedSession(currentRecord, currentSession),
+                    currentAgent: currentTask.agent,
+                    destinationAgent: currentResolution.agent,
+                    currentTrack: currentRecord?.isolated_swimlane_id ?? null,
+                    destinationTrack: resolveIsolatedSwimlaneId(currentLane),
+                    liveSubmissionPolicy: currentPlan?.liveSubmissionPolicy,
+                    rootNativeSessionId: currentSnapshot?.rootNativeSessionId ?? null,
+                    sessionGeneration: currentSnapshot?.sessionGeneration ?? null,
+                    inputGeneration: currentSnapshot?.inputGeneration ?? null,
+                    destinationLaneId: currentLane.id,
+                    sequence: currentPlan?.sequence ?? [],
+                  },
+                );
+                const currentPrepared = prepareLiveSubmission(currentDisposition);
+                if ((liveSubmission === null && currentPrepared !== null)
+                  || (liveSubmission !== null
+                    && (!currentPrepared || currentPrepared.fingerprint !== capturedFingerprint.value))) {
                   throw new Error('live submission superseded before prefix persistence');
                 }
                 if (plan.appliedSettings) currentSessionRepo.updateAppliedSettings(capturedSessionId, plan.appliedSettings);
@@ -792,27 +872,35 @@ export async function handleTaskMove(
                   project: currentProject,
                   autoCommand: currentInterpolatedAuto,
                 });
-                const persistedSourceEffort = currentTask.effort_override ?? persistedRecord?.applied_effort ?? null;
-                const persistedTargetEffort = currentTask.effort_override
-                  ?? currentLane.effort_override
-                  ?? currentProject?.default_effort
-                  ?? null;
-                const persistedRestartNeededForEffort = persistedTargetEffort !== persistedSourceEffort
-                  && persistedTargetEffort !== null
-                  && (persistedPlan?.verifiedPrefixLength ?? 0) === 0;
-                const persistedLiveSubmission = persistedPlan?.liveSubmissionPolicy
-                  ? prepareLiveSubmission({
-                      destinationLaneId: currentLane.id, autoSpawn: currentLane.auto_spawn,
-                      interpolatedLaneCommand: currentInterpolatedAuto, resolvedAgent: currentResolution.agent,
-                      currentAgent: currentTask.agent ?? '', currentTrack: persistedRecord?.isolated_swimlane_id ?? null,
-                      destinationTrack: resolveIsolatedSwimlaneId(currentLane), forceFresh: resolveForceFresh(currentLane),
-                      restartNeededForModel: persistedPlan.needsRestartForModel,
-                      restartNeededForEffort: persistedRestartNeededForEffort,
-                      policy: persistedPlan.liveSubmissionPolicy, sequence: persistedPlan.sequence,
-                    })
-                  : null;
-                if (!persistedLiveSubmission) throw new Error('live submission superseded after prefix');
-                capturedFingerprint.value = persistedLiveSubmission.fingerprint;
+                const persistedDisposition = evaluateAutoCommandDisposition(
+                  agentRegistry.get(currentResolution.agent),
+                  {
+                    hasCommand: currentInterpolatedAuto !== '',
+                    destinationAutoSpawn: currentLane.auto_spawn,
+                    lifecycle: { kind: 'active-live' },
+                    currentSessionRunning: ownsCapturedSession(persistedRecord, currentSession),
+                    currentSessionWritable: ownsCapturedSession(persistedRecord, currentSession),
+                    currentAgent: currentTask.agent,
+                    destinationAgent: currentResolution.agent,
+                    currentTrack: persistedRecord?.isolated_swimlane_id ?? null,
+                    destinationTrack: resolveIsolatedSwimlaneId(currentLane),
+                    liveSubmissionPolicy: persistedPlan?.liveSubmissionPolicy,
+                    rootNativeSessionId: currentSnapshot?.rootNativeSessionId ?? null,
+                    sessionGeneration: currentSnapshot?.sessionGeneration ?? null,
+                    inputGeneration: currentSnapshot?.inputGeneration ?? null,
+                    destinationLaneId: currentLane.id,
+                    sequence: persistedPlan?.sequence ?? [],
+                  },
+                );
+                const persistedLiveSubmission = prepareLiveSubmission(persistedDisposition);
+                if (liveSubmission !== null) {
+                  if (!persistedLiveSubmission) {
+                    throw new Error('live submission superseded after prefix');
+                  }
+                  capturedFingerprint.value = persistedLiveSubmission.fingerprint;
+                } else if (persistedLiveSubmission !== null) {
+                  throw new Error('live submission superseded after prefix');
+                }
               });
               if (settingsPrefix.length > 0) {
                 context.terminalSubmitScheduler.scheduleKeystrokes(task.id, task.session_id, settingsPrefix, {
@@ -823,8 +911,10 @@ export async function handleTaskMove(
                 });
               }
 
-              if (liveSubmission && nativeSnapshot?.rootNativeSessionId) {
-                context.terminalSubmitScheduler.scheduleNativeIdleSubmission({
+              if (liveSubmission
+                && autoCommandDisposition?.kind === 'deliver-live'
+                && nativeSnapshot?.rootNativeSessionId) {
+                const liveRegistration = context.terminalSubmitScheduler.scheduleNativeIdleSubmission({
                   taskId: task.id,
                   projectId: resolvedProjectId,
                   sessionId: capturedSessionId,
@@ -861,8 +951,13 @@ export async function handleTaskMove(
                     const currentSession = context.sessionManager.getSession(capturedSessionId);
                     if (!ownsCapturedSession(currentRecord, currentSession)) return 'session-exit';
                     const currentAdapter = currentTask.agent ? agentRegistry.get(currentTask.agent) : undefined;
-                    const currentInterpolatedAuto = currentLane.auto_command?.trim()
-                      ? interpolateTemplate(currentLane.auto_command, buildAutoCommandVars(currentTask))
+                    const currentEffectiveAutoCommand = resolveRevalidatedAutoCommand(
+                      currentTask,
+                      currentLane,
+                      capturedTaskAutoCommand,
+                    );
+                    const currentInterpolatedAuto = currentEffectiveAutoCommand?.trim()
+                      ? interpolateTemplate(currentEffectiveAutoCommand, buildAutoCommandVars(currentTask))
                       : '';
                     const currentPlan = prepareInjectionPlan({
                       adapter: currentAdapter,
@@ -874,40 +969,61 @@ export async function handleTaskMove(
                       autoCommand: currentInterpolatedAuto,
                     });
                     if (!currentPlan?.liveSubmissionPolicy) return 'superseded';
-                    const currentSourceEffort = currentTask.effort_override ?? currentRecord?.applied_effort ?? null;
-                    const currentTargetEffort = currentTask.effort_override
-                      ?? currentLane.effort_override
-                      ?? currentProject?.default_effort
-                      ?? null;
-                    const currentRestartNeededForEffort = currentTargetEffort !== currentSourceEffort
-                      && currentTargetEffort !== null
-                      && currentPlan.verifiedPrefixLength === 0;
-                    const currentPrepared = prepareLiveSubmission({
-                      destinationLaneId: currentLane.id,
-                      autoSpawn: currentLane.auto_spawn,
-                      interpolatedLaneCommand: currentInterpolatedAuto,
-                      resolvedAgent: currentResolution.agent,
-                      currentAgent: currentTask.agent ?? '',
-                      currentTrack: currentRecord?.isolated_swimlane_id ?? null,
-                      destinationTrack: resolveIsolatedSwimlaneId(currentLane),
-                      forceFresh: resolveForceFresh(currentLane),
-                      restartNeededForModel: currentPlan.needsRestartForModel,
-                      restartNeededForEffort: currentRestartNeededForEffort,
-                      policy: currentPlan.liveSubmissionPolicy,
-                      sequence: currentPlan.sequence,
-                    });
+                    const currentDisposition = evaluateAutoCommandDisposition(
+                      agentRegistry.get(currentResolution.agent),
+                      {
+                        hasCommand: currentInterpolatedAuto !== '',
+                        destinationAutoSpawn: currentLane.auto_spawn,
+                        lifecycle: { kind: 'active-live' },
+                        currentSessionRunning: ownsCapturedSession(currentRecord, currentSession),
+                        currentSessionWritable: ownsCapturedSession(currentRecord, currentSession),
+                        currentAgent: currentTask.agent,
+                        destinationAgent: currentResolution.agent,
+                        currentTrack: currentRecord?.isolated_swimlane_id ?? null,
+                        destinationTrack: resolveIsolatedSwimlaneId(currentLane),
+                        liveSubmissionPolicy: currentPlan.liveSubmissionPolicy,
+                        rootNativeSessionId: currentSnapshot?.rootNativeSessionId ?? null,
+                        sessionGeneration: currentSnapshot?.sessionGeneration ?? null,
+                        inputGeneration: currentSnapshot?.inputGeneration ?? null,
+                        destinationLaneId: currentLane.id,
+                        sequence: currentPlan.sequence,
+                      },
+                    );
+                    const currentPrepared = prepareLiveSubmission(currentDisposition);
                     return currentPrepared?.fingerprint === capturedFingerprint.value ? 'valid' : 'superseded';
                   },
                 });
-                scheduledLaneCommand = true;
+                if (liveRegistration !== null) {
+                  autoCommandGateResult = finalizeAutoCommandGate({
+                    kind: 'native-idle',
+                    disposition: autoCommandDisposition,
+                    registration: liveRegistration,
+                  });
+                }
               }
-            } else {
+            } else if (autoCommandDisposition === null) {
               context.terminalSubmitScheduler.scheduleKeystrokes(task.id, task.session_id, plan.sequence, {
                 verifier: plan.verifier,
                 verifiedPrefixLength: plan.verifiedPrefixLength,
               });
-              scheduledLaneCommand = plan.liveSubmissionPolicy !== undefined;
+              autoCommandGateResult = interpolatedAuto === ''
+                ? finalizeAutoCommandGate({ kind: 'not-dispatched', disposition: null })
+                : finalizeAutoCommandGate({ kind: 'legacy' });
+            } else {
+              const settingsPrefix = plan.sequence.slice(0, plan.verifiedPrefixLength);
+              if (settingsPrefix.length > 0) {
+                context.terminalSubmitScheduler.scheduleKeystrokes(task.id, task.session_id, settingsPrefix, {
+                  verifier: plan.verifier,
+                  verifiedPrefixLength: settingsPrefix.length,
+                });
+              }
             }
+            const immediateAutoCommand = autoCommandGateResult?.immediateOutcome ?? { kind: 'not-applicable' };
+            if (immediateAutoCommand.kind === 'scheduled') {
+              scheduledLaneCommand = true;
+            }
+            consumeFinalizedTaskAutoCommand(tasks, task, immediateAutoCommand);
+            phaseOneAutoCommand = immediateAutoCommand;
             // Record what the burst applied so the NEXT move diffs against the
             // session's new running value instead of re-injecting it.
             if (plan.appliedSettings && plan.liveSubmissionPolicy?.mode !== 'wait-for-native-idle') {
@@ -990,14 +1106,14 @@ export async function handleTaskMove(
       };
     });
 
-    if (!plan) return; // Phase 1 fully handled the move
+    if (!plan) return { ok: true, autoCommand: phaseOneAutoCommand }; // Phase 1 fully handled the move
 
     // Shutdown started while Phase 1 ran. Skip Phase 2 git work and Phase 3
     // spawn so we don't write to a closed DB. autoSpawnTasks on next launch
     // will spawn for the destination column.
-    if (isShuttingDown()) return;
+    if (isShuttingDown()) return { ok: true, autoCommand: { kind: 'not-applicable' } };
 
-    const { task, fromSwimlaneId, fromLane, originalPosition, toLane, skipPromptTemplate, resolvedProjectId, resolvedProjectPath, continuationPrompt, suppressAutoCommand } = plan;
+    const { task, fromSwimlaneId, fromLane, originalPosition, toLane, skipPromptTemplate, resolvedProjectId, resolvedProjectPath, continuationPrompt, suppressAutoCommand, autoCommandLifecycle } = plan;
 
     // === Phase 2 (unlocked, slow) ===
     // All async operations below receive the abort signal so a newer move
@@ -1015,6 +1131,7 @@ export async function handleTaskMove(
       info.jobsAhead,
       info.runningLabel ? { label: info.runningLabel, elapsedMs: info.runningElapsedMs } : undefined,
     );
+    let phaseThreeAutoCommand: AutoCommandImmediateOutcome = { kind: 'not-applicable' };
     try {
       // Create worktree if worktrees are enabled and task doesn't have one yet.
       // If worktree creation fails (e.g. duplicate branch), revert the task
@@ -1107,12 +1224,14 @@ export async function handleTaskMove(
           const sessionRepoPhase3 = new SessionRepository(dbPhase3);
           const engine = createTransitionEngine(context, actionsPhase3, tasksPhase3, sessionRepoPhase3, attachmentsPhase3, resolvedProjectId, resolvedProjectPath);
           if (toLane) {
-            await spawnAgent({ context, engine, tasks: tasksPhase3, sessionRepo: sessionRepoPhase3, task: current, fromSwimlaneId, toLane, skipPromptTemplate, signal, projectId: resolvedProjectId, projectPath: resolvedProjectPath, continuationPrompt, suppressAutoCommand, settingsSourceLane: fromLane ?? null });
+            const autoCommand = await spawnAgent({ context, engine, tasks: tasksPhase3, sessionRepo: sessionRepoPhase3, task: current, fromSwimlaneId, toLane, skipPromptTemplate, signal, projectId: resolvedProjectId, projectPath: resolvedProjectPath, continuationPrompt, suppressAutoCommand, autoCommandLifecycle, settingsSourceLane: fromLane ?? null });
+            phaseThreeAutoCommand = autoCommand;
           }
         } finally {
           clearSpawnProgress(context.mainWindow, task.id);
         }
       });
+      return { ok: true, autoCommand: phaseThreeAutoCommand };
     } catch (error) {
       // Shutdown closed the DB while a Phase 1 / 2 / 3 await was in flight.
       // Both the post-await DB write inside Phase 1 (e.g. line 226's
@@ -1123,7 +1242,7 @@ export async function handleTaskMove(
       // are committed. The IPC wrapper's swallow is a backstop; this guard
       // also keeps the rollback's "Rollback after move failure failed" log
       // from firing during shutdown.
-      if (isShuttingDown()) return;
+      if (isShuttingDown()) return { ok: true, autoCommand: { kind: 'not-applicable' } };
 
       clearSpawnProgress(context.mainWindow, task.id);
       const abort = isAbortError(error);
@@ -1156,7 +1275,7 @@ export async function handleTaskMove(
 
       if (abort) {
         console.log(`[TASK_MOVE] Aborted stale move for task ${task.id.slice(0, 8)}`);
-        return;
+        return { ok: true, autoCommand: { kind: 'not-applicable' } };
       }
       throw error;
     }

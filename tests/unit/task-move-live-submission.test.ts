@@ -1,5 +1,6 @@
 import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { handleTaskMove as HandleTaskMove } from '../../src/main/ipc/handlers/task-move';
+import type { TaskMoveResult } from '../../src/shared/auto-command-outcome';
 import {
   context,
   getLatestForTask,
@@ -10,15 +11,17 @@ import {
   resetHarness,
   scheduler,
   sessionManager,
+  setPhaseThreeSpawnOutcome,
   spawnAgent,
   state,
+  taskAutoCommandConsumptionLockCounts,
   updateAppliedSettings,
 } from './helpers/task-move-live-submission-harness';
 
 let handleTaskMove: typeof HandleTaskMove;
 
-async function moveToDestination(): Promise<void> {
-  await handleTaskMove(context as never, {
+async function moveToDestination(): Promise<TaskMoveResult> {
+  return handleTaskMove(context as never, {
     taskId: state.task.id,
     targetSwimlaneId: state.destinationLane.id,
     targetPosition: 0,
@@ -61,31 +64,152 @@ describe('handleTaskMove live lane submission', () => {
     expect(request?.validateCurrent()).toBe('valid');
   });
 
-  it('uses only destination lane auto_command even when task-level MCP autoCommand exists', async () => {
+  it('returns the accepted native-idle registration generation for a task-level command', async () => {
+    scheduler.scheduleNativeIdleSubmission.mockReturnValue({ accepted: true, generation: 47 });
+    state.task = makeTask({ auto_command: '/task-level-command' });
+    state.destinationLane = makeLane('lane-91', { auto_command: '/lane-level-command' });
+
+    const result = await moveToDestination();
+
+    const request = scheduler.scheduleNativeIdleSubmission.mock.calls[0]?.[0];
+    expect(request?.command).toBe('/task-level-command');
+    expect(result).toEqual({
+      ok: true,
+      autoCommand: { kind: 'scheduled', transport: 'native-idle', generation: 47 },
+    });
+  });
+
+  it('consumes a task-level command after native registration while preserving the lane command', async () => {
     state.task = makeTask({ auto_command: '/task-level-command' });
     state.destinationLane = makeLane('lane-91', { auto_command: '/lane-level-command' });
 
     await moveToDestination();
 
-    const request = scheduler.scheduleNativeIdleSubmission.mock.calls[0]?.[0];
-    expect(request?.command).toBe('/lane-level-command');
+    expect(state.task.auto_command).toBeNull();
+    expect(state.destinationLane.auto_command).toBe('/lane-level-command');
+    expect(taskAutoCommandConsumptionLockCounts).toEqual([1]);
   });
 
   it('preserves generic full-sequence delivery for non-wait policies', async () => {
-    state.task = makeTask({ agent: 'claude' });
+    state.task = makeTask({ agent: 'claude', auto_command: '/task-level-command' });
     state.project = { ...state.project, default_agent: 'claude' };
-    state.destinationLane = makeLane('lane-91', { auto_command: '/go', effort_override: 'high' });
+    state.destinationLane = makeLane('lane-91', { auto_command: '/lane-level-command', effort_override: 'high' });
     state.settingsSequence = ['/effort high'];
 
-    await moveToDestination();
+    const result = await moveToDestination();
 
     expect(scheduler.scheduleKeystrokes).toHaveBeenCalledWith(
       state.task.id,
       'pty-live-1',
-      ['/effort high', '/go'],
+      ['/effort high', '/task-level-command'],
       expect.objectContaining({ verifiedPrefixLength: 1 }),
     );
     expect(scheduler.scheduleNativeIdleSubmission).not.toHaveBeenCalled();
+    expect(result).toEqual({
+      ok: true,
+      autoCommand: { kind: 'scheduled', transport: 'legacy' },
+    });
+    expect(state.task.auto_command).toBe('/task-level-command');
+  });
+
+  it.each([
+    ['root identity', { rootNativeSessionId: null }],
+    ['session generation', { sessionGeneration: null }],
+    ['input generation', { inputGeneration: null }],
+  ])('returns a finalized native-evidence skip when the %s is missing', async (_name, snapshot) => {
+    state.task = makeTask({ auto_command: '/task-level-command' });
+    state.destinationLane = makeLane('lane-91', { auto_command: '/lane-level-command' });
+    state.snapshot = makeSnapshot(snapshot);
+
+    const result = await moveToDestination();
+
+    expect(result).toEqual({
+      ok: true,
+      autoCommand: {
+        kind: 'skipped',
+        reason: 'native-evidence-unavailable',
+        warning: 'Auto-command was skipped because required OpenCode native session evidence is unavailable.',
+      },
+    });
+    expect(state.task.auto_command).toBeNull();
+    expect(state.destinationLane.auto_command).toBe('/lane-level-command');
+    expect(scheduler.scheduleNativeIdleSubmission).not.toHaveBeenCalled();
+  });
+
+  it('returns no-active-main-session and consumes the task command when live ownership is missing', async () => {
+    state.task = makeTask({ auto_command: '/task-level-command' });
+    state.sessionStatus = 'suspended';
+
+    const result = await moveToDestination();
+
+    expect(result).toEqual({
+      ok: true,
+      autoCommand: {
+        kind: 'skipped',
+        reason: 'no-active-main-session',
+        warning: 'Auto-command was skipped because no active Main OpenCode session is available.',
+      },
+    });
+    expect(state.task.auto_command).toBeNull();
+    expect(scheduler.scheduleNativeIdleSubmission).not.toHaveBeenCalled();
+  });
+
+  it('consumes a finalized Phase 3 skip while the caller-held lock is active', async () => {
+    state.task = makeTask({ session_id: null, auto_command: '/task-level-command' });
+    state.sourceLane = makeLane('lane-source', { role: 'todo' });
+    state.destinationLane = makeLane('lane-91', { auto_command: '/lane-level-command' });
+    setPhaseThreeSpawnOutcome({
+      kind: 'skipped',
+      reason: 'fresh-not-supported',
+      warning: 'Auto-command was skipped because OpenCode fresh-session delivery is not supported.',
+    });
+
+    const result = await moveToDestination();
+
+    expect(result).toEqual({
+      ok: true,
+      autoCommand: {
+        kind: 'skipped',
+        reason: 'fresh-not-supported',
+        warning: 'Auto-command was skipped because OpenCode fresh-session delivery is not supported.',
+      },
+    });
+    expect(state.task.auto_command).toBeNull();
+    expect(state.destinationLane.auto_command).toBe('/lane-level-command');
+    expect(taskAutoCommandConsumptionLockCounts).toEqual([1]);
+  });
+
+  it('rolls back a Phase 3 failure without consuming the task command', async () => {
+    state.task = makeTask({ session_id: null, auto_command: '/task-level-command' });
+    state.sourceLane = makeLane('lane-source', { role: 'todo' });
+    spawnAgent.mockRejectedValue(new Error('spawn failed'));
+
+    await expect(moveToDestination()).rejects.toThrow('spawn failed');
+
+    expect(state.task.swimlane_id).toBe(state.sourceLane.id);
+    expect(state.task.auto_command).toBe('/task-level-command');
+  });
+
+  it('does not represent a rejected native registration as scheduled or consume the task command', async () => {
+    state.task = makeTask({ auto_command: '/task-level-command' });
+    scheduler.scheduleNativeIdleSubmission.mockReturnValue(null);
+
+    const result = await moveToDestination();
+
+    expect(result).toEqual({ ok: true, autoCommand: { kind: 'not-applicable' } });
+    expect(state.task.auto_command).toBe('/task-level-command');
+  });
+
+  it('keeps the returned immediate native outcome unchanged when later validation rejects delivery', async () => {
+    const result = await moveToDestination();
+    const request = scheduler.scheduleNativeIdleSubmission.mock.calls[0]?.[0];
+    state.sessionExists = false;
+
+    expect(request?.validateCurrent()).toBe('session-exit');
+    expect(result).toEqual({
+      ok: true,
+      autoCommand: { kind: 'scheduled', transport: 'native-idle', generation: 1 },
+    });
   });
 
   it('does not fall back to generic lane-command delivery without private native identity', async () => {
@@ -107,6 +231,20 @@ describe('handleTaskMove live lane submission', () => {
       expect.anything(), expect.anything(), expect.arrayContaining(['/go']), expect.anything(),
     );
     expect(log.mock.calls.flat().join(' ')).toContain('no lane command');
+  });
+
+  it('suppresses the active OpenCode auto_command for an isolated session while retaining its normal lifecycle', async () => {
+    state.destinationLane = makeLane('lane-91', {
+      auto_command: '/go',
+      session_target: 'isolated',
+    });
+    state.record = makeRecord({ isolated_swimlane_id: 'lane-91' });
+
+    await moveToDestination();
+
+    expect(scheduler.scheduleNativeIdleSubmission).not.toHaveBeenCalled();
+    expect(scheduler.scheduleKeystrokes).not.toHaveBeenCalled();
+    expect(spawnAgent).not.toHaveBeenCalled();
   });
 
   it('does not schedule live delivery when the captured record is not running', async () => {
@@ -237,14 +375,29 @@ describe('handleTaskMove live lane submission', () => {
     expect(scheduler.scheduleKeystrokes).not.toHaveBeenCalled();
   });
 
-  it('keeps auto_spawn role priority ahead of live routing', async () => {
-    state.destinationLane = makeLane('lane-91', { auto_spawn: false, auto_command: '/go' });
+  it('marks a settings-driven respawn as restart for adapter-owned auto-command policy', async () => {
+    state.record = makeRecord({ applied_effort: 'low' });
+    state.destinationLane = makeLane('lane-91', { auto_command: '/go', effort_override: 'high' });
+    state.settingsSequence = [];
 
     await moveToDestination();
+
+    expect(spawnAgent).toHaveBeenCalledWith(expect.objectContaining({
+      autoCommandLifecycle: { kind: 'restart' },
+    }));
+  });
+
+  it('keeps auto_spawn role priority ahead of live routing', async () => {
+    state.task = makeTask({ auto_command: '/task-level-command' });
+    state.destinationLane = makeLane('lane-91', { auto_spawn: false, auto_command: '/go' });
+
+    const result = await moveToDestination();
 
     expect(sessionManager.suspend).toHaveBeenCalledWith('pty-live-1');
     expect(scheduler.scheduleNativeIdleSubmission).not.toHaveBeenCalled();
     expect(scheduler.scheduleKeystrokes).not.toHaveBeenCalled();
+    expect(result).toEqual({ ok: true, autoCommand: { kind: 'not-applicable' } });
+    expect(state.task.auto_command).toBe('/task-level-command');
   });
 
   it('logs metadata only without command, fingerprint, or native identity', async () => {

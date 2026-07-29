@@ -1,7 +1,10 @@
 import { vi } from 'vitest';
 import type { NativeIdleSnapshot } from '../../../src/main/activity-engine/native-idle-evidence';
 import type { NativeIdleRequest } from '../../../src/main/transition-engine/native-idle-waiter';
+import type { AutoCommandImmediateOutcome } from '../../../src/shared/auto-command-outcome';
 import type { Swimlane, Task } from '../../../src/shared/types';
+import { getOpenCodeAutoCommandDisposition } from '../../../src/main/agent/adapters/opencode/auto-command-policy';
+import { _taskLockCountForTesting } from '../../../src/main/ipc/task-lifecycle-lock';
 
 const WAIT_POLICY = {
   mode: 'wait-for-native-idle',
@@ -13,7 +16,9 @@ const WAIT_POLICY = {
 export const scheduler = {
   cancel: vi.fn(),
   scheduleKeystrokes: vi.fn(),
-  scheduleNativeIdleSubmission: vi.fn<(request: NativeIdleRequest) => void>(),
+  scheduleNativeIdleSubmission: vi.fn<(request: NativeIdleRequest) => { readonly accepted: true; readonly generation: number } | null>(
+    () => ({ accepted: true, generation: 1 }),
+  ),
 };
 
 export const sessionManager = {
@@ -35,8 +40,36 @@ export const updateAppliedSettings = vi.fn((
     ...(settings.effort !== undefined ? { applied_effort: settings.effort } : {}),
   };
 });
-export const spawnAgent = vi.fn(async () => undefined);
+function shouldConsumeTaskAutoCommand(outcome: AutoCommandImmediateOutcome): boolean {
+  switch (outcome.kind) {
+    case 'scheduled':
+      return outcome.transport === 'native-idle';
+    case 'skipped':
+      return true;
+    case 'not-applicable':
+      return false;
+    default: {
+      const exhaustiveOutcome: never = outcome;
+      return exhaustiveOutcome;
+    }
+  }
+}
+
+export const spawnAgent = vi.fn(async (
+  _options: { readonly task: Task },
+): Promise<AutoCommandImmediateOutcome> => ({ kind: 'not-applicable' }));
+
+export function setPhaseThreeSpawnOutcome(outcome: AutoCommandImmediateOutcome): void {
+  spawnAgent.mockImplementation(async (options: { readonly task: Task }) => {
+    if (options.task.auto_command !== null && shouldConsumeTaskAutoCommand(outcome)) {
+      tasks.clearAutoCommand(options.task.id);
+    }
+    return outcome;
+  });
+}
+
 export const getLatestForTask = vi.fn(() => state.latestRecord);
+export const taskAutoCommandConsumptionLockCounts: number[] = [];
 
 export const state: {
   task: Task;
@@ -76,6 +109,7 @@ export function makeTask(overrides: Partial<Task> = {}): Task {
     swimlane_id: 'lane-source', position: 0, agent: 'opencode',
     session_id: 'pty-live-1', worktree_path: '/worktree', branch_name: 'branch',
     pr_number: null, pr_url: null, base_branch: null, use_worktree: null,
+    auto_command: null,
     labels: [], priority: 0, attachment_count: 0, archived_at: null,
     created_at: '2026-01-01T00:00:00.000Z', updated_at: '2026-01-01T00:00:00.000Z',
     ...overrides,
@@ -112,6 +146,9 @@ export function makeSnapshot(overrides: Partial<NativeIdleSnapshot> = {}): Nativ
 
 export function resetHarness(): void {
   vi.clearAllMocks();
+  scheduler.scheduleNativeIdleSubmission.mockImplementation(() => ({ accepted: true, generation: 1 }));
+  setPhaseThreeSpawnOutcome({ kind: 'not-applicable' });
+  taskAutoCommandConsumptionLockCounts.length = 0;
   state.task = makeTask();
   state.sourceLane = makeLane('lane-source');
   state.destinationLane = makeLane('lane-91', { name: 'Finalize', auto_command: '/go' });
@@ -140,6 +177,12 @@ const tasks = {
     state.task = { ...state.task, swimlane_id: input.targetSwimlaneId, position: input.targetPosition };
   }),
   update: vi.fn((input: Partial<Task>) => { state.task = { ...state.task, ...input }; }),
+  clearAutoCommand: vi.fn((taskId: string) => {
+    if (taskId === state.task.id) {
+      taskAutoCommandConsumptionLockCounts.push(_taskLockCountForTesting());
+      state.task = { ...state.task, auto_command: null };
+    }
+  }),
   list: vi.fn(() => [state.task]),
   archive: vi.fn(),
 };
@@ -177,6 +220,7 @@ vi.mock('../../../src/main/agent/agent-registry', () => ({
   agentRegistry: { get: vi.fn((name: string) => ({
     name,
     liveSubmissionPolicy: name === 'opencode' ? WAIT_POLICY : { mode: 'interrupt-immediately', sendCtrlC: true },
+    ...(name === 'opencode' ? { getAutoCommandDisposition: getOpenCodeAutoCommandDisposition } : {}),
     getInjectionSequence: vi.fn(({ effortChanged }: { readonly effortChanged: boolean }) =>
       effortChanged ? state.settingsSequence : []),
   })) },
