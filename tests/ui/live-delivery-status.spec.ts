@@ -112,7 +112,7 @@ function readAutoCommandWarningTaskId(page: Page, taskId = TASK_ID): Promise<str
 }
 
 test.describe('Live delivery status', () => {
-  test('uses a fixed resume label while an auto-command move is pending', async () => {
+  test('uses a fixed starting label when resume eligibility is unknown', async () => {
     const { browser, page } = await launchPage({ sessionStatus: 'suspended', taskLaneIndex: 0 });
     const card = page.locator(`[data-task-id="${TASK_ID}"]`);
     let movePromise: Promise<unknown> | null = null;
@@ -139,7 +139,7 @@ test.describe('Live delivery status', () => {
       await card.click();
       const launchOverlay = page.locator('[data-testid="launch-overlay"]');
       await expect(launchOverlay).toBeVisible();
-      await expect(launchOverlay).toHaveText('Resuming agent...');
+      await expect(launchOverlay).toHaveText('Starting agent...');
       await expect(launchOverlay).not.toContainText(COMMAND_CANARY);
       await expect(card).not.toContainText(COMMAND_CANARY);
       await expect(page.locator('[data-testid="toast"]').filter({ hasText: COMMAND_CANARY })).toHaveCount(0);

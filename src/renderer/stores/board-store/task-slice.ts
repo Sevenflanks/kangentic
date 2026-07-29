@@ -296,12 +296,13 @@ export const createTaskSlice: StateCreator<BoardStore, [], [], TaskSlice> = (set
     const thisGen = ++moveGeneration;
 
     // 活躍 session 的 wait-policy delivery 只可由 LiveDeliveryStatus 顯示固定、
-    // 不含 command 的狀態；fresh/resume 仍沿用既有啟動 overlay。
+    // 不含 command 的狀態。Renderer 無法得知 main 是否會依目標 adapter、track
+    // 與 native session identity resume，故 lifecycle resolve 前一律用中性 label。
     const isColumnChange = prevTask?.swimlane_id !== input.targetSwimlaneId;
     const existingSession = useSessionStore.getState()._sessionByTaskId.get(input.taskId);
     const hasLiveSession = existingSession?.status === 'running' || existingSession?.status === 'queued';
     if (isColumnChange && !hasLiveSession && targetLane?.auto_spawn && targetLane.auto_command?.trim()) {
-      useSessionStore.getState().setPendingCommandLabel(input.taskId, existingSession ? 'Resuming agent...' : 'Starting agent...');
+      useSessionStore.getState().setPendingCommandLabel(input.taskId, 'Starting agent...');
     }
 
     // Optimistically show spawn progress for auto-spawn columns, but only
