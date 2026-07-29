@@ -570,11 +570,12 @@ Caller-owned via `--session-id <uuid>`, mirroring Claude. `supportsCallerSession
 opencode [--session <id>]
 ```
 
-Important shape constraints, locally source-verified against OpenCode v1.18.4. Fresh real OpenCode QA remains pending:
+重要形狀限制已依 OpenCode 1.18.4 本機原始碼窄幅確認。完整 Task 5 QA 尚未成功，現有證據限於 automated 與 runtime boundary：
 
 - The TUI's positional argument is a **project directory**, not a prompt. The PTY layer already sets the shell cwd, so Kangentic never emits a positional or `--dir` value.
-- OpenCode initial prompt delivery is not terminal paste or shell argument parsing. `prepareInitialPrompt` writes a private payload which the activity plugin claims and deletes in the same OpenCode process before using the generated SDK. A fresh payload creates the session, records `session.create().data.id`, writes synthetic `session_start`, selects it with `client.tui.publish` and `tui.session.select`, then sends the prompt with `promptAsync`. A resumed payload validates its known ID with `session.get`, writes synthetic `session_start`, and calls `promptAsync` without selecting a session. Every generated SDK request carries object-internal `throwOnError: true`.
-- No prompt content is part of the shell command. A bootstrap failure writes one JSONL object containing sanitized public `idle` error fields and a private native error boundary with the same timestamp.
+- OpenCode initial prompt delivery 不是 terminal paste 或 shell argument parsing。專案本機 plugin discovery 掃描 `.ts` 與 `.js`，因此安裝檔為 `.opencode/plugins/kangentic-activity.js`；來源與 packaged build asset 仍為 `kangentic-activity.mjs`。loader await factory，Kangentic 同步回傳 hooks，然後以一個零延遲 macrotask 延後 bootstrap。這個 timer 只處理 ordering，不是 readiness evidence，也不是 upstream 的未來保證。
+- `prepareInitialPrompt` 寫入私有 payload，由同一 OpenCode process 的 activity plugin claim 並刪除，之後使用 generated SDK。fresh payload 會建立 session、取得 `session.create().data.id`，把早到或晚到的 matching `session.created` reconcile 為一個成功 bootstrap 的 `session_start`，重播不相關 starts，以 `client.tui.publish` 發布 `tui.session.select`，最後呼叫 `promptAsync`。resume payload 會用 `session.get` 驗證 known ID，reconcile 一個 `session_start`，不發布 selection，然後呼叫 `promptAsync`。每個 generated SDK request 都帶物件內的 `throwOnError: true`。
+- Shell command 不含 prompt content。每條 bootstrap failure path 至多 best-effort 附加一筆 sanitized public `idle` error 與相同 timestamp 的 private native error boundary；publish 或 prompt failure 前可能已有 `session_start`，start append failure 也可由後續 matching native event 補寫。錯誤 telemetry 不含 raw data，SDK call 沒有 retry 或 fallback。successful bootstrap `session_start` reconciliation exactly once 只適用 telemetry event，不代表 prompt execution 或 live-command delivery exactly once。
 - The session record still retains the intended prompt for existing lifecycle and audit display, while errors log metadata only and never prompt content.
 
 ### Permission Modes
@@ -583,13 +584,13 @@ The `permissions` list exposes two entries in OpenCode's own vocabulary: `plan` 
 
 ### Settings Merge
 
-OpenCode reads MCP and provider configuration from `opencode.json` sources and deep-merges `OPENCODE_CONFIG_CONTENT`. Kangentic injects its MCP entry through that environment variable, preserving user-defined `mcp.*` entries without changing their configuration file. The required activity plugin is installed at `.opencode/plugins/kangentic-activity.mjs`; spawn owners reference-count that shared same-cwd file, and `removeHooks` removes only the Kangentic-authored file after the final holder releases it. `clearSettingsCache` has nothing to clear.
+OpenCode 從 `opencode.json` sources 讀取 MCP 與 provider configuration，並 deep-merge `OPENCODE_CONFIG_CONTENT`。Kangentic 透過該 environment variable 注入 MCP entry，保留使用者定義的 `mcp.*` entries，且不變更其 configuration file。必要 activity plugin 的 source 與 packaged build asset 是 `kangentic-activity.mjs`，但 project-local installed file 是 `.opencode/plugins/kangentic-activity.js`。spawn owners 會 reference-count 此 shared same-cwd file，`removeHooks` 在最後一個 holder 釋放後只移除 Kangentic-authored `.js` file。`clearSettingsCache` 不需清除任何內容。
 
 ### Session ID Capture
 
 Not caller-owned (`supportsCallerSessionId = false`). Three capture pathways run concurrently and the first to succeed wins:
 
-- **Plugin JSONL:** The activity plugin writes `session_start` with the OpenCode session ID for `session.created` and `session.start`, plus `session.idle`, `session.error`, and `tool.execute.before` / `tool.execute.after` telemetry. Public parsing exposes only sanitized `SessionEvent` fields. Private `privateNativeBoundary` supplies native identity evidence to the native-idle path and is not renderer-visible.
+- **Plugin JSONL:** activity plugin 會為 `session.created` 與 `session.start` 寫入帶 OpenCode session ID 的 `session_start`，也會寫入 `session.idle`、`session.error` 與 `tool.execute.before` / `tool.execute.after` telemetry。fresh bootstrap 成功時，matching `session.created` 的 reconciliation 僅產生一個 `session_start` telemetry event，早到與晚到 event 都依相同規則處理。不相關 starts 會重播。Public parsing 只暴露 sanitized `SessionEvent` fields。Private `privateNativeBoundary` 提供 native-idle path 的 native identity evidence，不對 renderer 可見。
 - **`sessionId.fromOutput`:** `SessionIdScanner` strips ANSI escapes from each PTY chunk and matches an announced session label with a `:` or `=` separator. It accepts OpenCode's native `ses_<16-64 alphanumeric>` shape and canonical UUID format, while excluding bare `--session` command echoes.
 - **`sessionId.fromFilesystem`:** Polls the OpenCode SQLite database at `~/.local/share/opencode/opencode.db` (read-only, WAL-friendly handle) for a `session` row whose `directory` equals the spawn cwd and whose `time_created` falls within `[spawnedAt - 5s, spawnedAt + 30s]`. Polls every 500 ms for up to ~10 s. Direct DB read avoids ~200-500 ms `opencode` CLI spin-up per poll, and avoids the Windows `child_process.execFile` rejection of `.cmd` shims.
 
