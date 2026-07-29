@@ -87,10 +87,11 @@ function makeTaskRepo() {
   };
 }
 
-function makeActionRepo(action: ReturnType<typeof makeAction>) {
+function makeActionRepo(actions: readonly ReturnType<typeof makeAction>[]) {
+  const actionsById = new Map(actions.map((action) => [action.id, action]));
   return {
-    getTransitionsFor: vi.fn(() => [{ action_id: action.id }]),
-    getById: vi.fn(() => action),
+    getTransitionsFor: vi.fn(() => actions.map((action) => ({ action_id: action.id }))),
+    getById: vi.fn((actionId: string) => actionsById.get(actionId)),
   };
 }
 
@@ -226,14 +227,15 @@ function makeEngine(options: {
   sessionManager?: ReturnType<typeof makeSessionManager>;
   sessionRepo?: ReturnType<typeof makeSessionRepo>;
   action?: ReturnType<typeof makeAction>;
+  actions?: readonly ReturnType<typeof makeAction>[];
   includeSessionRepo?: boolean;
 }) {
   const sessionManager = options.sessionManager ?? makeSessionManager();
   const sessionRepo = options.includeSessionRepo === false
     ? undefined
     : (options.sessionRepo ?? makeSessionRepo());
-  const action = options.action ?? makeAction();
-  const actionRepo = makeActionRepo(action);
+  const actions = options.actions ?? [options.action ?? makeAction()];
+  const actionRepo = makeActionRepo(actions);
   const taskRepo = makeTaskRepo();
   const attachmentRepo = makeAttachmentRepo();
 
@@ -904,6 +906,210 @@ describe('TransitionEngine - raw/sanitized description split', () => {
     const insertedId = (sessionRepo.insert.mock.calls[0][0] as { id: string }).id;
     const [appliedSessionId] = sessionRepo.updateAppliedSettings.mock.calls[0] as [string, unknown];
     expect(appliedSessionId).toBe(insertedId);
+  });
+});
+
+describe('TransitionEngine - action spawn lifecycle observation', () => {
+  it('delivers an action continuation through prompt preparation and persistence only for a resumed session', async () => {
+    // Given
+    const continuation = 'opaque-action-continuation-7f3c';
+    const sessionRepo = makeSessionRepo();
+    sessionRepo.getLatestForTaskByTypeAndIsolation.mockReturnValue({
+      id: 'suspended-session',
+      agent_session_id: 'native-session-id',
+      session_type: 'claude_agent',
+      status: 'suspended',
+      cwd: '/some/project',
+    });
+    const prepare = vi.fn(() => ({}));
+    prepareInitialPrompt = prepare;
+    const { engine } = makeEngine({ sessionRepo });
+
+    // When
+    await engine.executeTransition(
+      makeTask() as Parameters<typeof engine.executeTransition>[0],
+      'todo',
+      'doing',
+      undefined,
+      true,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      continuation,
+    );
+
+    // Then
+    expect(prepare).toHaveBeenCalledWith(expect.objectContaining({
+      prompt: continuation,
+      resume: true,
+      sessionId: 'native-session-id',
+    }));
+    expect(sessionRepo.insert).toHaveBeenCalledWith(expect.objectContaining({ prompt: continuation }));
+  });
+
+  it('does not deliver an action continuation on a promptless fresh session', async () => {
+    // Given
+    const continuation = 'opaque-action-continuation-7f3c';
+    const prepare = vi.fn(() => ({}));
+    prepareInitialPrompt = prepare;
+    const sessionRepo = makeSessionRepo();
+    const { engine } = makeEngine({ sessionRepo });
+
+    // When
+    await engine.executeTransition(
+      makeTask() as Parameters<typeof engine.executeTransition>[0],
+      'todo',
+      'doing',
+      undefined,
+      true,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      continuation,
+    );
+
+    // Then
+    expect(prepare).not.toHaveBeenCalled();
+    expect(sessionRepo.insert).toHaveBeenCalledWith(expect.objectContaining({ prompt: null }));
+  });
+
+  it('reports a fresh lifecycle after spawning and before the next action starts', async () => {
+    // Given
+    const spawnAction = makeAction({ id: 'spawn-action', type: 'spawn_agent' });
+    const scriptAction = makeAction({
+      id: 'script-action',
+      type: 'run_script',
+      config_json: JSON.stringify({ script: 'echo next-action' }),
+    });
+    const observeSpawnLifecycle = vi.fn();
+    const { engine, sessionManager } = makeEngine({ actions: [spawnAction, scriptAction] });
+
+    // When
+    await engine.executeTransition(
+      makeTask() as Parameters<typeof engine.executeTransition>[0],
+      'todo',
+      'doing',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      observeSpawnLifecycle,
+    );
+
+    // Then
+    expect(observeSpawnLifecycle).toHaveBeenCalledExactlyOnceWith({ kind: 'fresh' });
+    expect(sessionManager.spawn).toHaveBeenCalledTimes(2);
+    expect(observeSpawnLifecycle.mock.invocationCallOrder[0]).toBeLessThan(
+      sessionManager.spawn.mock.invocationCallOrder[1],
+    );
+  });
+
+  it('reports a resume lifecycle after resuming an existing action session', async () => {
+    // Given
+    const sessionRepo = makeSessionRepo();
+    sessionRepo.getLatestForTaskByTypeAndIsolation.mockReturnValue({
+      id: 'suspended-session',
+      agent_session_id: 'native-session-id',
+      session_type: 'claude_agent',
+      status: 'suspended',
+      cwd: '/some/project',
+    });
+    const observeSpawnLifecycle = vi.fn();
+    const { engine } = makeEngine({ sessionRepo });
+
+    // When
+    await engine.executeTransition(
+      makeTask() as Parameters<typeof engine.executeTransition>[0],
+      'todo',
+      'doing',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      observeSpawnLifecycle,
+    );
+
+    // Then
+    expect(observeSpawnLifecycle).toHaveBeenCalledExactlyOnceWith({ kind: 'resume' });
+  });
+
+  it('notifies the successful spawn before propagating a later action rejection', async () => {
+    // Given
+    const spawnAction = makeAction({ id: 'spawn-action', type: 'spawn_agent' });
+    const scriptAction = makeAction({
+      id: 'script-action',
+      type: 'run_script',
+      config_json: JSON.stringify({ script: 'echo later-action' }),
+    });
+    const laterActionError = new Error('later action failed');
+    const observeSpawnLifecycle = vi.fn();
+    const sessionManager = makeSessionManager();
+    sessionManager.spawn
+      .mockResolvedValueOnce({ id: 'pty-session-1', status: 'running' })
+      .mockRejectedValueOnce(laterActionError);
+    const { engine } = makeEngine({
+      actions: [spawnAction, scriptAction],
+      sessionManager,
+    });
+
+    // When
+    const transition = engine.executeTransition(
+      makeTask() as Parameters<typeof engine.executeTransition>[0],
+      'todo',
+      'doing',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      observeSpawnLifecycle,
+    );
+
+    // Then
+    await expect(transition).rejects.toBe(laterActionError);
+    expect(observeSpawnLifecycle).toHaveBeenCalledExactlyOnceWith({ kind: 'fresh' });
+  });
+
+  it('does not notify for malformed or non-spawn actions', async () => {
+    // Given
+    const malformedAction = makeAction({
+      id: 'malformed-action',
+      type: 'spawn_agent',
+      config_json: '{',
+    });
+    const scriptAction = makeAction({
+      id: 'script-action',
+      type: 'run_script',
+      config_json: JSON.stringify({ script: 'echo no-spawn' }),
+    });
+    const observeSpawnLifecycle = vi.fn();
+    const { engine } = makeEngine({ actions: [malformedAction, scriptAction] });
+
+    // When
+    await engine.executeTransition(
+      makeTask() as Parameters<typeof engine.executeTransition>[0],
+      'todo',
+      'doing',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      observeSpawnLifecycle,
+    );
+
+    // Then
+    expect(observeSpawnLifecycle).not.toHaveBeenCalled();
   });
 });
 
