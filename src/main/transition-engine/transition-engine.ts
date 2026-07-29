@@ -149,7 +149,7 @@ export class TransitionEngine {
     };
 
     switch (action.type) {
-      case 'spawn_agent':
+      case 'spawn_agent': {
         if (skipPromptTemplate) {
           config.promptTemplate = undefined;
         }
@@ -157,6 +157,7 @@ export class TransitionEngine {
         // 只在 spawn 完成後通知，且必須在下一個 action 前更新；後續 action 失敗時呼叫端仍可使用最後成功的 lifecycle。
         onSpawnLifecycle?.(lifecycle);
         break;
+      }
 
       case 'send_command':
         // Fire-and-forget: executeSendCommand internally spawns a fire-and-
