@@ -34,9 +34,9 @@ export const OPENCODE_HOOK_EVENTS: Array<{
   { hook: 'tool.execute.after', bridgeEventType: EventType.ToolEnd },
 ];
 
-const PLUGIN_FILENAME = 'kangentic-activity.mjs';
+const PLUGIN_FILENAME = 'kangentic-activity.js';
 const PLUGIN_SENTINEL = '// kangentic-activity';
-const PLUGIN_GITIGNORE_ENTRY = '.opencode/plugins/kangentic-activity.mjs';
+const PLUGIN_GITIGNORE_ENTRY = '.opencode/plugins/kangentic-activity.js';
 
 class RequiredOpenCodePluginMissingError extends Error {
   readonly name = 'RequiredOpenCodePluginMissingError';
@@ -83,7 +83,7 @@ function hasPluginSentinel(contents: Buffer | string): boolean {
 }
 
 /**
- * Add `.opencode/plugins/kangentic-activity.mjs` to the project's
+ * Add `.opencode/plugins/kangentic-activity.js` to the project's
  * `.gitignore` so the auto-installed plugin file is not committed by
  * mistake. Only runs when the project is a git repo - in non-git
  * directories there is nothing to ignore. Idempotent: skips the write
