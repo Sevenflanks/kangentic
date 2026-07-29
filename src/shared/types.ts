@@ -1,5 +1,7 @@
 import type { PopOutDescriptor, PopOutKind, PopOutParamsByKind } from './pop-out';
 import type { LiveDeliveryStatus } from './live-delivery-status';
+import type { TaskMoveResult } from './auto-command-outcome';
+import type { TerminalFocusReport } from './terminal-focus-report';
 
 // === Database Models ===
 
@@ -3422,7 +3424,7 @@ export interface ElectronAPI {
     create: (input: TaskCreateInput, projectId?: string | null) => Promise<Task>;
     update: (input: TaskUpdateInput, projectId?: string | null) => Promise<Task>;
     delete: (id: string, projectId?: string | null) => Promise<void>;
-    move: (input: TaskMoveInput, projectId?: string | null) => Promise<void>;
+    move: (input: TaskMoveInput, projectId?: string | null) => Promise<TaskMoveResult>;
     /**
      * Cancel an in-flight spawn for a task (e.g. while it is parked in the
      * git queue or fetching). Aborts the move's AbortController; the existing
@@ -3516,6 +3518,7 @@ export interface ElectronAPI {
     reconcile: (taskId: string, projectId?: string | null) => Promise<Session | null>;
     reset: (taskId: string, projectId?: string | null) => Promise<void>;
     write: (sessionId: string, data: string) => Promise<void>;
+    writeFocusReport: (sessionId: string, report: TerminalFocusReport) => Promise<void>;
     resize: (sessionId: string, cols: number, rows: number) => Promise<{ colsChanged: boolean }>;
     list: () => Promise<Session[]>;
     getScrollback: (sessionId: string) => Promise<string>;

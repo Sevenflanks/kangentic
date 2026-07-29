@@ -18,6 +18,11 @@ import {
  */
 export type { CommandVerifier } from '../pty/terminal-submit';
 
+export interface LiveDeliveryRegistration {
+  readonly generation: number;
+  readonly accepted: true;
+}
+
 /** State for a task whose burst is in flight. `next` is the most-recently-
  *  scheduled follow-up that will run after the current one finishes; rapid
  *  drag-through transitions overwrite `next` so only the latest survives. */
@@ -273,8 +278,8 @@ export class TerminalSubmitScheduler {
     this.scheduleKeystrokeBurst(taskId, submission, mutation);
   }
 
-  scheduleNativeIdleSubmission(request: NativeIdleRequest): void {
-    if (!this.acceptingSubmissions) return;
+  scheduleNativeIdleSubmission(request: NativeIdleRequest): LiveDeliveryRegistration | null {
+    if (!this.acceptingSubmissions) return null;
     const mutation = this.beginTaskMutation(request.taskId);
     const entry: NativeIdleEntry = {
       token: mutation,
@@ -293,28 +298,29 @@ export class TerminalSubmitScheduler {
     const currentNative = this.nativeIdle.get(request.taskId);
     if (currentNative?.phase === 'committed') {
       // committed request 仍握有同一條 FIFO；successor 只能保留最新一筆，否則會形成第二個 task queue。
-      if (this.replaceSuccessor(currentNative, { kind: 'native-idle', entry }, mutation)) {
-        this.watchNativeEntry(entry);
-      } else {
+      if (!this.replaceSuccessor(currentNative, { kind: 'native-idle', entry }, mutation)) {
         this.cancelNativeEntry(entry, 'superseded');
+        return null;
       }
-      return;
+      return this.watchNativeEntryAndRegister(entry);
     }
     if (currentNative) this.cancelNativeEntry(currentNative, 'superseded');
     if (!this.isTaskMutationCurrent(request.taskId, mutation)) {
       this.cancelNativeEntry(entry, 'superseded');
-      return;
+      return null;
     }
 
     const pendingContent = this.content.get(request.taskId);
     if (pendingContent) {
-      if (this.replaceContentSuccessor(
+      if (!this.replaceContentSuccessor(
         request.taskId,
         pendingContent,
         { kind: 'native-idle', entry },
-      )) this.watchNativeEntry(entry);
-      else this.cancelNativeEntry(entry, 'superseded');
-      return;
+      )) {
+        this.cancelNativeEntry(entry, 'superseded');
+        return null;
+      }
+      return this.watchNativeEntryAndRegister(entry);
     }
 
     const activeBurst = this.active.get(request.taskId);
@@ -325,19 +331,18 @@ export class TerminalSubmitScheduler {
         { kind: 'native-idle', entry },
       )) {
         this.cancelNativeEntry(entry, 'superseded');
-      } else {
-        this.watchNativeEntry(entry);
+        return null;
       }
-      return;
+      return this.watchNativeEntryAndRegister(entry);
     }
 
     this.cancelKeystrokeBurst(request.taskId);
     if (!this.isTaskMutationCurrent(request.taskId, mutation)) {
       this.cancelNativeEntry(entry, 'superseded');
-      return;
+      return null;
     }
     this.nativeIdle.set(request.taskId, entry);
-    this.watchNativeEntry(entry);
+    return this.watchNativeEntryAndRegister(entry);
   }
 
   private scheduleKeystrokeBurst(
@@ -542,6 +547,12 @@ export class TerminalSubmitScheduler {
     }, remaining);
     this.emitNativeStatus(entry, { state: 'waiting' });
     this.evaluateNativeEntry(entry);
+  }
+
+  private watchNativeEntryAndRegister(entry: NativeIdleEntry): LiveDeliveryRegistration | null {
+    this.watchNativeEntry(entry);
+    // waiting status observer 會同步執行；若它替換目前 owner，這次 admission 不可回報 accepted。
+    return this.isNativeEntryOwned(entry) ? { accepted: true, generation: entry.generation } : null;
   }
 
   private evaluateNativeEntry(entry: NativeIdleEntry): void {
