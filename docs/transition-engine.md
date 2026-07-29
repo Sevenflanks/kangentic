@@ -24,7 +24,7 @@ When a task moves from one column to another, the IPC handler (`task:move`) chec
 | 2 | Target is **Done** (role=`done`) | Suspend session (resumable), archive task |
 | 2.5 | Target has `auto_spawn=false` (non-todo, non-done) | Suspend session |
 | 3 | Task has **active session** | Agent, a changed concrete effective model target, session-track, or force-fresh changes can suspend and respawn. An adapter may live-swap an effort change. A permission-only change or null/unchanged effective model target never restarts a live session. |
-| 4 | Task has **no session** | Resume suspended session (with `auto_command` preloaded as resume prompt) OR create worktree (if enabled) + execute transition action chain |
+| 4 | Task has **no session** | Resume suspended session OR create worktree (if enabled) + execute transition action chain. Non-OpenCode adapters retain existing legacy delivery; OpenCode finalizes Auto-command as a skip because no active writable compatible Main Session exists. |
 
 ### Priority 3: Active Session Handling
 
@@ -186,28 +186,19 @@ The transition engine receives that resolved agent and uses its `AgentAdapter` c
 
 When a task moves to a column with `auto_command` set, the command delivery depends on how the session was started:
 
-OpenCode uses an adapter-prepared private payload for initial content, locally source-verified against OpenCode v1.18.4. `prepareInitialPrompt` writes the payload; the activity plugin, running in the same OpenCode process, claims it before using the generated SDK. A fresh payload creates a session, selects it through the TUI SDK, and prompts it. A resumed payload validates the known session and prompts it without a new selection. This is not alternate-screen terminal paste, and fresh real OpenCode QA remains pending.
+OpenCode 的初始內容使用 adapter 準備的私有 payload，已依 OpenCode 1.18.4 本機原始碼窄幅確認。專案本機 discovery 掃描 `.ts` 與 `.js`，因此安裝 entry 是 `.opencode/plugins/kangentic-activity.js`，來源與 packaged build asset 則維持 `kangentic-activity.mjs`。loader await factory 後，Kangentic 會同步回傳 hooks，再以一個零延遲 macrotask 延後 bootstrap。timer 只用來處理順序，不是 readiness 證據，也不是 upstream 的未來保證。
 
-Later OpenCode live lane commands keep the approved delivery invariants: private same-process native-idle evidence admits delivery, user input takes priority and cancels a pending delivery, and the delivery neither sends `Ctrl+C` nor respawns the session. PTY is an allowed transport for those later commands; native API transport is not required.
+`prepareInitialPrompt` 寫入 payload，同一 OpenCode process 的 activity plugin claim 並刪除它，接著使用 generated SDK。fresh payload 建立 session，將早到或晚到的 matching `session.created` reconciliation 為一個成功 bootstrap 的 `session_start`，重播不相關 starts，以 `client.tui.publish` 選取 session，然後呼叫 `promptAsync`。resume payload 用 `session.get` 驗證已知 session，reconcile 一個 `session_start`，不選取 session，然後呼叫 `promptAsync`。這不是 alternate-screen terminal paste，也沒有新增 transition action 或 terminal fallback。每個 SDK request 皆帶物件內的 `throwOnError: true`；每條失敗路徑至多 best-effort 附加一筆 sanitized error，publish 或 prompt failure 前可能已有 `session_start`，且 SDK call 沒有 retry 或 fallback。成功 bootstrap 的 `session_start` reconciliation exactly once 僅指 telemetry event，不能據此宣稱 prompt 或 live command exactly once。完整 Task 5 QA 尚未成功。
 
-**Resumed sessions** (priority 3 suspend-and-resume, or priority 4 resume from suspended):
-- The `auto_command` is interpolated and passed as the resume prompt to `claude --resume <id>`
-- This is deterministic: the command is the first thing the agent sees on resume
+後續 OpenCode live lane command 維持既有 delivery invariant：只有 already-running active writable compatible Main Session，且稍後取得相符的 root-native clean idle 私有同 process evidence，才能授權交付。generic public idle、child idle 與 timer 完成都不能授權。使用者輸入優先並取消等待中的交付，既有 cancellation 不變，交付不送 `Ctrl+C`，也不 respawn session。PTY 是這些 later live command 唯一允許的 transport，無須 native API transport。
 
-**Fresh spawns with `skipPromptTemplate` on the normal `spawnAgent` fallback path** (no suspended destination session to resume):
-- On the normal `spawnAgent` fallback path, fresh spawns with `skipPromptTemplate` pass `auto_command` as the initial prompt.
-- The command is interpolated with task variables, so the promptless CLI starts work immediately instead of waiting for a deferred keystroke.
-
-**Fresh spawns with a task prompt template on the normal `spawnAgent` fallback path** (no suspended destination session to resume):
-- On the normal `spawnAgent` fallback path, a templated fresh spawn schedules `auto_command` through `TerminalSubmitScheduler.scheduleKeystrokes` with `sendCtrlC: false`.
-- For an OpenCode fresh spawn, the plugin-delivered initial prompt completes before the scheduler sends the latest queued fresh-spawn `auto_command` as a PTY keystroke burst. The burst uses `sendCtrlC: false`.
-- The scheduler interpolates the command, admits it only after same-process native-idle evidence, then writes text → Esc → Enter via `TerminalSubmit.submitKeystrokes` unless user input cancels the pending delivery.
+OpenCode 的 fresh、resume、handoff、restart、isolated、no-active lifecycle cases finalizes a skip for Auto-command。這個 disposition 不改變正常的 resume、fresh spawn、worktree 或 action chain，也不改 ordinary Task prompt、continuation prompt 或 action prompt。Non-OpenCode existing legacy delivery remains intact.
 
 This enables workflows like moving a task from "Running" to "Code Review" to automatically send a review prompt to the agent.
 
 A per-task `auto_command` (MCP-only, `kangentic_create_task`'s `autoCommand` param) wins over the column's for that task. The unarchive handlers (`TASK_UNARCHIVE` / `TASK_BULK_UNARCHIVE`) and any other move out of Done suppress injection entirely via `spawnAgent`'s `suppressAutoCommand` (the recovery-move contract; see [Session Lifecycle](session-lifecycle.md#resume)).
 
-When a `spawn_agent` transition action creates the session itself (a custom action wired onto the entry transition), that action's own prompt template runs and the fallback `auto_command` / continuation injection is skipped for that spawn. This is uniform across every entry point (move, create, promote, MCP create), since all route through `spawnAgent`, whose fallback delivery only fires when no action spawned the session. The default board is unaffected: its one action-backed column (Planning) has no `auto_command`.
+When an action-backed spawn creates the session itself (a custom `spawn_agent` action wired onto the entry transition), that action's own prompt template runs. It still finalizes the central Auto-command disposition for the operation, so OpenCode keeps the active-session-only rule without changing ordinary continuation or action prompts. This is uniform across every entry point (move, create, promote, MCP create). The default board is unaffected: its one action-backed column (Planning) has no `auto_command`.
 
 ## Swimlane Roles
 
@@ -251,7 +242,7 @@ An agent change is necessary but not sufficient for native-history handoff. `spa
 3. **Prepare the prompt and audit record.** `buildSessionHistoryReference()` supplies the target agent's initial prompt with an optional XML path reference. When the path is unavailable, the reference falls back to git-log guidance. A handoff audit row stores source and target metadata plus the nullable `session_history_path`.
 4. **Spawn and link.** The transition engine starts the target adapter. After a successful spawn, the audit row is linked to the target session record.
 
-Native-history handoff bypasses the transition action chain and schedules `auto_command` after the target spawn.
+Native-history handoff bypasses the transition action chain. For OpenCode, handoff finalizes an Auto-command skip; non-OpenCode existing legacy behavior remains intact.
 
 There is no synthesized context package, transcript, git diff, metrics package, or generated handoff file. The runtime still emits `packaging-handoff` while preparing this path, followed by `detecting-agent` and `starting-agent`.
 
