@@ -35,6 +35,7 @@
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { Task, Swimlane, SessionRecord } from '../../src/shared/types';
+import type { AutoCommandLifecycle } from '../../src/main/agent/auto-command-disposition';
 
 vi.mock('../../src/main/transition-engine/agent-resolver', () => ({
   resolveTargetAgent: vi.fn(() => ({ agent: 'claude', isHandoff: false })),
@@ -238,6 +239,7 @@ async function runSpawn(
   suppressAutoCommand = false,
   projectId?: string,
   taskFields: Partial<Task> = {},
+  autoCommandLifecycle?: AutoCommandLifecycle,
 ) {
   return spawnAgent({
     context: deps.context as never,
@@ -250,6 +252,7 @@ async function runSpawn(
     skipPromptTemplate,
     suppressAutoCommand,
     projectId,
+    autoCommandLifecycle,
   });
 }
 
@@ -583,6 +586,43 @@ describe('spawnAgent Auto-command finalization after action spawns', () => {
     });
     expect(deps.tasks.clearAutoCommand).toHaveBeenCalledExactlyOnceWith(TASK_ID);
     expect(toLane.auto_command).toBe('/lane-command');
+  });
+
+  it('preserves a task command when action-spawn finalization lacks native evidence', async () => {
+    // Given
+    const toLane = makeSwimlane(EXEC_LANE_ID, {
+      auto_command: '/lane-command',
+      agent_override: 'opencode',
+    });
+    const taskFields = { agent: 'opencode', auto_command: '/task-command' };
+    const deps = makeDeps({
+      manualPauseRecord: null,
+      resumeRecord: undefined,
+      taskFields,
+      transitionSpawnLifecycles: [{ kind: 'fresh' }],
+    });
+    vi.mocked(agentRegistry.get).mockReturnValue(new OpenCodeAdapter());
+    vi.mocked(resolveTargetAgent).mockReturnValueOnce({ agent: 'opencode', isHandoff: false });
+
+    // When
+    const outcome = await runSpawn(
+      toLane,
+      deps,
+      false,
+      false,
+      undefined,
+      taskFields,
+      { kind: 'active-live' },
+    );
+
+    // Then
+    expect(outcome).toEqual({
+      kind: 'skipped',
+      reason: 'native-evidence-unavailable',
+      warning: 'Auto-command was skipped because required OpenCode native session evidence is unavailable.',
+    });
+    expect(deps.tasks.clearAutoCommand).not.toHaveBeenCalled();
+    expect(deps.tasks.getById()).toEqual(expect.objectContaining({ auto_command: '/task-command' }));
   });
 
   it('keeps the successful action lifecycle when a later transition action rejects', async () => {

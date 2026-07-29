@@ -78,7 +78,7 @@ function shouldConsumeTaskAutoCommand(outcome: AutoCommandImmediateOutcome): boo
     case 'scheduled':
       return outcome.transport === 'native-idle';
     case 'skipped':
-      return true;
+      return outcome.reason !== 'native-evidence-unavailable';
     case 'not-applicable':
       return false;
     default: {
