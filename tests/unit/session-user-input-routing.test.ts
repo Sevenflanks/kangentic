@@ -85,4 +85,54 @@ describe('SESSION_WRITE user ingress routing', () => {
     expect(writeUserInput).toHaveBeenCalledWith('session-1', 'typed');
     expect(write).not.toHaveBeenCalled();
   });
+
+  it('routes exact focus reports through writeFocusReport without advancing user input', () => {
+    // Given
+    const writeFocusReport = vi.fn();
+    const writeUserInput = vi.fn();
+    const sessionManager = new Proxy(
+      { writeFocusReport, writeUserInput },
+      { get: (target, property) => Reflect.get(target, property) ?? vi.fn() },
+    );
+    const context = new Proxy(
+      { sessionManager },
+      { get: (target, property) => Reflect.get(target, property) ?? vi.fn() },
+    );
+    Reflect.apply(registerSessionHandlers, undefined, [context]);
+    const handler = handlers.get(IPC.SESSION_WRITE_FOCUS_REPORT);
+    if (!handler) throw new Error('SESSION_WRITE_FOCUS_REPORT handler was not registered');
+
+    // When
+    handler(undefined, 'session-1', '\x1b[I');
+
+    // Then
+    expect(writeFocusReport).toHaveBeenCalledOnce();
+    expect(writeFocusReport).toHaveBeenCalledWith('session-1', '\x1b[I');
+    expect(writeUserInput).not.toHaveBeenCalled();
+  });
+
+  it('routes non-focus strings through writeUserInput and rejects non-string focus payloads', () => {
+    // Given
+    const writeFocusReport = vi.fn();
+    const writeUserInput = vi.fn();
+    const sessionManager = new Proxy(
+      { writeFocusReport, writeUserInput },
+      { get: (target, property) => Reflect.get(target, property) ?? vi.fn() },
+    );
+    const context = new Proxy(
+      { sessionManager },
+      { get: (target, property) => Reflect.get(target, property) ?? vi.fn() },
+    );
+    Reflect.apply(registerSessionHandlers, undefined, [context]);
+    const handler = handlers.get(IPC.SESSION_WRITE_FOCUS_REPORT);
+    if (!handler) throw new Error('SESSION_WRITE_FOCUS_REPORT handler was not registered');
+
+    // When
+    handler(undefined, 'session-1', '\x1b[Iextra');
+
+    // Then
+    expect(writeUserInput).toHaveBeenCalledWith('session-1', '\x1b[Iextra');
+    expect(writeFocusReport).not.toHaveBeenCalled();
+    expect(() => handler(undefined, 'session-1', 42)).toThrow(TypeError);
+  });
 });

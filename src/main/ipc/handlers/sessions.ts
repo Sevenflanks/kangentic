@@ -22,6 +22,7 @@ import type { Session, TaskResolvePrResult } from '../../../shared/types';
 import type { IpcContext } from '../ipc-context';
 import { isAbortError } from '../../../shared/abort-utils';
 import { broadcast } from '../../pop-out/window-broadcast';
+import { isTerminalFocusReport } from '../../../shared/terminal-focus-report';
 
 // Track session start times for duration calculation on exit
 const sessionStartTimes = new Map<string, number>();
@@ -48,6 +49,11 @@ export function registerSessionHandlers(context: IpcContext): void {
     return withTaskLock(taskId, async () => context.sessionManager.kill(id));
   });
   ipcMain.handle(IPC.SESSION_WRITE, (_, id, data) => context.sessionManager.writeUserInput(id, data));
+  ipcMain.handle(IPC.SESSION_WRITE_FOCUS_REPORT, (_, id, data: unknown) => {
+    if (isTerminalFocusReport(data)) return context.sessionManager.writeFocusReport(id, data);
+    if (typeof data === 'string') return context.sessionManager.writeUserInput(id, data);
+    throw new TypeError('Focus report payload must be a string');
+  });
   // Renderer drain acknowledgement for per-session output backpressure. One-way
   // (send, not invoke): the renderer reports bytes it has consumed so main can
   // pause/resume the session's PTY. Keyed by sessionId only - not project-scoped.
