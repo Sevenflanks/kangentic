@@ -8,9 +8,20 @@ import { TransitionEngine } from '../../transition-engine/transition-engine';
 import { getProjectDb } from '../../db/database';
 import { interpolateTemplate } from '../../agent/shared';
 import { agentRegistry } from '../../agent/agent-registry';
+import {
+  evaluateAutoCommandDisposition,
+  finalizeAutoCommandGate,
+} from '../../agent/auto-command-disposition';
 import { buildSessionHistoryReference } from '../../agent/handoff/session-history-reference';
 import { DEFAULT_AGENT } from '../../../shared/types';
+import type { AutoCommandImmediateOutcome } from '../../../shared/auto-command-outcome';
 import type { Task, Swimlane, Project } from '../../../shared/types';
+import type {
+  AutoCommandDisposition,
+  AutoCommandGateResult,
+  AutoCommandLifecycle,
+} from '../../agent/auto-command-disposition';
+import type { AgentAdapter } from '../../agent/agent-adapter';
 import type { IpcContext } from '../ipc-context';
 import { isAbortError } from '../../../shared/abort-utils';
 import { runSpawnPreamble } from '../../transition-engine/spawn-preamble';
@@ -22,6 +33,11 @@ import { getProjectRepos } from './project-repos';
 import { withTaskLock } from '../task-lifecycle-lock';
 import { runWithProjectLogContext } from '../../diagnostics/project-log-context';
 
+type SpawnExecutionLifecycle = Extract<
+  AutoCommandLifecycle,
+  { readonly kind: 'fresh' | 'resume' }
+>;
+
 /** Build template variables for auto-command interpolation. */
 export function buildAutoCommandVars(task: Task): Record<string, string> {
   return {
@@ -32,6 +48,92 @@ export function buildAutoCommandVars(task: Task): Record<string, string> {
     branchName: task.branch_name || '',
     baseBranch: task.base_branch || '',
   };
+}
+
+function isLegacyAutoCommandFallback(
+  disposition: AutoCommandDisposition | null,
+): boolean {
+  if (disposition === null) return true;
+
+  switch (disposition.kind) {
+    case 'deliver-live':
+    case 'not-applicable':
+    case 'skip':
+      return false;
+    default: {
+      const exhaustiveDisposition: never = disposition;
+      return exhaustiveDisposition;
+    }
+  }
+}
+
+function toImmediateAutoCommandOutcome(
+  gateResult: AutoCommandGateResult | undefined,
+): AutoCommandImmediateOutcome {
+  return gateResult?.immediateOutcome ?? { kind: 'not-applicable' };
+}
+
+function shouldConsumeTaskAutoCommand(outcome: AutoCommandImmediateOutcome): boolean {
+  switch (outcome.kind) {
+    case 'scheduled':
+      return outcome.transport === 'native-idle';
+    case 'skipped':
+      return true;
+    case 'not-applicable':
+      return false;
+    default: {
+      const exhaustiveOutcome: never = outcome;
+      return exhaustiveOutcome;
+    }
+  }
+}
+
+function consumeFinalizedTaskAutoCommand(
+  tasks: TaskRepository,
+  task: Task,
+  outcome: AutoCommandImmediateOutcome,
+): void {
+  if (task.auto_command === null || !shouldConsumeTaskAutoCommand(outcome)) return;
+  tasks.clearAutoCommand(task.id);
+}
+
+function evaluateSpawnAutoCommandDisposition(input: {
+  readonly adapter: AgentAdapter | undefined;
+  readonly autoCommand: string | undefined;
+  readonly context: IpcContext;
+  readonly currentTrack: string | null;
+  readonly destinationAgent: string;
+  readonly lifecycle: AutoCommandLifecycle;
+  readonly task: Task;
+  readonly toLane: Swimlane;
+}): AutoCommandDisposition | null {
+  const sessionId = input.task.session_id;
+  const session = sessionId === null
+    ? undefined
+    : input.context.sessionManager.getSession(sessionId);
+  const nativeSnapshot = sessionId === null
+    ? null
+    : input.context.sessionManager.snapshotNativeIdle(sessionId);
+
+  return evaluateAutoCommandDisposition(input.adapter, {
+    hasCommand: input.autoCommand !== undefined,
+    destinationAutoSpawn: input.toLane.auto_spawn,
+    lifecycle: input.lifecycle,
+    currentSessionRunning: session?.status === 'running',
+    currentSessionWritable: sessionId !== null
+      && session !== undefined
+      && input.context.sessionManager.isWritable(sessionId),
+    currentAgent: input.task.agent,
+    destinationAgent: input.destinationAgent,
+    currentTrack: input.currentTrack,
+    destinationTrack: resolveIsolatedSwimlaneId(input.toLane),
+    liveSubmissionPolicy: input.adapter?.liveSubmissionPolicy,
+    rootNativeSessionId: nativeSnapshot?.rootNativeSessionId ?? null,
+    sessionGeneration: nativeSnapshot?.sessionGeneration ?? null,
+    inputGeneration: nativeSnapshot?.inputGeneration ?? null,
+    destinationLaneId: input.toLane.id,
+    sequence: input.autoCommand === undefined ? [] : [input.autoCommand],
+  });
 }
 
 /**
@@ -135,6 +237,7 @@ export interface AgentSpawnOptions {
    * without injecting auto_command.
    */
   suppressAutoCommand?: boolean;
+  autoCommandLifecycle?: AutoCommandLifecycle;
   /**
    * The lane whose inherited settings the New Task / Edit dialog displayed
    * when the user configured the task. The first-spawn override lock
@@ -160,7 +263,7 @@ export interface AgentSpawnOptions {
  * No-ops when: toLane.auto_spawn is false, task already has a session, or
  * task was deleted mid-operation. AbortError always propagates for cancellation.
  */
-export async function spawnAgent(options: AgentSpawnOptions): Promise<void> {
+export async function spawnAgent(options: AgentSpawnOptions): Promise<AutoCommandImmediateOutcome> {
   const { context, engine, tasks, sessionRepo, task, fromSwimlaneId, toLane, skipPromptTemplate, signal } = options;
 
   // Resolve the owning project once: used for the default-agent fallback below
@@ -170,16 +273,16 @@ export async function spawnAgent(options: AgentSpawnOptions): Promise<void> {
   // an enclosing task-move).
   const project = options.projectId ? context.projectRepo.getById(options.projectId) : null;
 
-  const run = async (): Promise<void> => {
+  const run = async (): Promise<AutoCommandImmediateOutcome> => {
   // Guard: if the target column doesn't want agents, no-op
-  if (!toLane.auto_spawn) return;
+  if (!toLane.auto_spawn) return { kind: 'not-applicable' };
 
   // Guard: if the user manually paused this task, don't auto-resume.
   // The user must explicitly click Resume (SESSION_RESUME) to restart.
   const latestSession = sessionRepo.getLatestForTask(task.id);
   if (latestSession?.status === 'suspended' && latestSession.suspended_by === 'user') {
     console.log(`[spawnAgent] Skipping auto-spawn for task ${task.id.slice(0, 8)} (manually paused by user)`);
-    return;
+    return { kind: 'not-applicable' };
   }
 
   // Shared spawn preamble: lock the Advanced overrides on the task's very
@@ -195,6 +298,7 @@ export async function spawnAgent(options: AgentSpawnOptions): Promise<void> {
     globalPermissionMode: () => context.configManager.getEffectiveConfig(options.projectPath || undefined).agent.permissionMode,
     tasks,
   });
+  const destinationAdapter = agentRegistry.get(targetAgent);
 
   // Handoff also requires a previous session to exist, a project context,
   // and the target column's handoff_context toggle to be enabled (default: false).
@@ -269,18 +373,12 @@ export async function spawnAgent(options: AgentSpawnOptions): Promise<void> {
 
     emitSpawnProgress(context.mainWindow, task.id, 'detecting-agent');
 
-    try {
-      await engine.resumeSuspendedSession(
-        task, toLane.permission_mode, skipPromptTemplate, undefined, signal,
-        targetAgent,
-        handoffPromptPrefix,
-        resolveSpawnOverrides(task, toLane, project),
-      );
-    } catch (error) {
-      if (isAbortError(error)) throw error;
-      console.error('[spawnAgent] Failed to start handoff session:', error);
-      return;
-    }
+    await engine.resumeSuspendedSession(
+      task, toLane.permission_mode, skipPromptTemplate, undefined, signal,
+      targetAgent,
+      handoffPromptPrefix,
+      resolveSpawnOverrides(task, toLane, project),
+    );
 
     // Post-spawn: link handoff record to the target session.
     const currentTask = tasks.getById(task.id);
@@ -298,18 +396,39 @@ export async function spawnAgent(options: AgentSpawnOptions): Promise<void> {
       }
 
       const effectiveAutoCommand = currentTask.auto_command ?? toLane.auto_command;
-      if (!options.suppressAutoCommand && effectiveAutoCommand?.trim()) {
-        const vars = buildAutoCommandVars(currentTask);
-        const interpolated = interpolateTemplate(effectiveAutoCommand, vars);
-        context.terminalSubmitScheduler.scheduleKeystrokes(currentTask.id, currentTask.session_id, [interpolated], { freshlySpawned: true });
+      const interpolatedAutoCommand = !options.suppressAutoCommand && effectiveAutoCommand?.trim()
+        ? interpolateTemplate(effectiveAutoCommand, buildAutoCommandVars(currentTask))
+        : undefined;
+      // OpenCode policy 在此集中阻擋 resume、fresh 與 post-spawn Auto-command fallback；一般 Task 與 continuation prompt 仍維持原本生命週期。
+      const autoCommandDisposition = evaluateSpawnAutoCommandDisposition({
+        adapter: destinationAdapter,
+        autoCommand: interpolatedAutoCommand,
+        context,
+        currentTrack: sessionRepo.getLatestForTask(currentTask.id)?.isolated_swimlane_id ?? null,
+        destinationAgent: targetAgent,
+        lifecycle: { kind: 'handoff' },
+        task: currentTask,
+        toLane,
+      });
+      if (interpolatedAutoCommand !== undefined
+        && isLegacyAutoCommandFallback(autoCommandDisposition)) {
+        context.terminalSubmitScheduler.scheduleKeystrokes(currentTask.id, currentTask.session_id, [interpolatedAutoCommand], { freshlySpawned: true });
+        return toImmediateAutoCommandOutcome(finalizeAutoCommandGate({ kind: 'legacy' }));
       }
+      return toImmediateAutoCommandOutcome(finalizeAutoCommandGate({
+        kind: 'not-dispatched',
+        disposition: autoCommandDisposition,
+      }));
     }
 
-    return;
+    return { kind: 'not-applicable' };
   }
 
   // --- Normal path: execute transition actions then fallback ---
   // targetAgent is passed through so spawn_agent actions use the correct agent.
+
+  // transition 可以在後續 action 失敗前已成功 spawn；保留最後成功的 lifecycle，讓 re-read 後仍能由中央 gate 做唯一的最終化。
+  let transitionSpawnLifecycle: SpawnExecutionLifecycle | null = null;
 
   try {
     await engine.executeTransition(
@@ -319,22 +438,44 @@ export async function spawnAgent(options: AgentSpawnOptions): Promise<void> {
       // progress labels as the default task-move worktree path so its
       // "Creating worktree..." / "Running setup script..." phases reach the card.
       createProgressCallback(context.mainWindow, task.id),
+      (lifecycle) => {
+        transitionSpawnLifecycle = lifecycle;
+      },
+      options.continuationPrompt,
     );
   } catch (error) {
     if (isAbortError(error)) throw error;
     console.error('[spawnAgent] Transition engine error (continuing to fallback):', error);
   }
 
-  // Re-read after the transition. If a spawn_agent ACTION already created the
-  // session, we return here and the fallback below never runs - so its
-  // auto_command / continuationPrompt delivery is skipped for that leg. The
-  // action delivers its own promptTemplate, but a separately configured
-  // auto_command is NOT injected on top in that case. This is the same
-  // narrowing every spawnAgent entry point (move, create, promote, MCP create)
-  // shares; the default board is unaffected (its one action-backed column,
-  // Planning, has no auto_command).
+  // transition action 已建立 session 時不走 fallback；用 observer 保留的 lifecycle
+  // 經中央 gate 最終化，避免 action-created OpenCode 走 legacy keystroke。
   let currentTask = tasks.getById(task.id);
-  if (!currentTask || currentTask.session_id) return;
+  if (!currentTask) return { kind: 'not-applicable' };
+
+  if (currentTask.session_id && transitionSpawnLifecycle !== null) {
+    const effectiveAutoCommand = currentTask.auto_command ?? toLane.auto_command;
+    const interpolatedAutoCommand = !options.suppressAutoCommand && effectiveAutoCommand?.trim()
+      ? interpolateTemplate(effectiveAutoCommand, buildAutoCommandVars(currentTask))
+      : undefined;
+    const currentTrack = sessionRepo.getLatestForTask(currentTask.id)?.isolated_swimlane_id ?? null;
+    const autoCommandDisposition = evaluateSpawnAutoCommandDisposition({
+      adapter: destinationAdapter,
+      autoCommand: interpolatedAutoCommand,
+      context,
+      currentTrack,
+      destinationAgent: targetAgent,
+      lifecycle: options.autoCommandLifecycle ?? transitionSpawnLifecycle,
+      task: currentTask,
+      toLane,
+    });
+    return toImmediateAutoCommandOutcome(finalizeAutoCommandGate({
+      kind: 'not-dispatched',
+      disposition: autoCommandDisposition,
+    }));
+  }
+
+  if (currentTask.session_id) return { kind: 'not-applicable' };
 
   // Fallback: no transition spawned a session - resume or spawn fresh
   console.log(`[spawnAgent] No session after transitions, spawning ${targetAgent} for task ${task.id.slice(0, 8)}`);
@@ -346,7 +487,6 @@ export async function spawnAgent(options: AgentSpawnOptions): Promise<void> {
   // auto_command and drop it; scoping by isolation keeps this decision in
   // lockstep with the actual spawn.
   const destinationIsolatedSwimlaneId = resolveIsolatedSwimlaneId(toLane);
-  const destinationAdapter = agentRegistry.get(targetAgent);
   const destinationResumeRecord = destinationAdapter
     ? sessionRepo.getLatestForTaskByTypeAndIsolation(task.id, destinationAdapter.sessionType, destinationIsolatedSwimlaneId)
     : undefined;
@@ -373,41 +513,58 @@ export async function spawnAgent(options: AgentSpawnOptions): Promise<void> {
   const interpolatedAutoCommand = !options.suppressAutoCommand && effectiveAutoCommand?.trim()
     ? interpolateTemplate(effectiveAutoCommand, buildAutoCommandVars(currentTask))
     : undefined;
-  const deliverAutoCommandAsPrompt = interpolatedAutoCommand !== undefined
+  const autoCommandDisposition = evaluateSpawnAutoCommandDisposition({
+    adapter: destinationAdapter,
+    autoCommand: interpolatedAutoCommand,
+    context,
+    currentTrack: destinationResumeRecord?.isolated_swimlane_id ?? null,
+    destinationAgent: targetAgent,
+    lifecycle: options.autoCommandLifecycle
+      ?? (canResumeDestination ? { kind: 'resume' } : { kind: 'fresh' }),
+    task: currentTask,
+    toLane,
+  });
+  const deliveredAutoCommand = isLegacyAutoCommandFallback(autoCommandDisposition)
+    ? interpolatedAutoCommand
+    : undefined;
+  const deliverAutoCommandAsPrompt = deliveredAutoCommand !== undefined
     && (canResumeDestination || skipPromptTemplate === true);
   // The continuation prompt (plan-exit auto-move) is a resume-only fallback:
   // the auto_command is the user's explicit per-column automation and wins,
   // and a fresh spawn has no prior conversation for "proceed" to refer to.
-  // Known limitation: a user-configured spawn_agent transition action spawns
-  // before this fallback runs, so the continuation is dropped there.
   const resumePrompt = deliverAutoCommandAsPrompt
-    ? interpolatedAutoCommand
+    ? deliveredAutoCommand
     : (canResumeDestination ? options.continuationPrompt : undefined);
 
-  try {
-    // Always pass targetAgent so the column's agent_override is respected.
-    // Without this, first-time spawns (task.agent=null, isHandoff=false)
-    // would fall through to the project default or 'claude' hardcoded fallback.
-    await engine.resumeSuspendedSession(
-      currentTask, toLane.permission_mode, skipPromptTemplate, resumePrompt, signal,
-      targetAgent,
-      undefined,
-      resolveSpawnOverrides(currentTask, toLane, project),
-    );
-  } catch (error) {
-    if (isAbortError(error)) throw error;
-    console.error('[spawnAgent] Failed to start session:', error);
-    return;
-  }
+  // Always pass targetAgent so the column's agent_override is respected.
+  // Without this, first-time spawns (task.agent=null, isHandoff=false)
+  // would fall through to the project default or 'claude' hardcoded fallback.
+  await engine.resumeSuspendedSession(
+    currentTask, toLane.permission_mode, skipPromptTemplate, resumePrompt, signal,
+    targetAgent,
+    undefined,
+    resolveSpawnOverrides(currentTask, toLane, project),
+  );
 
   currentTask = tasks.getById(task.id);
 
-  if (currentTask?.session_id && interpolatedAutoCommand !== undefined && !deliverAutoCommandAsPrompt) {
-    context.terminalSubmitScheduler.scheduleKeystrokes(currentTask.id, currentTask.session_id, [interpolatedAutoCommand], { freshlySpawned: true });
+  if (currentTask?.session_id && deliveredAutoCommand !== undefined && !deliverAutoCommandAsPrompt) {
+    context.terminalSubmitScheduler.scheduleKeystrokes(currentTask.id, currentTask.session_id, [deliveredAutoCommand], { freshlySpawned: true });
   }
+  if (deliveredAutoCommand !== undefined && currentTask?.session_id) {
+    return toImmediateAutoCommandOutcome(finalizeAutoCommandGate({ kind: 'legacy' }));
+  }
+  return toImmediateAutoCommandOutcome(finalizeAutoCommandGate({
+    kind: 'not-dispatched',
+    disposition: autoCommandDisposition,
+  }));
   };
 
-  return project?.name ? runWithProjectLogContext(project.name, run) : run();
+  const outcome = await (project?.name ? runWithProjectLogContext(project.name, run) : run());
+  // Every spawnAgent caller holds the task lock; finalizing here keeps the
+  // accepted one-shot decision adjacent to the immediate outcome without re-entry.
+  consumeFinalizedTaskAutoCommand(tasks, task, outcome);
+  return outcome;
 }
 
 /**
@@ -416,76 +573,66 @@ export async function spawnAgent(options: AgentSpawnOptions): Promise<void> {
  * transition engine execution, session resume fallback, and auto-command
  * injection.
  *
- * Called from both the SessionManager `task-created` event (internal MCP
- * bridge) and the external CommandBridge `onTaskCreated` callback.
+ * Called by the distinct MCP `onTaskAutoSpawn` lifecycle callback after
+ * `onTaskCreated` has completed its notification-only board update.
  */
 export async function autoSpawnForTask(
   context: IpcContext,
   projectId: string,
-  task: { id: string; title: string },
+  task: Pick<Task, 'id' | 'title'>,
   swimlaneId: string,
-): Promise<void> {
+): Promise<AutoCommandImmediateOutcome> {
   // Serialize against any other task-lifecycle op (suspend/resume/move/kill)
-  // so an MCP-created auto-spawn can't race a user drag of the same task.
+  // so an MCP-created auto-spawn can't race a user drag of the same task. This
+  // is also the caller-held lock for task-command finalization in spawnAgent.
   return withTaskLock(task.id, async () => {
     // Tag the worktree/checkout/spawn logs below with the project the new task
     // belongs to. This is the entry point for MCP-created-task spawns, which
     // have no enclosing move context to inherit a tag from.
     const logProjectName = context.projectRepo.getById(projectId)?.name ?? null;
-    const run = async (): Promise<void> => {
-    try {
+    const run = async (): Promise<AutoCommandImmediateOutcome> => {
       const db = getProjectDb(projectId);
       const swimlaneRepo = new SwimlaneRepository(db);
       const toLane = swimlaneRepo.getById(swimlaneId);
-      if (!toLane?.auto_spawn) return;
+      if (!toLane) throw new Error(`Swimlane ${swimlaneId} not found`);
+      if (!toLane.auto_spawn) return { kind: 'not-applicable' };
 
       const project = context.projectRepo.getById(projectId);
-      const projectPath = project?.path ?? null;
-      if (!projectPath) return;
+      if (!project) throw new Error(`Project ${projectId} not found`);
+      const projectPath = project.path;
+      if (!projectPath) throw new Error(`Project ${projectId} has no path`);
 
       const { tasks, actions, attachments } = getProjectRepos(context, projectId);
       const fullTask = tasks.getById(task.id);
-      if (!fullTask) return;
+      if (!fullTask) throw new Error(`Task ${task.id} not found`);
 
-      try {
-        await ensureTaskWorktree(context, fullTask, tasks, projectPath);
-      } catch (worktreeError) {
-        console.error('[MCP auto-spawn] Worktree creation failed:', worktreeError);
-        return;
-      }
+      await ensureTaskWorktree(context, fullTask, tasks, projectPath);
 
       // Checkout branch for non-worktree tasks (may fail if another session is active)
       if (fullTask.base_branch && !fullTask.worktree_path) {
-        try {
-          // Inlined from guardActiveNonWorktreeSessions to avoid circular import with task-move.ts
-          const activeSessions = context.sessionManager.listSessions()
-            .filter(session => session.taskId !== fullTask.id && (session.status === 'running' || session.status === 'queued'));
-          const otherNonWorktreeSessions = activeSessions.filter(session => {
-            const otherTask = tasks.getById(session.taskId);
-            return otherTask && !otherTask.worktree_path;
-          });
-          if (otherNonWorktreeSessions.length > 0) {
-            throw new Error(
-              `Cannot switch to branch '${fullTask.base_branch}': another task is running in the main repo. `
-              + `Enable worktree mode for branch isolation.`
-            );
-          }
-          await ensureTaskBranchCheckout(fullTask, projectPath);
-        } catch (checkoutError) {
-          console.error('[MCP auto-spawn] Branch checkout failed:', checkoutError);
-          return;
+        // Inlined from guardActiveNonWorktreeSessions to avoid circular import with task-move.ts
+        const activeSessions = context.sessionManager.listSessions()
+          .filter(session => session.taskId !== fullTask.id && (session.status === 'running' || session.status === 'queued'));
+        const otherNonWorktreeSessions = activeSessions.filter(session => {
+          const otherTask = tasks.getById(session.taskId);
+          return otherTask && !otherTask.worktree_path;
+        });
+        if (otherNonWorktreeSessions.length > 0) {
+          throw new Error(
+            `Cannot switch to branch '${fullTask.base_branch}': another task is running in the main repo. `
+            + `Enable worktree mode for branch isolation.`
+          );
         }
+        await ensureTaskBranchCheckout(fullTask, projectPath);
       }
 
       const sessionRepo = new SessionRepository(db);
       const engine = createTransitionEngine(context, actions, tasks, sessionRepo, attachments, projectId, projectPath);
 
-      await spawnAgent({ context, engine, tasks, sessionRepo, task: fullTask, fromSwimlaneId: '*', toLane, projectId, projectPath });
+      const outcome = await spawnAgent({ context, engine, tasks, sessionRepo, task: fullTask, fromSwimlaneId: '*', toLane, projectId, projectPath });
 
       console.log(`[MCP auto-spawn] Spawned agent for "${task.title}" in ${toLane.name}`);
-    } catch (err) {
-      console.error('[MCP auto-spawn] Failed:', err);
-    }
+      return outcome;
     };
     return logProjectName ? runWithProjectLogContext(logProjectName, run) : run();
   });

@@ -32,11 +32,15 @@ vi.mock('../../src/main/agent/agent-registry', () => ({
 }));
 
 import { spawnAgent } from '../../src/main/ipc/helpers/agent-spawn';
+import { agentRegistry } from '../../src/main/agent/agent-registry';
+import { OpenCodeAdapter } from '../../src/main/agent/adapters/opencode/opencode-adapter';
+import { resolveTargetAgent } from '../../src/main/transition-engine/agent-resolver';
 
 const TASK_ID = 'task-aaa00001';
 const EXECUTING_LANE_ID = 'lane-executing';
 const FRESH_PTY_SESSION_ID = 'pty-fresh-1';
 const CONTINUATION = 'Proceed with implementing the approved plan.';
+const ACTION_CONTINUATION = 'opaque-action-continuation-7f3c';
 
 function makeTask(overrides: Partial<Task> = {}): Task {
   return {
@@ -116,25 +120,47 @@ function makeRecord(overrides: Partial<SessionRecord> = {}): SessionRecord {
   } as SessionRecord;
 }
 
-function makeDeps(args: { resumeRecord: SessionRecord | undefined }) {
+function makeDeps(args: {
+  resumeRecord: SessionRecord | undefined;
+  actionCreatedSession?: boolean;
+}) {
+  let postSpawnTask = makeTask({ session_id: FRESH_PTY_SESSION_ID });
   const getById = vi.fn();
   getById
     .mockReturnValueOnce(makeTask({ session_id: null }))
-    .mockReturnValue(makeTask({ session_id: FRESH_PTY_SESSION_ID }));
+    .mockImplementation(() => postSpawnTask);
 
-  const tasks = { getById };
+  const tasks = {
+    getById,
+    clearAutoCommand: vi.fn((taskId: string) => {
+      if (taskId === TASK_ID) {
+        postSpawnTask = { ...postSpawnTask, auto_command: null };
+      }
+    }),
+  };
   const sessionRepo = {
     getLatestForTask: vi.fn(() => args.resumeRecord ?? null),
     getLatestForTaskByTypeAndIsolation: vi.fn(() => args.resumeRecord),
   };
   const engine = {
-    executeTransition: vi.fn(async () => {}),
+    executeTransition: vi.fn(async (...callArgs: unknown[]) => {
+      if (!args.actionCreatedSession) return;
+      getById.mockReset();
+      getById.mockReturnValue(postSpawnTask);
+      const lifecycleObserver = callArgs[9];
+      if (typeof lifecycleObserver === 'function') lifecycleObserver({ kind: 'resume' });
+    }),
     resumeSuspendedSession: vi.fn(async () => {}),
   };
   const scheduleKeystrokes = vi.fn();
   const context = {
     terminalSubmitScheduler: { scheduleKeystrokes },
     configManager: { getEffectiveConfig: vi.fn(() => ({ agent: { permissionMode: 'acceptEdits' } })) },
+    sessionManager: {
+      getSession: vi.fn(() => ({ status: 'running' })),
+      snapshotNativeIdle: vi.fn(() => null),
+      isWritable: vi.fn(() => true),
+    },
   };
 
   return { tasks, sessionRepo, engine, scheduleKeystrokes, context };
@@ -145,7 +171,7 @@ async function runSpawn(
   deps: ReturnType<typeof makeDeps>,
   continuationPrompt: string | undefined,
 ) {
-  await spawnAgent({
+  return spawnAgent({
     context: deps.context as never,
     engine: deps.engine as never,
     tasks: deps.tasks as never,
@@ -184,20 +210,22 @@ describe('spawnAgent continuationPrompt delivery', () => {
     const executingLane = makeSwimlane(EXECUTING_LANE_ID, { auto_command: '/implement' });
     const deps = makeDeps({ resumeRecord: makeRecord() });
 
-    await runSpawn(executingLane, deps, CONTINUATION);
+    const outcome = await runSpawn(executingLane, deps, CONTINUATION);
 
     expect(resumePromptArg(deps.engine)).toBe('/implement');
     expect(deps.scheduleKeystrokes).not.toHaveBeenCalled();
+    expect(outcome).toEqual({ kind: 'scheduled', transport: 'legacy' });
   });
 
   it('fresh spawn: the continuation is NOT delivered (no prior conversation to continue)', async () => {
     const executingLane = makeSwimlane(EXECUTING_LANE_ID);
     const deps = makeDeps({ resumeRecord: undefined });
 
-    await runSpawn(executingLane, deps, CONTINUATION);
+    const outcome = await runSpawn(executingLane, deps, CONTINUATION);
 
     expect(resumePromptArg(deps.engine)).toBeUndefined();
     expect(deps.scheduleKeystrokes).not.toHaveBeenCalled();
+    expect(outcome).toEqual({ kind: 'not-applicable' });
   });
 
   it('no continuation (user drag): a resumed session with no auto_command resumes idle', async () => {
@@ -228,5 +256,55 @@ describe('spawnAgent continuationPrompt delivery', () => {
     await runSpawn(executingLane, deps, undefined);
 
     expect(resumePromptArg(deps.engine)).toBe('/task-command');
+  });
+
+  it('OpenCode resume suppresses auto_command while preserving the explicit continuation prompt', async () => {
+    const executingLane = makeSwimlane(EXECUTING_LANE_ID, { auto_command: '/implement' });
+    const deps = makeDeps({ resumeRecord: makeRecord() });
+    vi.mocked(resolveTargetAgent).mockReturnValueOnce({ agent: 'opencode', isHandoff: false });
+    vi.mocked(agentRegistry.get).mockReturnValueOnce(new OpenCodeAdapter());
+
+    await runSpawn(executingLane, deps, CONTINUATION);
+
+    expect(resumePromptArg(deps.engine)).toBe(CONTINUATION);
+    expect(deps.scheduleKeystrokes).not.toHaveBeenCalled();
+  });
+
+  it('forwards continuation to an action-created OpenCode resume without fallback or keystrokes', async () => {
+    // Given
+    const executingLane = makeSwimlane(EXECUTING_LANE_ID, { auto_command: '/implement' });
+    const deps = makeDeps({ resumeRecord: makeRecord(), actionCreatedSession: true });
+    vi.mocked(resolveTargetAgent).mockReturnValueOnce({ agent: 'opencode', isHandoff: false });
+    vi.mocked(agentRegistry.get).mockReturnValueOnce(new OpenCodeAdapter());
+
+    // When
+    const outcome = await runSpawn(executingLane, deps, ACTION_CONTINUATION);
+
+    // Then
+    expect(deps.engine.executeTransition.mock.calls[0]?.at(-1)).toBe(ACTION_CONTINUATION);
+    expect(deps.engine.resumeSuspendedSession).not.toHaveBeenCalled();
+    expect(deps.scheduleKeystrokes).not.toHaveBeenCalled();
+    expect(outcome).toEqual({
+      kind: 'skipped',
+      reason: 'resume-not-supported',
+      warning: 'Auto-command was skipped because OpenCode resume delivery is not supported.',
+    });
+  });
+
+  it('OpenCode fresh spawn suppresses auto_command without removing the ordinary task prompt path', async () => {
+    const executingLane = makeSwimlane(EXECUTING_LANE_ID, { auto_command: '/implement' });
+    const deps = makeDeps({ resumeRecord: undefined });
+    vi.mocked(resolveTargetAgent).mockReturnValueOnce({ agent: 'opencode', isHandoff: false });
+    vi.mocked(agentRegistry.get).mockReturnValueOnce(new OpenCodeAdapter());
+
+    const outcome = await runSpawn(executingLane, deps, undefined);
+
+    expect(resumePromptArg(deps.engine)).toBeUndefined();
+    expect(deps.scheduleKeystrokes).not.toHaveBeenCalled();
+    expect(outcome).toEqual({
+      kind: 'skipped',
+      reason: 'fresh-not-supported',
+      warning: 'Auto-command was skipped because OpenCode fresh-session delivery is not supported.',
+    });
   });
 });

@@ -72,11 +72,14 @@ vi.mock('../../src/main/agent/handoff/session-history-reference', () => ({
 import { spawnAgent } from '../../src/main/ipc/helpers/agent-spawn';
 import { resolveTargetAgent } from '../../src/main/transition-engine/agent-resolver';
 import { agentRegistry } from '../../src/main/agent/agent-registry';
+import { OpenCodeAdapter } from '../../src/main/agent/adapters/opencode/opencode-adapter';
 
 const TASK_ID = 'task-aaa00001';
 const EXEC_LANE_ID = 'lane-exec';
 const ISOLATED_LANE_ID = 'lane-review-isolated';
 const FRESH_PTY_SESSION_ID = 'pty-fresh-1';
+
+type SpawnExecutionLifecycle = { readonly kind: 'fresh' | 'resume' };
 
 function makeTask(overrides: Partial<Task> = {}): Task {
   return {
@@ -170,19 +173,43 @@ function makeDeps(args: {
   resumeRecord: SessionRecord | undefined;
   /** Extra task fields applied to the getById returns the auto_command interpolation reads. */
   taskFields?: Partial<Task>;
+  transitionSpawnLifecycles?: readonly SpawnExecutionLifecycle[];
+  transitionError?: Error;
+  transitionSessionId?: string | null;
 }) {
-  const getById = vi.fn();
-  getById
-    .mockReturnValueOnce(makeTask({ session_id: null, ...args.taskFields }))
-    .mockReturnValue(makeTask({ session_id: FRESH_PTY_SESSION_ID, ...args.taskFields }));
+  const transitionSpawnLifecycles = args.transitionSpawnLifecycles ?? [];
+  const transitionSessionId = args.transitionSessionId === undefined
+    ? FRESH_PTY_SESSION_ID
+    : args.transitionSessionId;
+  let postSpawnTask = makeTask({ session_id: transitionSessionId, ...args.taskFields });
+  const getById = transitionSpawnLifecycles.length > 0
+    ? vi.fn(() => postSpawnTask)
+    : vi.fn()
+      .mockReturnValueOnce(makeTask({ session_id: null, ...args.taskFields }))
+      .mockImplementation(() => postSpawnTask);
 
-  const tasks = { getById };
+  const tasks = {
+    getById,
+    clearAutoCommand: vi.fn((taskId: string) => {
+      if (taskId === TASK_ID) {
+        postSpawnTask = { ...postSpawnTask, auto_command: null };
+      }
+    }),
+  };
   const sessionRepo = {
     getLatestForTask: vi.fn(() => args.manualPauseRecord),
     getLatestForTaskByTypeAndIsolation: vi.fn(() => args.resumeRecord),
   };
   const engine = {
-    executeTransition: vi.fn(async () => {}),
+    executeTransition: vi.fn(async (...parameters: unknown[]) => {
+      const observer = parameters.at(9);
+      if (typeof observer === 'function') {
+        for (const lifecycle of transitionSpawnLifecycles) {
+          observer(lifecycle);
+        }
+      }
+      if (args.transitionError) throw args.transitionError;
+    }),
     resumeSuspendedSession: vi.fn(async () => {}),
   };
   const scheduleKeystrokes = vi.fn();
@@ -191,6 +218,11 @@ function makeDeps(args: {
   // both normal-path and handoff-path tests without requiring a cast.
   const context = {
     terminalSubmitScheduler: { scheduleKeystrokes },
+    sessionManager: {
+      getSession: vi.fn((id: string) => ({ id, status: 'running' })),
+      isWritable: vi.fn(() => true),
+      snapshotNativeIdle: vi.fn(() => null),
+    },
     mainWindow: { isDestroyed: vi.fn(() => false), webContents: { send: vi.fn() } },
     projectRepo: { getById: vi.fn(() => null) },
     configManager: { getEffectiveConfig: vi.fn(() => ({ agent: { permissionMode: 'acceptEdits' } })) },
@@ -205,13 +237,14 @@ async function runSpawn(
   skipPromptTemplate = false,
   suppressAutoCommand = false,
   projectId?: string,
+  taskFields: Partial<Task> = {},
 ) {
-  await spawnAgent({
+  return spawnAgent({
     context: deps.context as never,
     engine: deps.engine as never,
     tasks: deps.tasks as never,
     sessionRepo: deps.sessionRepo as never,
-    task: makeTask({ swimlane_id: toLane.id, session_id: null }),
+    task: makeTask({ swimlane_id: toLane.id, session_id: null, ...taskFields }),
     fromSwimlaneId: EXEC_LANE_ID,
     toLane,
     skipPromptTemplate,
@@ -284,13 +317,14 @@ describe('spawnAgent auto_command injection (isolation-scoped resume check)', ()
 
     // skipPromptTemplate=false: the task description owns the prompt slot, so the
     // auto_command must be injected afterward as a keystroke.
-    await runSpawn(isolatedLane, deps, false);
+    const outcome = await runSpawn(isolatedLane, deps, false);
 
     expect(resumePromptArg(deps.engine)).toBeUndefined();
     expect(deps.scheduleKeystrokes).toHaveBeenCalledTimes(1);
     expect(deps.scheduleKeystrokes).toHaveBeenCalledWith(
       TASK_ID, FRESH_PTY_SESSION_ID, ['/code-review'], { freshlySpawned: true },
     );
+    expect(outcome).toEqual({ kind: 'scheduled', transport: 'legacy' });
   });
 
   it('ISOLATED + resume: re-entering the isolated column resumes with the auto_command as the resume prompt, no keystroke', async () => {
@@ -473,5 +507,141 @@ describe('spawnAgent auto_command suppression on recovery move out of Done (hand
     expect(deps.scheduleKeystrokes).toHaveBeenCalledWith(
       TASK_ID, FRESH_PTY_SESSION_ID, ['/merge-back'], { freshlySpawned: true },
     );
+  });
+
+  it('OpenCode handoff suppresses auto_command even when recovery suppression is off', async () => {
+    const openCodeLane = makeSwimlane('lane-opencode', {
+      session_target: 'main',
+      auto_command: '/merge-back',
+      handoff_context: true,
+      agent_override: 'opencode',
+    });
+    const priorRecord = makeRecord({
+      id: 'rec-claude',
+      isolated_swimlane_id: null,
+      agent_session_id: 'claude-session-1',
+    });
+    const deps = makeDeps({
+      manualPauseRecord: priorRecord,
+      resumeRecord: undefined,
+      taskFields: { session_id: FRESH_PTY_SESSION_ID },
+    });
+    vi.mocked(resolveTargetAgent).mockReturnValueOnce({ agent: 'opencode', isHandoff: true });
+    vi.mocked(agentRegistry.get)
+      .mockReturnValueOnce(new OpenCodeAdapter())
+      .mockReturnValueOnce(null)
+      .mockReturnValueOnce(new OpenCodeAdapter());
+
+    await runSpawn(openCodeLane, deps, true, false, PROJECT_ID);
+
+    expect(deps.engine.resumeSuspendedSession).toHaveBeenCalledTimes(1);
+    expect(deps.scheduleKeystrokes).not.toHaveBeenCalled();
+  });
+});
+
+describe('spawnAgent Auto-command finalization after action spawns', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('finalizes a successful OpenCode action spawn through the central gate without legacy keystrokes', async () => {
+    // Given
+    const toLane = makeSwimlane(EXEC_LANE_ID, {
+      auto_command: '/lane-command',
+      agent_override: 'opencode',
+    });
+    const taskFields = {
+      auto_command: '/task-command {{baseBranch}}',
+      base_branch: 'release',
+    };
+    const deps = makeDeps({
+      manualPauseRecord: null,
+      resumeRecord: undefined,
+      taskFields,
+      transitionSpawnLifecycles: [{ kind: 'fresh' }],
+    });
+    const adapter = new OpenCodeAdapter();
+    const disposition = vi.spyOn(adapter, 'getAutoCommandDisposition');
+    vi.mocked(agentRegistry.get).mockReturnValue(adapter);
+    vi.mocked(resolveTargetAgent).mockReturnValueOnce({ agent: 'opencode', isHandoff: false });
+
+    // When
+    const outcome = await runSpawn(toLane, deps, false, false, undefined, taskFields);
+
+    // Then
+    expect(deps.engine.resumeSuspendedSession).not.toHaveBeenCalled();
+    expect(deps.scheduleKeystrokes).not.toHaveBeenCalled();
+    expect(disposition).toHaveBeenCalledWith(expect.objectContaining({
+      lifecycle: { kind: 'fresh' },
+      currentTrack: null,
+      sequence: ['/task-command release'],
+    }));
+    expect(outcome).toEqual({
+      kind: 'skipped',
+      reason: 'fresh-not-supported',
+      warning: 'Auto-command was skipped because OpenCode fresh-session delivery is not supported.',
+    });
+    expect(deps.tasks.clearAutoCommand).toHaveBeenCalledExactlyOnceWith(TASK_ID);
+    expect(toLane.auto_command).toBe('/lane-command');
+  });
+
+  it('keeps the successful action lifecycle when a later transition action rejects', async () => {
+    // Given
+    const toLane = makeSwimlane(EXEC_LANE_ID, {
+      auto_command: '/lane-command',
+      agent_override: 'opencode',
+    });
+    const taskFields = { auto_command: '/task-command' };
+    const laterActionError = new Error('later action failed');
+    const deps = makeDeps({
+      manualPauseRecord: null,
+      resumeRecord: undefined,
+      taskFields,
+      transitionSpawnLifecycles: [{ kind: 'fresh' }],
+      transitionError: laterActionError,
+    });
+    vi.mocked(agentRegistry.get).mockReturnValue(new OpenCodeAdapter());
+    vi.mocked(resolveTargetAgent).mockReturnValueOnce({ agent: 'opencode', isHandoff: false });
+
+    // When
+    const outcome = await runSpawn(toLane, deps, false, false, undefined, taskFields);
+
+    // Then
+    expect(deps.engine.resumeSuspendedSession).not.toHaveBeenCalled();
+    expect(deps.scheduleKeystrokes).not.toHaveBeenCalled();
+    expect(outcome).toEqual({
+      kind: 'skipped',
+      reason: 'fresh-not-supported',
+      warning: 'Auto-command was skipped because OpenCode fresh-session delivery is not supported.',
+    });
+    expect(deps.tasks.clearAutoCommand).toHaveBeenCalledExactlyOnceWith(TASK_ID);
+  });
+
+  it('uses the last successful action spawn lifecycle for central finalization', async () => {
+    // Given
+    const toLane = makeSwimlane(EXEC_LANE_ID, {
+      auto_command: '/lane-command',
+      agent_override: 'opencode',
+    });
+    const taskFields = { auto_command: '/task-command' };
+    const deps = makeDeps({
+      manualPauseRecord: null,
+      resumeRecord: undefined,
+      taskFields,
+      transitionSpawnLifecycles: [{ kind: 'fresh' }, { kind: 'resume' }],
+    });
+    vi.mocked(agentRegistry.get).mockReturnValue(new OpenCodeAdapter());
+    vi.mocked(resolveTargetAgent).mockReturnValueOnce({ agent: 'opencode', isHandoff: false });
+
+    // When
+    const outcome = await runSpawn(toLane, deps, false, false, undefined, taskFields);
+
+    // Then
+    expect(outcome).toEqual({
+      kind: 'skipped',
+      reason: 'resume-not-supported',
+      warning: 'Auto-command was skipped because OpenCode resume delivery is not supported.',
+    });
+    expect(deps.tasks.clearAutoCommand).toHaveBeenCalledExactlyOnceWith(TASK_ID);
   });
 });
