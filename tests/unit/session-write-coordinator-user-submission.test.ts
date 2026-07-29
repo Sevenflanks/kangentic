@@ -85,6 +85,36 @@ describe('SessionWriteCoordinator user submission', () => {
     expect(submit).toHaveBeenCalledTimes(1);
   });
 
+  it('defers focus reports until an active user submission releases ownership', async () => {
+    // Given
+    const { coordinator, writes } = createHarness();
+    coordinator.initialize('s1');
+    const userSubmission = coordinator.acquireUserSubmission('s1');
+    let resolveSubmit = (): void => undefined;
+    const submit = vi.fn(() => new Promise<void>((resolve) => {
+      resolveSubmit = resolve;
+    }));
+    const submission = userSubmission?.run(submit);
+    await Promise.resolve();
+    expect(submit).toHaveBeenCalledTimes(1);
+
+    // When
+    coordinator.recordFocusReport('s1', '\x1b[I');
+    coordinator.recordFocusReport('s1', '\x1b[O');
+
+    // Then
+    expect(writes).toEqual([]);
+    expect(coordinator.getInputGeneration('s1')).toBe(1);
+
+    // When
+    resolveSubmit();
+    await expect(submission).resolves.toBeUndefined();
+
+    // Then
+    expect(writes).toEqual(['\x1b[I', '\x1b[O']);
+    expect(coordinator.getInputGeneration('s1')).toBe(1);
+  });
+
   it('does not invoke a user submission callback after explicit release', async () => {
     // Given
     const { coordinator } = createHarness();

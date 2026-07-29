@@ -111,7 +111,7 @@ export class SessionWriteCoordinator {
 
   recordFocusReport(sessionId: string, report: TerminalFocusReport): void {
     const state = this.requireState(sessionId);
-    if (state.automation?.committed) {
+    if (state.automation?.committed || state.userSubmission) {
       state.deferredWrites.push(report);
       return;
     }
@@ -215,7 +215,21 @@ export class SessionWriteCoordinator {
       const waiting = ownership.waiting;
       ownership.waiting = null;
       waiting?.cancel();
-      if (state.userSubmission === ownership) state.userSubmission = null;
+      if (state.userSubmission !== ownership) return;
+      state.userSubmission = null;
+      if (state.automation?.committed) return;
+
+      // submit callback 可能用 writeRaw 分 chunk；ownership 清除後才把 focus reports 接回 FIFO，
+      // 並等 queue drained 才讓下一筆 submit 啟動，避免兩筆 raw submission 夾住 focus bytes。
+      const queue = this.getWriteQueue(sessionId);
+      const deferred = state.deferredWrites.splice(0, state.deferredWrites.length);
+      for (const data of deferred) queue?.enqueue(data);
+      if (!queue || deferred.length === 0) return;
+      state.deferredInputDraining = true;
+      void queue.drained().then(() => {
+        state.deferredInputDraining = false;
+        if (!state.automation?.committed) state.userSubmission?.waiting?.start();
+      });
     };
 
     return {
