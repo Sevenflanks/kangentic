@@ -52,7 +52,7 @@ export function buildCommandContextForProject(
     getProjectDb: () => getProjectDb(projectId),
     getProjectPath: () => projectPath,
 
-    onTaskCreated: (task, columnName, swimlaneId) => {
+    onTaskCreated: (task, columnName, _swimlaneId) => {
       sendToRenderer(
         ipcContext.mainWindow, IPC.TASK_CREATED_BY_AGENT, task.id, task.title, columnName, projectId,
       );
