@@ -113,10 +113,10 @@ export function registerTranscriptionHandlers(context: IpcContext): void {
     async (_event, sessionId: string, text: string, eraseCount: number): Promise<boolean> => {
       const sanitized = text.replace(/[\r\n]+/g, ' ').trim();
       if (!sessionId || sanitized.length === 0) return false;
-      if (eraseCount > 0) context.sessionManager.writeUserInput(sessionId, '\x7f'.repeat(eraseCount));
       const lease = context.sessionManager.acquireUserSubmission(sessionId);
       if (!lease) throw new Error('Session is not accepting input');
       try {
+        if (eraseCount > 0) context.sessionManager.writeUserInput(sessionId, '\x7f'.repeat(eraseCount));
         await lease.run(() => context.terminalSubmit.submitContent(
           sessionId,
           sanitized,

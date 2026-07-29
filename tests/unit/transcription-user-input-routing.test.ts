@@ -69,7 +69,7 @@ describe('transcription user ingress routing', () => {
     expect(write).not.toHaveBeenCalled();
   });
 
-  it('records erase before acquiring one lease and runs submit once through it', async () => {
+  it('acquires the user submission lease before erasing and runs submit once through it', async () => {
     // Given
     const events: string[] = [];
     const submitContent = vi.fn(async () => {
@@ -93,7 +93,7 @@ describe('transcription user ingress routing', () => {
 
     // Then
     expect(result).toBe(true);
-    expect(events).toEqual(['erase', 'acquire', 'run', 'submit', 'release']);
+    expect(events).toEqual(['acquire', 'erase', 'run', 'submit', 'release']);
     expect(writeUserInput).toHaveBeenCalledWith('session-1', '\x7f\x7f\x7f');
     expect(acquireUserSubmission).toHaveBeenCalledOnce();
     expect(run).toHaveBeenCalledOnce();
@@ -102,7 +102,7 @@ describe('transcription user ingress routing', () => {
     expect(release).toHaveBeenCalledOnce();
   });
 
-  it('rejects a missing lease after recording erase', async () => {
+  it('rejects a missing lease without erasing', async () => {
     // Given
     const events: string[] = [];
     const writeUserInput = vi.fn(() => events.push('erase'));
@@ -118,7 +118,8 @@ describe('transcription user ingress routing', () => {
 
     // Then
     await expect(submission).rejects.toThrow('Session is not accepting input');
-    expect(events).toEqual(['erase', 'acquire']);
+    expect(events).toEqual(['acquire']);
+    expect(writeUserInput).not.toHaveBeenCalled();
   });
 
   it('preserves the false result and releases the lease when submit rejects', async () => {
