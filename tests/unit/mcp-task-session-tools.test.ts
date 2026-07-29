@@ -109,6 +109,7 @@ vi.mock('../../src/main/agent/commands/task-commands', () => ({
 
 import { registerTaskTools } from '../../src/main/agent/mcp-http/task-tools';
 import { registerSessionTools } from '../../src/main/agent/mcp-http/session-tools';
+import type { CommandContext } from '../../src/main/agent/commands/types';
 import type { RequestResolver } from '../../src/main/agent/mcp-http/project-resolver';
 import type { TaskCounter } from '../../src/main/agent/mcp-http/handler-helpers';
 
@@ -116,6 +117,7 @@ import type { TaskCounter } from '../../src/main/agent/mcp-http/handler-helpers'
 // invoke them directly without the real SDK transport machinery.
 type AnyToolHandler = (args: Record<string, unknown>) => Promise<{
   content: Array<{ type: string; text: string }>;
+  structuredContent?: Record<string, unknown>;
   isError?: boolean;
 }>;
 
@@ -215,20 +217,20 @@ describe('create_task rate-limit wiring', () => {
     expect(taskCounter.tryReserve).toHaveBeenCalledOnce();
   });
 
-  it('returns a rate-limit error and does NOT call callHandler when the counter is exhausted', async () => {
+  it('returns a rate-limit error and does NOT call runHandler when the counter is exhausted', async () => {
     // Drain the counter.
     for (let i = 0; i < MAX_TASKS; i++) {
       await server.getHandler('kangentic_create_task')({ title: `Task ${i}` });
     }
-    mockCallHandler.mockClear();
+    mockRunHandler.mockClear();
 
     const result = await server.getHandler('kangentic_create_task')({ title: 'One too many' });
 
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain('Task-creation limit reached');
     expect(result.content[0].text).toContain(String(MAX_TASKS));
-    // callHandler must NOT be called after a failed tryReserve.
-    expect(mockCallHandler).not.toHaveBeenCalled();
+    // runHandler must NOT be called after a failed tryReserve.
+    expect(mockRunHandler).not.toHaveBeenCalled();
   });
 
   it('rate-limit error message sources from taskCounter.limit(), not the count at exhaustion', async () => {
@@ -308,7 +310,7 @@ describe('create_task routing guardrail', () => {
     expect(result.content[0].text).toContain('project: "Active"');
     // No quota slot burned and no task created.
     expect(taskCounter.tryReserve).not.toHaveBeenCalled();
-    expect(mockCallHandler).not.toHaveBeenCalled();
+    expect(mockRunHandler).not.toHaveBeenCalled();
   });
 
   it('does NOT run the guardrail when an explicit project selector is passed', async () => {
@@ -324,7 +326,7 @@ describe('create_task routing guardrail', () => {
     expect(result.isError).toBeUndefined();
     expect(mockDetectCrossProjectMention).not.toHaveBeenCalled();
     expect(taskCounter.tryReserve).toHaveBeenCalledOnce();
-    expect(mockCallHandler).toHaveBeenCalledOnce();
+    expect(mockRunHandler).toHaveBeenCalledOnce();
   });
 
   it('does NOT block when no other project is mentioned in the text', async () => {
@@ -334,7 +336,7 @@ describe('create_task routing guardrail', () => {
     expect(result.isError).toBeUndefined();
     expect(mockDetectCrossProjectMention).toHaveBeenCalledOnce();
     expect(taskCounter.tryReserve).toHaveBeenCalledOnce();
-    expect(mockCallHandler).toHaveBeenCalledOnce();
+    expect(mockRunHandler).toHaveBeenCalledOnce();
   });
 
   it('uses the plural branch of the routing-check message when multiple projects are mentioned', async () => {
@@ -358,7 +360,7 @@ describe('create_task routing guardrail', () => {
     expect(text).toContain('project: "Active"');
     // Guardrail fires before quota - no slot burned, no task created.
     expect(taskCounter.tryReserve).not.toHaveBeenCalled();
-    expect(mockCallHandler).not.toHaveBeenCalled();
+    expect(mockRunHandler).not.toHaveBeenCalled();
   });
 
   it('fires the guardrail for Backlog creates (no column carve-out)', async () => {
@@ -375,7 +377,7 @@ describe('create_task routing guardrail', () => {
     expect(result.content[0].text).toContain('Routing check');
     // No quota slot burned and no task created even for a Backlog column.
     expect(taskCounter.tryReserve).not.toHaveBeenCalled();
-    expect(mockCallHandler).not.toHaveBeenCalled();
+    expect(mockRunHandler).not.toHaveBeenCalled();
   });
 });
 
@@ -416,8 +418,8 @@ describe('kangentic_create_task agent/model/effort/permissionMode/autoCommand ov
       modelOverride: 'Opus 4.8',
     });
 
-    expect(mockCallHandler).toHaveBeenCalledOnce();
-    const [handlerName, params] = mockCallHandler.mock.calls[0];
+    expect(mockRunHandler).toHaveBeenCalledOnce();
+    const [handlerName, params] = mockRunHandler.mock.calls[0];
     expect(handlerName).toBe('create_task');
     expect((params as Record<string, unknown>).modelOverride).toBe('claude-opus-4-8');
   });
@@ -428,8 +430,8 @@ describe('kangentic_create_task agent/model/effort/permissionMode/autoCommand ov
       effortOverride: 'XHigh',
     });
 
-    expect(mockCallHandler).toHaveBeenCalledOnce();
-    const [, params] = mockCallHandler.mock.calls[0];
+    expect(mockRunHandler).toHaveBeenCalledOnce();
+    const [, params] = mockRunHandler.mock.calls[0];
     expect((params as Record<string, unknown>).effortOverride).toBe('xhigh');
   });
 
@@ -441,8 +443,8 @@ describe('kangentic_create_task agent/model/effort/permissionMode/autoCommand ov
       autoCommand: '/code-review',
     });
 
-    expect(mockCallHandler).toHaveBeenCalledOnce();
-    const [, params] = mockCallHandler.mock.calls[0];
+    expect(mockRunHandler).toHaveBeenCalledOnce();
+    const [, params] = mockRunHandler.mock.calls[0];
     const typedParams = params as Record<string, unknown>;
     expect(typedParams.agentOverride).toBe('codex');
     expect(typedParams.permissionMode).toBe('bypassPermissions');
@@ -452,14 +454,161 @@ describe('kangentic_create_task agent/model/effort/permissionMode/autoCommand ov
   it('forwards null for every override field when none are provided', async () => {
     await server.getHandler('kangentic_create_task')({ title: 'Plain task' });
 
-    expect(mockCallHandler).toHaveBeenCalledOnce();
-    const [, params] = mockCallHandler.mock.calls[0];
+    expect(mockRunHandler).toHaveBeenCalledOnce();
+    const [, params] = mockRunHandler.mock.calls[0];
     const typedParams = params as Record<string, unknown>;
     expect(typedParams.agentOverride).toBeNull();
     expect(typedParams.modelOverride).toBeNull();
     expect(typedParams.effortOverride).toBeNull();
     expect(typedParams.permissionMode).toBeNull();
     expect(typedParams.autoCommand).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Immediate Auto-command outcomes must remain machine-observable at the MCP
+// transport boundary even when command handlers also supply human-readable
+// success text. The standard callHandler shape intentionally prioritizes text;
+// create/move opt into runHandler-based structured content instead.
+// ---------------------------------------------------------------------------
+
+describe('kangentic create/move structured immediate outcomes', () => {
+  let server: ReturnType<typeof makeFakeServer>;
+  let resolver: RequestResolver;
+  let taskCounter: TaskCounter;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockDetectCrossProjectMention.mockReturnValue([]);
+    server = makeFakeServer();
+    resolver = makeResolver();
+    taskCounter = { tryReserve: vi.fn(() => true), limit: () => 50 };
+    registerTaskTools(server as never, resolver, taskCounter);
+  });
+
+  it('returns create text plus safe skipped outcome and warning in structuredContent', async () => {
+    const data = {
+      id: 'task-create-1',
+      taskId: 'task-create-1',
+      title: 'Created task',
+      displayId: 41,
+      column: 'Review',
+      autoCommand: {
+        kind: 'skipped',
+        reason: 'fresh-not-supported',
+        warning: 'Fresh sessions do not support this Auto-command.',
+      },
+      warning: 'Fresh sessions do not support this Auto-command.',
+    };
+    mockRunHandler.mockResolvedValueOnce({ success: true, message: 'Created task in Review.', data });
+
+    const result = await server.getHandler('kangentic_create_task')({ title: 'Created task' });
+
+    expect(result.content[0].text).toBe('Created task in Review.');
+    expect(result.structuredContent).toEqual(data);
+    expect(mockRunHandler).toHaveBeenCalledWith(
+      'create_task',
+      expect.objectContaining({ title: 'Created task' }),
+      expect.anything(),
+    );
+  });
+
+  it('serializes the real Option B startup-rejection response as a safe create success', async () => {
+    const rawErrorCanary = 'synthetic-command=internal-only;synthetic-path=/not-a-real-private-path;synthetic-credential=NOT_A_SECRET';
+    const warning = 'Task was created, but the agent could not be started. The task remains on the board.';
+    const createdTask = { id: 'task-create-option-b', title: 'Created task', display_id: 43 };
+    const taskCreateInputs: Array<Record<string, unknown>> = [];
+    const callbackOrder: string[] = [];
+
+    vi.resetModules();
+    vi.doMock('../../src/main/db/repositories/task-repository', () => ({
+      TaskRepository: class {
+        create(input: Record<string, unknown>) {
+          taskCreateInputs.push(input);
+          return createdTask;
+        }
+      },
+    }));
+    vi.doMock('../../src/main/agent/commands/column-resolver', () => ({
+      resolveColumn: () => ({ swimlane: { id: 'todo-lane', name: 'To Do' } }),
+    }));
+
+    try {
+      const { handleCreateTask: isolatedHandleCreateTask } = await vi.importActual<typeof import('../../src/main/agent/commands/task-commands')>('../../src/main/agent/commands/task-commands');
+      const context: CommandContext = {
+        getProjectDb: vi.fn(() => ({}) as never),
+        getProjectPath: () => '/mock/project',
+        onTaskCreated: () => callbackOrder.push('created'),
+        onTaskUpdated: () => {},
+        onTaskDeleted: () => {},
+        onTaskMove: () => Promise.resolve({ ok: true, autoCommand: { kind: 'not-applicable' } } as const),
+        onTaskAutoSpawn: async () => {
+          callbackOrder.push('auto-spawn');
+          throw new Error(rawErrorCanary);
+        },
+        onSwimlaneUpdated: () => {},
+        onBacklogChanged: () => {},
+        onLabelColorsChanged: () => {},
+      };
+      const message = `Created task "${createdTask.title}" in To Do column (#${createdTask.display_id}, id: ${createdTask.id}) ${warning}`;
+      const data = {
+        id: createdTask.id,
+        taskId: createdTask.id,
+        title: createdTask.title,
+        displayId: createdTask.display_id,
+        column: 'To Do',
+        warning,
+      };
+
+      mockWithProject.mockImplementationOnce(async (_resolver, _selector, run) => run(context, {
+        projectId: '11111111-1111-4111-8111-111111111111',
+        projectName: 'Active',
+        isDefault: true,
+      }));
+      mockRunHandler.mockImplementationOnce((handlerName, params, handlerContext) => {
+        expect(handlerName).toBe('create_task');
+        expect(handlerContext).toBe(context);
+        return isolatedHandleCreateTask(params, context);
+      });
+
+      const result = await server.getHandler('kangentic_create_task')({ title: createdTask.title, autoCommand: '/review' });
+      const serialized = JSON.stringify(result);
+
+      expect(taskCreateInputs).toEqual([expect.objectContaining({ auto_command: '/review' })]);
+      expect(callbackOrder).toEqual(['created', 'auto-spawn']);
+      expect(result.content[0].text).toBe(message);
+      expect(result.structuredContent).toEqual(data);
+      expect(result.isError).toBeUndefined();
+      expect(serialized).toContain(warning);
+      expect(serialized).not.toContain(rawErrorCanary);
+      expect(serialized).not.toContain('"error"');
+      expect(serialized).not.toContain('autoCommand');
+      expect(serialized).not.toContain('isError');
+    } finally {
+      vi.doUnmock('../../src/main/db/repositories/task-repository');
+      vi.doUnmock('../../src/main/agent/commands/column-resolver');
+      vi.resetModules();
+    }
+  });
+
+  it('returns move text plus scheduled outcome in structuredContent', async () => {
+    const data = {
+      id: 'task-move-1',
+      displayId: 42,
+      column: 'Review',
+      autoCommand: { kind: 'scheduled', transport: 'native-idle', generation: 9 },
+    };
+    mockRunHandler.mockResolvedValueOnce({ success: true, message: 'Moving task to Review.', data });
+
+    const result = await server.getHandler('kangentic_move_task')({ taskId: 'task-move-1', column: 'Review' });
+
+    expect(result.content[0].text).toBe('Moving task to Review.');
+    expect(result.structuredContent).toEqual(data);
+    expect(mockRunHandler).toHaveBeenCalledWith(
+      'move_task',
+      { taskId: 'task-move-1', column: 'Review' },
+      expect.anything(),
+    );
   });
 });
 
