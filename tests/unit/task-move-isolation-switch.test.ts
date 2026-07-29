@@ -210,9 +210,13 @@ describe('handleTaskMove session switch', () => {
     mockSpawnAgent.mockResolvedValue(undefined);
   });
 
-  it('ENTER isolated: suspends the live main session and spawns the isolated column', async () => {
+  it('ENTER isolated force-fresh: suspends the live main session without a restart lifecycle override', async () => {
     const execLane = makeSwimlane(EXEC_LANE_ID, { session_target: 'main' });
-    const isolatedLane = makeSwimlane(REVIEW_ISOLATED_LANE_ID, { session_target: 'isolated', auto_command: '/code-review' });
+    const isolatedLane = makeSwimlane(REVIEW_ISOLATED_LANE_ID, {
+      session_target: 'isolated',
+      session_spawn_strategy: 'always_spawn_new',
+      auto_command: '/code-review',
+    });
     const swimlaneRepo = {
       getById: vi.fn((id: string) => (id === EXEC_LANE_ID ? execLane : id === REVIEW_ISOLATED_LANE_ID ? isolatedLane : null)),
       list: vi.fn(() => [execLane, isolatedLane]),
@@ -251,6 +255,10 @@ describe('handleTaskMove session switch', () => {
     const spawnArg = mockSpawnAgent.mock.calls[0][0] as { toLane: Swimlane };
     expect(spawnArg.toLane.id).toBe(REVIEW_ISOLATED_LANE_ID);
     expect(spawnArg.toLane.session_target).toBe('isolated');
+    expect(spawnArg.toLane.session_spawn_strategy).toBe('always_spawn_new');
+    expect(mockSpawnAgent).toHaveBeenCalledWith(expect.objectContaining({
+      autoCommandLifecycle: undefined,
+    }));
   });
 
   it('LEAVE isolated: suspends the isolated line and spawns the normal column (no keep-alive strand)', async () => {
@@ -293,6 +301,9 @@ describe('handleTaskMove session switch', () => {
     const spawnArg = mockSpawnAgent.mock.calls[0][0] as { toLane: Swimlane };
     expect(spawnArg.toLane.id).toBe(EXEC_LANE_ID);
     expect(spawnArg.toLane.session_target).toBe('main');
+    expect(mockSpawnAgent).toHaveBeenCalledWith(expect.objectContaining({
+      autoCommandLifecycle: undefined,
+    }));
   });
 
   it('regression: normal -> normal move of a main session does NOT line-switch', async () => {
@@ -374,5 +385,8 @@ describe('handleTaskMove session switch', () => {
     const spawnArg = mockSpawnAgent.mock.calls[0][0] as { toLane: Swimlane };
     expect(spawnArg.toLane.id).toBe('lane-reset');
     expect(spawnArg.toLane.session_spawn_strategy).toBe('always_spawn_new');
+    expect(mockSpawnAgent).toHaveBeenCalledWith(expect.objectContaining({
+      autoCommandLifecycle: { kind: 'restart' },
+    }));
   });
 });
