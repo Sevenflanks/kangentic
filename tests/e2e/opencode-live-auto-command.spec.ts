@@ -79,6 +79,8 @@ test.describe('OpenCode live lane command delivery', () => {
     test.slow();
     const runId = Date.now();
     const testName = `opencode-live-auto-command-${runId}`;
+    const taskTitle = `OpenCode Live Delivery ${runId}`;
+    const taskDescription = 'Exercise root-native idle authorization';
     const paths = {
       receipt: path.join(testInfo.outputDir, 'live-receipt.txt'),
       probeReceipt: path.join(testInfo.outputDir, 'probe-receipt.txt'),
@@ -99,7 +101,10 @@ test.describe('OpenCode live lane command delivery', () => {
     fs.writeFileSync(paths.capture, '', 'utf8');
     fs.writeFileSync(path.join(dataDir, 'config.json'), JSON.stringify({
       agent: {
-        cliPaths: { opencode: mockAgentPath('opencode') },
+          cliPaths: {
+            claude: mockAgentPath('claude'),
+            opencode: mockAgentPath('opencode'),
+          },
         permissionMode: 'acceptEdits',
         maxConcurrentSessions: 5,
         queueOverflow: 'queue',
@@ -135,16 +140,17 @@ test.describe('OpenCode live lane command delivery', () => {
         const swimlanes = await window.electronAPI.swimlanes.list();
         const byName = (name: string) => swimlanes.find((lane) => lane.name === name)?.id ?? null;
         return {
+          todo: swimlanes.find((lane) => lane.role === 'todo')?.id ?? null,
           executing: byName('Executing'),
           review: byName('Code Review'),
           tests: byName('Tests'),
           shipping: byName('Ship It'),
         };
       });
-      if (!lanes.executing || !lanes.review || !lanes.tests || !lanes.shipping) {
-        throw new Error('OpenCode live delivery E2E requires Executing, Code Review, Tests, and Ship It lanes');
+      if (!lanes.todo || !lanes.executing || !lanes.review || !lanes.tests || !lanes.shipping) {
+        throw new Error('OpenCode live delivery E2E requires To Do, Executing, Code Review, Tests, and Ship It lanes');
       }
-      const taskId = await page.evaluate(async ({ executing, review, tests, shipping, bootstrap, command }) => {
+      const taskId = await page.evaluate(async ({ todo, executing, review, tests, shipping, bootstrap, command, title, description }) => {
         const project = await window.electronAPI.projects.getCurrent();
         const holding = await window.electronAPI.swimlanes.create({
           name: 'Live Delivery Holding',
@@ -156,23 +162,42 @@ test.describe('OpenCode live lane command delivery', () => {
         await window.electronAPI.swimlanes.update({ id: shipping, auto_command: command });
         if (!project) return null;
         const task = await window.electronAPI.tasks.create({
-          title: `OpenCode Live Delivery ${Date.now()}`,
-          description: 'Exercise root-native idle authorization',
-          swimlane_id: holding.id,
+          title,
+          description,
+          swimlane_id: todo,
         }, project.id);
         return task.id;
       }, {
+        todo: lanes.todo,
         executing: lanes.executing,
         review: lanes.review,
         tests: lanes.tests,
         shipping: lanes.shipping,
         bootstrap: BOOTSTRAP_PROMPT_CANARY,
         command: LIVE_COMMAND_CANARY,
+        title: taskTitle,
+        description: taskDescription,
       });
       if (!taskId) throw new Error('OpenCode live delivery E2E requires a current project');
-      await moveTaskIpc(page, taskId, lanes.executing);
-      await expect.poll(() => readPromptCaptures(paths.capture)).toEqual([BOOTSTRAP_PROMPT_CANARY]);
+      const freshMove = await moveTaskIpc(page, taskId, lanes.executing);
+      expect(freshMove).toEqual({
+        ok: true,
+        autoCommand: {
+          kind: 'skipped',
+          reason: 'fresh-not-supported',
+          warning: 'Auto-command was skipped because OpenCode fresh-session delivery is not supported.',
+        },
+      });
       await waitForAgentSessionId(page, taskId, 'ses_2349b5c91ffeKd6qajuUTR4clq');
+      await expect.poll(() => readPromptCaptures(paths.capture).length).toBe(1);
+      const initialPrompts = readPromptCaptures(paths.capture);
+      expect(initialPrompts).toHaveLength(1);
+      const initialPrompt = initialPrompts[0];
+      if (initialPrompt === undefined) throw new Error('Expected exactly one initial OpenCode prompt capture');
+      expect(initialPrompt).toContain(taskTitle);
+      expect(initialPrompt).toContain(taskDescription);
+      expect(initialPrompt).not.toContain(BOOTSTRAP_PROMPT_CANARY);
+      expect(initialPrompt).not.toContain(LIVE_COMMAND_CANARY);
 
       const readSessionId = async (): Promise<string | null> => page.evaluate(async (id) => {
         const sessions = await window.electronAPI.sessions.list();
@@ -189,7 +214,15 @@ test.describe('OpenCode live lane command delivery', () => {
         return events.some((event) => event.type === 'session_start');
       }, sessionId), { intervals: [POLL_INTERVAL_MS], timeout: 15_000 }).toBe(true);
 
-      await moveTaskIpc(page, taskId, lanes.review);
+      const activeMove = await moveTaskIpc(page, taskId, lanes.review);
+      expect(activeMove).toEqual({
+        ok: true,
+        autoCommand: {
+          kind: 'scheduled',
+          transport: 'native-idle',
+          generation: expect.any(Number),
+        },
+      });
       await expect.poll(async () => page.evaluate(async ({ id, captureId }) => {
         const tasks = await window.electronAPI.tasks.list();
         const sessions = await window.electronAPI.sessions.list();
@@ -253,11 +286,37 @@ test.describe('OpenCode live lane command delivery', () => {
       });
       await waitForFile(paths.probeReceipt, 'received');
       expect(await fs.promises.readFile(paths.receipt, 'utf8')).toBe('received\n');
-      expect(readPromptCaptures(paths.capture)).toEqual([BOOTSTRAP_PROMPT_CANARY]);
+      expect(readPromptCaptures(paths.capture)).toHaveLength(1);
+      expect(readPromptCaptures(paths.capture)).not.toContain(LIVE_COMMAND_CANARY);
       expect(await fs.promises.readFile(paths.launchMarkers, 'utf8')).toBe('launch\n');
       const inputBytes = await fs.promises.readFile(paths.inputCapture);
       expect(inputBytes[0]).toBe(0x7f);
       expect(inputBytes.includes(0x03)).toBe(false);
+
+      const holdingId = await page.evaluate(async () => {
+        const swimlanes = await window.electronAPI.swimlanes.list();
+        return swimlanes.find((lane) => lane.name === 'Live Delivery Holding')?.id ?? null;
+      });
+      if (!holdingId) throw new Error('OpenCode live delivery E2E requires the holding lane');
+      const legacyTaskId = await page.evaluate(async ({ holdingId }) => {
+        const project = await window.electronAPI.projects.getCurrent();
+        if (!project) return null;
+        const task = await window.electronAPI.tasks.create({
+          title: `Legacy live delivery ${Date.now()}`,
+          description: 'Exercise the non-OpenCode delivery transport.',
+          swimlane_id: holdingId,
+          agent_override: 'claude',
+        }, project.id);
+        return task.id;
+      }, { holdingId });
+      if (!legacyTaskId) throw new Error('OpenCode live delivery E2E could not create the legacy task');
+
+      const legacyMove = await moveTaskIpc(page, legacyTaskId, lanes.executing);
+      expect(legacyMove).toEqual({
+        ok: true,
+        autoCommand: { kind: 'scheduled', transport: 'legacy' },
+      });
+      expect(await fs.promises.readFile(paths.launchMarkers, 'utf8')).toBe('launch\n');
     } finally {
       await closeApp(app);
       cleanupTempProject(testName);

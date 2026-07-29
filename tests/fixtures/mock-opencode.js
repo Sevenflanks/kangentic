@@ -25,7 +25,6 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
-const { pathToFileURL } = require('node:url');
 
 const args = process.argv.slice(2);
 
@@ -70,12 +69,23 @@ appendCapture({ kind: 'launch', argv: process.argv.slice(2) });
 const MOCK_SESSION_ID = 'ses_2349b5c91ffeKd6qajuUTR4clq';
 
 async function activateInstalledPlugin() {
-  const pluginPath = path.join(process.cwd(), '.opencode', 'plugins', 'kangentic-activity.mjs');
-  const { KangenticActivity } = await import(pathToFileURL(pluginPath).href);
-  await KangenticActivity({
+  const pluginPath = path.join(process.cwd(), '.opencode', 'plugins', 'kangentic-activity.js');
+  // 以 data URL 固定用 ESM 解析，避免 disposable project 的 package type 將 installed `.js` 當成 CommonJS。
+  const pluginBytes = fs.readFileSync(pluginPath);
+  const pluginUrl = `data:text/javascript;base64,${pluginBytes.toString('base64')}`;
+  const { KangenticActivity } = await import(pluginUrl);
+  const hooks = KangenticActivity({
     client: {
       session: {
-        create: async () => ({ data: { id: MOCK_SESSION_ID } }),
+        create: async () => {
+          hooks.event({
+            event: {
+              type: 'session.created',
+              properties: { info: { id: MOCK_SESSION_ID } },
+            },
+          });
+          return { data: { id: MOCK_SESSION_ID } };
+        },
         get: async ({ path: requestPath }) => ({ data: { id: requestPath.id } }),
         promptAsync: async ({ body }) => {
           const textPart = body.parts.find((part) => part.type === 'text');
