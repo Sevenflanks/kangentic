@@ -73,6 +73,39 @@ describe('OpenCode Adapter', () => {
       });
     });
 
+    it('delegates active Main-session Auto-command policy to the OpenCode boundary', () => {
+      // Given
+      const input = {
+        hasCommand: true,
+        destinationAutoSpawn: true,
+        lifecycle: { kind: 'active-live' } as const,
+        currentSessionRunning: true,
+        currentSessionWritable: true,
+        currentAgent: 'opencode',
+        destinationAgent: 'opencode',
+        currentTrack: null,
+        destinationTrack: null,
+        liveSubmissionPolicy: adapter.liveSubmissionPolicy,
+        rootNativeSessionId: 'ses_root_123',
+        sessionGeneration: 4,
+        inputGeneration: 9,
+        destinationLaneId: 'lane-build',
+        sequence: ['review the current change'],
+      };
+
+      // When
+      const disposition = adapter.getAutoCommandDisposition(input);
+
+      // Then
+      expect(disposition).toMatchObject({
+        kind: 'deliver-live',
+        policy: adapter.liveSubmissionPolicy,
+      });
+      if (disposition.kind === 'deliver-live') {
+        expect(disposition.fingerprint).toEqual(expect.any(String));
+      }
+    });
+
     it('declares only OpenCode-native permission options (Plan and Build)', () => {
       // OpenCode's autonomy is expressed through agents, not the
       // Claude-shaped 4-mode union. The dropdown should only offer
@@ -764,7 +797,7 @@ describe('OpenCodeAdapter - removeHooks refcount deferral', () => {
   let concurrentAdapter: OpenCodeAdapter;
 
   function pluginPath(): string {
-    return path.join(projectDir, '.opencode', 'plugins', 'kangentic-activity.mjs');
+    return path.join(projectDir, '.opencode', 'plugins', 'kangentic-activity.js');
   }
 
   function makeBuildOptions(taskId: string, hookOwnerId?: string): SpawnCommandOptions {
@@ -845,8 +878,8 @@ describe('OpenCodeAdapter - removeHooks refcount deferral', () => {
     const projectRoot = path.join(projectDir, 'main-project');
     fs.mkdirSync(cwd);
     fs.mkdirSync(projectRoot);
-    const cwdPluginPath = path.join(cwd, '.opencode', 'plugins', 'kangentic-activity.mjs');
-    const projectRootPluginPath = path.join(projectRoot, '.opencode', 'plugins', 'kangentic-activity.mjs');
+    const cwdPluginPath = path.join(cwd, '.opencode', 'plugins', 'kangentic-activity.js');
+    const projectRootPluginPath = path.join(projectRoot, '.opencode', 'plugins', 'kangentic-activity.js');
 
     const buildOptions = {
       ...makeBuildOptions('task-worktree-alpha'),

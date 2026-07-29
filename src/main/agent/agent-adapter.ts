@@ -15,6 +15,10 @@ import type {
   AgentParser,
 } from '../../shared/types';
 import type { NativeIdleEvidence } from '../activity-engine/native-idle-evidence';
+import type {
+  AutoCommandDisposition,
+  AutoCommandDispositionInput,
+} from './auto-command-disposition';
 
 /**
  * Result of `AgentAdapter.parseTranscript`. `entries` is the parsed
@@ -198,6 +202,8 @@ export interface AgentAdapter {
   readonly initialPromptDelivery?: InitialPromptDelivery;
 
   readonly liveSubmissionPolicy?: LiveSubmissionPolicy;
+
+  getAutoCommandDisposition?(input: AutoCommandDispositionInput): AutoCommandDisposition;
 
   ingestPrivateEventLines?(input: PrivateEventLinesInput): void;
 

@@ -8,6 +8,7 @@ import { parseOpenCodeTranscript, openCodeTranscriptSourcePath } from './transcr
 import { migrateOpenCodeProjectData } from './project-relocation';
 import { removeHooks as removeOpenCodeHooks } from './hook-manager';
 import { discoverOpenCodeCapabilities } from './capability-discovery';
+import { getOpenCodeAutoCommandDisposition } from './auto-command-policy';
 import { runCliPrintSummarize, buildSummarizePrompt } from '../../shared/auto-name';
 import type {
   AgentAdapter,
@@ -24,6 +25,10 @@ import { EventTypeActivity } from '../../../../shared/types';
 import { parseOpenCodeNativeBoundary } from './native-boundary';
 import type { EventType as SessionEventType } from '../../../../shared/types';
 import type { PrivateEventLinesInput } from '../../agent-adapter';
+import type {
+  AutoCommandDisposition,
+  AutoCommandDispositionInput,
+} from '../../auto-command-disposition';
 
 const INITIAL_PROMPT_PAYLOAD_FILENAME = 'opencode-initial-prompt.json';
 const INITIAL_PROMPT_PAYLOAD_PATH_ENV = 'KANGENTIC_OPENCODE_INITIAL_PROMPT_PATH';
@@ -157,6 +162,10 @@ export class OpenCodeAdapter implements AgentAdapter {
     cancelOnUserInput: true,
     sendCtrlC: false,
   } as const;
+
+  getAutoCommandDisposition(input: AutoCommandDispositionInput): AutoCommandDisposition {
+    return getOpenCodeAutoCommandDisposition(input);
+  }
 
   ingestPrivateEventLines(input: PrivateEventLinesInput): void {
     for (const line of input.rawLines) {
