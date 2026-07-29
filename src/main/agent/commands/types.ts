@@ -1,5 +1,6 @@
 import type Database from 'better-sqlite3';
-import type { Task, Swimlane } from '../../../shared/types';
+import type { Task, Swimlane, TaskMoveInput } from '../../../shared/types';
+import type { AutoCommandImmediateOutcome, TaskMoveResult } from '../../../shared/auto-command-outcome';
 
 export interface CommandContext {
   getProjectDb: () => Database.Database;
@@ -7,7 +8,8 @@ export interface CommandContext {
   onTaskCreated: (task: Task, columnName: string, swimlaneId: string) => void;
   onTaskUpdated: (task: Task) => void;
   onTaskDeleted: (task: Task) => void;
-  onTaskMove: (input: { taskId: string; targetSwimlaneId: string; targetPosition: number }) => Promise<void>;
+  onTaskMove: (input: TaskMoveInput) => Promise<TaskMoveResult>;
+  onTaskAutoSpawn: (task: Pick<Task, 'id' | 'title'>, swimlaneId: string) => Promise<AutoCommandImmediateOutcome>;
   onSwimlaneUpdated: (swimlane: Swimlane) => void;
   onBacklogChanged: () => void;
   onLabelColorsChanged: (colors: Record<string, string>) => void;

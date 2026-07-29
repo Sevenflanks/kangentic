@@ -57,12 +57,9 @@ export function buildCommandContextForProject(
         ipcContext.mainWindow, IPC.TASK_CREATED_BY_AGENT, task.id, task.title, columnName, projectId,
       );
       ipcContext.boardEvents.emitBoardChanged({ projectId, change: 'task-created', ids: [task.id] });
-      // Auto-spawn fire-and-forget so the tool call returns immediately
-      // and Claude doesn't block on a multi-second PTY spawn.
-      autoSpawnForTask(ipcContext, projectId, task, swimlaneId).catch((err) => {
-        console.error('[mcp-http auto-spawn] Failed:', err);
-      });
     },
+
+    onTaskAutoSpawn: (task, swimlaneId) => autoSpawnForTask(ipcContext, projectId, task, swimlaneId),
 
     onTaskUpdated: (task) => {
       sendToRenderer(ipcContext.mainWindow, IPC.TASK_UPDATED_BY_AGENT, task.id, task.title, projectId);
@@ -101,7 +98,7 @@ export function buildCommandContextForProject(
     },
 
     onTaskMove: async (input) => {
-      await handleTaskMove(ipcContext, input, projectId, projectPath);
+      const result = await handleTaskMove(ipcContext, input, projectId, projectPath);
       // Notify renderer to reload board (handleTaskMove assumes UI initiated)
       const movedTask = getProjectDb(projectId)
         .prepare('SELECT id, title FROM tasks WHERE id = ?')
@@ -110,6 +107,7 @@ export function buildCommandContextForProject(
         sendToRenderer(ipcContext.mainWindow, IPC.TASK_UPDATED_BY_AGENT, movedTask.id, movedTask.title, projectId);
         ipcContext.boardEvents.emitBoardChanged({ projectId, change: 'task-updated', ids: [movedTask.id] });
       }
+      return result;
     },
 
     onSwimlaneUpdated: (swimlane) => {
