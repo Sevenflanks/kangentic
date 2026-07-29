@@ -179,6 +179,7 @@ export function App() {
     cleanups.push(() => {
       for (const timer of liveDeliveryTimers) clearTimeout(timer);
       useSessionStore.getState().clearLiveDeliveryStatuses();
+      useSessionStore.getState().clearAutoCommandWarnings();
     });
 
     if (sessions.onLiveDeliveryStatus) {
@@ -186,6 +187,14 @@ export function App() {
         if (status.projectId !== useProjectStore.getState().currentProject?.id) return;
         const sessionStore = useSessionStore.getState();
         sessionStore.setLiveDeliveryStatus(status);
+        if (useSessionStore.getState().liveDeliveryByTaskId[status.taskId] !== status) return;
+        // async delivery outcome 只會經過這個 listener；toast 放在這裡可避免和 immediate skipped、silent cancellation 重複。
+        if (status.state === 'cancelled' && status.reason === 'delivery-error') {
+          useToastStore.getState().addToast({
+            message: 'Lane command could not be delivered safely.',
+            variant: 'warning',
+          });
+        }
         if (status.state !== 'delivered') return;
         const timer = setTimeout(() => {
           liveDeliveryTimers.delete(timer);
@@ -325,6 +334,7 @@ export function App() {
         const currentSession = useSessionStore.getState().sessions.find((s) => s.id === sessionId);
         const exitedTaskId = currentSession?.taskId;
         if (exitedTaskId) {
+          useSessionStore.getState().clearAutoCommandWarningForTask(exitedTaskId);
           const timer = autoNameTimers.get(exitedTaskId);
           if (timer) {
             clearTimeout(timer);
