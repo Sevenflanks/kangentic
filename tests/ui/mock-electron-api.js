@@ -882,6 +882,14 @@
           archivedTasks.push(archived);
           tasks.splice(idx, 1);
         }
+
+        if (typeof window !== 'undefined' && window.__mockTaskMoveResult) {
+          var moveResult = window.__mockTaskMoveResult;
+          window.__mockTaskMoveResult = null;
+          return moveResult;
+        }
+
+        return { ok: true, autoCommand: { kind: 'not-applicable' } };
       },
       cancelSpawn: async function (taskId) {
         // Record cancellations so UI tests can assert the stall toast's Cancel
@@ -1371,6 +1379,10 @@
       __writeCalls: [],
       write: async function (sessionId, payload) {
         window.electronAPI.sessions.__writeCalls.push({ sessionId: sessionId, payload: payload });
+      },
+      __focusReportCalls: [],
+      writeFocusReport: async function (sessionId, report) {
+        window.electronAPI.sessions.__focusReportCalls.push({ sessionId: sessionId, report: report });
       },
       resize: async function () { return { colsChanged: false }; },
       list: async function () {
