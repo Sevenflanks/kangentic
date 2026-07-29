@@ -91,7 +91,8 @@ function makeContext(overrides: Partial<CommandContext> = {}): CommandContext {
     onTaskCreated: vi.fn(),
     onTaskUpdated: vi.fn(),
     onTaskDeleted: vi.fn(),
-    onTaskMove: vi.fn(async () => {}),
+    onTaskMove: vi.fn(async () => ({ ok: true, autoCommand: { kind: 'not-applicable' } })),
+    onTaskAutoSpawn: vi.fn(async () => ({ kind: 'not-applicable' })),
     onSwimlaneUpdated: vi.fn(),
     ...overrides,
   };
@@ -118,9 +119,9 @@ describe('handleCreateTask - labels survive a large description (round-trip guar
     }));
   });
 
-  it('persists label names and registers label colors with a 2KB description and a mixed labels array', () => {
+  it('persists label names and registers label colors with a 2KB description and a mixed labels array', async () => {
     // The exact #229 payload shape: a plain string label plus a {name, color} object.
-    const result = handleCreateTask(
+    const result = await handleCreateTask(
       {
         title: 'Fix the thing',
         description: LARGE_DESCRIPTION,
@@ -207,8 +208,8 @@ describe('handleCreateTask - persists the full description up to the raised 50,0
     }));
   });
 
-  it('persists a description well past the old 10,000-char cap in full (board task path, column omitted)', () => {
-    const result = handleCreateTask(
+  it('persists a description well past the old 10,000-char cap in full (board task path, column omitted)', async () => {
+    const result = await handleCreateTask(
       { title: 'Long description task', description: DESCRIPTION_OVER_OLD_TASK_CAP },
       context,
     );
@@ -281,8 +282,8 @@ describe('handleCreateTask - agent/model/effort/permissionMode/auto_command over
     }));
   });
 
-  it('forwards agentOverride/modelOverride/effortOverride/permissionMode/autoCommand to taskRepo.create', () => {
-    const result = handleCreateTask(
+  it('forwards agentOverride/modelOverride/effortOverride/permissionMode/autoCommand to taskRepo.create', async () => {
+    const result = await handleCreateTask(
       {
         title: 'Spawn with overrides',
         agentOverride: 'codex',
@@ -310,8 +311,8 @@ describe('handleCreateTask - agent/model/effort/permissionMode/auto_command over
     );
   });
 
-  it('omits every override key from taskRepo.create when none are provided (no accidental null overwrite)', () => {
-    const result = handleCreateTask({ title: 'No overrides' }, context);
+  it('omits every override key from taskRepo.create when none are provided (no accidental null overwrite)', async () => {
+    const result = await handleCreateTask({ title: 'No overrides' }, context);
 
     expect(result.success).toBe(true);
     expect(mockTaskRepoCreate).toHaveBeenCalledOnce();
@@ -339,10 +340,10 @@ describe('handleCreateTask - Backlog column enforces its own lower description c
     }));
   });
 
-  it('rejects a Backlog create whose description exceeds the backlog cap, and creates no row', () => {
+  it('rejects a Backlog create whose description exceeds the backlog cap, and creates no row', async () => {
     const overBacklogCapDescription = 'x'.repeat(BACKLOG_DESCRIPTION_MAX_LENGTH + 5_000);
 
-    const result = handleCreateTask(
+    const result = await handleCreateTask(
       { title: 'Too-long backlog item', description: overBacklogCapDescription, column: 'Backlog' },
       context,
     );
@@ -353,8 +354,8 @@ describe('handleCreateTask - Backlog column enforces its own lower description c
     expect(mockTaskRepoCreate).not.toHaveBeenCalled();
   });
 
-  it('creates a backlog item normally when the description is within the backlog cap', () => {
-    const result = handleCreateTask(
+  it('creates a backlog item normally when the description is within the backlog cap', async () => {
+    const result = await handleCreateTask(
       { title: 'Short backlog item', description: 'A short description', column: 'Backlog' },
       context,
     );
