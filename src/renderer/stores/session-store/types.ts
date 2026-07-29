@@ -10,6 +10,7 @@ import type { TaskChangesPanelSlice } from './task-changes-panel-slice';
 import type { TransientSessionSlice } from './transient-session-slice';
 import type { RateLimitSnapshot } from '../../utils/rate-limit-window';
 import type { LiveDeliveryStatus } from '../../../shared/live-delivery-status';
+import type { AutoCommandWarning } from '../../../shared/auto-command-outcome';
 
 /** A one-shot capture of a task's terminal scrollback viewport at the moment
  *  its conversation viewer was opened. See `pendingTuiAnchor` below. */
@@ -126,6 +127,8 @@ export interface CoreSessionSlice {
   spawnProgress: Record<string, string>;
   /** Ephemeral, project-scoped delivery feedback keyed by task ID. */
   liveDeliveryByTaskId: Record<string, LiveDeliveryStatus>;
+  /** Ephemeral, project-scoped auto-command feedback keyed by task ID. */
+  autoCommandWarningsByTaskId: Record<string, AutoCommandWarning>;
   _pendingOpenTaskId: string | null;
   /** One-shot flag set by notification click for transient (Command Terminal) sessions. */
   _pendingOpenCommandTerminal: boolean;
@@ -191,6 +194,10 @@ export interface CoreSessionSlice {
   clearLiveDeliveryStatusForSession: (sessionId: string) => void;
   clearDeliveredLiveDeliveryStatus: (status: LiveDeliveryStatus) => void;
   clearLiveDeliveryStatuses: () => void;
+  setAutoCommandWarning: (warning: AutoCommandWarning) => void;
+  clearAutoCommandWarningForTask: (taskId: string) => void;
+  clearAutoCommandWarningsForTasks: (taskIds: readonly string[]) => void;
+  clearAutoCommandWarnings: () => void;
   markIdleSessionsSeen: (projectId: string) => void;
   markSingleIdleSessionSeen: (sessionId: string) => void;
 

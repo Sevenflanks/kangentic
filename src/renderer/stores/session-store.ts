@@ -9,8 +9,10 @@ import { createTaskChangesPanelSlice } from './session-store/task-changes-panel-
 import { createTransientSessionSlice, transientKey, type TransientSessionEntry } from './session-store/transient-session-slice';
 import { mergeRateLimitSnapshot } from '../utils/rate-limit-window';
 import type { LiveDeliveryStatus } from '../../shared/live-delivery-status';
+import type { AutoCommandWarning } from '../../shared/auto-command-outcome';
 
 const MAX_EVENTS_PER_SESSION = 500;
+const DELIVERY_ERROR_WARNING_MESSAGE = 'Lane command could not be delivered safely.';
 
 function withoutLiveDeliveryTask(
   statuses: Record<string, LiveDeliveryStatus>,
@@ -18,6 +20,24 @@ function withoutLiveDeliveryTask(
 ): Record<string, LiveDeliveryStatus> {
   const { [taskId]: _removed, ...remaining } = statuses;
   return remaining;
+}
+
+function withoutAutoCommandWarningTask(
+  warnings: Record<string, AutoCommandWarning>,
+  taskId: string,
+): Record<string, AutoCommandWarning> {
+  const { [taskId]: _removed, ...remaining } = warnings;
+  return remaining;
+}
+
+function withoutAutoCommandWarningTasks(
+  warnings: Record<string, AutoCommandWarning>,
+  taskIds: readonly string[],
+): Record<string, AutoCommandWarning> {
+  const taskIdSet = new Set(taskIds);
+  return Object.fromEntries(
+    Object.entries(warnings).filter(([taskId]) => !taskIdSet.has(taskId)),
+  );
 }
 
 function withoutLiveDeliverySession(
@@ -265,6 +285,7 @@ export const useSessionStore = create<SessionStore>((set, get, api) => ({
   pendingCommandLabel: preservedPendingCommandLabel,
   spawnProgress: preservedSpawnProgress,
   liveDeliveryByTaskId: {},
+  autoCommandWarningsByTaskId: {},
   _pendingOpenTaskId: null,
   _pendingOpenCommandTerminal: false,
   setPendingOpenCommandTerminal: (value) => set({ _pendingOpenCommandTerminal: value }),
@@ -283,6 +304,8 @@ export const useSessionStore = create<SessionStore>((set, get, api) => ({
     // Snapshot session references before async gap -- used to detect
     // IPC-delivered updates that arrive during the gap.
     const preAsyncSessions = new Map(get().sessions.map((s) => [s.id, s]));
+    const preAsyncSessionIdsByTaskId = new Map(get().sessions.map((s) => [s.taskId, s.id]));
+    const preAsyncWarningsByTaskId = get().autoCommandWarningsByTaskId;
 
     // Sessions list is always unscoped -- sidebar needs cross-project data.
     // Usage/events are scoped to current project; activity, first-output and
@@ -356,6 +379,20 @@ export const useSessionStore = create<SessionStore>((set, get, api) => ({
     const nextLiveDeliveryByTaskId = Object.fromEntries(
       Object.entries(currentState.liveDeliveryByTaskId).filter(([taskId, status]) =>
         liveTaskIds.has(taskId) && liveSessionIds.has(status.sessionId)),
+    );
+    const arrivedOrReplacedTaskIds = new Set(
+      mergedSessions
+        .filter((session) => {
+          const previousSessionId = preAsyncSessionIdsByTaskId.get(session.taskId);
+          // 首次 session 也會解決舊 warning；但 async gap 新增的 warning 屬於較新的事件，不可清除。
+          return previousSessionId !== session.id;
+        })
+        .map((session) => session.taskId),
+    );
+    const nextAutoCommandWarningsByTaskId = Object.fromEntries(
+      Object.entries(currentState.autoCommandWarningsByTaskId).filter(([taskId, warning]) =>
+        !arrivedOrReplacedTaskIds.has(taskId) || preAsyncWarningsByTaskId[taskId] !== warning,
+      ),
     );
 
     // spawnProgress: reconcile against the queryable main map. Cleared for any
@@ -445,6 +482,7 @@ export const useSessionStore = create<SessionStore>((set, get, api) => ({
       spawnProgress: nextSpawnProgress,
       pendingCommandLabel: nextPendingCommandLabel,
       liveDeliveryByTaskId: nextLiveDeliveryByTaskId,
+      autoCommandWarningsByTaskId: nextAutoCommandWarningsByTaskId,
     });
 
     // Recover transient session entries after a full page reload. The main
@@ -491,6 +529,7 @@ export const useSessionStore = create<SessionStore>((set, get, api) => ({
         sessions,
         _sessionByTaskId: buildSessionByTaskId(sessions),
         activeSessionId: session.id,
+        autoCommandWarningsByTaskId: withoutAutoCommandWarningTask(s.autoCommandWarningsByTaskId, session.taskId),
       };
     });
     return session;
@@ -499,6 +538,7 @@ export const useSessionStore = create<SessionStore>((set, get, api) => ({
   killSession: async (id) => {
     await window.electronAPI.sessions.kill(id);
     set((s) => {
+      const taskId = s.sessions.find((session) => session.id === id)?.taskId;
       const sessions = s.sessions.map((sess) =>
         sess.id === id ? { ...sess, status: 'exited' as const, exitCode: -1 } : sess
       );
@@ -506,6 +546,9 @@ export const useSessionStore = create<SessionStore>((set, get, api) => ({
         sessions,
         _sessionByTaskId: buildSessionByTaskId(sessions),
         liveDeliveryByTaskId: withoutLiveDeliverySession(s.liveDeliveryByTaskId, id),
+        autoCommandWarningsByTaskId: taskId
+          ? withoutAutoCommandWarningTask(s.autoCommandWarningsByTaskId, taskId)
+          : s.autoCommandWarningsByTaskId,
       };
     });
   },
@@ -518,6 +561,7 @@ export const useSessionStore = create<SessionStore>((set, get, api) => ({
         sessions,
         _sessionByTaskId: buildSessionByTaskId(sessions),
         liveDeliveryByTaskId: withoutLiveDeliveryTask(s.liveDeliveryByTaskId, taskId),
+        autoCommandWarningsByTaskId: withoutAutoCommandWarningTask(s.autoCommandWarningsByTaskId, taskId),
       };
     });
   },
@@ -532,6 +576,7 @@ export const useSessionStore = create<SessionStore>((set, get, api) => ({
         sessions,
         _sessionByTaskId: buildSessionByTaskId(sessions),
         liveDeliveryByTaskId: withoutLiveDeliveryTask(s.liveDeliveryByTaskId, taskId),
+        autoCommandWarningsByTaskId: withoutAutoCommandWarningTask(s.autoCommandWarningsByTaskId, taskId),
       };
     });
     await window.electronAPI.sessions.suspend(taskId, useProjectStore.getState().currentProject?.id ?? null);
@@ -548,6 +593,7 @@ export const useSessionStore = create<SessionStore>((set, get, api) => ({
         sessions,
         _sessionByTaskId: buildSessionByTaskId(sessions),
         activeSessionId: newSession.id,
+        autoCommandWarningsByTaskId: withoutAutoCommandWarningTask(s.autoCommandWarningsByTaskId, taskId),
       };
     });
     return newSession;
@@ -587,6 +633,10 @@ export const useSessionStore = create<SessionStore>((set, get, api) => ({
         sessions,
         _sessionByTaskId: buildSessionByTaskId(sessions),
         spawnProgress: remainingProgress,
+        autoCommandWarningsByTaskId: withoutAutoCommandWarningTask(
+          state.autoCommandWarningsByTaskId,
+          liveSession.taskId,
+        ),
       };
     });
     return liveSession;
@@ -659,6 +709,10 @@ export const useSessionStore = create<SessionStore>((set, get, api) => ({
         _sessionByTaskId: buildSessionByTaskId(sessions),
         spawnProgress: remainingProgress,
         liveDeliveryByTaskId,
+        autoCommandWarningsByTaskId: withoutAutoCommandWarningTask(
+          state.autoCommandWarningsByTaskId,
+          session.taskId,
+        ),
       };
     });
   },
@@ -817,9 +871,31 @@ export const useSessionStore = create<SessionStore>((set, get, api) => ({
         return state;
       }
       if (isSilentLiveDeliveryStatus(status)) {
-        return { liveDeliveryByTaskId: withoutLiveDeliveryTask(state.liveDeliveryByTaskId, status.taskId) };
+        return {
+          liveDeliveryByTaskId: withoutLiveDeliveryTask(state.liveDeliveryByTaskId, status.taskId),
+          autoCommandWarningsByTaskId: withoutAutoCommandWarningTask(
+            state.autoCommandWarningsByTaskId,
+            status.taskId,
+          ),
+        };
       }
-      return { liveDeliveryByTaskId: { ...state.liveDeliveryByTaskId, [status.taskId]: status } };
+      const deliveryErrorWarning: AutoCommandWarning = {
+        projectId: status.projectId,
+        taskId: status.taskId,
+        reason: 'delivery-error',
+        message: DELIVERY_ERROR_WARNING_MESSAGE,
+        at: status.at,
+      };
+      const autoCommandWarningsByTaskId = status.state === 'cancelled' && status.reason === 'delivery-error'
+        ? {
+            ...state.autoCommandWarningsByTaskId,
+            [status.taskId]: deliveryErrorWarning,
+          }
+        : withoutAutoCommandWarningTask(state.autoCommandWarningsByTaskId, status.taskId);
+      return {
+        liveDeliveryByTaskId: { ...state.liveDeliveryByTaskId, [status.taskId]: status },
+        autoCommandWarningsByTaskId,
+      };
     });
   },
 
@@ -855,6 +931,36 @@ export const useSessionStore = create<SessionStore>((set, get, api) => ({
   },
 
   clearLiveDeliveryStatuses: () => set({ liveDeliveryByTaskId: {} }),
+
+  setAutoCommandWarning: (warning) => {
+    if (warning.projectId !== useProjectStore.getState().currentProject?.id) return;
+    set((state) => ({
+      autoCommandWarningsByTaskId: {
+        ...state.autoCommandWarningsByTaskId,
+        [warning.taskId]: warning,
+      },
+    }));
+  },
+
+  clearAutoCommandWarningForTask: (taskId) => {
+    set((state) => ({
+      autoCommandWarningsByTaskId: withoutAutoCommandWarningTask(
+        state.autoCommandWarningsByTaskId,
+        taskId,
+      ),
+    }));
+  },
+
+  clearAutoCommandWarningsForTasks: (taskIds) => {
+    set((state) => ({
+      autoCommandWarningsByTaskId: withoutAutoCommandWarningTasks(
+        state.autoCommandWarningsByTaskId,
+        taskIds,
+      ),
+    }));
+  },
+
+  clearAutoCommandWarnings: () => set({ autoCommandWarningsByTaskId: {} }),
 
   markIdleSessionsSeen: (projectId) => {
     const { sessions, sessionActivity, seenIdleSessions } = get();

@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import type { AutoCommandWarning } from '../../src/shared/auto-command-outcome';
 import type { LiveDeliveryStatus } from '../../src/shared/live-delivery-status';
 import type { Session } from '../../src/shared/types';
 
@@ -64,7 +65,22 @@ function deliveryStatus(
 
 function resetStore(): void {
   useProjectStore.setState({ currentProject: { id: 'project-1' } });
-  useSessionStore.setState({ liveDeliveryByTaskId: {}, sessions: [], _sessionByTaskId: new Map() });
+  useSessionStore.setState({
+    autoCommandWarningsByTaskId: {},
+    liveDeliveryByTaskId: {},
+    sessions: [],
+    _sessionByTaskId: new Map(),
+  });
+}
+
+function autoCommandWarning(taskId = 'task-1', projectId = 'project-1'): AutoCommandWarning {
+  return {
+    projectId,
+    taskId,
+    reason: 'no-active-main-session',
+    message: 'Lane command could not be scheduled for this task.',
+    at: '2026-07-27T00:00:00.000Z',
+  };
 }
 
 function session(status: Session['status']): Session {
@@ -84,6 +100,73 @@ function session(status: Session['status']): Session {
 
 describe('live delivery status store', () => {
   beforeEach(resetStore);
+
+  it('starts with no transient auto-command warnings', () => {
+    expect(useSessionStore.getState().autoCommandWarningsByTaskId).toEqual({});
+  });
+
+  it('stores warnings only for the active project and dismisses one task only', () => {
+    const firstWarning = autoCommandWarning();
+    const secondWarning = autoCommandWarning('task-2');
+
+    useSessionStore.getState().setAutoCommandWarning({ ...firstWarning, projectId: 'project-2' });
+    useSessionStore.getState().setAutoCommandWarning(firstWarning);
+    useSessionStore.getState().setAutoCommandWarning(secondWarning);
+    useSessionStore.getState().clearAutoCommandWarningForTask('task-1');
+
+    expect(useSessionStore.getState().autoCommandWarningsByTaskId).toEqual({
+      'task-2': secondWarning,
+    });
+  });
+
+  it('replaces a prior warning when live delivery progresses or is cancelled', () => {
+    for (const state of ['waiting', 'sending', 'delivered', 'cancelled'] as const) {
+      useSessionStore.setState({ autoCommandWarningsByTaskId: { 'task-1': autoCommandWarning() } });
+
+      useSessionStore.getState().setLiveDeliveryStatus(deliveryStatus(1, state));
+
+      expect(useSessionStore.getState().autoCommandWarningsByTaskId).toEqual({});
+    }
+  });
+
+  it('creates a safe sessionless warning for an asynchronous delivery error', () => {
+    const status = {
+      ...deliveryStatus(1, 'cancelled'),
+      reason: 'delivery-error',
+      at: '2026-07-27T00:00:00.000Z',
+    } satisfies LiveDeliveryStatus;
+
+    useSessionStore.getState().setLiveDeliveryStatus(status);
+
+    expect(useSessionStore.getState().autoCommandWarningsByTaskId).toEqual({
+      'task-1': {
+        projectId: 'project-1',
+        taskId: 'task-1',
+        reason: 'delivery-error',
+        message: 'Lane command could not be delivered safely.',
+        at: status.at,
+      },
+    });
+  });
+
+  it('clears warnings when a task receives a replacement session or task lifecycle cleanup', () => {
+    useSessionStore.getState().setAutoCommandWarning(autoCommandWarning());
+    useSessionStore.getState().upsertSession(session('running'));
+
+    expect(useSessionStore.getState().autoCommandWarningsByTaskId).toEqual({});
+
+    useSessionStore.getState().setAutoCommandWarning(autoCommandWarning('task-1'));
+    useSessionStore.getState().setAutoCommandWarning(autoCommandWarning('task-2'));
+    useSessionStore.getState().clearAutoCommandWarningsForTasks(['task-1']);
+
+    expect(useSessionStore.getState().autoCommandWarningsByTaskId).toEqual({
+      'task-2': autoCommandWarning('task-2'),
+    });
+
+    useSessionStore.getState().clearAutoCommandWarnings();
+
+    expect(useSessionStore.getState().autoCommandWarningsByTaskId).toEqual({});
+  });
 
   it('keeps the newest generation for the current project', () => {
     const generationTwo = deliveryStatus(2, 'waiting');
@@ -164,5 +247,71 @@ describe('live delivery status store', () => {
     await useSessionStore.getState().syncSessions();
 
     expect(useSessionStore.getState().liveDeliveryByTaskId).toEqual({});
+  });
+
+  it('preserves a warning when sync confirms the same live session', async () => {
+    useSessionStore.setState({ sessions: [session('running')] });
+    useSessionStore.getState().setAutoCommandWarning(autoCommandWarning());
+    window.electronAPI.sessions.list = async () => [session('running')];
+
+    await useSessionStore.getState().syncSessions();
+
+    expect(useSessionStore.getState().autoCommandWarningsByTaskId).toEqual({
+      'task-1': autoCommandWarning(),
+    });
+  });
+
+  it('preserves a warning delivered while a same-session sync is in flight', async () => {
+    useSessionStore.setState({ sessions: [session('running')] });
+    let resolveList: ((sessions: Session[]) => void) | undefined;
+    window.electronAPI.sessions.list = () => new Promise<Session[]>((resolve) => {
+      resolveList = resolve;
+    });
+
+    const sync = useSessionStore.getState().syncSessions();
+    useSessionStore.getState().setAutoCommandWarning(autoCommandWarning());
+    resolveList?.([session('running')]);
+
+    await sync;
+
+    expect(useSessionStore.getState().autoCommandWarningsByTaskId).toEqual({
+      'task-1': autoCommandWarning(),
+    });
+  });
+
+  it('clears a pre-existing warning when sync replaces its session identity', async () => {
+    useSessionStore.setState({ sessions: [{ ...session('running'), id: 'old-session' }] });
+    useSessionStore.getState().setAutoCommandWarning(autoCommandWarning());
+    window.electronAPI.sessions.list = async () => [{ ...session('running'), id: 'replacement-session' }];
+
+    await useSessionStore.getState().syncSessions();
+
+    expect(useSessionStore.getState().autoCommandWarningsByTaskId).toEqual({});
+  });
+
+  it('clears a pre-existing warning when sync first discovers a task session', async () => {
+    useSessionStore.getState().setAutoCommandWarning(autoCommandWarning());
+    window.electronAPI.sessions.list = async () => [session('running')];
+
+    await useSessionStore.getState().syncSessions();
+
+    expect(useSessionStore.getState().autoCommandWarningsByTaskId).toEqual({});
+  });
+
+  it('preserves a warning created during sync when it first discovers a task session', async () => {
+    let resolveList: ((sessions: Session[]) => void) | undefined;
+    window.electronAPI.sessions.list = () => new Promise<Session[]>((resolve) => {
+      resolveList = resolve;
+    });
+
+    const sync = useSessionStore.getState().syncSessions();
+    useSessionStore.getState().setAutoCommandWarning(autoCommandWarning());
+    resolveList?.([session('running')]);
+
+    await sync;
+
+    expect(useSessionStore.getState().autoCommandWarningsByTaskId).toEqual({
+      'task-1': autoCommandWarning(),
+    });
   });
 });
