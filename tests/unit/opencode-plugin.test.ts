@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest';
+import { afterEach, describe, it, expect, vi } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import {
@@ -6,6 +6,7 @@ import {
   extractToolDetail,
   extractToolEndEvent,
   extractToolStartEvent,
+  KangenticActivity,
 } from '../../src/main/agent/adapters/opencode/plugin/kangentic-activity.mjs';
 
 const fixturePath = path.join(__dirname, '..', 'fixtures', 'opencode-plugin-events.json');
@@ -13,7 +14,25 @@ const fixtures = JSON.parse(fs.readFileSync(fixturePath, 'utf-8'));
 
 const FIXED_TIMESTAMP = 1717000000000;
 
+afterEach(() => vi.useRealTimers());
+
 describe('opencode-plugin', () => {
+  it('exposes synchronous callbacks that do not require caller await', () => {
+    vi.useFakeTimers();
+    const hooks = KangenticActivity({
+      client: {
+        session: {},
+        tui: {},
+      },
+      directory: process.cwd(),
+    });
+
+    expect(hooks).not.toBeInstanceOf(Promise);
+    expect(hooks.event({ event: { type: 'unknown' } })).toBeUndefined();
+    expect(hooks['tool.execute.before']({ tool: 'bash' }, { args: { command: 'pwd' } })).toBeUndefined();
+    expect(hooks['tool.execute.after']({ tool: 'bash' })).toBeUndefined();
+  });
+
   describe('extractSessionEvent', () => {
     it('maps session.created to session_start with sessionID hookContext', () => {
       const result = extractSessionEvent(fixtures.event_session_created, FIXED_TIMESTAMP);
