@@ -131,9 +131,10 @@ describe('handleTaskMove live lane submission', () => {
         warning: 'Auto-command was skipped because required OpenCode native session evidence is unavailable.',
       },
     });
-    expect(state.task.auto_command).toBeNull();
+    expect(state.task.auto_command).toBe('/task-level-command');
     expect(state.destinationLane.auto_command).toBe('/lane-level-command');
     expect(scheduler.scheduleNativeIdleSubmission).not.toHaveBeenCalled();
+    expect(taskAutoCommandConsumptionLockCounts).toEqual([]);
   });
 
   it('returns no-active-main-session and consumes the task command when live ownership is missing', async () => {
