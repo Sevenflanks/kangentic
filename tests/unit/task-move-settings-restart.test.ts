@@ -35,7 +35,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import type { Task, Swimlane } from '../../src/shared/types';
+import type { Session, Task, Swimlane } from '../../src/shared/types';
 
 const hoisted = vi.hoisted(() => ({
   activeRecord: null as Record<string, unknown> | null,
@@ -111,7 +111,7 @@ vi.mock('../../src/main/agent/shared', () => ({
 const mockGetProjectRepos = vi.fn();
 const mockEnsureTaskWorktree = vi.fn(async () => null);
 const mockEnsureTaskBranchCheckout = vi.fn(async () => {});
-const mockSpawnAgent = vi.fn(async () => {});
+const mockSpawnAgent = vi.fn(async () => ({ kind: 'not-applicable' } as const));
 const mockCreateTransitionEngine = vi.fn(() => ({}));
 const mockBuildAutoCommandVars = vi.fn(() => ({}));
 
@@ -186,10 +186,29 @@ function makeSwimlane(id: string, overrides: Partial<Swimlane> = {}): Swimlane {
 }
 
 function makeContext(taskRepo: unknown, swimlaneRepo: unknown) {
+  const getSession = vi.fn((sessionId: string): Session | undefined => {
+    if (hoisted.activeRecord?.id !== sessionId) return undefined;
+    return {
+      id: sessionId,
+      taskId: 'task-aaa00001',
+      projectId: 'proj-test',
+      pid: 12345,
+      status: 'running',
+      shell: '/bin/bash',
+      cwd: '/mock/project',
+      startedAt: '2026-01-01T00:00:00.000Z',
+      exitCode: null,
+      resuming: false,
+      agentSessionId: 'agent-A',
+    };
+  });
   const sessionManager = {
     removeByTaskId: vi.fn(),
     killByTaskId: vi.fn(),
     listSessions: vi.fn(() => []),
+    getSession,
+    isWritable: vi.fn((sessionId: string) => getSession(sessionId) !== undefined),
+    snapshotNativeIdle: vi.fn(() => null),
     suspend: vi.fn(async () => {}),
   };
   const context = {
@@ -307,7 +326,7 @@ describe('handleTaskMove model/effort restart and live-injection', () => {
     hoisted.updateAppliedSettings.mockReset();
     mockEnsureTaskWorktree.mockResolvedValue(null);
     mockEnsureTaskBranchCheckout.mockResolvedValue(undefined);
-    mockSpawnAgent.mockResolvedValue(undefined);
+    mockSpawnAgent.mockResolvedValue({ kind: 'not-applicable' });
     vi.mocked(prepareInjectionPlan).mockReturnValue(null);
   });
 

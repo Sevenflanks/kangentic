@@ -47,6 +47,7 @@ vi.mock('../../src/main/db/database', () => ({ getProjectDb: vi.fn(() => ({})) }
 vi.mock('../../src/main/db/repositories/task-repository', () => ({ TaskRepository: class {} }));
 vi.mock('../../src/main/db/repositories/session-repository', () => ({
   SessionRepository: class {
+    findById = vi.fn((sessionId: string) => hoisted.activeRecord?.id === sessionId ? hoisted.activeRecord : undefined);
     getLatestForTask = vi.fn(() => hoisted.activeRecord);
     getSummaryForTask = vi.fn(() => null);
     updateGitStats = vi.fn();
@@ -104,7 +105,7 @@ vi.mock('../../src/main/agent/shared', () => ({
 const mockGetProjectRepos = vi.fn();
 const mockEnsureTaskWorktree = vi.fn(async () => null);
 const mockEnsureTaskBranchCheckout = vi.fn(async () => {});
-const mockSpawnAgent = vi.fn(async () => {});
+const mockSpawnAgent = vi.fn(async () => ({ kind: 'not-applicable' } as const));
 const mockCreateTransitionEngine = vi.fn(() => ({}));
 const mockBuildAutoCommandVars = vi.fn(() => ({}));
 
@@ -217,7 +218,7 @@ describe('handleTaskMove git-churn capture wiring', () => {
     mockPrepareInjectionPlan.mockReturnValue(null);
     mockEnsureTaskWorktree.mockResolvedValue(null);
     mockEnsureTaskBranchCheckout.mockResolvedValue(undefined);
-    mockSpawnAgent.mockResolvedValue(undefined);
+    mockSpawnAgent.mockResolvedValue({ kind: 'not-applicable' });
   });
 
   it('Priority 2 (move to Done): captures git churn for the latest session record using the resolved default branch', async () => {
@@ -273,7 +274,7 @@ describe('handleTaskMove git-churn capture wiring', () => {
     };
 
     const taskRepo = {
-      getById: vi.fn(() => makeTask({ swimlane_id: EXEC_LANE_ID, session_id: 'active-session-1' })),
+      getById: vi.fn(() => makeTask({ swimlane_id: EXEC_LANE_ID, session_id: 'rec-noswap' })),
       move: vi.fn(),
       update: vi.fn(),
       archive: vi.fn(),
@@ -285,7 +286,7 @@ describe('handleTaskMove git-churn capture wiring', () => {
       taskId: TASK_ID, targetSwimlaneId: 'lane-no-spawn', targetPosition: 0,
     });
 
-    expect(context.sessionManager.suspend).toHaveBeenCalledWith('active-session-1');
+    expect(context.sessionManager.suspend).toHaveBeenCalledWith('rec-noswap');
     expect(hoisted.captureGitChurn).toHaveBeenCalledWith(
       expect.objectContaining({ id: TASK_ID }),
       expect.anything(),
@@ -313,7 +314,7 @@ describe('handleTaskMove git-churn capture wiring', () => {
 
     const taskRepo = {
       getById: vi.fn()
-        .mockReturnValueOnce(makeTask({ swimlane_id: EXEC_LANE_ID, session_id: 'active-session-1' }))
+        .mockReturnValueOnce(makeTask({ swimlane_id: EXEC_LANE_ID, session_id: 'rec-main' }))
         .mockReturnValue(makeTask({ swimlane_id: 'lane-review-isolated', session_id: null })),
       move: vi.fn(),
       update: vi.fn(),
@@ -354,7 +355,7 @@ describe('handleTaskMove git-churn capture wiring', () => {
 
     const taskRepo = {
       getById: vi.fn()
-        .mockReturnValueOnce(makeTask({ swimlane_id: EXEC_LANE_ID, session_id: 'active-session-1', agent: 'claude' }))
+        .mockReturnValueOnce(makeTask({ swimlane_id: EXEC_LANE_ID, session_id: 'rec-handoff', agent: 'claude' }))
         .mockReturnValue(makeTask({ swimlane_id: 'lane-codex', session_id: null, agent: 'claude' })),
       move: vi.fn(),
       update: vi.fn(),
@@ -396,7 +397,7 @@ describe('handleTaskMove git-churn capture wiring', () => {
 
     const taskRepo = {
       getById: vi.fn()
-        .mockReturnValueOnce(makeTask({ swimlane_id: EXEC_LANE_ID, session_id: 'active-session-1' }))
+        .mockReturnValueOnce(makeTask({ swimlane_id: EXEC_LANE_ID, session_id: 'rec-model-restart' }))
         .mockReturnValue(makeTask({ swimlane_id: 'lane-target', session_id: null })),
       move: vi.fn(),
       update: vi.fn(),
@@ -409,7 +410,7 @@ describe('handleTaskMove git-churn capture wiring', () => {
       taskId: TASK_ID, targetSwimlaneId: 'lane-target', targetPosition: 0,
     });
 
-    expect(context.sessionManager.suspend).toHaveBeenCalledWith('active-session-1');
+    expect(context.sessionManager.suspend).toHaveBeenCalledWith('rec-model-restart');
     expect(hoisted.captureGitChurn).toHaveBeenCalledWith(
       expect.objectContaining({ id: TASK_ID }),
       expect.anything(),
