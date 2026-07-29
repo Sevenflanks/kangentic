@@ -19,6 +19,7 @@
 // (tests/fixtures/opencode-plugin-events.json).
 import fs from 'node:fs';
 
+// allow: SIZE_OK - 單一安裝 asset 保留 bootstrap closure，避免 OpenCode plugin discovery 失配。
 const INITIAL_PROMPT_PATH_ENV = 'KANGENTIC_OPENCODE_INITIAL_PROMPT_PATH';
 
 function nativeSessionIdFrom(properties) {
@@ -142,8 +143,7 @@ function appendEvent(eventsPath, event) {
   }
 }
 
-function claimInitialPromptSource() {
-  const sourcePath = process.env[INITIAL_PROMPT_PATH_ENV];
+function claimInitialPromptSource(sourcePath) {
   if (!sourcePath) return null;
   const claimPath = `${sourcePath}.claim-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
   try {
@@ -200,55 +200,142 @@ function appendSanitizedError(eventsPath, nativeSessionId = null) {
   });
 }
 
-export const KangenticActivity = async ({ client, directory } = {}) => {
+export const KangenticActivity = ({ client, directory } = {}) => {
   const eventsPath = process.env.KANGENTIC_EVENTS_PATH;
+  const initialPromptSourcePath = process.env[INITIAL_PROMPT_PATH_ENV];
+  let bootstrapTimerScheduled = false;
+  let freshCreatePending = false;
   let bootstrapSessionID;
   let bootstrapSessionStartWritten = false;
-  let claimPath;
-  try {
-    claimPath = claimInitialPromptSource();
-  } catch {
-    appendSanitizedError(eventsPath);
-    claimPath = null;
-  }
-  if (claimPath) {
-    try {
-      const rawText = fs.readFileSync(claimPath, 'utf8');
-      if (!removeClaimPath(claimPath)) {
-        appendSanitizedError(eventsPath);
-      } else {
+  const bufferedSessionStarts = [];
+  let bootstrapFailureReported = false;
+
+  const appendBootstrapSessionStart = (event) => {
+    if (bootstrapSessionStartWritten) return;
+    bootstrapSessionStartWritten = appendEvent(eventsPath, event);
+  };
+
+  const makeBootstrapSessionStart = (sessionID) => {
+    const occurredAt = Date.now();
+    return {
+      ts: occurredAt,
+      type: 'session_start',
+      hookContext: JSON.stringify({ sessionID }),
+      privateNativeBoundary: privateBoundary('created', sessionID, occurredAt),
+    };
+  };
+
+  const reportSanitizedBootstrapFailure = (claimPath = null) => {
+    if (bootstrapFailureReported) return;
+    bootstrapFailureReported = true;
+    freshCreatePending = false;
+    for (const bufferedEvent of bufferedSessionStarts.splice(0)) {
+      appendEvent(eventsPath, bufferedEvent);
+    }
+    if (claimPath) removeClaimPath(claimPath);
+    appendSanitizedError(eventsPath, bootstrapSessionID ?? null);
+  };
+
+  const hooks = {
+    event: ({ event }) => {
+      const extracted = extractSessionEvent(event);
+      if (extracted?.type === 'session_start') {
+        const nativeSessionID = extracted.privateNativeBoundary?.nativeSessionId ?? null;
+        if (freshCreatePending) {
+          bufferedSessionStarts.push(extracted);
+          return;
+        }
+        if (nativeSessionID !== null && nativeSessionID === bootstrapSessionID) {
+          appendBootstrapSessionStart(extracted);
+          return;
+        }
+      }
+      appendEvent(eventsPath, extracted);
+    },
+    'tool.execute.before': (input, output) => {
+      appendEvent(eventsPath, extractToolStartEvent(input, output));
+    },
+    'tool.execute.after': (input) => {
+      appendEvent(eventsPath, extractToolEndEvent(input));
+    },
+  };
+
+  // OpenCode 1.18.4 會 await factory，但不會 await event hooks；先回傳同步 hooks，避免 session.create reentrancy 卡住。
+  if (!bootstrapTimerScheduled) {
+    bootstrapTimerScheduled = true;
+    setTimeout(() => {
+      let claimPath = null;
+
+      const runBootstrap = async () => {
+        try {
+          claimPath = claimInitialPromptSource(initialPromptSourcePath);
+        } catch {
+          reportSanitizedBootstrapFailure(claimPath);
+          return;
+        }
+        if (!claimPath) return;
+
+        let rawText;
+        try {
+          rawText = fs.readFileSync(claimPath, 'utf8');
+        } catch {
+          reportSanitizedBootstrapFailure(claimPath);
+          return;
+        }
+        if (!removeClaimPath(claimPath)) {
+          // 已嘗試刪除 claim；不可再交給 reporter，避免 failure handling 變成隱性 retry。
+          reportSanitizedBootstrapFailure();
+          return;
+        }
         claimPath = null;
+
         const payload = readInitialPromptPayload(rawText);
         if (!payload) {
-          appendSanitizedError(eventsPath);
-        } else {
-          let sessionID;
-          if (payload.mode === 'fresh') {
-            const result = await client.session.create({
+          reportSanitizedBootstrapFailure();
+          return;
+        }
+
+        let sessionID;
+        if (payload.mode === 'fresh') {
+          freshCreatePending = true;
+          let result;
+          try {
+            result = await client.session.create({
               query: { directory },
               body: {},
               throwOnError: true,
             });
-            sessionID = result.data.id;
-            bootstrapSessionID = sessionID;
-          } else {
-            sessionID = payload.sessionId;
-            bootstrapSessionID = sessionID;
-            await client.session.get({
-              path: { id: sessionID },
-              query: { directory },
-              throwOnError: true,
-            });
+          } catch {
+            freshCreatePending = false;
+            for (const bufferedEvent of bufferedSessionStarts.splice(0)) {
+              appendEvent(eventsPath, bufferedEvent);
+            }
+            reportSanitizedBootstrapFailure();
+            return;
           }
+
+          sessionID = result.data.id;
+          bootstrapSessionID = sessionID;
           rootSessionId = sessionID;
-          const bootstrapStartedAt = Date.now();
-          bootstrapSessionStartWritten = appendEvent(eventsPath, {
-            ts: bootstrapStartedAt,
-            type: 'session_start',
-            hookContext: JSON.stringify({ sessionID }),
-            privateNativeBoundary: privateBoundary('created', sessionID, bootstrapStartedAt),
-          });
-          if (payload.mode === 'fresh') {
+          freshCreatePending = false;
+          const pendingStarts = bufferedSessionStarts.splice(0);
+          let claimedStart = null;
+          const unrelatedStarts = [];
+          // 先 claim 完整 buffer 再做任何 append，避免 telemetry I/O 期間讓 matching duplicate 穿透。
+          for (const bufferedEvent of pendingStarts) {
+            const nativeSessionID = bufferedEvent.privateNativeBoundary?.nativeSessionId ?? null;
+            if (nativeSessionID === sessionID) {
+              claimedStart ??= bufferedEvent;
+            } else {
+              unrelatedStarts.push(bufferedEvent);
+            }
+          }
+          appendBootstrapSessionStart(claimedStart ?? makeBootstrapSessionStart(sessionID));
+          for (const unrelatedStart of unrelatedStarts) {
+            appendEvent(eventsPath, unrelatedStart);
+          }
+
+          try {
             await client.tui.publish({
               query: { directory },
               body: {
@@ -257,7 +344,28 @@ export const KangenticActivity = async ({ client, directory } = {}) => {
               },
               throwOnError: true,
             });
+          } catch {
+            reportSanitizedBootstrapFailure();
+            return;
           }
+        } else {
+          sessionID = payload.sessionId;
+          bootstrapSessionID = sessionID;
+          rootSessionId = sessionID;
+          try {
+            await client.session.get({
+              path: { id: sessionID },
+              query: { directory },
+              throwOnError: true,
+            });
+          } catch {
+            reportSanitizedBootstrapFailure();
+            return;
+          }
+          appendBootstrapSessionStart(makeBootstrapSessionStart(sessionID));
+        }
+
+        try {
           await client.session.promptAsync({
             path: { id: sessionID },
             query: { directory },
@@ -268,38 +376,14 @@ export const KangenticActivity = async ({ client, directory } = {}) => {
             },
             throwOnError: true,
           });
+        } catch {
+          reportSanitizedBootstrapFailure();
         }
-      }
-    } catch {
-      if (claimPath) removeClaimPath(claimPath);
-      appendSanitizedError(eventsPath, bootstrapSessionID ?? null);
-    }
+      };
+
+      void runBootstrap().catch(() => reportSanitizedBootstrapFailure(claimPath));
+    }, 0);
   }
 
-  return {
-    event: async ({ event }) => {
-      const extracted = extractSessionEvent(event);
-      if (extracted?.type === 'session_start' && extracted.hookContext) {
-        try {
-          const context = JSON.parse(extracted.hookContext);
-          if (typeof context.sessionID === 'string') {
-            if (context.sessionID === bootstrapSessionID) {
-              if (bootstrapSessionStartWritten) return;
-              bootstrapSessionStartWritten = appendEvent(eventsPath, extracted);
-              return;
-            }
-          }
-        } catch {
-          return;
-        }
-      }
-      appendEvent(eventsPath, extracted);
-    },
-    'tool.execute.before': async (input, output) => {
-      appendEvent(eventsPath, extractToolStartEvent(input, output));
-    },
-    'tool.execute.after': async (input) => {
-      appendEvent(eventsPath, extractToolEndEvent(input));
-    },
-  };
+  return hooks;
 };

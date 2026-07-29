@@ -6,6 +6,22 @@ import { vi } from 'vitest';
 export const INITIAL_PROMPT_PATH_ENV = 'KANGENTIC_OPENCODE_INITIAL_PROMPT_PATH';
 export const EVENTS_PATH_ENV = 'KANGENTIC_EVENTS_PATH';
 
+export type Deferred<T> = {
+  readonly promise: Promise<T>;
+  readonly resolve: (value: T | PromiseLike<T>) => void;
+  readonly reject: (reason?: unknown) => void;
+};
+
+export function createDeferred<T>(): Deferred<T> {
+  let resolve: Deferred<T>['resolve'] = () => undefined;
+  let reject: Deferred<T>['reject'] = () => undefined;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, reject, resolve };
+}
+
 type InitialPromptPayload = {
   readonly version: number;
   readonly mode: 'fresh' | 'resume';
@@ -42,10 +58,25 @@ export function createOpenCodePluginFixture() {
   }
 
   function makeRootClient(createdSessionId = 'ses_created_123') {
-    const create = vi.fn(async () => ({ data: { id: createdSessionId } }));
-    const get = vi.fn(async () => ({ data: { id: createdSessionId } }));
-    const promptAsync = vi.fn(async () => undefined);
-    const publish = vi.fn(async () => ({ data: true }));
+    const createCalled = createDeferred<void>();
+    const getCalled = createDeferred<void>();
+    const promptCalled = createDeferred<void>();
+    const publishCalled = createDeferred<void>();
+    const create = vi.fn(async () => {
+      createCalled.resolve(undefined);
+      return { data: { id: createdSessionId } };
+    });
+    const get = vi.fn(async () => {
+      getCalled.resolve(undefined);
+      return { data: { id: createdSessionId } };
+    });
+    const promptAsync = vi.fn(async () => {
+      promptCalled.resolve(undefined);
+    });
+    const publish = vi.fn(async () => {
+      publishCalled.resolve(undefined);
+      return { data: true };
+    });
     const command = vi.fn(async () => undefined);
 
     return {
@@ -54,9 +85,13 @@ export function createOpenCodePluginFixture() {
         tui: { publish },
       },
       create,
+      createCalled,
       get,
+      getCalled,
       promptAsync,
+      promptCalled,
       publish,
+      publishCalled,
       command,
     };
   }
@@ -73,6 +108,7 @@ export function createOpenCodePluginFixture() {
       fs.rmSync(directory, { recursive: true, force: true });
     }
     vi.restoreAllMocks();
+    vi.useRealTimers();
   }
 
   return {
