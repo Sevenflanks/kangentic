@@ -124,6 +124,106 @@ describe('TerminalSubmitScheduler native-idle lifecycle', () => {
 
   afterEach(() => { scheduler.cancelAll(); vi.useRealTimers(); });
 
+  it('returns an admission registration before root idle or timeout settles delivery', () => {
+    const registration = scheduler.scheduleNativeIdleSubmission(request());
+
+    expect(registration).toEqual({ accepted: true, generation: 1 });
+    expect(statuses).toEqual([
+      expect.objectContaining({ generation: 1, state: 'waiting' }),
+    ]);
+    expect(statuses.some((status) => status.state === 'delivered' || status.state === 'cancelled')).toBe(false);
+    expect(submit.calls).toHaveLength(0);
+    expect(vi.getTimerCount()).toBe(1);
+  });
+
+  it('returns null when shutdown has closed scheduler admission', () => {
+    scheduler.cancelAll('shutdown');
+
+    const registration = scheduler.scheduleNativeIdleSubmission(request());
+
+    expect(registration).toBeNull();
+    expect(statuses).toHaveLength(0);
+    expect(submit.calls).toHaveLength(0);
+  });
+
+  it('returns null when a cancellation callback takes ownership before admission completes', () => {
+    let callbackRegistration: unknown;
+    scheduler = new TerminalSubmitScheduler(manager as never, submit as never, (status) => {
+      statuses.push(status);
+      if (status.state === 'cancelled' && status.generation === 1) {
+        callbackRegistration = scheduler.scheduleNativeIdleSubmission(request({ command: '/callback-owner' }));
+      }
+    });
+    const firstRegistration = scheduler.scheduleNativeIdleSubmission(request({ command: '/first-owner' }));
+
+    const displacedRegistration = scheduler.scheduleNativeIdleSubmission(request({ command: '/displaced-owner' }));
+
+    expect(firstRegistration).toEqual({ accepted: true, generation: 1 });
+    expect(displacedRegistration).toBeNull();
+    expect(callbackRegistration).toEqual({ accepted: true, generation: 3 });
+  });
+
+  it('returns null when its waiting callback synchronously replaces the new owner', async () => {
+    let replacementRegistration: ReturnType<TerminalSubmitScheduler['scheduleNativeIdleSubmission']> = null;
+    scheduler = new TerminalSubmitScheduler(manager as never, submit as never, (status) => {
+      statuses.push(status);
+      if (status.state === 'waiting' && status.generation === 1) {
+        replacementRegistration = scheduler.scheduleNativeIdleSubmission(request({ command: '/replacement-owner' }));
+      }
+    });
+
+    const displacedRegistration = scheduler.scheduleNativeIdleSubmission(request({ command: '/displaced-owner' }));
+
+    expect(displacedRegistration).toBeNull();
+    expect(replacementRegistration).toEqual({ accepted: true, generation: 2 });
+    expect(manager.listeners.get('s1')?.size).toBe(1);
+    expect(vi.getTimerCount()).toBe(1);
+    manager.updateSnapshot('s1', manager.makeSnapshot({ cleanIdle: { nativeSessionId: 'root-1', occurredAt: 10 } }));
+    await tick();
+    expect(submit.calls.map((call) => call.commands)).toEqual([['/replacement-owner']]);
+  });
+
+  it('keeps delivery terminal status asynchronous after admission', async () => {
+    manager.autoAcknowledge = false;
+    const registration = scheduler.scheduleNativeIdleSubmission(request());
+
+    manager.updateSnapshot('s1', manager.makeSnapshot({ cleanIdle: { nativeSessionId: 'root-1', occurredAt: 10 } }));
+
+    expect(registration).toEqual({ accepted: true, generation: 1 });
+    expect(statuses.at(-1)).toMatchObject({ generation: 1, state: 'sending' });
+    expect(statuses.some((status) => status.state === 'delivered' || status.state === 'cancelled')).toBe(false);
+    manager.acknowledgements[0]?.resolve(); await tick();
+    manager.acknowledgements[1]?.resolve(); await tick();
+    manager.acknowledgements[2]?.resolve(); await tick();
+    expect(statuses.at(-1)).toMatchObject({ generation: 1, state: 'delivered' });
+  });
+
+  it.each([
+    ['user input', 'user-input', () => manager.updateSnapshot('s1', manager.makeSnapshot({ inputGeneration: 1 }))],
+    ['turn error', 'turn-error', () => manager.updateSnapshot('s1', manager.makeSnapshot({ errorLatched: true }))],
+    ['timeout', 'timeout', () => vi.advanceTimersByTime(50)],
+  ] as const)('emits %s cancellation after accepted admission', async (_event, reason, trigger) => {
+    const registration = scheduler.scheduleNativeIdleSubmission(request({
+      policy: { ...request().policy, timeoutMs: 50 },
+    }));
+
+    expect(registration).toEqual({ accepted: true, generation: 1 });
+    expect(statuses.some((status) => status.state === 'delivered' || status.state === 'cancelled')).toBe(false);
+    trigger(); await tick();
+    expect(statuses.at(-1)).toMatchObject({ generation: 1, state: 'cancelled', reason });
+  });
+
+  it('emits delivery-error cancellation after accepted admission', async () => {
+    submit.failure = new Error('delivery failed');
+    const registration = scheduler.scheduleNativeIdleSubmission(request());
+
+    expect(registration).toEqual({ accepted: true, generation: 1 });
+    expect(statuses.some((status) => status.state === 'delivered' || status.state === 'cancelled')).toBe(false);
+    manager.updateSnapshot('s1', manager.makeSnapshot({ cleanIdle: { nativeSessionId: 'root-1', occurredAt: 10 } }));
+    await tick();
+    expect(statuses.at(-1)).toMatchObject({ generation: 1, state: 'cancelled', reason: 'delivery-error' });
+  });
+
   it('subscribes before snapshot and sends once across cached/racing duplicate idle notifications', async () => {
     const ready = manager.makeSnapshot({ cleanIdle: { nativeSessionId: 'root-1', occurredAt: 10 } });
     manager.snapshotRace = () => manager.updateSnapshot('s1', ready);
@@ -225,10 +325,16 @@ describe('TerminalSubmitScheduler native-idle lifecycle', () => {
   });
 
   it('supersedes pre-commit work and keeps only the latest post-commit successor', async () => {
-    scheduler.scheduleNativeIdleSubmission(request({ command: '/old' })); scheduler.scheduleNativeIdleSubmission(request({ command: '/current' }));
+    const oldRegistration = scheduler.scheduleNativeIdleSubmission(request({ command: '/old' }));
+    const currentRegistration = scheduler.scheduleNativeIdleSubmission(request({ command: '/current' }));
     manager.autoAcknowledge = false;
     manager.updateSnapshot('s1', manager.makeSnapshot({ cleanIdle: { nativeSessionId: 'root-1', occurredAt: 10 } }));
-    scheduler.scheduleNativeIdleSubmission(request({ command: '/discarded-successor' })); scheduler.scheduleNativeIdleSubmission(request({ command: '/latest-successor' }));
+    const discardedSuccessorRegistration = scheduler.scheduleNativeIdleSubmission(request({ command: '/discarded-successor' }));
+    const latestSuccessorRegistration = scheduler.scheduleNativeIdleSubmission(request({ command: '/latest-successor' }));
+    expect(oldRegistration).toEqual({ accepted: true, generation: 1 });
+    expect(currentRegistration).toEqual({ accepted: true, generation: 2 });
+    expect(discardedSuccessorRegistration).toEqual({ accepted: true, generation: 3 });
+    expect(latestSuccessorRegistration).toEqual({ accepted: true, generation: 4 });
     expect(statuses.filter((status) => status.state === 'cancelled' && status.reason === 'superseded')).toHaveLength(2);
     manager.autoAcknowledge = true; for (const acknowledgement of manager.acknowledgements) acknowledgement.resolve(); await tick();
     expect(submit.calls.map((call) => call.commands[0])).toEqual(['/current', '/latest-successor']);
@@ -268,7 +374,8 @@ describe('TerminalSubmitScheduler native-idle lifecycle', () => {
     const genericSubmit = vi.fn(() => new Promise<void>((resolve) => { finishGeneric = resolve; }));
     submit.submitKeystrokes = genericSubmit;
     scheduler.scheduleKeystrokes('t1', 's1', ['/generic']); manager.updateSnapshot('s1', manager.makeSnapshot({ cleanIdle: { nativeSessionId: 'root-1', occurredAt: 10 } }));
-    scheduler.scheduleNativeIdleSubmission(request());
+    const registration = scheduler.scheduleNativeIdleSubmission(request());
+    expect(registration).toEqual({ accepted: true, generation: 1 });
     expect(genericSubmit).toHaveBeenCalledTimes(1);
     finishGeneric(); await tick();
     expect(genericSubmit).toHaveBeenCalledTimes(2);
@@ -292,7 +399,9 @@ describe('TerminalSubmitScheduler native-idle lifecycle', () => {
 
   it('serializes native delivery behind in-flight content', async () => {
     scheduler.scheduleContent('t1', 's1', 'content'); manager.emit('first-output', 's1'); await tick();
-    manager.updateSnapshot('s1', manager.makeSnapshot({ cleanIdle: { nativeSessionId: 'root-1', occurredAt: 10 } })); scheduler.scheduleNativeIdleSubmission(request());
+    manager.updateSnapshot('s1', manager.makeSnapshot({ cleanIdle: { nativeSessionId: 'root-1', occurredAt: 10 } }));
+    const registration = scheduler.scheduleNativeIdleSubmission(request());
+    expect(registration).toEqual({ accepted: true, generation: 1 });
     expect(submit.calls).toHaveLength(0);
     submit.contentCompletions[0].resolve(); await tick();
     expect(submit.calls[0].commands).toEqual(['/review']);
