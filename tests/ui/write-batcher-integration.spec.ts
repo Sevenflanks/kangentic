@@ -192,10 +192,14 @@ test.describe('WriteBatcher - useTerminal IPC wiring', () => {
         window.electronAPI.sessions.__focusReportCalls,
       );
       expect(focusReportCalls).toEqual(expect.arrayContaining([
-        { sessionId: TRANSIENT_SESSION_ID, report: '\x1b[I' },
+        { sessionId: TRANSIENT_SESSION_ID, report: '\x1b[I', projectId: PROJECT_ID },
       ]));
       expect(focusReportCalls).toEqual(expect.arrayOf(
-        { sessionId: TRANSIENT_SESSION_ID, report: expect.stringMatching(/^\x1b\[[IO]$/) },
+        {
+          sessionId: TRANSIENT_SESSION_ID,
+          report: expect.stringMatching(/^\x1b\[[IO]$/),
+          projectId: PROJECT_ID,
+        },
       ));
       expect(await page.evaluate(() => window.electronAPI.sessions.__writeCalls)).toEqual([]);
     } finally {
