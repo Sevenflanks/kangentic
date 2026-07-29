@@ -301,7 +301,7 @@ export const createTaskSlice: StateCreator<BoardStore, [], [], TaskSlice> = (set
     const existingSession = useSessionStore.getState()._sessionByTaskId.get(input.taskId);
     const hasLiveSession = existingSession?.status === 'running' || existingSession?.status === 'queued';
     if (isColumnChange && !hasLiveSession && targetLane?.auto_spawn && targetLane.auto_command?.trim()) {
-      useSessionStore.getState().setPendingCommandLabel(input.taskId, targetLane.auto_command.trim());
+      useSessionStore.getState().setPendingCommandLabel(input.taskId, existingSession ? 'Resuming agent...' : 'Starting agent...');
     }
 
     // Optimistically show spawn progress for auto-spawn columns, but only

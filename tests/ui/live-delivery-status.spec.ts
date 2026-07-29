@@ -11,7 +11,12 @@ const TASK_ID = 'task-live-delivery';
 const SESSION_ID = 'session-live-delivery';
 const COMMAND_CANARY = 'private-command-canary';
 
-async function launchPage(): Promise<{ browser: Browser; page: Page }> {
+interface LaunchPageOptions {
+  readonly sessionStatus?: 'running' | 'suspended' | null;
+  readonly taskLaneIndex?: number;
+}
+
+async function launchPage({ sessionStatus = 'running', taskLaneIndex = 1 }: LaunchPageOptions = {}): Promise<{ browser: Browser; page: Page }> {
   await waitForViteReady(VITE_URL);
   const browser = await chromium.launch({ headless: true });
   const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
@@ -31,8 +36,10 @@ async function launchPage(): Promise<{ browser: Browser; page: Page }> {
           auto_command: index === 1 ? '${COMMAND_CANARY}' : lane.auto_command,
         }));
       });
-      state.sessions.push({ id: '${SESSION_ID}', taskId: '${TASK_ID}', projectId: '${PROJECT_ID}', pid: 1, status: 'running', shell: 'bash', cwd: '/mock/live-delivery', startedAt: ts, exitCode: null });
-      state.tasks.push({ id: '${TASK_ID}', title: 'Live delivery task', description: '', swimlane_id: 'lane-1', position: 0, agent: 'opencode', session_id: '${SESSION_ID}', worktree_path: null, branch_name: null, pr_number: null, pr_url: null, pr_state: null, base_branch: null, labels: [], priority: 0, attachment_count: 0, archived_at: null, created_at: ts, updated_at: ts });
+       if (${JSON.stringify(sessionStatus)}) {
+         state.sessions.push({ id: '${SESSION_ID}', taskId: '${TASK_ID}', projectId: '${PROJECT_ID}', pid: 1, status: ${JSON.stringify(sessionStatus)}, shell: 'bash', cwd: '/mock/live-delivery', startedAt: ts, exitCode: null });
+       }
+       state.tasks.push({ id: '${TASK_ID}', title: 'Live delivery task', description: '', swimlane_id: 'lane-${taskLaneIndex}', position: 0, agent: 'opencode', session_id: ${sessionStatus ? `'${SESSION_ID}'` : 'null'}, worktree_path: null, branch_name: null, pr_number: null, pr_url: null, pr_state: null, base_branch: null, labels: [], priority: 0, attachment_count: 0, archived_at: null, created_at: ts, updated_at: ts });
       return { currentProjectId: '${PROJECT_ID}' };
     });
   `);
@@ -105,6 +112,44 @@ function readAutoCommandWarningTaskId(page: Page, taskId = TASK_ID): Promise<str
 }
 
 test.describe('Live delivery status', () => {
+  test('uses a fixed resume label while an auto-command move is pending', async () => {
+    const { browser, page } = await launchPage({ sessionStatus: 'suspended', taskLaneIndex: 0 });
+    const card = page.locator(`[data-task-id="${TASK_ID}"]`);
+    let movePromise: Promise<unknown> | null = null;
+
+    try {
+      await page.evaluate(() => {
+        (window as unknown as { __mockTaskMoveDeferred?: boolean }).__mockTaskMoveDeferred = true;
+      });
+      movePromise = page.evaluate(async ({ projectId, taskId }) => {
+        const stores = (window as unknown as {
+          __zustandStores?: {
+            board: {
+              getState: () => {
+                moveTask: (input: { taskId: string; targetSwimlaneId: string; targetPosition: number }, skip: boolean, project: string) => Promise<unknown>;
+              };
+            };
+          };
+        }).__zustandStores;
+        if (!stores?.board) throw new Error('board store not exposed on __zustandStores');
+        await stores.board.getState().moveTask({ taskId, targetSwimlaneId: 'lane-1', targetPosition: 0 }, true, projectId);
+      }, { projectId: PROJECT_ID, taskId: TASK_ID });
+      await page.waitForFunction('typeof window.__mockTaskMoveResolve === "function"');
+
+      await card.click();
+      const launchOverlay = page.locator('[data-testid="launch-overlay"]');
+      await expect(launchOverlay).toBeVisible();
+      await expect(launchOverlay).toHaveText('Resuming agent...');
+      await expect(launchOverlay).not.toContainText(COMMAND_CANARY);
+      await expect(card).not.toContainText(COMMAND_CANARY);
+      await expect(page.locator('[data-testid="toast"]').filter({ hasText: COMMAND_CANARY })).toHaveCount(0);
+    } finally {
+      await page.evaluate('window.__mockTaskMoveResolve?.()');
+      await movePromise;
+      await browser.close();
+    }
+  });
+
   test('shows only fixed lifecycle feedback and never command content', async () => {
     const { browser, page } = await launchPage();
     const card = page.locator(`[data-task-id="${TASK_ID}"]`);
