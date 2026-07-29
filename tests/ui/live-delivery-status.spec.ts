@@ -6,6 +6,7 @@ import { waitForViteReady } from './helpers';
 const MOCK_SCRIPT = path.join(__dirname, 'mock-electron-api.js');
 const VITE_URL = `http://localhost:${process.env.PLAYWRIGHT_VITE_PORT || '5173'}`;
 const PROJECT_ID = 'project-live-delivery';
+const PROJECT_B_ID = 'project-live-delivery-b';
 const TASK_ID = 'task-live-delivery';
 const SESSION_ID = 'session-live-delivery';
 const COMMAND_CANARY = 'private-command-canary';
@@ -21,6 +22,7 @@ async function launchPage(): Promise<{ browser: Browser; page: Page }> {
     window.__mockPreConfigure(function (state) {
       var ts = new Date().toISOString();
       state.projects.push({ id: '${PROJECT_ID}', name: 'Live delivery', path: '/mock/live-delivery', default_agent: 'opencode', last_opened: ts, created_at: ts });
+      state.projects.push({ id: '${PROJECT_B_ID}', name: 'Live delivery destination', path: '/mock/live-delivery-b', default_agent: 'opencode', last_opened: ts, created_at: ts });
       state.DEFAULT_SWIMLANES.forEach(function (lane, index) {
         state.swimlanes.push(Object.assign({}, lane, {
           id: 'lane-' + index,
@@ -56,6 +58,50 @@ function status(state: string, generation: number, reason?: string): Record<stri
   };
   if (reason) value.reason = reason;
   return value;
+}
+
+async function setAutoCommandWarning(page: Page, taskId = TASK_ID): Promise<void> {
+  await page.evaluate(({ projectId, id }) => {
+    const stores = (window as unknown as {
+      __zustandStores?: {
+        session: {
+          getState: () => {
+            setAutoCommandWarning: (warning: {
+              projectId: string;
+              taskId: string;
+              reason: 'no-active-main-session';
+              message: string;
+              at: string;
+            }) => void;
+          };
+        };
+      };
+    }).__zustandStores;
+    if (!stores?.session) throw new Error('session store not exposed on __zustandStores');
+    stores.session.getState().setAutoCommandWarning({
+      projectId,
+      taskId: id,
+      reason: 'no-active-main-session',
+      message: 'Lifecycle warning.',
+      at: '2026-07-27T00:00:00.000Z',
+    });
+  }, { projectId: PROJECT_ID, id: taskId });
+}
+
+function readAutoCommandWarningTaskId(page: Page, taskId = TASK_ID): Promise<string | null> {
+  return page.evaluate((taskId) => {
+    const stores = (window as unknown as {
+      __zustandStores?: {
+        session: {
+          getState: () => {
+            autoCommandWarningsByTaskId: Record<string, { taskId: string }>;
+          };
+        };
+      };
+    }).__zustandStores;
+    if (!stores?.session) throw new Error('session store not exposed on __zustandStores');
+    return stores.session.getState().autoCommandWarningsByTaskId[taskId]?.taskId ?? null;
+  }, taskId);
 }
 
 test.describe('Live delivery status', () => {
@@ -150,6 +196,55 @@ test.describe('Live delivery status', () => {
     });
   }
 
+  test('surfaces asynchronous delivery errors through a safe amber toast and retained card feedback', async () => {
+    const { browser, page } = await launchPage();
+    const card = page.locator(`[data-task-id="${TASK_ID}"]`);
+    const warning = 'Lane command could not be delivered safely.';
+
+    try {
+      await fireStatus(page, status('cancelled', 2, 'delivery-error'));
+
+      await expect(page.locator('[data-testid="toast"]').filter({ hasText: warning })).toHaveClass(/border-yellow-500\/50/);
+      await expect(card.locator('[data-testid="auto-command-warning"]')).toContainText(warning);
+      await expect(card.locator('[data-testid="live-delivery-status"]')).toContainText(warning);
+      await expect(card).not.toContainText(COMMAND_CANARY);
+    } finally {
+      await browser.close();
+    }
+  });
+
+  test('does not toast or replace newer feedback for an older delivery-error generation', async () => {
+    const { browser, page } = await launchPage();
+    const card = page.locator(`[data-task-id="${TASK_ID}"]`);
+
+    try {
+      await fireStatus(page, status('waiting', 3));
+      await fireStatus(page, status('cancelled', 2, 'delivery-error'));
+
+      await expect(card.locator('[data-testid="live-delivery-status"]')).toContainText('Waiting for agent input...');
+      await expect(card.locator('[data-testid="auto-command-warning"]')).toHaveCount(0);
+      await expect(page.locator('[data-testid="toast"]')).toHaveCount(0);
+    } finally {
+      await browser.close();
+    }
+  });
+
+  test('does not toast or replace current feedback for a same-generation different session', async () => {
+    const { browser, page } = await launchPage();
+    const card = page.locator(`[data-task-id="${TASK_ID}"]`);
+
+    try {
+      await fireStatus(page, status('waiting', 3));
+      await fireStatus(page, { ...status('cancelled', 3, 'delivery-error'), sessionId: 'stale-session' });
+
+      await expect(card.locator('[data-testid="live-delivery-status"]')).toContainText('Waiting for agent input...');
+      await expect(card.locator('[data-testid="auto-command-warning"]')).toHaveCount(0);
+      await expect(page.locator('[data-testid="toast"]')).toHaveCount(0);
+    } finally {
+      await browser.close();
+    }
+  });
+
   for (const reason of ['superseded', 'shutdown']) {
     test(`keeps ${reason} cancellation silent`, async () => {
       const { browser, page } = await launchPage();
@@ -172,6 +267,170 @@ test.describe('Live delivery status', () => {
     try {
       await fireStatus(page, { ...status('waiting', 1), projectId: 'other-project' });
       await expect(card.locator('[data-testid="live-delivery-status"]')).toHaveCount(0);
+    } finally {
+      await browser.close();
+    }
+  });
+
+  test('clears the stored warning through the session-exit listener', async () => {
+    const { browser, page } = await launchPage();
+
+    try {
+      await page.waitForFunction('typeof window.__mockFireExit === "function"');
+      await setAutoCommandWarning(page);
+      expect(await readAutoCommandWarningTaskId(page)).toBe(TASK_ID);
+
+      await page.evaluate(({ sessionId, projectId }) => {
+        (window as unknown as {
+          __mockFireExit: (id: string, exitCode: number, project: string, intentional: boolean) => void;
+        }).__mockFireExit(sessionId, 0, projectId, true);
+      }, { sessionId: SESSION_ID, projectId: PROJECT_ID });
+
+      await expect.poll(() => readAutoCommandWarningTaskId(page)).toBeNull();
+    } finally {
+      await browser.close();
+    }
+  });
+
+  test('clears warnings on a real project switch but not same-id HMR parity', async () => {
+    const { browser, page } = await launchPage();
+
+    try {
+      await page.waitForFunction('typeof window.__mockFireProjectAutoOpened === "function"');
+      await setAutoCommandWarning(page);
+
+      await page.evaluate((projectId) => {
+        (window as unknown as { __mockFireProjectAutoOpened: (id: string) => void })
+          .__mockFireProjectAutoOpened(projectId);
+      }, PROJECT_ID);
+      expect(await readAutoCommandWarningTaskId(page)).toBe(TASK_ID);
+
+      await page.evaluate((projectId) => {
+        (window as unknown as { __mockFireProjectAutoOpened: (id: string) => void })
+          .__mockFireProjectAutoOpened(projectId);
+      }, PROJECT_B_ID);
+
+      await expect.poll(() => readAutoCommandWarningTaskId(page)).toBeNull();
+    } finally {
+      await browser.close();
+    }
+  });
+
+  test('clears the transient warning after archive succeeds', async () => {
+    const { browser, page } = await launchPage();
+
+    try {
+      await setAutoCommandWarning(page);
+      await page.evaluate((taskId) => {
+        const stores = (window as unknown as {
+          __zustandStores?: {
+            board: { getState: () => { archiveTask: (id: string) => void } };
+          };
+        }).__zustandStores;
+        if (!stores?.board) throw new Error('board store not exposed on __zustandStores');
+        stores.board.getState().archiveTask(taskId);
+      }, TASK_ID);
+
+      await expect.poll(() => readAutoCommandWarningTaskId(page)).toBeNull();
+    } finally {
+      await browser.close();
+    }
+  });
+
+  test('clears the transient warning after task deletion succeeds', async () => {
+    const { browser, page } = await launchPage();
+
+    try {
+      await setAutoCommandWarning(page);
+      await page.evaluate(async (taskId) => {
+        const stores = (window as unknown as {
+          __zustandStores?: {
+            board: { getState: () => { deleteTask: (id: string) => Promise<void> } };
+          };
+        }).__zustandStores;
+        if (!stores?.board) throw new Error('board store not exposed on __zustandStores');
+        await stores.board.getState().deleteTask(taskId);
+      }, TASK_ID);
+
+      await expect.poll(() => readAutoCommandWarningTaskId(page)).toBeNull();
+    } finally {
+      await browser.close();
+    }
+  });
+
+  test('shows a task-local skipped warning, retains live delivery status, and dismisses without opening the card', async () => {
+    const { browser, page } = await launchPage();
+    const card = page.locator(`[data-task-id="${TASK_ID}"]`);
+    const warning = 'Lane command could not be scheduled for this task.';
+
+    try {
+      await fireStatus(page, status('waiting', 1));
+      await setAutoCommandWarning(page);
+      await page.evaluate(`window.__mockTaskMoveResult = {
+        ok: true,
+        autoCommand: {
+          kind: 'skipped',
+          reason: 'no-active-main-session',
+          warning: ${JSON.stringify(warning)}
+        }
+      }`);
+      await page.evaluate(`window.__zustandStores.board.getState().moveTask({
+        taskId: ${JSON.stringify(TASK_ID)},
+        targetSwimlaneId: 'lane-2',
+        targetPosition: 0
+      }, true, ${JSON.stringify(PROJECT_ID)})`);
+
+      const autoCommandWarning = card.locator('[data-testid="auto-command-warning"]');
+      await expect(autoCommandWarning).toContainText(warning);
+      await expect(autoCommandWarning).not.toContainText('Stale warning from the previous move.');
+      await expect(card.locator('[data-testid="live-delivery-status"]')).toContainText('Waiting for agent input...');
+      await expect(page.locator('[data-testid="toast"]').filter({ hasText: warning })).toHaveClass(/border-yellow-500\/50/);
+      await expect(card).not.toContainText(COMMAND_CANARY);
+
+      const dismissButton = autoCommandWarning.getByRole('button', { name: 'Dismiss auto-command warning' });
+      const dismissBounds = await dismissButton.boundingBox();
+      if (!dismissBounds) throw new Error('Expected dismiss button bounding box');
+      expect(dismissBounds.width).toBeGreaterThanOrEqual(24);
+      expect(dismissBounds.height).toBeGreaterThanOrEqual(24);
+
+      const restingBackgroundColor = await dismissButton.evaluate((button) => getComputedStyle(button).backgroundColor);
+      await dismissButton.hover();
+      await expect.poll(async () => dismissButton.evaluate((button) => getComputedStyle(button).backgroundColor))
+        .not.toBe(restingBackgroundColor);
+
+      await dismissButton.click();
+
+      await expect(autoCommandWarning).toHaveCount(0);
+      await expect(card.locator('[data-testid="live-delivery-status"]')).toContainText('Waiting for agent input...');
+      await expect(page.locator('[data-testid="task-detail-dialog"]')).toHaveCount(0);
+    } finally {
+      await browser.close();
+    }
+  });
+
+  test('replaces a warning on later status and dismisses only the warning task', async () => {
+    const { browser, page } = await launchPage();
+    const card = page.locator(`[data-task-id="${TASK_ID}"]`);
+    const otherTaskId = 'task-live-delivery-other';
+
+    try {
+      await setAutoCommandWarning(page);
+      await setAutoCommandWarning(page, otherTaskId);
+      await expect(card.locator('[data-testid="auto-command-warning"]')).toContainText('Lifecycle warning.');
+
+      await fireStatus(page, status('waiting', 2));
+      await expect(card.locator('[data-testid="auto-command-warning"]')).toHaveCount(0);
+      expect(await readAutoCommandWarningTaskId(page)).toBeNull();
+      expect(await readAutoCommandWarningTaskId(page, otherTaskId)).toBe(otherTaskId);
+
+      await setAutoCommandWarning(page);
+      const dismissButton = card
+        .locator('[data-testid="auto-command-warning"]')
+        .getByRole('button', { name: 'Dismiss auto-command warning' });
+      await dismissButton.click();
+
+      expect(await readAutoCommandWarningTaskId(page)).toBeNull();
+      expect(await readAutoCommandWarningTaskId(page, otherTaskId)).toBe(otherTaskId);
     } finally {
       await browser.close();
     }

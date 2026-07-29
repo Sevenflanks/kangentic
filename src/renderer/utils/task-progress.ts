@@ -2,6 +2,7 @@ import { useCallback, useMemo } from 'react';
 import { useSessionStore } from '../stores/session-store';
 import type { Session, SessionUsage, ActivityState, SessionDisplayState } from '../../shared/types';
 import type { LiveDeliveryStatus } from '../../shared/live-delivery-status';
+import type { AutoCommandWarning } from '../../shared/auto-command-outcome';
 
 // ---------------------------------------------------------------------------
 // Unified task progress derivation
@@ -142,6 +143,15 @@ export function useLiveDeliveryStatus(taskId: string): LiveDeliveryStatus | null
   return useSessionStore(
     useCallback(
       (state: ReturnType<typeof useSessionStore.getState>) => state.liveDeliveryByTaskId[taskId] ?? null,
+      [taskId],
+    ),
+  );
+}
+
+export function useAutoCommandWarning(taskId: string): AutoCommandWarning | null {
+  return useSessionStore(
+    useCallback(
+      (state: ReturnType<typeof useSessionStore.getState>) => state.autoCommandWarningsByTaskId[taskId] ?? null,
       [taskId],
     ),
   );

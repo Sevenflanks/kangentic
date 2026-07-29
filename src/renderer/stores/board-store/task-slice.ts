@@ -180,6 +180,7 @@ export const createTaskSlice: StateCreator<BoardStore, [], [], TaskSlice> = (set
 
     try {
       await window.electronAPI.tasks.delete(id, useProjectStore.getState().currentProject?.id ?? null);
+      useSessionStore.getState().clearAutoCommandWarningForTask(id);
     } catch (err) {
       // Restore both arrays so the card reappears in its original slot.
       // No loadBoard() reconcile (unlike unarchiveTask): backend withTaskLock
@@ -204,6 +205,7 @@ export const createTaskSlice: StateCreator<BoardStore, [], [], TaskSlice> = (set
     const sourceProjectId = projectId !== undefined
       ? projectId
       : (useProjectStore.getState().currentProject?.id ?? null);
+    useSessionStore.getState().clearAutoCommandWarningForTask(input.taskId);
     // True when the user has switched away from the project this move targets.
     // Used so a reload/rollback never runs against the wrong project's board;
     // instead we invalidate the source project's warm-cache snapshot so the next
@@ -317,6 +319,7 @@ export const createTaskSlice: StateCreator<BoardStore, [], [], TaskSlice> = (set
     // waiting for the backend's clearSpawnProgress push to arrive.
     if (isColumnChange && targetLane?.role === 'todo') {
       useSessionStore.getState().clearLiveDeliveryStatusForTask(input.taskId);
+      useSessionStore.getState().clearAutoCommandWarningForTask(input.taskId);
       useSessionStore.setState((state) => {
         const { [input.taskId]: _removedProgress, ...nextSpawnProgress } = state.spawnProgress;
         const { [input.taskId]: _removedLabel, ...nextPendingCommandLabel } = state.pendingCommandLabel;
@@ -329,7 +332,7 @@ export const createTaskSlice: StateCreator<BoardStore, [], [], TaskSlice> = (set
     }
 
     try {
-      await window.electronAPI.tasks.move(input, sourceProjectId);
+      const moveResult = await window.electronAPI.tasks.move(input, sourceProjectId);
       if (moveGeneration !== thisGen) return { ok: true }; // Superseded; the newer move owns the reload
 
       // The user switched to another project while this move was in flight. The
@@ -340,6 +343,20 @@ export const createTaskSlice: StateCreator<BoardStore, [], [], TaskSlice> = (set
       if (switchedAway()) {
         invalidateProject(sourceProjectId!);
         return { ok: true };
+      }
+
+      if (moveResult.autoCommand.kind === 'skipped' && sourceProjectId !== null) {
+        useSessionStore.getState().setAutoCommandWarning({
+          projectId: sourceProjectId,
+          taskId: input.taskId,
+          reason: moveResult.autoCommand.reason,
+          message: moveResult.autoCommand.warning,
+          at: new Date().toISOString(),
+        });
+        useToastStore.getState().addToast({
+          message: moveResult.autoCommand.warning,
+          variant: 'warning',
+        });
       }
 
       // Reload tasks and archived tasks (sessions arrive via push-based
