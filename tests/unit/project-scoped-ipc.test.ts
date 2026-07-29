@@ -35,6 +35,7 @@ const MUTATION_CHANNELS = new Set([
   'SESSION_RESUME',
   'SESSION_RESET',
   'SESSION_RECONCILE',
+  'SESSION_WRITE_FOCUS_REPORT',
 ]);
 
 // Allowlisted channels: reads, by-session-id operations, or project-agnostic actions that do not

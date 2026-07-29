@@ -3518,7 +3518,7 @@ export interface ElectronAPI {
     reconcile: (taskId: string, projectId?: string | null) => Promise<Session | null>;
     reset: (taskId: string, projectId?: string | null) => Promise<void>;
     write: (sessionId: string, data: string) => Promise<void>;
-    writeFocusReport: (sessionId: string, report: TerminalFocusReport) => Promise<void>;
+    writeFocusReport: (sessionId: string, report: TerminalFocusReport, projectId: string | null) => Promise<void>;
     resize: (sessionId: string, cols: number, rows: number) => Promise<{ colsChanged: boolean }>;
     list: () => Promise<Session[]>;
     getScrollback: (sessionId: string) => Promise<string>;

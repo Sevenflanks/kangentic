@@ -103,7 +103,7 @@ describe('SESSION_WRITE user ingress routing', () => {
     if (!handler) throw new Error('SESSION_WRITE_FOCUS_REPORT handler was not registered');
 
     // When
-    handler(undefined, 'session-1', '\x1b[I');
+    handler(undefined, 'session-1', '\x1b[I', 'project-1');
 
     // Then
     expect(writeFocusReport).toHaveBeenCalledOnce();
@@ -128,11 +128,11 @@ describe('SESSION_WRITE user ingress routing', () => {
     if (!handler) throw new Error('SESSION_WRITE_FOCUS_REPORT handler was not registered');
 
     // When
-    handler(undefined, 'session-1', '\x1b[Iextra');
+    handler(undefined, 'session-1', '\x1b[Iextra', 'project-1');
 
     // Then
     expect(writeUserInput).toHaveBeenCalledWith('session-1', '\x1b[Iextra');
     expect(writeFocusReport).not.toHaveBeenCalled();
-    expect(() => handler(undefined, 'session-1', 42)).toThrow(TypeError);
+    expect(() => handler(undefined, 'session-1', 42, 'project-1')).toThrow(TypeError);
   });
 });

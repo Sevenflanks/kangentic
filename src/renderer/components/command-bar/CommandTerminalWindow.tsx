@@ -311,6 +311,7 @@ export function CommandTerminalWindow({ managedWindow, isMaximized, titleBarPoin
 
   const { terminalRef, initTerminal, fit, flushResize, focus } = useTerminal({
     sessionId: effectiveSessionId,
+    projectId,
     fontFamily: config.terminal.fontFamily,
     fontSize: config.terminal.fontSize,
     scrollbackLines: config.terminal.scrollbackLines,

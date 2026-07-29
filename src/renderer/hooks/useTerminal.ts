@@ -82,6 +82,7 @@ const TERMINAL_THEME = {
 
 interface UseTerminalOptions {
   sessionId: string | null;
+  projectId: string | null;
   fontFamily?: string;
   fontSize?: number;
   scrollbackLines?: number;
@@ -248,7 +249,7 @@ export function useTerminal(options: UseTerminalOptions) {
       terminal.onData((data) => routeTerminalData(
         data,
         batcher,
-        (report) => window.electronAPI.sessions.writeFocusReport(sid, report),
+        (report) => window.electronAPI.sessions.writeFocusReport(sid, report, options.projectId),
       ));
 
       // Debounced PTY resize -- coalesces rapid dimension changes so the
@@ -357,7 +358,7 @@ export function useTerminal(options: UseTerminalOptions) {
       // No session -- just fit immediately
       fitAddon.fit();
     }
-  }, [options.sessionId, options.fontFamily, options.fontSize, options.scrollbackLines, options.cursorStyle, options.shellName, options.releaseEscapeWhenPointerOutside, settleScrollback]);
+  }, [options.sessionId, options.projectId, options.fontFamily, options.fontSize, options.scrollbackLines, options.cursorStyle, options.shellName, options.releaseEscapeWhenPointerOutside, settleScrollback]);
 
   // Set up data listener. Inbound PTY data flows through a bounded queue that
   // writes capped slices paced by xterm.write's completion callback, yielding

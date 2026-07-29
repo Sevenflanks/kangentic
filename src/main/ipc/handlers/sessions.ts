@@ -49,7 +49,7 @@ export function registerSessionHandlers(context: IpcContext): void {
     return withTaskLock(taskId, async () => context.sessionManager.kill(id));
   });
   ipcMain.handle(IPC.SESSION_WRITE, (_, id, data) => context.sessionManager.writeUserInput(id, data));
-  ipcMain.handle(IPC.SESSION_WRITE_FOCUS_REPORT, (_, id, data: unknown) => {
+  ipcMain.handle(IPC.SESSION_WRITE_FOCUS_REPORT, (_, id, data: unknown, _projectId: string | null) => {
     if (isTerminalFocusReport(data)) return context.sessionManager.writeFocusReport(id, data);
     if (typeof data === 'string') return context.sessionManager.writeUserInput(id, data);
     throw new TypeError('Focus report payload must be a string');
