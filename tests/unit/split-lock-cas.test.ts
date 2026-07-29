@@ -50,6 +50,15 @@ vi.mock('simple-git', () => ({
 vi.mock('../../src/main/db/database', () => ({ getProjectDb: vi.fn(() => ({})) }));
 vi.mock('../../src/main/db/repositories/session-repository', () => ({
   SessionRepository: class {
+    findById = vi.fn((sessionId: string) => sessionId === 'sess-running' ? {
+      id: 'sess-running',
+      task_id: 'task-3a',
+      isolated_swimlane_id: null,
+      agent_session_id: 'agent-session-running',
+      status: 'running',
+      started_at: '2026-01-01T00:00:00.000Z',
+      session_type: 'claude_agent',
+    } : undefined);
     getLatestForTask = vi.fn(() => null);
     insert = vi.fn();
     updateStatus = vi.fn();
@@ -107,7 +116,7 @@ vi.mock('../../src/main/ipc/handlers/backlog', () => ({
 const mockGetProjectRepos = vi.fn();
 const mockEnsureTaskWorktree = vi.fn(async () => {});
 const mockEnsureTaskBranchCheckout = vi.fn(async () => {});
-const mockSpawnAgent = vi.fn(async () => {});
+const mockSpawnAgent = vi.fn(async () => ({ kind: 'not-applicable' } as const));
 const mockCreateTransitionEngine = vi.fn();
 const mockCleanupTaskResources = vi.fn(async () => {});
 const mockDeleteTaskWorktree = vi.fn(async () => true);
@@ -581,8 +590,11 @@ describe('TASK_MOVE AbortError cleanup', () => {
       targetPosition: 1,
     });
 
-    // Neither move should throw - AbortError is caught and returns void.
-    await expect(firstMovePromise).resolves.toBeUndefined();
+    // Neither move should throw - AbortError is caught and returns a successful result.
+    await expect(firstMovePromise).resolves.toEqual({
+      ok: true,
+      autoCommand: { kind: 'not-applicable' },
+    });
     // Let the second move settle too.
     await secondMovePromise.catch(() => {});
 

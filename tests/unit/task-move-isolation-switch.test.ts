@@ -24,6 +24,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import type { TaskMoveResult } from '../../src/shared/auto-command-outcome';
 import type { Task, Swimlane } from '../../src/shared/types';
 
 const hoisted = vi.hoisted(() => ({
@@ -99,7 +100,7 @@ vi.mock('../../src/main/agent/shared', () => ({
 const mockGetProjectRepos = vi.fn();
 const mockEnsureTaskWorktree = vi.fn(async () => null);
 const mockEnsureTaskBranchCheckout = vi.fn(async () => {});
-const mockSpawnAgent = vi.fn(async () => {});
+const mockSpawnAgent = vi.fn(async () => ({ kind: 'not-applicable' } as const));
 const mockCreateTransitionEngine = vi.fn(() => ({}));
 const mockBuildAutoCommandVars = vi.fn(() => ({}));
 
@@ -207,7 +208,7 @@ describe('handleTaskMove session switch', () => {
     hoisted.activeRecord = null;
     mockEnsureTaskWorktree.mockResolvedValue(null);
     mockEnsureTaskBranchCheckout.mockResolvedValue(undefined);
-    mockSpawnAgent.mockResolvedValue(undefined);
+    mockSpawnAgent.mockResolvedValue({ kind: 'not-applicable' } as const);
   });
 
   it('ENTER isolated force-fresh: suspends the live main session without a restart lifecycle override', async () => {
@@ -241,7 +242,7 @@ describe('handleTaskMove session switch', () => {
 
     const context = makeContext(taskRepo, swimlaneRepo);
 
-    await handleTaskMove(context as never, {
+    const result = await handleTaskMove(context as never, {
       taskId: 'task-aaa00001', targetSwimlaneId: REVIEW_ISOLATED_LANE_ID, targetPosition: 0,
     });
 
@@ -259,6 +260,7 @@ describe('handleTaskMove session switch', () => {
     expect(mockSpawnAgent).toHaveBeenCalledWith(expect.objectContaining({
       autoCommandLifecycle: undefined,
     }));
+    expect(result).toEqual({ ok: true, autoCommand: { kind: 'not-applicable' } } satisfies TaskMoveResult);
   });
 
   it('LEAVE isolated: suspends the isolated line and spawns the normal column (no keep-alive strand)', async () => {
