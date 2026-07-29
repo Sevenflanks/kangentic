@@ -154,6 +154,29 @@ describe('SessionWriteCoordinator', () => {
     expect(writes).toEqual(['automation-1', 'automation-2', 'user-1', 'user-2']);
   });
 
+  it('preserves mixed deferred user input and focus reports in FIFO order without advancing focus generations', async () => {
+    // Given
+    const { coordinator, writes } = createHarness();
+    coordinator.initialize('s1');
+    const automation = coordinator.acquireAutomation(
+      's1',
+      { sessionGeneration: 1, inputGeneration: 0 },
+      vi.fn(),
+    );
+    await automation?.write('automation');
+
+    // When
+    coordinator.recordUserInput('s1', 'human-1', 20);
+    coordinator.recordFocusReport('s1', '\x1b[I');
+    coordinator.recordUserInput('s1', 'human-2', 21);
+    coordinator.recordFocusReport('s1', '\x1b[O');
+    automation?.release();
+
+    // Then
+    expect(writes).toEqual(['automation', 'human-1', '\x1b[I', 'human-2', '\x1b[O']);
+    expect(coordinator.getInputGeneration('s1')).toBe(2);
+  });
+
   it('publishes the input marker before admitting deferred user bytes', async () => {
     // Given
     const events: string[] = [];

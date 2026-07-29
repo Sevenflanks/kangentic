@@ -1,4 +1,5 @@
 import type { WriteQueue } from './write-queue';
+import type { TerminalFocusReport } from '../../shared/terminal-focus-report';
 
 export interface SubmissionLease {
   readonly sessionId: string;
@@ -58,7 +59,7 @@ type SessionWriteState = {
   inputGeneration: number;
   automation: AutomationOwnership | null;
   userSubmission: UserSubmissionOwnership | null;
-  readonly deferredUserInput: string[];
+  readonly deferredWrites: string[];
   deferredInputDraining: boolean;
 };
 
@@ -83,7 +84,7 @@ export class SessionWriteCoordinator {
       inputGeneration: 0,
       automation: null,
       userSubmission: null,
-      deferredUserInput: [],
+      deferredWrites: [],
       deferredInputDraining: false,
     });
     return sessionGeneration;
@@ -100,12 +101,21 @@ export class SessionWriteCoordinator {
     const marker = this.recordInputMarker(sessionId, state, occurredAt);
 
     if (automation?.committed) {
-      state.deferredUserInput.push(data);
+      state.deferredWrites.push(data);
       return marker;
     }
 
     this.getWriteQueue(sessionId)?.enqueue(data);
     return marker;
+  }
+
+  recordFocusReport(sessionId: string, report: TerminalFocusReport): void {
+    const state = this.requireState(sessionId);
+    if (state.automation?.committed) {
+      state.deferredWrites.push(report);
+      return;
+    }
+    this.getWriteQueue(sessionId)?.enqueue(report);
   }
 
   getSessionGeneration(sessionId: string): number | null {
@@ -148,9 +158,9 @@ export class SessionWriteCoordinator {
       if (state.automation !== ownership) return;
       state.automation = null;
 
-      // Automation 一旦送出首 byte 就必須先完成 ownership；release 把 deferred user input 接回同一條 FIFO，
+      // Automation 一旦送出首 byte 就必須先完成 ownership；release 把 deferred writes 接回同一條 FIFO，
       // 並等 queue 完整 drained 才喚醒 user submission，避免 callback 越過尚未送完的較早 user bytes。
-      const deferred = state.deferredUserInput.splice(0, state.deferredUserInput.length);
+      const deferred = state.deferredWrites.splice(0, state.deferredWrites.length);
       for (const data of deferred) ownership.queue.enqueue(data);
       state.deferredInputDraining = true;
       void ownership.queue.drained().then(() => {
@@ -261,7 +271,7 @@ export class SessionWriteCoordinator {
     if (state.automation) state.automation.active = false;
     state.userSubmission?.waiting?.cancel();
     if (state.userSubmission) state.userSubmission.active = false;
-    state.deferredUserInput.length = 0;
+    state.deferredWrites.length = 0;
     this.states.delete(sessionId);
   }
 

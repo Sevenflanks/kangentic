@@ -3020,6 +3020,32 @@ describe('Input coordination', () => {
     expect(writes).toEqual(['automation', 'user']);
   });
 
+  it('keeps focus reports in mixed deferred FIFO order without recording user input evidence', async () => {
+    // Given
+    const { session, writes } = await spawnCoordinatedSession('task-coordination-focus-report');
+    const sessionGeneration = manager.getSessionGeneration(session.id);
+    const inputGeneration = manager.getInputGeneration(session.id);
+    const automation = sessionGeneration === null || inputGeneration === null
+      ? null
+      : manager.acquireAutomation(
+          session.id,
+          { sessionGeneration, inputGeneration },
+          vi.fn(),
+        );
+    await automation?.write('automation');
+
+    // When
+    manager.writeUserInput(session.id, 'human-1', 20);
+    manager.writeFocusReport(session.id, '\x1b[I');
+    manager.writeUserInput(session.id, 'human-2', 21);
+    manager.writeFocusReport(session.id, '\x1b[O');
+    automation?.release();
+
+    // Then
+    expect(writes).toEqual(['automation', 'human-1', '\x1b[I', 'human-2', '\x1b[O']);
+    expect(manager.getInputGeneration(session.id)).toBe(2);
+  });
+
   it('blocks automation while a user submission lease is active', async () => {
     // Given
     const { session } = await spawnCoordinatedSession('task-coordination-user-submission');
