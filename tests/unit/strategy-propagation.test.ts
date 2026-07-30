@@ -90,7 +90,10 @@ function makeContext() {
     currentProjectId: 'proj-1',
     currentProjectPath: '/mock/project',
     projectRepo: { getById: vi.fn(() => ({ id: 'proj-1', default_model: null, default_effort: null })) },
-    sessionManager: { getSession: (...args: unknown[]) => mockGetSession(...args) },
+    sessionManager: {
+      getSession: (...args: unknown[]) => mockGetSession(...args),
+      isWritable: () => true,
+    },
     terminalSubmitScheduler: { scheduleKeystrokes: (...args: unknown[]) => mockScheduleKeystrokes(...args) },
     mainWindow: { isDestroyed: () => false, webContents: { send: vi.fn() } },
     boardConfigManager: {},
