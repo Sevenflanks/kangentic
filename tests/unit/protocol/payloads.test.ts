@@ -25,6 +25,26 @@ describe('parseCapabilityRequestPayload', () => {
     expect(() => parseCapabilityRequestPayload('read-stream', { sessionId: 'sess-1', action: 'watch' })).toThrow(/action/);
   });
 
+  /**
+   * `terminal: false` is how a phone showing its session list subscribes to
+   * activity without the PTY bytes it would discard. Absent means true, so an
+   * older phone that never sends it keeps the full stream.
+   */
+  it('read-stream: carries the terminal flag through, and omits it when absent', () => {
+    expect(parseCapabilityRequestPayload('read-stream', { sessionId: 'sess-1', action: 'subscribe', terminal: false })).toEqual({
+      sessionId: 'sess-1',
+      action: 'subscribe',
+      terminal: false,
+    });
+    expect(parseCapabilityRequestPayload('read-stream', { sessionId: 'sess-1', action: 'subscribe' })).not.toHaveProperty('terminal');
+  });
+
+  it('read-stream: rejects a non-boolean terminal flag', () => {
+    expect(() => parseCapabilityRequestPayload('read-stream', { sessionId: 'sess-1', action: 'subscribe', terminal: 'no' })).toThrow(
+      /terminal/,
+    );
+  });
+
   it('read-board: allows an omitted projectId', () => {
     const parsed = parseCapabilityRequestPayload('read-board', {});
     expect(parsed).toEqual({ projectId: undefined, action: undefined });
@@ -178,6 +198,53 @@ describe('parseCapabilityRequestPayload', () => {
 
   it('register-push: an unregister without token or key is accepted', () => {
     expect(parseCapabilityRequestPayload('register-push', { action: 'unregister' })).toEqual({ action: 'unregister' });
+  });
+
+  it('register-push: categories is absent by default, and an explicit list survives', () => {
+    const pushKeyBase64 = 'A'.repeat(43);
+    const withoutCategories = parseCapabilityRequestPayload('register-push', {
+      action: 'register',
+      expoPushToken: 'tok',
+      pushKeyBase64,
+    });
+    expect(withoutCategories).not.toHaveProperty('categories');
+
+    const withCategories = parseCapabilityRequestPayload('register-push', {
+      action: 'register',
+      expoPushToken: 'tok',
+      pushKeyBase64,
+      categories: ['turn-complete', 'session-failed'],
+    });
+    expect(withCategories).toMatchObject({ categories: ['turn-complete', 'session-failed'] });
+  });
+
+  it('register-push: an unrecognized category is dropped, not rejected', () => {
+    const parsed = parseCapabilityRequestPayload('register-push', {
+      action: 'register',
+      expoPushToken: 'tok',
+      pushKeyBase64: 'A'.repeat(43),
+      categories: ['turn-complete', 'a-category-from-the-future'],
+    });
+    expect(parsed).toMatchObject({ categories: ['turn-complete'] });
+  });
+
+  it('register-push: an explicitly empty categories list is preserved as "none"', () => {
+    const parsed = parseCapabilityRequestPayload('register-push', {
+      action: 'register',
+      expoPushToken: 'tok',
+      pushKeyBase64: 'A'.repeat(43),
+      categories: [],
+    });
+    expect(parsed).toMatchObject({ categories: [] });
+  });
+
+  it('register-push: rejects a malformed categories value', () => {
+    expect(() =>
+      parseCapabilityRequestPayload('register-push', { action: 'register', expoPushToken: 'tok', pushKeyBase64: 'A'.repeat(43), categories: 'turn-complete' }),
+    ).toThrow(/categories/);
+    expect(() =>
+      parseCapabilityRequestPayload('register-push', { action: 'register', expoPushToken: 'tok', pushKeyBase64: 'A'.repeat(43), categories: [123] }),
+    ).toThrow(/categories/);
   });
 
   it('rejects a non-object payload for every verb', () => {

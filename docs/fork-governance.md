@@ -9,7 +9,7 @@
 | `main` | upstream 鏡像 | 鎖定為 upstream 的精確鏡像，不接受個人功能、修補或合併。只有經確認的 upstream 同步可以更新此 branch。 |
 | `sevenflanks-main` | 個人整合主線 | 承接個人功能、修補與日常整合，是所有個人開發的預設起點與回流目標。 |
 
-目前尚未設定 upstream remote。新增 remote、調整 tracking 或執行 upstream 同步，皆不屬於本治理文件的實作範圍，必須另行確認後處理。
+`fork-from` remote 已設定，fetch 與 push 均指向 `https://github.com/Kangentic/kangentic.git`；此設定只描述已存在的 remote，調整 tracking 或執行 upstream 同步仍須另行確認。
 
 ## Branch 流程
 
@@ -67,7 +67,7 @@
     "upstreamMirror": {
       "name": "main",
       "locked": true,
-      "remoteConfigured": false
+      "remoteConfigured": true
     },
     "personalIntegration": {
       "name": "sevenflanks-main",

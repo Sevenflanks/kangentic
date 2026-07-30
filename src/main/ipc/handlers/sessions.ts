@@ -5,10 +5,11 @@ import { SessionRepository } from '../../db/repositories/session-repository';
 import { UsageHistoryRepository } from '../../db/repositories/usage-history-repository';
 import { TaskRepository } from '../../db/repositories/task-repository';
 import { getProjectDb } from '../../db/database';
-import { getProjectRepos, ensureTaskWorktree, createTransitionEngine, resolveSpawnOverrides } from '../helpers';
+import { getProjectRepos, ensureTaskWorktree, createTransitionEngine, spawnAgent } from '../helpers';
 import { linkPR, autoLinkPRForTask } from '../../pr/pr-linking';
 import { resolveProjectContext } from '../helpers/project-repos';
-import { getCachedTaskTitle } from './task-title-cache';
+import { applyProfileToLane } from '../../transition-engine/column-strategy';
+import { loadTaskProfile } from '../helpers/task-profile';
 import { handleTaskMove } from './task-move';
 import { trackEvent } from '../../analytics/analytics';
 import { parseModelId } from '../../../shared/model-id';
@@ -49,7 +50,11 @@ export function registerSessionHandlers(context: IpcContext): void {
     return withTaskLock(taskId, async () => context.sessionManager.kill(id));
   });
   ipcMain.handle(IPC.SESSION_WRITE, (_, id, data) => context.sessionManager.writeUserInput(id, data));
-  ipcMain.handle(IPC.SESSION_WRITE_FOCUS_REPORT, (_, id, data: unknown, _projectId: string | null) => {
+  ipcMain.handle(IPC.SESSION_WRITE_FOCUS_REPORT, (_, id, data: unknown, projectId: string | null) => {
+    if (!projectId) throw new Error('Focus report project id is required');
+    if (context.sessionManager.getSessionProjectId(id) !== projectId) {
+      throw new Error('Focus report project does not match session');
+    }
     if (isTerminalFocusReport(data)) return context.sessionManager.writeFocusReport(id, data);
     if (typeof data === 'string') return context.sessionManager.writeUserInput(id, data);
     throw new TypeError('Focus report payload must be a string');
@@ -203,9 +208,22 @@ export function registerSessionHandlers(context: IpcContext): void {
             resolvedProjectId, resolvedProjectPath,
           );
 
-          const project = context.projectRepo.getById(resolvedProjectId);
-          const overrides = resolveSpawnOverrides(current, currentLane, project);
-          await engine.resumeSuspendedSession(current, currentLane?.permission_mode, undefined, resumePrompt, signal, undefined, undefined, overrides);
+          await spawnAgent({
+            context,
+            engine,
+            tasks,
+            sessionRepo,
+            task: current,
+            fromSwimlaneId: current.swimlane_id,
+            toLane: currentLane ?? null,
+            signal,
+            projectId: resolvedProjectId,
+            projectPath: resolvedProjectPath,
+            attachments: attachmentRepo,
+            mode: resumePrompt === undefined
+              ? { kind: 'explicit-resume' }
+              : { kind: 'explicit-resume', resumePrompt },
+          });
 
           const updated = tasks.getById(taskId);
           if (!updated?.session_id) throw new Error('Session resume failed - no session_id on task');
@@ -374,22 +392,7 @@ export function registerSessionHandlers(context: IpcContext): void {
     if (!context.mainWindow.isDestroyed()) {
       const projectId = context.sessionManager.getSessionProjectId(sessionId);
       const taskId = context.sessionManager.getSessionTaskId(sessionId);
-      let taskTitle: string | undefined;
-      if (taskId && projectId) {
-        // Resolved through a short-TTL cache: this fires on every activity
-        // transition (including the frequent `thinking` signal) but the title
-        // is only used for the occasional notification, so a per-event DB query
-        // would be pure main-loop tax. See task-title-cache.ts.
-        taskTitle = getCachedTaskTitle(taskId, Date.now(), () => {
-          try {
-            return new TaskRepository(getProjectDb(projectId)).getById(taskId)?.title;
-          } catch {
-            // Project DB may not exist yet -- skip title lookup
-            return undefined;
-          }
-        });
-      }
-      broadcast(context.mainWindow, IPC.SESSION_ACTIVITY, sessionId, state, reason, projectId, taskId, taskTitle);
+      broadcast(context.mainWindow, IPC.SESSION_ACTIVITY, sessionId, state, reason, projectId, taskId);
 
       // A session going idle (the agent finished its turn) is the catch-all
       // signal that a PR may have just been created mid-session - the move-time
@@ -691,7 +694,14 @@ export function registerSessionHandlers(context: IpcContext): void {
       const task = tasks.getBySessionId(sessionId);
       if (!task) return;
 
-      const lane = swimlanes.getById(task.swimlane_id);
+      // Folded through the task's Board Profile: a profile can re-point where
+      // this column routes on plan exit, so two tasks leaving plan mode in the
+      // same column can legitimately land in different columns.
+      const lane = applyProfileToLane(
+        swimlanes.getById(task.swimlane_id),
+        loadTaskProfile(context, task, resolvedProjectPath),
+        swimlanes.list(),
+      );
       if (!lane?.plan_exit_target_id) return;
 
       const target = swimlanes.getById(lane.plan_exit_target_id);

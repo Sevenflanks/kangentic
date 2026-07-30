@@ -6,7 +6,8 @@ import { SessionRepository } from '../../db/repositories/session-repository';
 import { HandoffRepository } from '../../db/repositories/handoff-repository';
 import { TransitionEngine } from '../../transition-engine/transition-engine';
 import { getProjectDb } from '../../db/database';
-import { interpolateTemplate } from '../../agent/shared';
+import { interpolateTaskTemplate, resolveTaskTemplateVars } from '../../agent/shared';
+import { resolveDefaultBaseBranch } from '../handlers/git-stats-capture';
 import { agentRegistry } from '../../agent/agent-registry';
 import {
   evaluateAutoCommandDisposition,
@@ -27,6 +28,8 @@ import { isAbortError } from '../../../shared/abort-utils';
 import { runSpawnPreamble } from '../../transition-engine/spawn-preamble';
 import { isResumeEligible } from '../../transition-engine/spawn-intent';
 import { resolveIsolatedSwimlaneId, resolveForceFresh } from '../../transition-engine/session-isolation';
+import { resolveEffectiveAutoCommand, applyProfileToLane } from '../../transition-engine/column-strategy';
+import { loadTaskProfile } from './task-profile';
 import { emitSpawnProgress, createProgressCallback } from '../../transition-engine/spawn-progress';
 import { ensureTaskWorktree, ensureTaskBranchCheckout } from './task-git';
 import { getProjectRepos } from './project-repos';
@@ -37,18 +40,6 @@ type SpawnExecutionLifecycle = Extract<
   AutoCommandLifecycle,
   { readonly kind: 'fresh' | 'resume' }
 >;
-
-/** Build template variables for auto-command interpolation. */
-export function buildAutoCommandVars(task: Task): Record<string, string> {
-  return {
-    title: task.title,
-    description: task.description,
-    taskId: task.id,
-    worktreePath: task.worktree_path || '',
-    branchName: task.branch_name || '',
-    baseBranch: task.base_branch || '',
-  };
-}
 
 function isLegacyAutoCommandFallback(
   disposition: AutoCommandDisposition | null,
@@ -135,7 +126,6 @@ function evaluateSpawnAutoCommandDisposition(input: {
     sequence: input.autoCommand === undefined ? [] : [input.autoCommand],
   });
 }
-
 /**
  * Resolve the column-derived spawn overrides handed to
  * `engine.resumeSuspendedSession` and `engine.executeTransition`.
@@ -198,11 +188,19 @@ export function createTransitionEngine(
         mcpServerToken: context.mcpServerHandle?.token,
         defaultAgent: project?.default_agent ?? DEFAULT_AGENT,
         cliPathOverrides: config.agent.cliPaths,
+        executionServers: config.agent.executionServers,
+        execution: config.agent.execution,
+        launchOptions: config.agent.launchOptions,
       };
     },
     sessionRepo,
     attachments,
   );
+}
+
+export interface ExplicitResumeSpawnMode {
+  readonly kind: 'explicit-resume';
+  readonly resumePrompt?: string;
 }
 
 export interface AgentSpawnOptions {
@@ -212,13 +210,22 @@ export interface AgentSpawnOptions {
   sessionRepo: SessionRepository;
   task: Task;
   fromSwimlaneId: string;
-  toLane: Swimlane;
+  toLane: Swimlane | null;
+  mode?: ExplicitResumeSpawnMode;
   skipPromptTemplate?: boolean;
   signal?: AbortSignal;
   /** Project ID for handoff context resolution. Resolved from caller's context. */
   projectId?: string;
   /** Project filesystem path for handoff context resolution. */
   projectPath?: string | null;
+  /**
+   * Attachment repository for the task's project, used to resolve
+   * {{attachments}} in the auto_command template context. Every spawnAgent
+   * call site already has this from getProjectRepos; omitted only where a
+   * caller has no project context, in which case {{attachments}} resolves
+   * empty.
+   */
+  attachments?: AttachmentRepository;
   /**
    * Fallback resume prompt when the destination column has no auto_command.
    * Set by plan-exit auto-moves ("Your plan was approved...") so a respawned
@@ -264,7 +271,21 @@ export interface AgentSpawnOptions {
  * task was deleted mid-operation. AbortError always propagates for cancellation.
  */
 export async function spawnAgent(options: AgentSpawnOptions): Promise<AutoCommandImmediateOutcome> {
-  const { context, engine, tasks, sessionRepo, task, fromSwimlaneId, toLane, skipPromptTemplate, signal } = options;
+  const { context, engine, tasks, sessionRepo, task, fromSwimlaneId, skipPromptTemplate, signal } = options;
+
+  // Board Profiles: fold the task's profile over the destination column ONCE,
+  // here, and shadow `toLane` with the result. Everything below then reads the
+  // profile-resolved strategy without threading a parallel argument through each
+  // downstream call - which is how one path ends up honoring a profile while
+  // another silently ignores it.
+  //
+  // Only strategy fields are re-pointed; identity (id, name, role, ...) passes
+  // through untouched. A task with no profile gets the lane back unchanged, so
+  // a board with no profiles behaves exactly as before.
+  const toLane = applyProfileToLane(
+    options.toLane,
+    loadTaskProfile(context, task, options.projectPath),
+  ) ?? options.toLane;
 
   // Resolve the owning project once: used for the default-agent fallback below
   // and to tag every log this spawn emits with [projectName] (see
@@ -274,16 +295,19 @@ export async function spawnAgent(options: AgentSpawnOptions): Promise<AutoComman
   const project = options.projectId ? context.projectRepo.getById(options.projectId) : null;
 
   const run = async (): Promise<AutoCommandImmediateOutcome> => {
-  // Guard: if the target column doesn't want agents, no-op
-  if (!toLane.auto_spawn) return { kind: 'not-applicable' };
+  // Auto_command template vars for the current task snapshot. defaultBaseBranch
+  // is resolved once per spawn (board config -> project/global config ->
+  // 'main') so {{baseBranch}} matches resolveDefaultBaseBranch everywhere else
+  // it's used, rather than resolving empty for the ~99% of tasks with no
+  // per-task base_branch override.
+  const resolveAutoCommandVars = (currentTask: Task): Record<string, string> =>
+    resolveTaskTemplateVars({
+      task: currentTask,
+      defaultBaseBranch: resolveDefaultBaseBranch(context, options.projectPath),
+      attachmentPaths: options.attachments?.getPathsForTask(currentTask.id) ?? [],
+    });
 
-  // Guard: if the user manually paused this task, don't auto-resume.
-  // The user must explicitly click Resume (SESSION_RESUME) to restart.
   const latestSession = sessionRepo.getLatestForTask(task.id);
-  if (latestSession?.status === 'suspended' && latestSession.suspended_by === 'user') {
-    console.log(`[spawnAgent] Skipping auto-spawn for task ${task.id.slice(0, 8)} (manually paused by user)`);
-    return { kind: 'not-applicable' };
-  }
 
   // Shared spawn preamble: lock the Advanced overrides on the task's very
   // first ever spawn, then resolve the target agent ONCE (single source of
@@ -298,6 +322,31 @@ export async function spawnAgent(options: AgentSpawnOptions): Promise<AutoComman
     globalPermissionMode: () => context.configManager.getEffectiveConfig(options.projectPath || undefined).agent.permissionMode,
     tasks,
   });
+
+  if (options.mode?.kind === 'explicit-resume') {
+    await engine.resumeSuspendedSession(
+      task,
+      toLane?.permission_mode,
+      undefined,
+      options.mode.resumePrompt,
+      signal,
+      targetAgent,
+      undefined,
+      resolveSpawnOverrides(task, toLane, project),
+    );
+    return { kind: 'not-applicable' };
+  }
+
+  // Guard: if the target column doesn't want agents, no-op
+  if (!toLane || !toLane.auto_spawn) return { kind: 'not-applicable' };
+
+  // Guard: if the user manually paused this task, don't auto-resume.
+  // The user must explicitly click Resume (SESSION_RESUME) to restart.
+  if (latestSession?.status === 'suspended' && latestSession.suspended_by === 'user') {
+    console.log(`[spawnAgent] Skipping auto-spawn for task ${task.id.slice(0, 8)} (manually paused by user)`);
+    return { kind: 'not-applicable' };
+  }
+
   const destinationAdapter = agentRegistry.get(targetAgent);
 
   // Handoff also requires a previous session to exist, a project context,
@@ -395,9 +444,9 @@ export async function spawnAgent(options: AgentSpawnOptions): Promise<AutoComman
         console.error('[spawnAgent] Failed to finalize handoff:', error);
       }
 
-      const effectiveAutoCommand = currentTask.auto_command ?? toLane.auto_command;
+      const effectiveAutoCommand = resolveEffectiveAutoCommand(currentTask.auto_command, toLane.auto_command);
       const interpolatedAutoCommand = !options.suppressAutoCommand && effectiveAutoCommand?.trim()
-        ? interpolateTemplate(effectiveAutoCommand, buildAutoCommandVars(currentTask))
+        ? interpolateTaskTemplate(effectiveAutoCommand, resolveAutoCommandVars(currentTask))
         : undefined;
       // OpenCode policy 在此集中阻擋 resume、fresh 與 post-spawn Auto-command fallback；一般 Task 與 continuation prompt 仍維持原本生命週期。
       const autoCommandDisposition = evaluateSpawnAutoCommandDisposition({
@@ -454,9 +503,9 @@ export async function spawnAgent(options: AgentSpawnOptions): Promise<AutoComman
   if (!currentTask) return { kind: 'not-applicable' };
 
   if (currentTask.session_id && transitionSpawnLifecycle !== null) {
-    const effectiveAutoCommand = currentTask.auto_command ?? toLane.auto_command;
+    const effectiveAutoCommand = resolveEffectiveAutoCommand(currentTask.auto_command, toLane.auto_command);
     const interpolatedAutoCommand = !options.suppressAutoCommand && effectiveAutoCommand?.trim()
-      ? interpolateTemplate(effectiveAutoCommand, buildAutoCommandVars(currentTask))
+      ? interpolateTaskTemplate(effectiveAutoCommand, resolveAutoCommandVars(currentTask))
       : undefined;
     const currentTrack = sessionRepo.getLatestForTask(currentTask.id)?.isolated_swimlane_id ?? null;
     const autoCommandDisposition = evaluateSpawnAutoCommandDisposition({
@@ -509,9 +558,9 @@ export async function spawnAgent(options: AgentSpawnOptions): Promise<AutoComman
   // so the resume is promptless, and the post-spawn keystroke is skipped. A
   // fresh-spawn outcome also sits idle because skipPromptTemplate is already
   // true for any non-To-Do source.
-  const effectiveAutoCommand = currentTask.auto_command ?? toLane.auto_command;
+  const effectiveAutoCommand = resolveEffectiveAutoCommand(currentTask.auto_command, toLane.auto_command);
   const interpolatedAutoCommand = !options.suppressAutoCommand && effectiveAutoCommand?.trim()
-    ? interpolateTemplate(effectiveAutoCommand, buildAutoCommandVars(currentTask))
+    ? interpolateTaskTemplate(effectiveAutoCommand, resolveAutoCommandVars(currentTask))
     : undefined;
   const autoCommandDisposition = evaluateSpawnAutoCommandDisposition({
     adapter: destinationAdapter,
@@ -629,7 +678,7 @@ export async function autoSpawnForTask(
       const sessionRepo = new SessionRepository(db);
       const engine = createTransitionEngine(context, actions, tasks, sessionRepo, attachments, projectId, projectPath);
 
-      const outcome = await spawnAgent({ context, engine, tasks, sessionRepo, task: fullTask, fromSwimlaneId: '*', toLane, projectId, projectPath });
+      const outcome = await spawnAgent({ context, engine, tasks, sessionRepo, task: fullTask, fromSwimlaneId: '*', toLane, projectId, projectPath, attachments });
 
       console.log(`[MCP auto-spawn] Spawned agent for "${task.title}" in ${toLane.name}`);
       return outcome;

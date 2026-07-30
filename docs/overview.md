@@ -3,6 +3,7 @@
 ## What is Kangentic?
 
 Kangentic is a cross-platform desktop Kanban application purpose-built for orchestrating AI coding agents. It supports twelve agent adapters: Claude Code, Codex CLI, Gemini CLI, Aider, Cursor CLI, Oz CLI, GitHub Copilot CLI, OpenCode, Qwen Code, Kimi Code, Droid, and Ollama. Dragging a task card between columns can spawn, suspend, resume, or terminate sessions, turning a familiar Kanban workflow into a powerful multi-agent control plane.
+Kangentic is a cross-platform desktop Kanban application purpose-built for orchestrating AI coding agents. It supports Claude Code, Codex CLI, Gemini CLI, Qwen Code, Kimi Code, OpenCode, Droid (Factory), Cursor CLI, GitHub Copilot CLI, Aider, Oz CLI (Warp), and Ollama. Dragging a task card between columns can spawn, suspend, resume, or terminate agent sessions - turning a familiar Kanban workflow into a powerful multi-agent control plane.
 
 ## The Problem
 
@@ -17,6 +18,7 @@ Kangentic replaces terminal tab chaos with a drag-and-drop board. Each task card
 ### Multi-Agent Support
 
 Orchestrate Claude Code, Codex CLI, Gemini CLI, Aider, Cursor CLI, Oz CLI, GitHub Copilot CLI, OpenCode, Qwen Code, Kimi Code, Droid, and Ollama from a single board. Set a default adapter per project, or override it per column. Cross-agent history passthrough needs an agent change, an existing session, and the destination column's `handoff_context` option. When those conditions hold, the target's initial prompt includes a reference to the source adapter's resolved native history when available. Kangentic does not inline full history or synthesize transcript, git, or metrics context, and the target agent may not read the reference.
+Orchestrate Claude Code, Codex CLI, Gemini CLI, Qwen Code, Kimi Code, OpenCode, Droid (Factory), Cursor CLI, GitHub Copilot CLI, Aider, Oz CLI (Warp), and Ollama from a single board. Set a default agent per project, or override it per column. When a task moves between columns with different agents, Kangentic automatically packages the outgoing agent's context (transcript, git changes, metrics) and hands it off to the incoming agent. No manual copy-paste between tools.
 
 ### Visual Agent Orchestration
 

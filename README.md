@@ -65,7 +65,7 @@ Twelve supported agent adapters on one Kanban board. Mix adapters per column and
 - [GitHub Copilot CLI](https://docs.github.com/en/copilot/how-tos/copilot-cli/cli-getting-started)
 - [Aider](https://aider.chat/)
 - [Oz CLI](https://docs.warp.dev/reference/cli/cli) (Warp)
-- [Ollama](https://ollama.com/)
+- [Ollama](https://ollama.com) (local models)
 
 ## Supported Boards
 
@@ -125,6 +125,7 @@ npm run make:win
 
 - [GitHub Discussions](https://github.com/Sevenflanks/kangentic/discussions) 用於問題與功能建議
 - [GitHub Issues](https://github.com/Sevenflanks/kangentic/issues) 用於錯誤回報
+Found a security issue? See [SECURITY.md](SECURITY.md) instead.
 
 ## License
 

@@ -54,6 +54,14 @@
   --kng-active: #34d399;      /* working / thinking (emerald-400) */
   --kng-attention: #e3b341;   /* needs-you / idle / permission (soft honey) */
 
+  /* Severity bands for consumed-budget progress fills (context window, rate-limit
+     quota). Identical across all themes, like the activity indicators above.
+     Deliberately NOT --kng-attention: that amber already means "session needs you",
+     and a caution band must not borrow a session-state hue. Seeded from
+     kangentic-mobile's warning/danger tokens. */
+  --kng-warning: #d9b83f;   /* caution band (true yellow, distinct from attention amber) */
+  --kng-danger: #e05d5d;    /* critical band */
+
   /* Categorical chart series (usage dashboard donuts/legends). Dark-surface
      steps of the validated dataviz reference palette; slot ORDER is the
      CVD-safety mechanism - assign series by slot index, never re-order or
@@ -299,6 +307,8 @@
 
   --color-active: var(--kng-active);
   --color-attention: var(--kng-attention);
+  --color-warning: var(--kng-warning);
+  --color-danger: var(--kng-danger);
 
   --color-chart-1: var(--kng-chart-1);
   --color-chart-2: var(--kng-chart-2);
@@ -383,17 +393,11 @@
   z-index: 0;
 }
 
-/* Command Terminal activity: a dash marches around the terminal icon's own
-   square border while an agent is working (the square-fitting counterpart to the
-   circular spinner used by the task-detail / Stop buttons). `pathLength="100"` on
-   the rect normalizes the rounded-square perimeter to 100 units, so the dash math
-   is geometry-independent. */
-@keyframes march-border {
-  to { stroke-dashoffset: -100; }
-}
-.animate-march-border {
-  animation: march-border 1.4s linear infinite;
-}
+/* The activity marks' marching-border animation used to live here as
+   `@keyframes march-border` / `.animate-march-border`. It now ships with the marks themselves,
+   in `@kangentic/branding/assets/activity/activity.css` (`kng-activity-march` / `.kng-march`,
+   same 1.4s linear dashoffset), imported by `components/ActivityMark.tsx` - so the keyframe
+   and the geometry it animates can no longer drift apart. */
 
 /* xterm: fill parent height so scrollbar is flush with bottom edge.
    xterm.js creates a .xterm child div that is content-sized (rows * cellHeight)
@@ -402,16 +406,22 @@
   height: 100%;
 }
 
-/* Match the viewport background to the terminal theme so leftover pixels
-   below the last rendered row blend in (xterm.css defaults to #000). */
+/* Let the host container's resolved terminal background (near-black by
+   default, user-customizable via the Terminal Colors setting) show through
+   (xterm.css defaults this to #000) so leftover sub-cell pixels below/right of
+   the last rendered row blend into one continuous terminal surface instead of
+   a theme-tracking color. Transparent, not a duplicated hex, so there is one
+   source of truth (resolveTerminalBackground in useTerminal.ts) for the
+   terminal background. */
 .xterm .xterm-viewport {
-  background-color: var(--kng-surface) !important;
+  background-color: transparent !important;
 }
 
 /* Terminal scrollbar visibility: the global thumb color (--kng-edge, #3f3f46) is
-   nearly invisible against the dark terminal background (#18181b), so the scrollbar
-   reads as missing. Use a brighter translucent thumb so it is discoverable. Width is
-   left at the global 8px so the fit-addon's DEFAULT_SCROLLBAR_WIDTH assumption holds. */
+   nearly invisible against the terminal's near-black default background, so the
+   scrollbar reads as missing. Use a brighter translucent thumb so it is
+   discoverable. Width is left at the global 8px so the fit-addon's
+   DEFAULT_SCROLLBAR_WIDTH assumption holds. */
 .xterm .xterm-viewport::-webkit-scrollbar-thumb {
   background: rgba(228, 228, 231, 0.28);
   border-radius: 4px;

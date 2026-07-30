@@ -2,6 +2,20 @@
 
 <!-- releases -->
 
+## [protocol-v0.7.0] - 2026-07-20
+
+### Breaking Changes
+- five-category push taxonomy + wake-channel seam (5d4a67eb)
+
+  `PUSH_CATEGORIES` is now exactly `input-required`, `turn-complete`,
+  `session-failed`, `plan-complete`, `spawn-stalled`, replacing the prior
+  four (`permission-needed`, `agent-question`, `idle`, `agent-crash`).
+  `input-required` merges the old `permission-needed` and `agent-question`
+  categories into one, sourced from A2A Protocol's `TaskState.INPUT_REQUIRED`
+  / MCP's `input_required` rather than Claude-specific naming.
+  `RegisterPushRequestPayload` gains an optional `categories` field so a
+  device can register only the categories it wants pushed.
+
 ## [protocol-v0.5.0] - 2026-07-16
 
 All additive; wire `PROTOCOL_VERSION` stays '2'. Includes everything since

@@ -30,6 +30,7 @@ import { useKeybinding } from '../../hooks/useKeybinding';
 import { PriorityBadge } from '../../components/backlog/PriorityBadge';
 import { ConfirmDialog } from '../../components/dialogs/ConfirmDialog';
 import { MaximizeToggleButton } from '../../components/dialogs/dialog-maximize';
+import { DialogFooterActions } from '../../components/dialogs/DialogFooterActions';
 import {
   TaskDetailHeader,
   TaskDetailEditForm,
@@ -46,7 +47,7 @@ import { useLayerStore } from '../context';
 import { registerWindowCloser, unregisterWindowCloser } from '../store/window-close-registry';
 import { classifySnapZone, nextSnap } from '../dnd/snap-zones';
 import type { SnapDirection } from '../dnd/snap-zones';
-import type { Task, ShortcutConfig } from '../../../shared/types';
+import type { Task, ShortcutConfig, TaskRunMode } from '../../../shared/types';
 
 interface TaskDetailWindowProps {
   task: Task;
@@ -92,6 +93,8 @@ export function TaskDetailWindow({
   const swimlanes = useBoardStore((s) => s.swimlanes);
   const shortcuts = useBoardStore((s) => s.shortcuts);
   const loadBoard = useBoardStore((s) => s.loadBoard);
+  const boardManagerOpen = useBoardStore((s) => s.boardManagerOpen);
+  const settingsOpen = useConfigStore((s) => s.settingsOpen);
   const projectPath = useProjectStore((s) => s.currentProject?.path ?? null);
   const killSession = useSessionStore((s) => s.killSession);
   const suspendSession = useSessionStore((s) => s.suspendSession);
@@ -122,6 +125,8 @@ export function TaskDetailWindow({
   const [modelOverride, setModelOverride] = useState(task.model_override ?? '');
   const [effortOverride, setEffortOverride] = useState(task.effort_override ?? '');
   const [permissionOverride, setPermissionOverride] = useState(task.permission_mode ?? '');
+  const [profileId, setProfileId] = useState<string | null>(task.profile_id ?? null);
+  const [runMode, setRunMode] = useState<TaskRunMode>(task.run_mode);
   const [isEditing, setIsEditing] = useState(!!initialEdit);
   const [descriptionPeekOpen, setDescriptionPeekOpen] = useState(false);
   const [confirmDiscard, setConfirmDiscard] = useState(false);
@@ -158,6 +163,8 @@ export function TaskDetailWindow({
     modelOverride,
     effortOverride,
     permissionOverride,
+    profileId,
+    runMode,
     setTitle,
     setDescription,
     setPrUrl,
@@ -167,6 +174,8 @@ export function TaskDetailWindow({
     setModelOverride,
     setEffortOverride,
     setPermissionOverride,
+    setProfileId,
+    setRunMode,
     setIsEditing,
     branchConfig,
     session: sessionState.session,
@@ -230,11 +239,13 @@ export function TaskDetailWindow({
     || modelOverride !== (task.model_override ?? '')
     || effortOverride !== (task.effort_override ?? '')
     || permissionOverride !== (task.permission_mode ?? '')
+    || profileId !== (task.profile_id ?? null)
+    || runMode !== task.run_mode
     || JSON.stringify(labels) !== JSON.stringify(task.labels ?? [])
     || branchConfig.baseBranch !== (task.base_branch || '')
     || branchConfig.customBranchName !== (task.branch_name || '')
     || branchConfig.useWorktree !== (task.use_worktree != null ? Boolean(task.use_worktree) : null)
-  ), [title, description, prUrl, priority, agentOverride, modelOverride, effortOverride, permissionOverride, labels, branchConfig.baseBranch, branchConfig.customBranchName, branchConfig.useWorktree, task]);
+  ), [title, description, prUrl, priority, agentOverride, modelOverride, effortOverride, permissionOverride, profileId, runMode, labels, branchConfig.baseBranch, branchConfig.customBranchName, branchConfig.useWorktree, task]);
 
   // Guard close gestures (header X, Escape, panel.close) while editing with
   // unsaved changes: ask before discarding. Returns true to let the caller
@@ -398,7 +409,12 @@ export function TaskDetailWindow({
   // xterm consumes the Ctrl-letter control chars). Gated on `isFocused` so only
   // the focused window reacts when several are open.
   useKeybinding('panel.maximize', handleToggleMaximized, { capture: true, enabled: isFocused });
-  useKeybinding('panel.close', closeWithGuard, { capture: true, enabled: isFocused });
+  // `!boardManagerOpen && !settingsOpen`: the edit form's Advanced section can
+  // open the Board Manager (profile pencil) or Settings (agent pencil) over this
+  // window, and a single Escape meant for that surface must not also close the
+  // window (or raise its discard confirm) underneath. Gates the bubble-phase
+  // Escape listener below too.
+  useKeybinding('panel.close', closeWithGuard, { capture: true, enabled: isFocused && !boardManagerOpen && !settingsOpen });
   // Close on a header click with the bound mouse button (default middle). Routed
   // through `closeWithGuard` so an unsaved edit still prompts to discard. The
   // `when` scopes the mouse path to THIS window's title bar; a keyboard rebind
@@ -427,14 +443,14 @@ export function TaskDetailWindow({
   // PTY, consumes Escape itself (reaching the agent's TUI) and this never sees
   // it; with the pointer elsewhere Escape bubbles here and closes.
   useEffect(() => {
-    if (!isFocused) return;
+    if (!isFocused || boardManagerOpen || settingsOpen) return;
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key !== 'Escape') return;
       closeWithGuard();
     };
     document.addEventListener('keydown', handleKeyDown);
     return () => document.removeEventListener('keydown', handleKeyDown);
-  }, [isFocused, closeWithGuard]);
+  }, [isFocused, boardManagerOpen, settingsOpen, closeWithGuard]);
 
   // Expose this window's guarded close to the central click-outside dismiss hook
   // (`useClickOutsideToClose`), so a board-background click routes through the
@@ -573,7 +589,10 @@ export function TaskDetailWindow({
         <div className="flex-1 min-h-0 flex flex-col overflow-hidden">
           {isEditing ? (
             <>
-              <div className="px-4 py-4 flex-1 flex flex-col min-h-0 overflow-y-auto">
+              <div
+                className="px-4 py-4 flex-1 flex flex-col min-h-0 overflow-y-auto"
+                data-testid="task-detail-edit-scroll"
+              >
                 <TaskDetailEditForm
                   task={task}
                   title={title}
@@ -593,6 +612,10 @@ export function TaskDetailWindow({
                   effortOverride={effortOverride}
                   setEffortOverride={setEffortOverride}
                   permissionOverride={permissionOverride}
+                  profileId={profileId}
+                  setProfileId={setProfileId}
+                  runMode={runMode}
+                  setRunMode={setRunMode}
                   setPermissionOverride={setPermissionOverride}
                   attachments={attachments}
                   branchConfig={branchConfig}
@@ -602,36 +625,24 @@ export function TaskDetailWindow({
                 />
               </div>
               <div className="px-4 py-3 border-t border-edge flex-shrink-0">
-                <div className={`flex ${isInTodo ? 'justify-between' : 'justify-end'} items-center`}>
-                  {isInTodo && (
+                <DialogFooterActions
+                  onCancel={actions.handleCancel}
+                  onSubmit={actions.handleSave}
+                  submitLabel="Save"
+                  busyLabel="Saving..."
+                  busy={actions.saving}
+                  disabled={!!branchConfig.branchNameError}
+                  leading={isInTodo ? (
                     <button
+                      type="button"
                       onClick={() => skipDeleteConfirm ? actions.handleDelete(false) : actions.setConfirmDelete(true)}
-                      className="flex items-center gap-1.5 px-3 py-1.5 text-xs text-fg-faint hover:text-red-400 hover:bg-red-400/10 rounded transition-colors"
+                      className="flex items-center gap-1.5 rounded px-3 py-1.5 text-xs text-fg-faint transition-colors hover:bg-danger/10 hover:text-danger"
                     >
                       <Trash2 size={14} />
                       Delete
                     </button>
-                  )}
-                  <div className="flex items-center gap-2">
-                    <button
-                      onClick={actions.handleCancel}
-                      className="px-3 py-1.5 text-xs text-fg-muted hover:text-fg-secondary border border-edge-input hover:border-fg-faint rounded transition-colors"
-                    >
-                      Cancel
-                    </button>
-                    <button
-                      onClick={actions.handleSave}
-                      disabled={!!branchConfig.branchNameError || actions.saving}
-                      className={`px-3 py-1.5 text-xs rounded transition-colors ${
-                        branchConfig.branchNameError || actions.saving
-                          ? 'bg-accent-emphasis/50 text-accent-on/50 cursor-not-allowed'
-                          : 'bg-accent-emphasis hover:bg-accent text-accent-on'
-                      }`}
-                    >
-                      {actions.saving ? 'Saving...' : 'Save'}
-                    </button>
-                  </div>
-                </div>
+                  ) : undefined}
+                />
               </div>
             </>
           ) : (
@@ -650,7 +661,6 @@ export function TaskDetailWindow({
               savedAttachments={attachments.savedAttachments}
               handlePreview={attachments.handlePreview}
               handleOpenExternal={attachments.handleOpenExternal}
-              removeAttachment={attachments.removeAttachment}
               handleToggle={actions.handleToggle}
               changesOpen={changesOpen}
               projectPath={projectPath ?? ''}

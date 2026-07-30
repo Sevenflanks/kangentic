@@ -31,7 +31,7 @@ src/main/mobile-bridge/       # desktop implementation, consumes @kangentic/prot
   roster-store.ts             # signed device roster persistence
   pairing/
     pairing-token.ts          # single-use, ~10min pairing token
-    pairing-service.ts        # one pairing ceremony: handshake -> SAS -> confirm
+    pairing-service.ts        # one pairing ceremony: handshake -> SAS -> phone confirm frame -> auto-enroll
   transport/
     relay-client.ts           # outbound WebSocket relay client with reconnect/backoff
     transport-factory.ts      # Transport swap point (relay today, P2P later)
@@ -57,12 +57,14 @@ src/main/mobile-bridge/       # desktop implementation, consumes @kangentic/prot
     board-tool-allowlist.ts      # per-tool read/mutate classification (excludes query_db + move_task/list_tasks/list_columns/list_backlog, which duplicate dedicated verbs; browser/devtools/diagnostics/cross-project tools are absent from commandHandlers, so they are excluded for free)
     register-push.ts             # push registration keyed by the requesting session's roster deviceId
     project-color.ts             # deterministic per-project accent color for read-board
+  prompt-options-probe.ts     # pure parser: pending dialog's numbered option labels out of a serialized PTY frame
   board-event-bus.ts          # consolidated main-process board-mutation event stream (IpcContext.boardEvents)
   session-lifecycle-feed.ts   # bridges SessionManager session-changed/exit edges onto the board-changed bus
   mobile-bridge-service.ts    # top-level service: identity, roster, pairing, sessions, attachContext()
 ```
 
 桌面服務在 `src/main/ipc/register-all.ts` 建立，並在 `src/main/index.ts` 的 `clearPendingTimers` 同步關閉，遵循根目錄 `CLAUDE.md` 的同步 shutdown 邊界。它透過完整的七層 IPC bridge 連接 renderer，包含 `src/shared/ipc-channels.ts` 的 channel (`MOBILE_*`，見 [Architecture > Mobile Bridge](architecture.md#mobile-bridge-10-channels))、`src/shared/types.ts` 的型別、`src/preload/preload.ts` 的 `mobile:` namespace、`src/main/ipc/handlers/mobile-bridge.ts` 的 handler、`useMobileStore` renderer store 與 Mobile Devices 設定分頁。
+The desktop service is constructed in `src/main/ipc/register-all.ts` and torn down synchronously in `src/main/index.ts`'s `clearPendingTimers` as required by the synchronous shutdown invariant. It is wired to the renderer through the full 7-layer IPC bridge - channels in `src/shared/ipc-channels.ts` (`MOBILE_*`, see [Architecture > Mobile Bridge](architecture.md#mobile-bridge-12-channels)), types in `src/shared/types.ts` ("Mobile Bridge" section), the `mobile:` namespace in `src/preload/preload.ts`, the handler in `src/main/ipc/handlers/mobile-bridge.ts`, the `useMobileStore` renderer store, and the Mobile Devices settings tab.
 
 ## Why a separate package
 
@@ -91,15 +93,19 @@ Direction: **the desktop displays a QR code, the phone scans it.** The desktop i
 
 The original research doc considered a PAKE (SPAKE2) for the pairing exchange so two devices could authenticate from a short, human-typed code. What actually shipped uses a **high-entropy, machine-generated token as a Noise PSK** instead. The reasoning, documented in `pairing-handshake.ts`'s module comment: a PAKE's real value is defending a *low-entropy, human-typed* code against offline dictionary attacks. A 32-byte token scanned from a QR is already high-entropy, so an online-guess-only, single-use property (the same property a PAKE would give a short code) falls out of the token itself - no PAKE is needed to get it. Avoiding SPAKE2 also sidesteps a real practical gap: there is no maintained, audited JavaScript SPAKE2 implementation (the one npm package is years-stale, draft-08, and Node-only, which would have broken React Native parity). Using PSK-mode Noise instead keeps exactly **one** audited crypto primitive (Noise) across both pairing and ongoing sessions, rather than two.
 
-### SAS confirmation
+### SAS confirmation and the pairing-confirm frame
 
-After the handshake completes, both sides derive a **Short Authentication String** (`packages/protocol/src/crypto/sas.ts`, `deriveShortAuthenticationString`) from the handshake transcript hash - a 6-digit code plus a short emoji sequence, Matrix-style commitment-before-reveal. The desktop's settings UI shows this alongside a device-name field and two buttons: "Codes match" and "Codes don't match." The user visually compares the code against what the phone displays. This step defeats a photographed or relayed QR: an attacker who intercepts the QR cannot also make both sides' SAS values agree, because the SAS is derived from a live handshake transcript involving both parties' ephemeral keys, not from anything printed on the QR.
+After the handshake completes, both sides derive a **Short Authentication String** (`packages/protocol/src/crypto/sas.ts`, `deriveShortAuthenticationString`) from the handshake transcript hash - a 6-digit code, Matrix-style commitment-before-reveal (the derivation also yields an emoji sequence, unused since neither side renders it: the digits alone already carry the full comparison, and emoji added cross-platform font risk with no assurance). The phone shows its code with a single **Confirm** button; the desktop shows the same code under "Waiting for your phone…" and does not ask a second question - the human already answered it once, on the phone. Backing out on the phone (not the code prompt) is the rejection: there is no separate reject frame.
 
-Confirming ("Codes match") signs the phone's static public key into the device roster with a display name and an initial capability grant (`DEFAULT_PAIRING_CAPABILITIES` - `read-stream`, `read-board`, `read-diff`, `board-tool-read`, `register-push`; write/control verbs are granted explicitly afterward, not by default). Rejecting ("Codes don't match") or cancelling tears down the pairing ceremony without touching the roster.
+Tapping Confirm sends a **pairing-confirm frame** (`packages/protocol/src/pairing/confirm.ts`, `sealPairingConfirm`/`openPairingConfirm`) - a fixed plaintext constant, AEAD-sealed under the cipher state the just-completed IKpsk0 handshake's `split()` already produced. This is a **liveness and intent signal, not the pairing's security boundary**: a relay-in-the-middle already holds a valid session with the desktop and could forge any frame it wants. The actual defense is unchanged - the SAS comparison the human makes before tapping Confirm. What the frame buys instead: both peers derive their transport keys from the SAME completed handshake transcript, so if the sealed frame opens under the desktop's key, the two transcripts necessarily agree, which means the SAS the human compared necessarily agreed too. **The AEAD open IS the desktop's SAS verification** - that is why the frame carries no digits of its own.
+
+On a successful open, the desktop auto-enrolls: it signs the phone's static public key (never any key carried in a payload - `PairingService` always reads `HandshakeState.getRemoteStaticKey()`) into the device roster, using the phone-supplied device name from the handshake's message-1 payload and the full capability grant (see [Capability Verbs](#capability-verbs)). The desktop only interrupts the human on **mismatch** (the frame fails to open) or **timeout** (no frame arrives - `waiting-for-phone` bounded by whatever is left of the pairing token's 10-minute TTL, `sas-pending` a flat 5-minute window, generous because a human is physically tapping their phone). A device's name can be changed afterward from the paired-devices list; renaming is not part of the ceremony.
 
 ## Signed Device Roster
 
 `src/main/mobile-bridge/roster-store.ts` persists a `DeviceRoster` (one JSON file, globally scoped - like the identity, this represents the desktop installation, not any one project). Every entry (`RosterDeviceEntry`: device id, static public key, display name, capabilities, paired-at, expiry, signature) is signed with the desktop's Ed25519 master signing key at pairing time and **re-verified against that same key every time the roster is loaded from disk**. A corrupted or hand-edited roster file degrades to "that device drops out," not "an unverified entry is silently trusted" - the roster, not the relay, is the source of truth for who is paired.
+
+The paired-devices list identifies each device by a **key fingerprint** (`packages/protocol/src/roster/fingerprint.ts`, `formatKeyFingerprint`): the leading 16 hex characters of its static public key, in four space-separated groups. That is the identity the ceremony actually bound and the SAS actually confirmed, unlike a display name (not unique, and user-editable) or a hardware id (unavailable on modern Android, and permanent PII). The mobile app formats it identically, so a user can hold the phone next to the desktop and compare the two directly - hence front-only slice, no ellipsis, no case change.
 
 ### Revocation is drop-plus-rekey
 
@@ -110,20 +116,26 @@ Revoking a device (`revokeDevice()`) removes its entry from the roster **and** i
 `packages/protocol/src/capabilities/verbs.ts` defines the complete allowlist a paired device can be granted:
 
 - `read-stream` - live scrollback, terminal output, activity/usage telemetry, and transcript deltas for one session.
-- `read-board` - a project's columns/tasks/backlog, or (with no `projectId`) the machine's project list; live updates via the board-changed bus.
+- `read-board` - a project's columns and tasks, or (with no `projectId`) the machine's project list; live updates via the board-changed bus. The `view` field picks the projection: `'sessions'` (session-bearing tasks plus whole-column counts, what an agent feed draws across every project) or `'full'` (every task, for the one board the user has open). Either way the backlog stays home; only a pre-0.9.0 request that names no `view` still gets it.
 - `read-diff` - a task's diff file list or a single file's content, via `DiffService`; live "something changed, re-fetch" pushes via a bridge-owned `DiffWatcher`.
 - `send-user-message` - deliver text to a running session via the same bracketed-paste path (`TerminalSubmit.submitContent`) the renderer's Browser-pane Send affordance uses.
 - `move-task` - move a task between columns via `handleTaskMove` (respects `withTaskLock` and the transition engine).
 - `answer-permission-prompt` - the most sensitive verb; binds a phone's raw keystrokes to a specific outstanding permission-prompt id before writing them to the PTY.
-- `interactive-terminal` - raw PTY write-path parity (full desktop-terminal keystroke control), an explicit-grant-only verb, not in the read-only default. Three actions ride the one grant: `write` (the default; an action-less payload from a pre-0.4.0 phone parses as a write), `resize` (fit-to-phone: sets the PTY grid so the TUI redraws phone-shaped), and `release-size` (give the grid back). Resize deliberately shares the write grant - a device trusted to type raw bytes into the PTY gains nothing new from resizing it. While a phone holds a session's grid, a per-device guard (`handlers/terminal-size-guard.ts`) registered in the same `SubscriptionRegistry` restores the desktop's last dimensions on EVERY release path: explicit `release-size`, device disconnect, roster revoke, or bridge shutdown; it disarms without restoring when the session exits. Contention is latest-writer-wins - a desktop resize while a phone holds simply wins and becomes the new restore target; with two phones, either one's release restores desktop dims (documented limitation).
+- `interactive-terminal` - raw PTY write-path parity (full desktop-terminal keystroke control). Three actions ride the one grant: `write` (the default; an action-less payload from a pre-0.4.0 phone parses as a write), `resize` (fit-to-phone: sets the PTY grid so the TUI redraws phone-shaped), and `release-size` (give the grid back). Resize deliberately shares the write grant - a device trusted to type raw bytes into the PTY gains nothing new from resizing it. While a phone holds a session's grid, a per-device guard (`handlers/terminal-size-guard.ts`) registered in the same `SubscriptionRegistry` restores the desktop's last dimensions on EVERY release path: explicit `release-size`, device disconnect, roster revoke, or bridge shutdown; it disarms without restoring when the session exits. Contention is latest-writer-wins - a desktop resize while a phone holds simply wins and becomes the new restore target; with two phones, either one's release restores desktop dims (documented limitation).
 - `board-tool-read` / `board-tool-write` - the long-tail task/backlog CRUD surface (create, edit, delete, link PR, ...) that has no dedicated verb, split by read vs mutate access so the grant granularity matches the rest of the model. **Not MCP** - no agent, LLM, or JSON-RPC round-trip is involved; see [Board Tool Surface](#board-tool-surface) below.
 - `register-push` - register (or unregister) the device for E2E-encrypted push notifications: the phone hands over its Expo push token plus a device-generated 32-byte push-envelope key, keyed by the requesting session's authenticated roster identity, never by payload content. See [Push Notifications](#push-notifications-e2e) below.
 
 There is **deliberately no shell, file-read, or arbitrary-command verb** - absent from the protocol entirely, not filtered at runtime. This mirrors the lesson from SSH forced-command escapes and is the counter-example to Chrome Remote Desktop / VS Code tunnels, which are identity-gated but capability-unscoped. Adding a verb to this list is a protocol change; it does not by itself grant anything to a device - a device's roster entry still has to include the verb in its `CapabilitySet`, and the desktop's `CapabilityRouter` still has to have a handler registered for it.
 
-`src/main/mobile-bridge/capability-router.ts` is the desktop-side dispatch point: it checks the requesting session's `CapabilitySet` (bound at pairing time, adjustable per-device afterward via the Mobile Devices settings tab's per-verb toggles) before even looking up a handler, so an unauthorized verb is rejected before any handler code runs. Every verb has a registered handler (`src/main/mobile-bridge/handlers/`, wired once by `MobileBridgeService.attachContext()`); an authorized-but-unregistered verb would still fail closed with an explicit "no handler registered" error rather than doing nothing silently - that guarantee stays load-bearing even though nothing exercises it in production today.
+`src/main/mobile-bridge/capability-router.ts` is the desktop-side dispatch point: it checks the requesting session's `CapabilitySet` (bound at pairing time) before even looking up a handler, so an unauthorized verb is rejected before any handler code runs. Every verb has a registered handler (`src/main/mobile-bridge/handlers/`, wired once by `MobileBridgeService.attachContext()`); an authorized-but-unregistered verb would still fail closed with an explicit "no handler registered" error rather than doing nothing silently - that guarantee stays load-bearing even though nothing exercises it in production today. The check itself is unconditional infrastructure, independent of what a device happens to be granted - see [Full access on pair](#full-access-on-pair) for what changed there.
 
-`DEFAULT_PAIRING_CAPABILITIES` (granted automatically on a successful pairing) is the read-only set plus push registration: `read-stream`, `read-board`, `read-diff`, `board-tool-read`, `register-push` (registering for notifications neither reads nor mutates the board or any session). Every write/control verb (`send-user-message`, `move-task`, `answer-permission-prompt`, `interactive-terminal`, `board-tool-write`) requires an explicit grant afterward via the settings UI.
+### Full access on pair
+
+`DEFAULT_PAIRING_CAPABILITIES` (granted automatically on a successful pairing) is **all ten verbs** - `[...CAPABILITY_VERBS]`. The phone is an extension of the user's own desktop environment, not a third-party integration: the same person holds both devices, and the QR scan plus SAS comparison (now the pairing-confirm frame - see [SAS confirmation](#sas-confirmation-and-the-pairing-confirm-frame)) already prove physical possession of both, so pairing is the only approval the human needs to give. What stays true regardless of the grant: the protocol still defines no shell, file, or arbitrary-command verb at all, and **unpair remains the kill switch**.
+
+A device paired before this change is upgraded to the full grant once, automatically, the next time the bridge starts (`MobileBridgeService.attachContext()`'s `migrateDevicesToFullCapabilityGrant()`, before the first `reconcile()` opens any session) - routed through `setDeviceCapabilities()` so the roster entry is correctly re-signed rather than silently invalidated (capabilities are inside the Ed25519-signed payload; see [Signed Device Roster](#signed-device-roster)).
+
+The per-device capability CHECK stays (`CapabilityRouter.dispatch`'s deny-by-default gate, `setDeviceCapabilities()`'s IPC/service surface) as the seam for a future narrower preset ("view only"), but the Mobile Devices settings tab no longer exposes a per-verb toggle UI - there is nothing to configure at pairing time, and per-device controls are limited to rename and unpair/revoke.
 
 ## Data Feeds
 
@@ -147,7 +159,9 @@ Session lifecycle edges feed the same bus: `src/main/mobile-bridge/session-lifec
 
 There is no dedicated permission-prompt object in the desktop app - a prompt is just the agent's own TUI prompt, and the activity engine tracks only that one is pending (`ActivityStatsSnapshot.permissionPending`) plus which tool it is for (`permissionAwaitedToolId`, the `tool_use_id` - added in Phase 2, kept in sync between the engine-internal and IPC copies of `ActivityStatsSnapshot` per `activity-stats-snapshot-parity.test.ts`). `answer-permission-prompt`'s handler synthesizes a prompt id (`${sessionId}:${permissionAwaitedToolId}`), reports it in `read-stream`'s snapshot as `awaitedPromptId`, and rejects an answer whose `promptId` does not match the CURRENT live value - the safety property that makes this verb meaningfully different from a plain `interactive-terminal` write. The phone sends raw keystrokes; no agent-specific interpretation happens in the bridge (per `agent-adapters-boundary.md`).
 
-A prompt that appears (or clears) AFTER the subscribe snapshot is pushed live as the `permission` activity payload (`{type: 'permission', promptId, pending}`): `read-stream`'s subscription re-derives the awaited id on every activity/session-event emission and pushes only on change (pending `false` carries the id that just cleared). Without this, a phone could answer only prompts already outstanding at subscribe time or blindly re-subscribe to discover new ones.
+A prompt that appears (or clears) AFTER the subscribe snapshot is pushed live as the `permission` activity payload (`{type: 'permission', promptId, pending, options?}`): `read-stream`'s subscription re-derives the awaited id on every activity/session-event emission and pushes only on change (pending `false` carries the id that just cleared). Without this, a phone could answer only prompts already outstanding at subscribe time or blindly re-subscribe to discover new ones.
+
+The phone answers with raw keystrokes either way, but since 0.6.0 it no longer has to LABEL its buttons blind: `src/main/mobile-bridge/prompt-options-probe.ts` (`extractPromptOptions`, pure) parses the pending dialog's numbered option rows (`❯ 1. Yes`, `2. Yes, and don't ask again...`, box border tolerated; last complete 1..n run wins, minimum two options) out of the same serialized frame the mobile seed uses, rendered through the shared `VirtualScreen` VT-grid (`src/main/pty/virtual-screen.ts`, extracted from the Claude model-picker probe). The subscribe snapshot reports the labels as `awaitedPromptOptions` (probed from the frame already fetched for `scrollback`), and the live pending push attaches them as `options`, probing when the prompt appears with one short retry in case the activity emission beat the TUI's dialog paint. Both fields are additive and best-effort: absent or null means "unknown", and the phone falls back to its blind approve/deny keystrokes. `answer-permission-prompt` is untouched - keystrokes remain the answer transport, and no agent-specific parsing enters the bridge (any TUI that draws a numbered dialog parses; anything else yields null).
 
 ## Board Tool Surface
 
@@ -164,16 +178,17 @@ A phone bootstraps its project list through `read-board` with no `projectId`, si
 
 Push payloads transit Expo's push service (and APNs/FCM under it), which must never see notification content. The pipeline keeps every hop blind:
 
-1. **Registration** (`register-push` verb, `handlers/register-push.ts`): the phone sends its Expo push token plus a device-generated 32-byte push key (base64url, length-checked at the protocol parse boundary). The desktop stores both in `push/push-registration-store.ts`'s `mobile-push-registrations.json` sidecar (config dir, roster-store pattern, tolerant load), keyed by the requesting session's authenticated roster `deviceId` - never by payload content, so one device cannot register or unregister another. Revoking a device also clears its registration, unconditionally.
+1. **Registration** (`register-push` verb, `handlers/register-push.ts`): the phone sends its Expo push token, a device-generated 32-byte push key (base64url, length-checked at the protocol parse boundary), and optionally its enabled `categories` (absent means every category; an explicit empty list means none). The desktop stores all of it in `push/push-registration-store.ts`'s `mobile-push-registrations.json` sidecar (config dir, roster-store pattern, tolerant load), keyed by the requesting session's authenticated roster `deviceId` - never by payload content, so one device cannot register or unregister another. Revoking a device also clears its registration, unconditionally. Preferences are enforced **desktop-side**: the phone's category list is checked before a notification is even sealed, so a future iOS Notification Service Extension never needs to know about them.
 2. **Envelope** (`packages/protocol/src/crypto/push-envelope.ts`): the desktop seals a `PushEnvelopePlaintext` (`category`, `projectId`, `taskId`, `sessionId`, `taskTitle`, `detail`, `sentAt`) with XChaCha20-Poly1305 under the device's push key: a fresh random 24-byte nonce prepended to the ciphertext, the recipient device's static public key as AAD (a blob sealed for one device cannot be replayed at another), base64url without padding. `openPushEnvelope` (run on-device: Android Notifee / iOS Notification Service Extension) rejects tampering, wrong keys, wrong recipients, malformed plaintext, unknown categories, and any `sentAt` older than 24h or more than 5min in the future; every failure degrades to the generic placeholder, never to plaintext.
-3. **Triggers** (`push/push-notifier.ts`, keyed off `SessionManager`'s `activity`/`exit` emissions). Four categories:
-   - `permission-needed` - the session transitioned INTO the `permission` activity state.
-   - `agent-question` - same transition, but the awaited prompt is an `AskUserQuestion` (resolved by matching the awaited `tool_use_id` against the session's cached `tool_start` events).
+3. **Triggers** (`push/push-notifier.ts`, keyed off `SessionManager`'s `activity`/`exit` emissions, plus two sources elsewhere). Five categories, named for cross-vendor task-lifecycle vocabulary (`input-required` mirrors A2A's `TaskState.INPUT_REQUIRED`) rather than any one agent's terms:
+   - `input-required` - the session transitioned INTO the `permission` activity state (an approval request or an `AskUserQuestion` alike - the phone renders one "needs your input" experience for both, so the desktop no longer distinguishes them on the wire).
    - `turn-complete` - the session transitioned `thinking` -> `idle`.
    - `session-failed` - the session exited with `intentional` false (a crash; a deliberate stop never notifies).
+   - `plan-complete` - the session emitted `plan-exit` (a plan was approved).
+   - `spawn-stalled` - a task's spawn (worktree/git prep) has been in flight past the stall threshold; this one has no `sessionId` yet (the session doesn't exist until spawn finishes), so it notifies keyed by `taskId` instead.
    Permission triggers are debounced 2s and re-checked at fire time, so a prompt answered at the desk within the window never pings the phone.
-4. **Suppression**: a device with a live established bridge session is never pinged (presence suppression - the user is already watching from it), and each (device, session, category) tuple has a 30s cooldown.
-5. **Delivery** (`push/expo-push-client.ts`): a plain injected-fetch POST to the Expo push API (no SDK), one 5s retry on network error. The visible `title` is always `Kangentic` and the `body` a static per-category placeholder (`Agent needs your attention` for the two attention categories, `Task update`, `Session stopped`); **only `data.blob` carries real content**, and a unit test asserts no plaintext field value appears anywhere else in the POST body. The Android `channelId` maps per category: `needs-attention`, `completions`, `failures`. A `DeviceNotRegistered` ticket drops the registration.
+4. **Suppression**: a device with a live established bridge session is never pinged (presence suppression - the user is already watching from it), then the device's category preferences are checked, then each (device, session-or-task, category) tuple has a 30s cooldown.
+5. **Delivery** (`push/wake-channel.ts`, `push/expo-push-client.ts`): `PushNotifier` talks to a vendor-neutral `WakeChannel` interface, not to Expo directly - the only implementation today, `createExpoWakeChannel`, is a plain injected-fetch POST to the Expo push API (no SDK), one 5s retry on network error, with `mutableContent: true` set so the future iOS Notification Service Extension is invoked. A drop-in replacement (e.g. a small Cloudflare Worker holding the same push credentials) only has to implement `WakeChannel`. The visible `title` is always `Kangentic` and the `body` a static per-category placeholder; **only `data.blob` carries real content**, and a unit test asserts no plaintext field value appears anywhere else in the POST body. The Android `channelId` maps per category: `needs-attention`, `completions`, `failures`, `stalls`. A `DeviceNotRegistered` ticket drops the registration.
 
 ## Ongoing Session: Noise KK + Re-handshake + Secretstream
 
@@ -185,6 +200,62 @@ Once a device is paired, `src/main/mobile-bridge/session/bridge-session.ts` mana
 - No Double Ratchet: it solves offline-queued asynchronous messaging, which this interactive, always-connected link does not have.
 
 `src/main/mobile-bridge/wire/session-frame.ts` (re-exported from the protocol package) tags every frame as either a `Handshake` frame (routed to the in-progress `HandshakeState`) or an `Application` frame (routed to the established secretstream pair), so handshake and application traffic can share one transport connection without ambiguity.
+
+### Per-device connection state
+
+Each row in the Mobile Devices settings tab reports `BridgeSession.connectionState`
+(`MobileDeviceConnectionState` in `src/shared/types.ts`), **not** the raw transport state. The
+transport alone cannot answer "is the phone there": the desktop's relay socket reads `connected`
+whenever the relay is up and the slot is dialable, with the phone powered off. So a badge driven
+by the transport shows a green "Connected" for a device that is gone.
+
+| Reported | Means |
+|---|---|
+| `idle` | No session open for this device yet. Renders no badge (not an error). |
+| `connecting` | The transport is up and the KK handshake is in flight. |
+| `connected` | The KK session is established: the phone answered, so it is genuinely attached. |
+| `offline` | The relay slot is healthy but no phone is attached to it. |
+| `reconnecting` | The relay link itself dropped and `RelayClient` is backing off. |
+| `closed` | The transport was closed. |
+
+`offline` and `reconnecting` are deliberately distinct: they call for opposite user actions (open
+the phone vs. fix the network). `offline` is a presence conclusion rather than a transport state,
+so it is **not** part of `MobileBridgeTransportState`, which must keep mirroring
+`@kangentic/protocol`'s `TransportState` exactly.
+
+Two guards keep the value honest without making it twitchy:
+
+- **A probe budget before `offline`.** Every handshake initiation doubles as a presence probe.
+  Silence for `PEER_PRESENCE_TIMEOUT_MS` (5s) spends one unit; only `PEER_PRESENCE_FAILURES_BEFORE_ABSENT`
+  (2) consecutive failures conclude the peer is absent, so one slow round trip never flashes
+  "Offline" on a live phone. An explicit goodbye (a `FrameTag.Final` frame) skips the budget. Once
+  absent, `PEER_PROBE_INTERVAL_MS` (15s) keeps probing so a returning phone is picked up in ~20s
+  rather than on the next rekey tick. The probe window is anchored to the start of an
+  unestablished episode and is **never restarted** by a later initiation: `HANDSHAKE_RETRY_MS`
+  (3s) re-initiates faster than the window expires, so a restartable window would let a relay
+  injecting garbage handshake frames hold `offline` permanently out of reach and pin the badge on
+  "Connecting..." forever.
+- **Application traffic proves presence.** Promotion is evidence-based the same way demotion is:
+  any frame the desktop can open came from the phone, since only it holds the matching send key,
+  so opening one restarts the probe budget. Without that, presence rested on the handshake alone,
+  and a single dropped initiation (a rekey is attempted every `REHANDSHAKE_INTERVAL_MS`, so a
+  lossy relay gets a fresh chance every two minutes) drained the budget while the phone, never
+  having learned a rekey was attempted, kept serving on streams the desktop was still decrypting.
+  That reported "Offline" for a demonstrably live device: the exact mirror of the stale green
+  "Connected" this whole state exists to remove.
+- **A hold before surfacing a blip.** The relay force-closes both peers when either drops, so an
+  ordinary phone reload costs a ~500ms reconnect plus a re-handshake. A known-good session keeps
+  reporting `connected` for `RECONNECT_GRACE_MS` (2s), spanning the reconnect *and* the
+  re-handshake, so the badge does not flicker `connected -> reconnecting -> connecting -> connected`
+  on every reload. A genuine outage outlasts the hold and correctly falls through.
+
+`MobileBridgeStatus.relayState` is the separate panel-wide aggregate over each session's
+*transport* state, with precedence `connected > connecting > reconnecting > closed`. It describes
+the relay link, so it deliberately stays transport-based. Because that precedence pins it at
+`connected` the moment any one device connects, the renderer's `mobile:stateChanged` notification
+is gated on a signature covering the aggregate **and** every device's own connection state -
+gating on the aggregate alone left a second device's row frozen on "Connecting..." while its phone
+was already serving data.
 
 ## Relay Transport
 
@@ -209,7 +280,8 @@ Even a correctly-implemented blind relay is not metadata-invisible. A relay oper
 - Signed device roster with revoke-drop (rekey-on-revoke is scaffolded but the full multi-device re-provisioning flow is deferred).
 - QR pairing ceremony (token-bound Noise PSK + SAS confirmation) with desktop settings UI.
 - The desktop's outbound relay CLIENT connection with reconnect/backoff.
-- Mobile Devices settings tab: enable toggle, relay URL, pairing flow, paired-device list, revoke.
+- Mobile Devices settings tab: enable toggle, relay mode (resolved default vs. custom override) with a Test connection probe, pairing flow, paired-device list, revoke.
+- **Pairing overhaul (one comparison, one tap):** the pairing-confirm frame (`packages/protocol/src/pairing/confirm.ts`) and desktop auto-enroll on it, replacing the desktop's own "Codes match" / "Codes don't match" question; the emoji half of the SAS display dropped everywhere (digits only); explicit ceremony timeouts on both the `waiting-for-phone` and `sas-pending` phases (there was none before - the pairing token's TTL was only checked lazily); `startPairing()` now supersedes a stale in-progress ceremony instead of throwing, and the settings tab cancels on unmount, so "Pair a device" always reopens a fresh QR. Paired-device cards now show the device's X25519 key fingerprint (`formatKeyFingerprint`, `packages/protocol/src/roster/fingerprint.ts` - matches `kangentic-mobile`'s own display exactly), live per-device connection state, and paired date, with rename added alongside revoke. See [Full access on pair](#full-access-on-pair) for the paired capability grant.
 
 **Shipped (Bridge Phase 2 - data feeds, interactive control & capabilities):**
 
@@ -218,7 +290,7 @@ Even a correctly-implemented blind relay is not metadata-invisible. A relay oper
 - All 9 capability-verb handlers (`src/main/mobile-bridge/handlers/`), each described under [Data Feeds](#data-feeds) and [Board Tool Surface](#board-tool-surface) above.
 - `SessionManager`'s unfiltered `data-tap` event and `ActivityStatsSnapshot.permissionAwaitedToolId`.
 - The consolidated `BoardEventBus` (`IpcContext.boardEvents`).
-- Per-device capability-granting UI in the Mobile Devices settings tab (one toggle per verb, driven by `MOBILE_CAPABILITY_VERBS`).
+- ~~Per-device capability-granting UI in the Mobile Devices settings tab (one toggle per verb, driven by `MOBILE_CAPABILITY_VERBS`).~~ Superseded: pairing now grants all ten verbs (see [Full access on pair](#full-access-on-pair)) and the per-verb toggle UI was removed; the capability CHECK and `setDeviceCapabilities()` surface it depended on stay as the seam for a future narrower preset.
 - **Protocol 0.2.0 (typed feed payloads):** wire mirrors + phone-side runtime guards for every feed/response payload that was `JsonValue` in 0.1.x (`packages/protocol/src/events/payloads.ts`, typed `events/event.ts` + `wire/payloads.ts`, `capabilities/board-tools.ts` tool-name tuples), the desktop `wire-mappers.ts` adoption, the subscribe-time transcript seed, and the live `permission` activity event. Wire-compatible with 0.1.x (`PROTOCOL_VERSION` unchanged): it types what was already sent, plus two additive emissions.
 - Still deferred within Phase 2's own scope: re-handshaking `BridgeSession` on a transport reconnect (mid-interval connect latency is a UX rough edge, not a correctness gap - the existing ~2-minute timer still re-handshakes).
 
@@ -227,9 +299,21 @@ Even a correctly-implemented blind relay is not metadata-invisible. A relay oper
 - Protocol: the `session-ended` activity payload and read-stream `sessionStatus`, the `register-push` verb + payloads, the E2E push envelope (`crypto/push-envelope.ts`), and optional project accent colors on the read-board payloads. All additive and wire-compatible (absent fields parse as before on older peers).
 - Desktop: `SessionLifecycleBoardFeed` (lifecycle edges onto the board-changed bus), the read-stream `session-ended` push + `sessionStatus` snapshot field, the push stack described under [Push Notifications](#push-notifications-e2e), and derived project accent colors in `read-board`.
 
+**Shipped (Protocol 0.8.0 - what a session list actually costs):**
+
+- Protocol: the read-stream subscribe `terminal` flag and the `message-preview` activity payload. Both additive and wire-compatible - absent means the previous behaviour, so an older phone and an older desktop each keep working against a newer peer.
+- Desktop: `resolveTaskTranscript` revalidates a task by `fs.stat` before parsing any session, using file signatures recorded in the stitch memo itself (not read back from the file cache, which is a bounded LRU and goes empty on a busy board); `transcript-cache.ts`'s cap raised 16 -> 64 with a 192MB byte budget; `read-stream` honours `terminal: false` by attaching neither the `data-tap` nor the `pty-resize` listener and returning an empty `scrollback` instead of building a serialized frame; `message-preview.ts` derives the one line a phone's session list renders from the transcript the subscription already resolves.
+- Why: measured from a Pixel over a LOOPBACK relay, one Home-feed refresh touched 20 transcript files totalling 319MB (a `--resume` writes a NEW file replaying its parent's whole history, so one task resumed five times owned 267MB across five near-identical files), and individual `transcript-window` requests took 0.7 to 3.8 seconds - the SMALLEST response was the slowest, because the cost was finding the entries rather than sending them. Separately, `event:terminal` streamed continuously to a phone showing no terminal at all (~13MB/hour), because every subscription carried PTY bytes the phone discards by design at its own terminal boundary.
+
+**Shipped (Protocol 0.9.0 - a board projection that matches what a phone draws):**
+
+- Protocol: the read-board subscribe `view` field (`'full' | 'sessions'`), the `view` echo and `taskCountsByColumnId` on the snapshot response, and an optional `backlog`. Additive in both directions: a pre-0.9.0 phone sends no `view` and gets the old payload verbatim; a 0.9.0 phone against a pre-0.9.0 desktop gets a full board with no `view` echo, which is exactly how it knows the snapshot was not filtered.
+- Desktop: `read-board` builds the backlog only for a request that named no `view`, filters `tasks` to session-bearing ones under `'sessions'`, and sends whole-column counts alongside, since a phone appending a card to a column cannot take the column's length from a filtered list.
+- Why: measured across a 15-project desktop, the boards were 63kB compressed of a ~96kB cold start. 23kB of that was a backlog no phone build has ever rendered, and another 30kB was tasks with no session on them, which the Agents feed never draws. Worse, a board subscription re-snapshots on every board change, so the whole payload repeated for as long as the phone stayed connected: for the busiest project that is 17.7kB per change against 4.6kB for the projection. The `'sessions'` view is 12kB for the same 15 projects, and the Board tab upgrades the one project the user actually opens to `'full'`.
+
 **Explicitly out of scope, later phases:**
 
-- **Bridge Phase 3 remainder:** full desktop static-key rotation and re-provisioning of remaining paired devices on revoke; fuller device-management UX beyond the per-verb toggles.
+- **Bridge Phase 3 remainder:** full desktop static-key rotation and re-provisioning of remaining paired devices on revoke; fuller device-management UX beyond rename/revoke (grouping, a narrower capability preset such as "view only").
 - **Bridge Phase 4 (direct P2P + IPv6 speed upgrade):** WebRTC data channels (`node-datachannel` desktop / `react-native-webrtc` mobile), signaling over the already-secure channel, DTLS fingerprint pinning, IPv6-first candidate ordering, Tailscale detection.
 - **The relay SERVER.** This doc describes the desktop's client-side contract against a relay; the relay itself (a tiny stateless blind byte-forwarder) lives in the separate, open-source [`kangentic-relay`](https://github.com/Kangentic/kangentic-relay) repo and is not part of this codebase.
 - The mobile app itself (`kangentic-mobile`, a separate repo).
@@ -237,6 +321,6 @@ Even a correctly-implemented blind relay is not metadata-invisible. A relay oper
 ## See Also
 
 - [Mobile Companion App Research](research/mobile-companion-app.md) - Full product rationale, transport decision (relay-first), security architecture, notification design, and phasing this doc summarizes.
-- [Architecture > Mobile Bridge](architecture.md#mobile-bridge-10-channels) - IPC channel table.
-- [Configuration](configuration.md) - `AppConfig.mobileBridge` (`enabled`, `relayUrl`).
+- [Architecture > Mobile Bridge](architecture.md#mobile-bridge-12-channels) - IPC channel table.
+- [Configuration](configuration.md) - `AppConfig.mobileBridge` (`enabled`, `relayMode`, `relayUrl`) and `src/shared/relay.ts`'s resolver/validator.
 - [Board Integration](board-integration.md) - The analogous per-provider adapter pattern this bridge's `Transport` swap point mirrors in spirit.

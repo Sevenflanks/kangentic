@@ -39,37 +39,74 @@ async function closeSettings() {
 }
 
 test.describe('Settings Panel', () => {
-  test('titlebar gear opens Settings panel with all 11 tabs when project is open', async () => {
+  test('titlebar gear opens Settings panel with project and system tabs when project is open', async () => {
     await openSettings();
     await expect(page.locator('h2:has-text("Settings")')).toBeVisible();
 
-    // All 11 tabs should be visible (5 project + 6 system)
-    await expect(page.getByRole('button', { name: 'Theme' })).toBeVisible();
-    await expect(page.getByRole('button', { name: 'Terminal', exact: true })).toBeVisible();
+    // Representative sample across project tabs (General, Theme, Agent, Git,
+    // Shortcuts) and system tabs (Board, Changes, Terminal, Behavior,
+    // Hotkeys, MCP Server, Notifications, Privacy). Terminal is a SYSTEM tab
+    // (global-only: shell/font/colors/context bar), not a project tab - there
+    // is no separate per-project Terminal tab. "Board" is scoped to the
+    // settings sidebar because the board/backlog view-toggle behind the panel
+    // is also labeled "Board" (see the MCP Server tools-list test below for the
+    // same class of collision).
+    await expect(page.getByRole('button', { name: 'General' })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Theme', exact: true })).toBeVisible();
     await expect(page.getByRole('button', { name: 'Agent', exact: true })).toBeVisible();
     await expect(page.getByRole('button', { name: 'Git' })).toBeVisible();
     await expect(page.getByRole('button', { name: 'Shortcuts' })).toBeVisible();
-    await expect(page.getByRole('button', { name: 'Layout' })).toBeVisible();
+    await expect(page.getByTestId('settings-tab-list').getByRole('button', { name: 'Board' })).toBeVisible();
+    await expect(page.getByTestId('settings-tab-list').getByRole('button', { name: 'Task', exact: true })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Changes' })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Terminal', exact: true })).toBeVisible();
     await expect(page.getByRole('button', { name: 'Behavior' })).toBeVisible();
     await expect(page.getByRole('button', { name: 'Hotkeys', exact: true })).toBeVisible();
     await expect(page.getByRole('button', { name: 'MCP Server' })).toBeVisible();
     await expect(page.getByRole('button', { name: 'Notifications' })).toBeVisible();
     await expect(page.getByRole('button', { name: 'Privacy' })).toBeVisible();
 
+    // System tabs are further grouped into tiers: Core (no header - the
+    // first, unlabeled group), Advanced, and Other (Privacy, Developer).
+    const tabList = page.getByTestId('settings-tab-list');
+    await expect(tabList.getByText('Advanced', { exact: true })).toBeVisible();
+    await expect(tabList.getByText('Other', { exact: true })).toBeVisible();
+
     await closeSettings();
   });
 
   test('shows Theme tab with color scheme selector', async () => {
     await openSettings();
+    await page.getByRole('button', { name: 'Theme', exact: true }).click();
     await expect(page.locator('text=Color scheme for the interface')).toBeVisible();
     await closeSettings();
   });
 
-  test('shows Agent section with CLI Path and Idle Timeout', async () => {
+  test('Privacy tab links fork support to GitHub Discussions and Issues', async () => {
+    await openSettings();
+    await page.getByRole('button', { name: 'Privacy' }).click();
+
+    await page.evaluate(() => {
+      window.__openedExternalUrls = [];
+      window.electronAPI.shell.openExternal = async (url: string) => {
+        window.__openedExternalUrls?.push(url);
+      };
+    });
+
+    await page.getByTestId('privacy-contact-discussions').click();
+    await page.getByTestId('privacy-contact-issues').click();
+
+    await expect.poll(() => page.evaluate(() => window.__openedExternalUrls)).toEqual([
+      'https://github.com/Sevenflanks/kangentic/discussions',
+      'https://github.com/Sevenflanks/kangentic/issues',
+    ]);
+    await closeSettings();
+  });
+
+  test('shows Agent section with CLI Path', async () => {
     await openSettings();
     await page.getByRole('button', { name: 'Agent', exact: true }).click();
     await expect(page.getByText('Claude Code Path')).toBeVisible();
-    await expect(page.getByText('Idle Timeout (minutes)')).toBeVisible();
     await closeSettings();
   });
 
@@ -80,24 +117,75 @@ test.describe('Settings Panel', () => {
     await expect(page.locator('text=When Max Sessions Reached')).toBeVisible();
     await expect(page.locator('text=Auto-Focus Idle Sessions')).toBeVisible();
     await expect(page.locator('text=Auto-Resume Agents on Restart')).toBeVisible();
-    await expect(page.locator('text=Auto-Apply Board Config Changes')).toBeVisible();
-    // Task Windows section: close-on-outside-click policy (light-dismiss).
+    // Idle Timeout moved here from the Agent tab: it is a flat, agent-agnostic
+    // session-lifecycle setting, not a per-agent one.
+    await expect(page.getByText('Idle Timeout (minutes)')).toBeVisible();
+    // Windows section: task-window light-dismiss + app window position restore,
+    // merged from the old separate Task Windows / App Window sections.
     await expect(page.locator('text=Close on Outside Click')).toBeVisible();
+    await expect(page.locator('text=Restore Window Position')).toBeVisible();
     await closeSettings();
   });
 
-  test('shows Layout tab with density, width, visibility, and animation settings', async () => {
+  test('shows Board tab with width, config sync, and animation settings', async () => {
     await openSettings();
-    await page.getByRole('button', { name: 'Layout' }).click();
-    await expect(page.locator('text=Card Density')).toBeVisible();
+    await page.getByTestId('settings-tab-list').getByRole('button', { name: 'Board' }).click();
     await expect(page.locator('text=Column Width')).toBeVisible();
-    // Ticket Numbers toggle row (showTaskNumbers) - goes RED if SettingToggleRow is
-    // removed from LayoutTab.tsx, while leaving all other assertions green.
-    await expect(page.locator('text=Ticket Numbers')).toBeVisible();
+    // Config Sync section: moved here from Behavior - it is board data
+    // reconciliation (kangentic.json), not session/window behavior.
+    await expect(page.locator('text=Auto-Apply Board Config Changes')).toBeVisible();
     await expect(page.getByText('Terminal Panel', { exact: true })).toBeVisible();
     await expect(page.getByText('Status Bar', { exact: true })).toBeVisible();
-    await expect(page.locator('text=Restore Window Position')).toBeVisible();
     await expect(page.locator('text=Animations')).toBeVisible();
+    await closeSettings();
+  });
+
+  test('shows Task tab with card density, ticket numbers, and context bar settings', async () => {
+    await openSettings();
+    await page.getByTestId('settings-tab-list').getByRole('button', { name: 'Task', exact: true }).click();
+    await expect(page.locator('text=Card Density')).toBeVisible();
+    // Ticket Numbers toggle row (showTaskNumbers) - goes RED if SettingToggleRow is
+    // removed from TaskTab.tsx, while leaving all other assertions green.
+    await expect(page.locator('text=Ticket Numbers')).toBeVisible();
+    await expect(page.getByText('Context Bar')).toBeVisible();
+    await closeSettings();
+  });
+
+  test('shows Changes tab with diff scope, whitespace, collapse, sort, and flat-list settings', async () => {
+    // diffViewMode itself is exercised end-to-end (including that the Changes
+    // tab mounts and drives the shared config key) by
+    // diff-view-mode-preference.spec.ts. This test's unique value is the other
+    // five rows on ChangesTab.tsx, which had no render-level assertion of their
+    // own before (only the sidebar tab BUTTON's visibility was checked).
+    await openSettings();
+    await page.getByTestId('settings-tab-list').getByRole('button', { name: 'Changes' }).click();
+    await expect(page.locator('text=Default Diff Scope')).toBeVisible();
+    await expect(page.locator('text=Ignore Whitespace')).toBeVisible();
+    // Collapse Unchanged Regions toggle row - goes RED if the SettingToggleRow
+    // is removed from ChangesTab.tsx, while leaving all other assertions green.
+    await expect(page.locator('text=Collapse Unchanged Regions')).toBeVisible();
+    await expect(page.locator('text=File Sort')).toBeVisible();
+    await expect(page.locator('text=Flat File List')).toBeVisible();
+    await closeSettings();
+  });
+
+  test('Terminal tab Terminal Colors offers customizable background, foreground, and cursor swatches', async () => {
+    await openSettings();
+    await page.getByRole('button', { name: 'Terminal', exact: true }).click();
+
+    const colorsRow = page.locator('[data-testid="setting-row-terminal.colors"]');
+    await expect(colorsRow.getByTestId('terminal-color-swatch-background')).toBeVisible();
+    await expect(colorsRow.getByTestId('terminal-color-swatch-foreground')).toBeVisible();
+    await expect(colorsRow.getByTestId('terminal-color-swatch-cursor')).toBeVisible();
+
+    // Opening a swatch shows the shared color picker popover.
+    await colorsRow.getByTestId('terminal-color-swatch-background').click();
+    await expect(page.getByTitle('Custom color')).toBeVisible();
+    await page.keyboard.press('Escape');
+    await expect(page.getByTitle('Custom color')).toHaveCount(0);
+
+    await expect(colorsRow.getByTestId('terminal-colors-reset-all')).toBeVisible();
+
     await closeSettings();
   });
 
@@ -113,25 +201,296 @@ test.describe('Settings Panel', () => {
     await closeSettings();
   });
 
-  test('shows Terminal tab with shell, font size, font family, scrollback, and cursor style', async () => {
+  test('shows Terminal tab with shell, font size, font family, cursor style, and backspace behavior', async () => {
+    // Terminal is a SYSTEM (global-only) tab: these fields no longer save to
+    // the project override, they save to global config.
     await openSettings();
     await page.getByRole('button', { name: 'Terminal', exact: true }).click();
 
     await expect(page.getByText('Terminal shell used for agent sessions')).toBeVisible();
     await expect(page.getByText('Font Size', { exact: true })).toBeVisible();
     await expect(page.getByText('Font Family', { exact: true })).toBeVisible();
-    await expect(page.getByText('Scrollback Lines')).toBeVisible();
     await expect(page.getByText('Cursor Style')).toBeVisible();
-    await expect(page.getByText('Context Bar')).toBeVisible();
+    // Word delete on Backspace (terminal.backspaceSendsCtrlH) - goes RED if the
+    // SettingToggleRow is removed from TerminalTab.tsx, while leaving all other
+    // assertions here green.
+    await expect(page.getByText('Word delete on Backspace')).toBeVisible();
+    // Scrollback Lines was removed (the live xterm scrollback cap is now a
+    // fixed internal constant, TERMINAL_SCROLLBACK_LINES in useTerminal.ts,
+    // not a user setting). Pin the row's absence by testid so a re-added
+    // SettingRow/registry entry is caught even if the label text changes.
+    await expect(page.locator('[data-testid="setting-row-terminal.scrollbackLines"]')).toHaveCount(0);
 
     await closeSettings();
   });
 
-  test('Terminal tab Context Bar section exposes Rate Limits toggle', async () => {
+  test('Terminal tab font size writes to global config, not the project override', async () => {
+    // terminal.fontSize (and shell/fontFamily/cursorStyle) moved
+    // from project-overridable to global-only. This pins the actual write
+    // path, not just the UI copy.
     await openSettings();
     await page.getByRole('button', { name: 'Terminal', exact: true }).click();
+
+    const fontSizeRow = page.locator('[data-testid="setting-row-terminal.fontSize"]');
+    const fontSizeInput = fontSizeRow.locator('input');
+    await fontSizeInput.fill('22');
+    await fontSizeInput.blur();
+
+    await expect.poll(async () => {
+      const globalConfig = await page.evaluate(() => window.electronAPI.config.getGlobal());
+      return (globalConfig as { terminal: { fontSize: number } }).terminal.fontSize;
+    }, { timeout: 3000 }).toBe(22);
+
+    const projectOverrides = await page.evaluate(() => window.electronAPI.config.getProjectOverrides());
+    expect((projectOverrides as { terminal?: { fontSize?: number } } | null)?.terminal?.fontSize).toBeUndefined();
+
+    // Restore so later tests are unaffected.
+    await fontSizeInput.fill('14');
+    await fontSizeInput.blur();
+    await expect.poll(async () => {
+      const globalConfig = await page.evaluate(() => window.electronAPI.config.getGlobal());
+      return (globalConfig as { terminal: { fontSize: number } }).terminal.fontSize;
+    }, { timeout: 3000 }).toBe(14);
+
+    await closeSettings();
+  });
+
+  test('Terminal tab Font Family offers detected system fonts and accepts a typed value', async () => {
+    // FontResolver is mocked (mock-electron-api.js font.getAvailable) to a
+    // fixed list so this stays deterministic across dev machines and CI.
+    await openSettings();
+    await page.getByRole('button', { name: 'Terminal', exact: true }).click();
+
+    const fontFamilyRow = page.locator('[data-testid="setting-row-terminal.fontFamily"]');
+    const fontFamilyInput = fontFamilyRow.locator('[data-testid="terminal-font-family"]');
+    await fontFamilyInput.click();
+    await expect(page.getByTestId('terminal-font-family-option-Consolas')).toBeVisible();
+
+    await page.getByTestId('terminal-font-family-option-Consolas').click();
+    await expect(fontFamilyInput).toHaveValue('Consolas');
+    await expect.poll(async () => {
+      const globalConfig = await page.evaluate(() => window.electronAPI.config.getGlobal());
+      return (globalConfig as { terminal: { fontFamily: string } }).terminal.fontFamily;
+    }, { timeout: 3000 }).toBe('Consolas');
+
+    // A font not in the detected list is still a valid typed value - the
+    // picker must never block entry when detection misses (or fails on) a
+    // font the user actually wants.
+    await fontFamilyInput.fill('Custom Handwritten Font');
+    await expect.poll(async () => {
+      const globalConfig = await page.evaluate(() => window.electronAPI.config.getGlobal());
+      return (globalConfig as { terminal: { fontFamily: string } }).terminal.fontFamily;
+    }, { timeout: 3000 }).toBe('Custom Handwritten Font');
+
+    // Restore so later tests are unaffected.
+    await fontFamilyInput.fill('Menlo, Consolas, "Courier New", monospace');
+    await expect.poll(async () => {
+      const globalConfig = await page.evaluate(() => window.electronAPI.config.getGlobal());
+      return (globalConfig as { terminal: { fontFamily: string } }).terminal.fontFamily;
+    }, { timeout: 3000 }).toBe('Menlo, Consolas, "Courier New", monospace');
+
+    await closeSettings();
+  });
+
+  test('Terminal tab Font Family shows the live-cleared value, not the stale committed one, while the async config round trip is still pending', async () => {
+    // Regression test for FontCombobox's `filterText` sentinel fix. `value`
+    // is committed through an ASYNC config-store round trip (updateConfig
+    // awaits config.set, then re-fetches, before globalConfig.terminal.fontFamily
+    // updates), so a just-cleared field must display the live edit rather than
+    // falling back to the stale committed value while that round trip is still
+    // in flight. The mock's config.set() normally resolves within the same
+    // microtask turn (no real IPC latency), which collapses the race window to
+    // nothing observable - so this test patches config.set() with an
+    // artificial delay to create a real, deterministic window to observe the
+    // mid-flight display value against.
+    await openSettings();
+    await page.getByRole('button', { name: 'Terminal', exact: true }).click();
+
+    const fontFamilyRow = page.locator('[data-testid="setting-row-terminal.fontFamily"]');
+    const fontFamilyInput = fontFamilyRow.locator('[data-testid="terminal-font-family"]');
+
+    // Establish a known starting value before slowing the round trip.
+    await fontFamilyInput.click();
+    await page.getByTestId('terminal-font-family-option-Consolas').click();
+    await expect.poll(async () => {
+      const globalConfig = await page.evaluate(() => window.electronAPI.config.getGlobal());
+      return (globalConfig as { terminal: { fontFamily: string } }).terminal.fontFamily;
+    }, { timeout: 3000 }).toBe('Consolas');
+
+    try {
+      // Artificially slow config.set() so the async round trip has a real,
+      // observable window. The real preload IPC round trip is normally too
+      // fast for Playwright to reliably catch mid-flight; this mock is a
+      // synchronous in-memory function with no such latency by default.
+      await page.evaluate(() => {
+        const original = window.electronAPI.config.set;
+        (window as unknown as { __originalConfigSet: typeof original }).__originalConfigSet = original;
+        window.electronAPI.config.set = (partial: Parameters<typeof original>[0]) =>
+          new Promise((resolve) => {
+            setTimeout(() => resolve(original(partial)), 1000);
+          });
+      });
+
+      await fontFamilyInput.click();
+      // selectText + Backspace (not fill()) so a snap-back-to-stale-value
+      // shows up as a wrong `.inputValue()` read rather than a fill()
+      // actionability timeout - the assertion below is the sole discriminator
+      // either way.
+      await fontFamilyInput.selectText();
+      await fontFamilyInput.press('Backspace');
+
+      // Mid-flight: read a single snapshot (never a retrying `toHaveValue`,
+      // which would just wait out the delay and pass on buggy code too). The
+      // input must already show the live (cleared) edit...
+      const displayedRightAfterClear = await fontFamilyInput.inputValue();
+      expect(displayedRightAfterClear).toBe('');
+      // ...while the config's committed value is still the OLD one, proving
+      // this is genuinely observing the async gap and not a resolved update.
+      const midFlightConfig = await page.evaluate(() => window.electronAPI.config.getGlobal());
+      expect((midFlightConfig as { terminal: { fontFamily: string } }).terminal.fontFamily).toBe('Consolas');
+
+      // Once the round trip actually completes, the cleared value persists
+      // (no snap-back either during or after the round trip).
+      await expect.poll(async () => {
+        const globalConfig = await page.evaluate(() => window.electronAPI.config.getGlobal());
+        return (globalConfig as { terminal: { fontFamily: string } }).terminal.fontFamily;
+      }, { timeout: 3000 }).toBe('');
+      expect(await fontFamilyInput.inputValue()).toBe('');
+    } finally {
+      await page.evaluate(() => {
+        const patched = window as unknown as { __originalConfigSet?: typeof window.electronAPI.config.set };
+        if (patched.__originalConfigSet) {
+          window.electronAPI.config.set = patched.__originalConfigSet;
+          delete patched.__originalConfigSet;
+        }
+      });
+
+      // Restore so later tests are unaffected, even if an assertion above threw.
+      await fontFamilyInput.fill('Menlo, Consolas, "Courier New", monospace');
+      await expect.poll(async () => {
+        const globalConfig = await page.evaluate(() => window.electronAPI.config.getGlobal());
+        return (globalConfig as { terminal: { fontFamily: string } }).terminal.fontFamily;
+      }, { timeout: 3000 }).toBe('Menlo, Consolas, "Courier New", monospace');
+
+      await closeSettings();
+    }
+  });
+
+  test('Terminal tab Font Family filters suggestions as you type and shows an empty state for no matches', async () => {
+    await openSettings();
+    await page.getByRole('button', { name: 'Terminal', exact: true }).click();
+
+    const fontFamilyRow = page.locator('[data-testid="setting-row-terminal.fontFamily"]');
+    const fontFamilyInput = fontFamilyRow.locator('[data-testid="terminal-font-family"]');
+
+    await fontFamilyInput.click();
+    await fontFamilyInput.fill('Con');
+
+    // Mock font list (mock-electron-api.js font.getAvailable): Cascadia Code,
+    // Consolas, Courier New, Fira Code, JetBrains Mono, Menlo. "Con" narrows
+    // to Consolas only (case-insensitive substring match) - none of the other
+    // five fonts contain "con".
+    await expect(page.getByTestId('terminal-font-family-option-Consolas')).toBeVisible();
+    await expect(page.getByTestId('terminal-font-family-option-Cascadia Code')).toHaveCount(0);
+    await expect(page.getByTestId('terminal-font-family-option-Courier New')).toHaveCount(0);
+    await expect(page.getByTestId('terminal-font-family-option-Fira Code')).toHaveCount(0);
+    await expect(page.getByTestId('terminal-font-family-option-JetBrains Mono')).toHaveCount(0);
+    await expect(page.getByTestId('terminal-font-family-option-Menlo')).toHaveCount(0);
+
+    await fontFamilyInput.fill('zzzznomatch');
+    await expect(page.getByText('No fonts match "zzzznomatch"')).toBeVisible();
+
+    // Restore so later tests are unaffected.
+    await fontFamilyInput.fill('Menlo, Consolas, "Courier New", monospace');
+    await expect.poll(async () => {
+      const globalConfig = await page.evaluate(() => window.electronAPI.config.getGlobal());
+      return (globalConfig as { terminal: { fontFamily: string } }).terminal.fontFamily;
+    }, { timeout: 3000 }).toBe('Menlo, Consolas, "Courier New", monospace');
+
+    await closeSettings();
+  });
+
+  test('Terminal tab Font Family dropdown closes when clicking outside', async () => {
+    await openSettings();
+    await page.getByRole('button', { name: 'Terminal', exact: true }).click();
+
+    const fontFamilyRow = page.locator('[data-testid="setting-row-terminal.fontFamily"]');
+    const fontFamilyInput = fontFamilyRow.locator('[data-testid="terminal-font-family"]');
+
+    await fontFamilyInput.click();
+    await expect(page.getByTestId('terminal-font-family-option-Consolas')).toBeVisible();
+
+    // Click something else within the panel, outside the combobox - the
+    // capture-phase mousedown listener should close the dropdown.
+    await page.locator('h2:has-text("Settings")').click();
+
+    await expect(page.getByTestId('terminal-font-family-option-Consolas')).toHaveCount(0);
+
+    await closeSettings();
+  });
+
+  test('Terminal tab Font Family keyboard: ArrowDown moves focus into the option list, Escape closes it', async () => {
+    await openSettings();
+    await page.getByRole('button', { name: 'Terminal', exact: true }).click();
+
+    const fontFamilyRow = page.locator('[data-testid="setting-row-terminal.fontFamily"]');
+    const fontFamilyInput = fontFamilyRow.locator('[data-testid="terminal-font-family"]');
+
+    await fontFamilyInput.click();
+    // "Cascadia Code" is first in the mock font list, so it's the first
+    // navigable suggestion.
+    const firstOption = page.getByTestId('terminal-font-family-option-Cascadia Code');
+    await expect(firstOption).toBeVisible();
+
+    await fontFamilyInput.press('ArrowDown');
+    await expect(firstOption).toBeFocused();
+
+    await firstOption.press('Escape');
+    await expect(firstOption).toHaveCount(0);
+
+    await closeSettings();
+  });
+
+  test('Task tab Context Bar section exposes Rate Limits toggle', async () => {
+    await openSettings();
+    await page.getByTestId('settings-tab-list').getByRole('button', { name: 'Task', exact: true }).click();
+    await expect(page.getByText('Context Bar')).toBeVisible();
     await expect(page.getByText('Rate Limits', { exact: true })).toBeVisible();
     await expect(page.getByText('Claude 5h / weekly quota bars')).toBeVisible();
+    await closeSettings();
+  });
+
+  test('toggling Word delete on Backspace persists terminal.backspaceSendsCtrlH to global config, not the project override', async () => {
+    // DEFAULT_CONFIG.terminal.backspaceSendsCtrlH is false on all platforms
+    // (src/shared/types.ts) - opt-in, so existing users never feel a Backspace
+    // behavior change they didn't ask for - so the switch starts unchecked
+    // with no prior setup. Terminal is a SYSTEM (global-only) tab, so this
+    // pins the actual write path, not just the UI copy.
+    await openSettings();
+    await page.getByRole('button', { name: 'Terminal', exact: true }).click();
+
+    const toggle = page.getByRole('switch', { name: 'Word delete on Backspace' });
+    await expect(toggle).toHaveAttribute('aria-checked', 'false');
+
+    await toggle.click();
+    await expect(toggle).toHaveAttribute('aria-checked', 'true');
+    await expect.poll(async () => {
+      const globalConfig = await page.evaluate(() => window.electronAPI.config.getGlobal());
+      return (globalConfig as { terminal: { backspaceSendsCtrlH: boolean } }).terminal.backspaceSendsCtrlH;
+    }, { timeout: 3000 }).toBe(true);
+
+    const projectOverrides = await page.evaluate(() => window.electronAPI.config.getProjectOverrides());
+    expect((projectOverrides as { terminal?: { backspaceSendsCtrlH?: boolean } } | null)?.terminal?.backspaceSendsCtrlH).toBeUndefined();
+
+    // Toggle back off, restoring the default state so later tests in this
+    // shared-page file are unaffected.
+    await toggle.click();
+    await expect(toggle).toHaveAttribute('aria-checked', 'false');
+    await expect.poll(async () => {
+      const globalConfig = await page.evaluate(() => window.electronAPI.config.getGlobal());
+      return (globalConfig as { terminal: { backspaceSendsCtrlH: boolean } }).terminal.backspaceSendsCtrlH;
+    }, { timeout: 3000 }).toBe(false);
+
     await closeSettings();
   });
 
@@ -368,8 +727,8 @@ test.describe('Settings Panel', () => {
     await openSettings();
     await expect(page.getByText('Enable Worktrees')).toBeVisible();
 
-    // Reset to Theme so later tests start from a known tab.
-    await page.getByRole('button', { name: 'Theme', exact: true }).click();
+    // Reset to General so later tests start from a known tab.
+    await page.getByRole('button', { name: 'General', exact: true }).click();
     await closeSettings();
   });
 });
@@ -397,11 +756,11 @@ test.describe('Project Settings via Sidebar', () => {
     await page.locator('h2:has-text("Settings")').waitFor({ state: 'visible', timeout: 3000 });
 
     // All tabs visible (no separate project panel with fewer tabs)
-    await expect(page.getByRole('button', { name: 'Theme' })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'General' })).toBeVisible();
     await expect(page.getByRole('button', { name: 'Terminal', exact: true })).toBeVisible();
     await expect(page.getByRole('button', { name: 'Agent', exact: true })).toBeVisible();
     await expect(page.getByRole('button', { name: 'Git' })).toBeVisible();
-    await expect(page.getByRole('button', { name: 'Layout' })).toBeVisible();
+    await expect(page.getByTestId('settings-tab-list').getByRole('button', { name: 'Board' })).toBeVisible();
     await expect(page.getByRole('button', { name: 'MCP Server' })).toBeVisible();
     await expect(page.getByRole('button', { name: 'Behavior' })).toBeVisible();
 
@@ -516,7 +875,7 @@ test.describe('Settings Search', () => {
     // Clear search
     await searchInput.fill('');
 
-    // Should return to normal view (Theme tab is default but font search
+    // Should return to normal view (General tab is default but font search
     // was in Terminal only, so auto-switch should land on Terminal)
     await expect(page.getByText('Terminal shell used for agent sessions')).toBeVisible();
 
@@ -542,9 +901,14 @@ test.describe('Settings Search', () => {
     const searchInput = page.getByTestId('settings-search');
     await searchInput.fill('theme');
 
-    // Theme sidebar tab should have a match count badge (name includes count)
+    // Theme sidebar tab should have a match count badge (name includes count).
     const themeTab = page.getByRole('button', { name: 'Theme 1' });
     await expect(themeTab).not.toHaveClass(/opacity-40/);
+
+    // General sidebar tab should be dimmed (no matches for "theme" - it only
+    // holds Project Location now that Theme is its own tab).
+    const generalTab = page.getByRole('button', { name: 'General', exact: true });
+    await expect(generalTab).toHaveClass(/opacity-40/);
 
     // Terminal sidebar tab should be dimmed (no matches for "theme")
     const terminalTab = page.getByRole('button', { name: 'Terminal', exact: true }).first();

@@ -5,10 +5,11 @@
  * pairing-service.test.ts, etc.) exercises MobileBridgeService directly.
  * Nothing exercised the IPC handler layer itself: whether each channel
  * forwards to the right service method with the right arguments and shapes
- * its return value correctly, and whether the three push-event listeners
- * (pairingSas, pairingEnded, stateChanged) forward the service's emitted
- * payloads to the renderer and honor the mainWindow.isDestroyed() guard
- * documented on every other push-event handler in the codebase.
+ * its return value correctly, and whether the four push-event listeners
+ * (pairingSas, pairingConfirmed, pairingEnded, stateChanged) forward the
+ * service's emitted payloads to the renderer and honor the
+ * mainWindow.isDestroyed() guard documented on every other push-event
+ * handler in the codebase.
  *
  * Strategy mirrors config-handler-wiring.test.ts: mock electron's ipcMain to
  * capture registered handlers, build a fake MobileBridgeService (a real
@@ -16,7 +17,7 @@
  * methods), then invoke the captured handlers directly.
  */
 import { EventEmitter } from 'node:events';
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { IPC } from '../../../src/shared/ipc-channels';
 
 // ---------------------------------------------------------------------------
@@ -52,15 +53,16 @@ class FakeMobileBridgeService extends EventEmitter {
     relayUrl: 'wss://relay.example.com',
     pairedDeviceCount: 0,
     pairingInProgress: false,
+    relayState: 'idle' as const,
   }));
   startPairing = vi.fn(async () => ({
     qrPayload: { expiresAt: '2026-01-01T00:10:00.000Z' } as { expiresAt: string },
     qrUri: 'kangentic-pair://mock',
   }));
-  confirmPairing = vi.fn();
   cancelPairing = vi.fn();
   listDevices = vi.fn(() => []);
   revokeDevice = vi.fn();
+  renameDevice = vi.fn();
   setDeviceCapabilities = vi.fn();
 }
 
@@ -109,24 +111,6 @@ describe('registerMobileBridgeHandlers - request/response channels', () => {
     expect(result).toEqual({ qrUri: 'kangentic-pair://mock', expiresAt: '2026-01-01T00:10:00.000Z' });
   });
 
-  it('MOBILE_CONFIRM_PAIRING forwards displayName and capabilities to service.confirmPairing()', () => {
-    const context = makeContext();
-    registerMobileBridgeHandlers(context);
-
-    invokeHandler(IPC.MOBILE_CONFIRM_PAIRING, "Tyler's Phone", ['read-board', 'move-task']);
-
-    expect(context.mobileBridgeService.confirmPairing).toHaveBeenCalledWith("Tyler's Phone", ['read-board', 'move-task']);
-  });
-
-  it('MOBILE_CONFIRM_PAIRING forwards an omitted capabilities arg as undefined (service applies its own default)', () => {
-    const context = makeContext();
-    registerMobileBridgeHandlers(context);
-
-    invokeHandler(IPC.MOBILE_CONFIRM_PAIRING, 'Paired Device');
-
-    expect(context.mobileBridgeService.confirmPairing).toHaveBeenCalledWith('Paired Device', undefined);
-  });
-
   it('MOBILE_CANCEL_PAIRING forwards to service.cancelPairing() with no arguments', () => {
     const context = makeContext();
     registerMobileBridgeHandlers(context);
@@ -156,6 +140,15 @@ describe('registerMobileBridgeHandlers - request/response channels', () => {
     expect(context.mobileBridgeService.revokeDevice).toHaveBeenCalledWith('device-123');
   });
 
+  it('MOBILE_RENAME_DEVICE forwards the deviceId and new display name to service.renameDevice()', () => {
+    const context = makeContext();
+    registerMobileBridgeHandlers(context);
+
+    invokeHandler(IPC.MOBILE_RENAME_DEVICE, 'device-123', 'New Name');
+
+    expect(context.mobileBridgeService.renameDevice).toHaveBeenCalledWith('device-123', 'New Name');
+  });
+
   it('MOBILE_SET_DEVICE_CAPABILITIES forwards deviceId and capabilities to service.setDeviceCapabilities()', () => {
     const context = makeContext();
     registerMobileBridgeHandlers(context);
@@ -171,7 +164,7 @@ describe('registerMobileBridgeHandlers - push events', () => {
     capturedHandlers.clear();
   });
 
-  it('forwards a pairingSas event to the renderer with the reshaped payload (drops any extra service fields)', () => {
+  it('forwards a pairingSas event to the renderer with the reshaped payload (drops the emoji field, if the service happened to still emit one)', () => {
     const context = makeContext();
     registerMobileBridgeHandlers(context);
 
@@ -182,7 +175,6 @@ describe('registerMobileBridgeHandlers - push events', () => {
 
     expect(context.mainWindow.webContents.send).toHaveBeenCalledWith(IPC.MOBILE_PAIRING_SAS, {
       digits: '123456',
-      emoji: ['star', 'rocket'],
       phoneStaticPublicKeyHex: 'deadbeef',
     });
   });
@@ -192,27 +184,48 @@ describe('registerMobileBridgeHandlers - push events', () => {
     registerMobileBridgeHandlers(context);
 
     context.mobileBridgeService.emit('pairingSas', {
-      sas: { digits: '123456', emoji: [] },
+      sas: { digits: '123456' },
       phoneStaticPublicKeyHex: 'deadbeef',
     });
 
     expect(context.mainWindow.webContents.send).not.toHaveBeenCalled();
   });
 
-  it('forwards a pairingEnded event to the renderer verbatim', () => {
+  it('forwards a pairingConfirmed event to the renderer verbatim', () => {
     const context = makeContext();
     registerMobileBridgeHandlers(context);
 
-    context.mobileBridgeService.emit('pairingEnded', { reason: 'Cancelled by user' });
+    context.mobileBridgeService.emit('pairingConfirmed', { deviceId: 'device-123', displayName: 'Pixel 10' });
 
-    expect(context.mainWindow.webContents.send).toHaveBeenCalledWith(IPC.MOBILE_PAIRING_ENDED, { reason: 'Cancelled by user' });
+    expect(context.mainWindow.webContents.send).toHaveBeenCalledWith(IPC.MOBILE_PAIRING_CONFIRMED, {
+      deviceId: 'device-123',
+      displayName: 'Pixel 10',
+    });
+  });
+
+  it('does NOT forward a pairingConfirmed event when the main window is destroyed', () => {
+    const context = makeContext({ isDestroyed: true });
+    registerMobileBridgeHandlers(context);
+
+    context.mobileBridgeService.emit('pairingConfirmed', { deviceId: 'device-123', displayName: 'Pixel 10' });
+
+    expect(context.mainWindow.webContents.send).not.toHaveBeenCalled();
+  });
+
+  it('forwards a pairingEnded event to the renderer verbatim, including kind', () => {
+    const context = makeContext();
+    registerMobileBridgeHandlers(context);
+
+    context.mobileBridgeService.emit('pairingEnded', { reason: 'Cancelled by user', kind: 'cancelled' });
+
+    expect(context.mainWindow.webContents.send).toHaveBeenCalledWith(IPC.MOBILE_PAIRING_ENDED, { reason: 'Cancelled by user', kind: 'cancelled' });
   });
 
   it('does NOT forward a pairingEnded event when the main window is destroyed', () => {
     const context = makeContext({ isDestroyed: true });
     registerMobileBridgeHandlers(context);
 
-    context.mobileBridgeService.emit('pairingEnded', { reason: 'timeout' });
+    context.mobileBridgeService.emit('pairingEnded', { reason: 'timeout', kind: 'failed' });
 
     expect(context.mainWindow.webContents.send).not.toHaveBeenCalled();
   });
@@ -233,5 +246,111 @@ describe('registerMobileBridgeHandlers - push events', () => {
     context.mobileBridgeService.emit('stateChanged');
 
     expect(context.mainWindow.webContents.send).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// MOBILE_TEST_RELAY: structurally a probe (mirrors handlers/system.ts's
+// AGENT_PROBE_EXECUTION_SERVER), not a service delegation - it validates and
+// fetches a candidate URL directly, using the real validateRelayUrl /
+// relayHealthUrl from src/shared/relay.ts (pure functions, safe to exercise
+// for real) with a stubbed global fetch. Every case below must resolve, never
+// throw or hang.
+// ---------------------------------------------------------------------------
+
+describe('registerMobileBridgeHandlers - MOBILE_TEST_RELAY', () => {
+  beforeEach(() => {
+    capturedHandlers.clear();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('rejects an invalid relay URL server-side without ever calling fetch', async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    const context = makeContext();
+    registerMobileBridgeHandlers(context);
+
+    const result = await invokeHandler(IPC.MOBILE_TEST_RELAY, 'not a url');
+
+    expect(result).toMatchObject({ reachable: false });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('rejects a non-loopback ws:// relay URL server-side, even if the renderer sent it', async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    const context = makeContext();
+    registerMobileBridgeHandlers(context);
+
+    const result = (await invokeHandler(IPC.MOBILE_TEST_RELAY, 'ws://not-loopback.example.com')) as { reachable: boolean; reason?: string };
+
+    expect(result.reachable).toBe(false);
+    expect(result.reason).toMatch(/TLS/);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('reports unreachable when fetch rejects (host unreachable)', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('ECONNREFUSED'); }));
+    const context = makeContext();
+    registerMobileBridgeHandlers(context);
+
+    const result = await invokeHandler(IPC.MOBILE_TEST_RELAY, 'wss://relay.example.com');
+
+    expect(result).toEqual({ reachable: false, reason: 'ECONNREFUSED' });
+  });
+
+  it('reports unreachable when the request times out (AbortSignal fires)', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new DOMException('The operation was aborted.', 'AbortError'); }));
+    const context = makeContext();
+    registerMobileBridgeHandlers(context);
+
+    const result = (await invokeHandler(IPC.MOBILE_TEST_RELAY, 'wss://relay.example.com')) as { reachable: boolean; reason?: string };
+
+    expect(result.reachable).toBe(false);
+    expect(result.reason).toBeTruthy();
+  });
+
+  it('reports unreachable with the HTTP status on a non-2xx response', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false, status: 503, json: async () => ({}) })));
+    const context = makeContext();
+    registerMobileBridgeHandlers(context);
+
+    const result = await invokeHandler(IPC.MOBILE_TEST_RELAY, 'wss://relay.example.com');
+
+    expect(result).toEqual({ reachable: false, reason: 'Relay responded with HTTP 503' });
+  });
+
+  it('reports reachable with a null version when the body is not JSON (the documented /healthz contract has no version field)', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, status: 200, json: async () => { throw new Error('Unexpected token'); } })));
+    const context = makeContext();
+    registerMobileBridgeHandlers(context);
+
+    const result = await invokeHandler(IPC.MOBILE_TEST_RELAY, 'wss://relay.example.com');
+
+    expect(result).toEqual({ reachable: true, version: null });
+  });
+
+  it('reports reachable with the version when the body provides one', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ version: '0.4.0' }) })));
+    const context = makeContext();
+    registerMobileBridgeHandlers(context);
+
+    const result = await invokeHandler(IPC.MOBILE_TEST_RELAY, 'wss://relay.example.com');
+
+    expect(result).toEqual({ reachable: true, version: '0.4.0' });
+  });
+
+  it('probes relayHealthUrl(normalized), not the raw input', async () => {
+    const fetchMock = vi.fn(async () => ({ ok: true, status: 200, json: async () => ({}) }));
+    vi.stubGlobal('fetch', fetchMock);
+    const context = makeContext();
+    registerMobileBridgeHandlers(context);
+
+    await invokeHandler(IPC.MOBILE_TEST_RELAY, 'WSS://Relay.Example.com');
+
+    expect(fetchMock).toHaveBeenCalledWith('https://relay.example.com/healthz', expect.anything());
   });
 });

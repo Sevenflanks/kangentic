@@ -18,12 +18,14 @@ import { describe, it, expect } from 'vitest';
 import { pickOverridableSubset } from '../../src/main/config/config-manager';
 
 describe('pickOverridableSubset', () => {
-  it('drops importSources and browser while keeping the setting keys', () => {
+  it('drops importSources, browser, and terminal.* while keeping the setting keys', () => {
     // Mirrors a real leaked config (TWC-Website): legit settings alongside the
     // project-specific importSources array and a per-project browser URL.
+    // terminal.* is global-only (see AppConfig['terminal'] doc comments in
+    // shared/types.ts), so it must never be picked as an overridable setting.
     const source = {
       theme: 'forest',
-      terminal: { shell: 'pwsh.exe', fontSize: 14, scrollbackLines: 5000 },
+      terminal: { shell: 'pwsh.exe', fontSize: 14, cursorStyle: 'block' },
       agent: { permissionMode: 'acceptEdits' },
       git: { worktreesEnabled: true, defaultBaseBranch: 'develop' },
       browser: { defaultUrl: 'http://troyweb.com/' },
@@ -36,10 +38,30 @@ describe('pickOverridableSubset', () => {
 
     expect(result).not.toHaveProperty('importSources');
     expect(result).not.toHaveProperty('browser');
+    expect(result).not.toHaveProperty('terminal');
     expect(result.theme).toBe('forest');
-    expect(result.terminal).toEqual({ shell: 'pwsh.exe', fontSize: 14, scrollbackLines: 5000 });
     expect(result.agent).toEqual({ permissionMode: 'acceptEdits' });
     expect(result.git).toEqual({ worktreesEnabled: true, defaultBaseBranch: 'develop' });
+  });
+
+  it('drops agent.execution and agent.executionServers - a new project must not inherit another project\'s remote server directory', () => {
+    // agent.execution is project-scoped and editable in Project Settings, but
+    // this function ALSO seeds a brand-new project's config from the most
+    // recently configured project (getLastProjectOverrides). A remote
+    // server's working directory is project-specific data, like
+    // browser.defaultUrl - cloning it here would point a new project's tasks
+    // at a different project's server-side directory.
+    const source = {
+      agent: {
+        permissionMode: 'acceptEdits',
+        execution: { opencode: { mode: 'remote', workingDirectory: '/srv/project' } },
+        executionServers: { opencode: { url: 'http://10.0.0.5:4096', auth: { kind: 'none' } } },
+      },
+    } as unknown as Parameters<typeof pickOverridableSubset>[0];
+
+    const result = pickOverridableSubset(source) as Record<string, unknown>;
+
+    expect(result.agent).toEqual({ permissionMode: 'acceptEdits' });
   });
 
   it('returns {} when the source has only non-overridable keys', () => {
@@ -50,6 +72,25 @@ describe('pickOverridableSubset', () => {
     } as unknown as Parameters<typeof pickOverridableSubset>[0];
 
     expect(pickOverridableSubset(source)).toEqual({});
+  });
+
+  it('drops the entire terminal block - every terminal.* field is documented global-only', () => {
+    // Every field under AppConfig['terminal'] (shell, fontSize, fontFamily,
+    // cursorStyle, colors, backspaceSendsCtrlH) is
+    // global-only (see the doc comments in shared/types.ts); none may be
+    // cloned into a new project's overrides or snapshotted as a project
+    // default.
+    const source = {
+      terminal: {
+        shell: 'bash',
+        fontSize: 13,
+        colors: { background: '#111111', foreground: '#eeeeee', cursor: '#eeeeee' },
+      },
+    } as unknown as Parameters<typeof pickOverridableSubset>[0];
+
+    const result = pickOverridableSubset(source) as Record<string, unknown>;
+
+    expect(result).not.toHaveProperty('terminal');
   });
 
   it('tolerates a sparse source and omits empty nested objects', () => {
@@ -67,8 +108,8 @@ describe('pickOverridableSubset', () => {
         shell: 'bash',
         fontSize: 13,
         fontFamily: 'Consolas',
-        scrollbackLines: 1000,
         cursorStyle: 'block',
+        backspaceSendsCtrlH: true,
       },
       agent: { permissionMode: 'plan' },
       git: {
@@ -84,13 +125,6 @@ describe('pickOverridableSubset', () => {
 
     expect(pickOverridableSubset(fullConfig)).toEqual({
       theme: 'ocean',
-      terminal: {
-        shell: 'bash',
-        fontSize: 13,
-        fontFamily: 'Consolas',
-        scrollbackLines: 1000,
-        cursorStyle: 'block',
-      },
       agent: { permissionMode: 'plan' },
       git: {
         worktreesEnabled: false,

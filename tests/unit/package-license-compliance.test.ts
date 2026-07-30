@@ -12,16 +12,25 @@ const repositorySchema = z.object({
   directory: z.string().optional(),
 });
 
+const authorSchema = z
+  .object({
+    name: z.literal('Kangentic'),
+    url: z.literal('https://github.com/Kangentic'),
+  })
+  .strict();
+
 const rootManifestSchema = z.object({
   private: z.literal(true),
   workspaces: z.array(z.string()),
   repository: repositorySchema,
+  author: authorSchema,
   license: z.literal('AGPL-3.0-only'),
 });
 
 const workspaceManifestSchema = z.object({
   private: z.literal(true),
   repository: repositorySchema,
+  author: authorSchema,
   license: z.literal('AGPL-3.0-only'),
   files: z.array(z.string()),
 });
@@ -86,6 +95,26 @@ describe('npm package license compliance', () => {
       expect(manifest.repository).toEqual({ type: 'git', url: FORK_REPOSITORY_URL, directory });
       expect(manifest.license).toBe('AGPL-3.0-only');
     }
+  });
+
+  it('declares the canonical author identity without email in every package manifest', () => {
+    // Given the root and workspace package manifests
+    const packageManifests = [
+      rootManifestSchema.parse(readJson('package.json')),
+      ...PACKAGE_CONTRACTS.map(({ directory }) => (
+        workspaceManifestSchema.parse(readJson(path.join(directory, 'package.json')))
+      )),
+    ];
+
+    // When the package author metadata is parsed at the boundary
+    const authorIdentities = packageManifests.map((manifest) => manifest.author);
+
+    // Then every package carries only the canonical name and URL
+    expect(authorIdentities).toEqual([
+      { name: 'Kangentic', url: 'https://github.com/Kangentic' },
+      { name: 'Kangentic', url: 'https://github.com/Kangentic' },
+      { name: 'Kangentic', url: 'https://github.com/Kangentic' },
+    ]);
   });
 
   it('allows exactly the governed legal and runtime package files', () => {

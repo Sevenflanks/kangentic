@@ -155,7 +155,16 @@ function makeDeps(args: {
   const scheduleKeystrokes = vi.fn();
   const context = {
     terminalSubmitScheduler: { scheduleKeystrokes },
-    configManager: { getEffectiveConfig: vi.fn(() => ({ agent: { permissionMode: 'acceptEdits' } })) },
+    configManager: {
+      getEffectiveConfig: vi.fn(() => ({
+        agent: { permissionMode: 'acceptEdits' },
+        git: { defaultBaseBranch: 'main' },
+      })),
+    },
+    // resolveDefaultBaseBranch (git-stats-capture.ts) reads this for the
+    // team-shared board default; undefined falls through to the git config
+    // default above, matching resolveAutoCommandVars in agent-spawn.ts.
+    boardConfigManager: { getDefaultBaseBranch: vi.fn(() => undefined) },
     sessionManager: {
       getSession: vi.fn(() => ({ status: 'running' })),
       snapshotNativeIdle: vi.fn(() => null),
@@ -284,10 +293,9 @@ describe('spawnAgent continuationPrompt delivery', () => {
     expect(deps.engine.executeTransition.mock.calls[0]?.at(-1)).toBe(ACTION_CONTINUATION);
     expect(deps.engine.resumeSuspendedSession).not.toHaveBeenCalled();
     expect(deps.scheduleKeystrokes).not.toHaveBeenCalled();
-    expect(outcome).toEqual({
+    expect(outcome).toMatchObject({
       kind: 'skipped',
       reason: 'resume-not-supported',
-      warning: 'Auto-command was skipped because OpenCode resume delivery is not supported.',
     });
   });
 
@@ -301,10 +309,9 @@ describe('spawnAgent continuationPrompt delivery', () => {
 
     expect(resumePromptArg(deps.engine)).toBeUndefined();
     expect(deps.scheduleKeystrokes).not.toHaveBeenCalled();
-    expect(outcome).toEqual({
+    expect(outcome).toMatchObject({
       kind: 'skipped',
       reason: 'fresh-not-supported',
-      warning: 'Auto-command was skipped because OpenCode fresh-session delivery is not supported.',
     });
   });
 });

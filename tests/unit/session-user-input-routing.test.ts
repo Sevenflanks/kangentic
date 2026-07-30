@@ -91,7 +91,7 @@ describe('SESSION_WRITE user ingress routing', () => {
     const writeFocusReport = vi.fn();
     const writeUserInput = vi.fn();
     const sessionManager = new Proxy(
-      { writeFocusReport, writeUserInput },
+      { getSessionProjectId: vi.fn(() => 'project-1'), writeFocusReport, writeUserInput },
       { get: (target, property) => Reflect.get(target, property) ?? vi.fn() },
     );
     const context = new Proxy(
@@ -111,12 +111,52 @@ describe('SESSION_WRITE user ingress routing', () => {
     expect(writeUserInput).not.toHaveBeenCalled();
   });
 
+  it('rejects a focus report without the interaction-time project id', () => {
+    const writeFocusReport = vi.fn();
+    const writeUserInput = vi.fn();
+    const sessionManager = new Proxy(
+      { getSessionProjectId: vi.fn(() => 'project-1'), writeFocusReport, writeUserInput },
+      { get: (target, property) => Reflect.get(target, property) ?? vi.fn() },
+    );
+    const context = new Proxy(
+      { sessionManager },
+      { get: (target, property) => Reflect.get(target, property) ?? vi.fn() },
+    );
+    Reflect.apply(registerSessionHandlers, undefined, [context]);
+    const handler = handlers.get(IPC.SESSION_WRITE_FOCUS_REPORT);
+    if (!handler) throw new Error('SESSION_WRITE_FOCUS_REPORT handler was not registered');
+
+    expect(() => handler(undefined, 'session-1', '\x1b[I', null)).toThrow('Focus report project id is required');
+    expect(writeFocusReport).not.toHaveBeenCalled();
+    expect(writeUserInput).not.toHaveBeenCalled();
+  });
+
+  it('rejects a focus report when its interaction-time project differs from the live session', () => {
+    const writeFocusReport = vi.fn();
+    const writeUserInput = vi.fn();
+    const sessionManager = new Proxy(
+      { getSessionProjectId: vi.fn(() => 'project-1'), writeFocusReport, writeUserInput },
+      { get: (target, property) => Reflect.get(target, property) ?? vi.fn() },
+    );
+    const context = new Proxy(
+      { sessionManager },
+      { get: (target, property) => Reflect.get(target, property) ?? vi.fn() },
+    );
+    Reflect.apply(registerSessionHandlers, undefined, [context]);
+    const handler = handlers.get(IPC.SESSION_WRITE_FOCUS_REPORT);
+    if (!handler) throw new Error('SESSION_WRITE_FOCUS_REPORT handler was not registered');
+
+    expect(() => handler(undefined, 'session-1', '\x1b[I', 'project-2')).toThrow('Focus report project does not match session');
+    expect(writeFocusReport).not.toHaveBeenCalled();
+    expect(writeUserInput).not.toHaveBeenCalled();
+  });
+
   it('routes non-focus strings through writeUserInput and rejects non-string focus payloads', () => {
     // Given
     const writeFocusReport = vi.fn();
     const writeUserInput = vi.fn();
     const sessionManager = new Proxy(
-      { writeFocusReport, writeUserInput },
+      { getSessionProjectId: vi.fn(() => 'project-1'), writeFocusReport, writeUserInput },
       { get: (target, property) => Reflect.get(target, property) ?? vi.fn() },
     );
     const context = new Proxy(

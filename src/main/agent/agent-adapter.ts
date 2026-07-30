@@ -13,6 +13,11 @@ import type {
   TranscriptUsage,
   TranscriptToolCounts,
   AgentParser,
+  AgentRemoteExecutionInfo,
+  AgentExecutionServer,
+  ResolvedExecutionTarget,
+  RemoteServerStatus,
+  AgentLaunchOptionInfo,
 } from '../../shared/types';
 import type { NativeIdleEvidence } from '../activity-engine/native-idle-evidence';
 import type {
@@ -81,6 +86,21 @@ export interface CommandOptions {
   model?: string;
   /** Adapter-specific effort/reasoning level (e.g. Claude `--effort xhigh`). Empty/undefined leaves the agent default in place. */
   effort?: string;
+  /**
+   * Fully-defaulted launch-option values for THIS agent, keyed by
+   * `AgentLaunchOptionInfo.id`. Populated by the spawn chokepoints via
+   * `resolveLaunchOptions`. Undefined for adapters that declare no launch options.
+   */
+  launchOptions?: Record<string, boolean>;
+  /**
+   * Present only when this project's execution mode for this agent is
+   * 'remote' (resolved by the spawn chokepoint from `agent.executionServers`
+   * + `agent.execution`). Adapters that declare `remoteExecution` read this
+   * instead of spawning the CLI locally; `cwd` still holds a locally-valid
+   * path for node-pty; the actual working directory the agent runs in is
+   * `executionTarget.workingDirectory`, which lives on the remote server.
+   */
+  executionTarget?: ResolvedExecutionTarget;
 }
 
 /** Agent-agnostic spawn options - renames `cliPath` to `agentPath`. */
@@ -122,6 +142,8 @@ export type InitialPromptInput = {
   readonly sessionDirectory: string;
   readonly permissionMode: PermissionMode;
   readonly model?: string;
+  /** Present when this spawn attaches to an already-running remote server. */
+  readonly executionTarget?: ResolvedExecutionTarget;
 } & (
   | {
       readonly resume: false;
@@ -133,6 +155,8 @@ export type InitialPromptInput = {
 );
 
 export interface InitialPromptPreparation {
+  /** Overrides the adapter default when one spawn requires a different transport. */
+  readonly delivery?: InitialPromptDelivery;
   readonly commandPrompt?: string;
   readonly env?: Record<string, string>;
   readonly cleanup?: SessionAttachment;
@@ -195,6 +219,36 @@ export interface AgentAdapter {
    * called by IPC after detect() returns found:true. Must never throw.
    */
   probeAuth?(): Promise<boolean | null>;
+
+  /**
+   * Declared by adapters whose CLI can attach to an already-running server
+   * the user operates, instead of always spawning a local process (e.g.
+   * OpenCode's `opencode attach <url> --dir <serverPath>`). Absent for every
+   * other adapter - the Agent settings tab renders no remote-mode rows
+   * for an agent that omits this, per `agent-adapters-boundary.md` (no
+   * agent-name branching outside this folder; the renderer gates on the
+   * presence of this capability instead).
+   *
+   * `probeServer` replaces `probeAuth` as the reachability/auth check when a
+   * project's execution mode for this agent is 'remote': it must hit the
+   * server directly (e.g. a health endpoint) rather than reading local
+   * on-disk credentials, and must never throw.
+   */
+  readonly remoteExecution?: {
+    readonly info: AgentRemoteExecutionInfo;
+    probeServer(server: AgentExecutionServer): Promise<RemoteServerStatus>;
+  };
+
+  /**
+   * Optional boolean startup toggles this agent CLI exposes (e.g. Codex's "Disable ChatGPT
+   * Apps", which maps to `--disable apps`). Absent for every other adapter - the Agent settings
+   * tab renders no launch-option rows for an agent that omits this, per
+   * `agent-adapters-boundary.md`. Values are resolved by `resolveLaunchOptions`
+   * (`src/main/agent/shared/launch-options.ts`) and threaded through as
+   * `CommandOptions.launchOptions`; only this adapter's command builder interprets `id` into a
+   * concrete CLI flag.
+   */
+  readonly launchOptions?: readonly AgentLaunchOptionInfo[];
 
   /** Build the shell command string to spawn the agent. */
   buildCommand(options: SpawnCommandOptions): string;

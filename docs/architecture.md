@@ -29,7 +29,7 @@ User drags task between columns
 
 All channels defined in `src/shared/ipc-channels.ts`. The preload bridge in `src/preload/preload.ts` mirrors them as `window.electronAPI.*`.
 
-### Projects (17 channels)
+### Projects (19 channels)
 | Channel | Pattern | Purpose |
 |---------|---------|---------|
 | `project:list` | invoke | Fetch all projects (ordered by position) |
@@ -38,6 +38,8 @@ All channels defined in `src/shared/ipc-channels.ts`. The preload bridge in `src
 | `project:open` | invoke | Open project (init DB, recover sessions) |
 | `project:getCurrent` | invoke | Get currently loaded project |
 | `project:openByPath` | invoke | Open project by filesystem path |
+| `project:probePath` | invoke | Inspect a folder before adding it (exists, is a directory, git state, suggested name, already-registered project id) |
+| `project:ensureGit` | invoke | Make sure a folder is covered by git, running `git init` when it is not |
 | `project:searchEntries` | invoke | Search files and directories within a project for mention autocomplete |
 | `project:reorder` | invoke | Reorder projects by ID array |
 | `project:setGroup` | invoke | Assign a project to a group (or clear group assignment) |
@@ -204,7 +206,7 @@ Build-excluded from production via `__KANGENTIC_DEV__` (esbuild dead-code elimin
 | `session:exit` | on | Session exited (includes `projectId`) |
 | `session:status` | on | Session changed - pushes full `Session` object (includes `projectId`) |
 | `session:usage` | on | Usage data updated (includes `projectId`) |
-| `session:activity` | on | Activity state changed (includes `projectId`, `taskId`, `taskTitle`) |
+| `session:activity` | on | Activity state changed (includes `projectId`, `taskId`) |
 | `session:event` | on | Structured event (includes `projectId`) |
 | `session:idleTimeout` | on | Session idle timeout fired |
 | `session:getSummary` | invoke | Get summary of a single session |
@@ -238,32 +240,37 @@ Build-excluded from production via `__KANGENTIC_DEV__` (esbuild dead-code elimin
 |---------|---------|---------|
 | `keybindings:probeGlobal` | invoke | Probe whether each canonical combo can be claimed as a system-wide global shortcut (via Electron `globalShortcut`); returns `Record<combo, 'available' \| 'taken' \| 'unsupported'>`. Used by the Hotkeys settings tab to warn when a combo is already owned by the OS or another app. |
 
-### Board Config (8 channels)
+### Board Config (11 channels)
 | Channel | Pattern | Purpose |
 |---------|---------|---------|
 | `boardConfig:exists` | invoke | Check if `kangentic.json` exists for the active project |
 | `boardConfig:export` | invoke | Export current board state to `kangentic.json` (auto-runs on project open) |
 | `boardConfig:apply` | invoke | Apply pending config file changes (reconcile file into DB) |
 | `boardConfig:changed` | on | Event: `kangentic.json` or `kangentic.local.json` changed on disk |
+| `boardConfig:getBoardProfiles` | invoke | Get the board's Board Profiles (see [Configuration](configuration.md#board-profiles)) |
+| `boardConfig:setBoardProfiles` | invoke | Replace the board's Board Profiles (team-scoped) |
+| `boardConfig:boardProfilesChanged` | on | Event: an agent (MCP) rewrote this project's Board Profiles |
 | `boardConfig:getShortcuts` | invoke | Get task detail dialog shortcuts |
 | `boardConfig:setShortcuts` | invoke | Update task detail dialog shortcuts |
 | `boardConfig:shortcutsChanged` | on | Event: shortcuts file changed |
 | `boardConfig:setDefaultBaseBranch` | invoke | Set the team-shared default base branch in `kangentic.json` |
 
-### Mobile Bridge (10 channels)
+### Mobile Bridge (12 channels)
 Machine-global (like Config), not project-scoped - backs the Mobile Devices settings tab. See [Mobile Bridge](mobile-bridge.md) for the pairing ceremony, roster, capability verbs, and relay transport this group fronts.
 | Channel | Pattern | Purpose |
 |---------|---------|---------|
-| `mobile:getStatus` | invoke | Report bridge status: enabled, secure-storage availability, identity fingerprint, relay URL, paired device count, pairing-in-progress |
-| `mobile:startPairing` | invoke | Mint a pairing token, connect the pairing relay slot, and return the QR payload URI |
-| `mobile:confirmPairing` | invoke | Confirm the SAS matched; signs the phone's static key into the roster with the given display name and capabilities |
+| `mobile:getStatus` | invoke | Report bridge status: enabled, secure-storage availability, identity fingerprint, relay URL, relay transport state, paired device count, pairing-in-progress |
+| `mobile:startPairing` | invoke | Mint a pairing token, connect the pairing relay slot, and return the QR payload URI. Supersedes a stale in-progress ceremony rather than throwing |
 | `mobile:cancelPairing` | invoke | Cancel an in-progress pairing ceremony |
-| `mobile:listDevices` | invoke | List paired devices (id, display name, capabilities, paired-at) |
+| `mobile:listDevices` | invoke | List paired devices (id, display name, capabilities, paired-at, live connection state) |
 | `mobile:revokeDevice` | invoke | Revoke a paired device: drop it from the signed roster and tear down its session |
-| `mobile:setDeviceCapabilities` | invoke | Update a paired device's granted capability verbs (re-signs the roster entry) |
-| `mobile:pairingSas` | on | Event: the SAS (digits + emoji) to display for the current pairing ceremony |
-| `mobile:pairingEnded` | on | Event: pairing cancelled or failed, with a reason |
-| `mobile:stateChanged` | on | Event: status or device list changed (confirm/revoke/capability update) |
+| `mobile:renameDevice` | invoke | Rename a paired device (re-signs the roster entry, preserves paired-at) |
+| `mobile:setDeviceCapabilities` | invoke | Update a paired device's granted capability verbs (re-signs the roster entry); no longer surfaced as settings-tab UI, kept as the enforcement/future-preset seam |
+| `mobile:testRelay` | invoke | Reachability probe for a candidate relay URL ("Test connection"); validates server-side and never throws |
+| `mobile:pairingSas` | on | Event: the SAS digits to display for the current pairing ceremony (no emoji) |
+| `mobile:pairingConfirmed` | on | Event: the phone's sealed confirm frame opened and the device was auto-enrolled, with its deviceId and phone-supplied display name |
+| `mobile:pairingEnded` | on | Event: pairing ended with a reason and a `kind` (`'cancelled'` \| `'failed'`); the desktop only surfaces a message for `'failed'` (mismatch, timeout, handshake error) - a plain cancel is already obvious from the UI returning to idle |
+| `mobile:stateChanged` | on | Event: status or device list changed (pairing confirmed/revoke/capability update) |
 
 ### Notifications (2 channels)
 | Channel | Pattern | Purpose |
@@ -271,17 +278,17 @@ Machine-global (like Config), not project-scoped - backs the Mobile Devices sett
 | `notification:show` | send | Show native OS notification (task name + project name) |
 | `notification:clicked` | on | User clicked a notification (includes projectId, taskId) |
 
-### Agent (3 channels)
+### Agent (2 channels)
 | Channel | Pattern | Purpose |
 |---------|---------|---------|
-| `agent:detect` | invoke | Detect agent CLI (path, version) |
 | `agent:listCommands` | invoke | List available agent commands and skills |
 | `agent:summarize` | invoke | Summarize a free-form prompt into a short task title via the active project's default agent (or `input.agentName`). Returns `{ ok, title } \| { ok: false, reason }`. Sliding-window rate limit per `AppConfig.autoNameRateLimitPerHour`. |
 
-### Agents (1 channel)
+### Agents (2 channels)
 | Channel | Pattern | Purpose |
 |---------|---------|---------|
-| `agent:list` | invoke | List all detected agent CLIs as `AgentDetectionInfo` (name, displayName, found, path, version, authenticated, permissions, defaultPermission, liveTelemetryUnsupported, reportsRateLimits, pastedImageReferenceTemplate, supportsSummarize) |
+| `agent:list` | invoke | List all detected agent CLIs as `AgentDetectionInfo` (name, displayName, found, path, version, authenticated, permissions, defaultPermission, liveTelemetryUnsupported, reportsRateLimits, pastedImageReferenceTemplate, supportsSummarize, remoteExecution) |
+| `agent:probeExecutionServer` | invoke | Reachability probe for an agent's configured remote execution server ("Test connection" in the Agent settings tab, shown when the selected agent declares remote-execution support). Returns `RemoteServerStatus`. |
 
 ### Handoffs (1 channel)
 | Channel | Pattern | Purpose |
@@ -294,9 +301,14 @@ Machine-global (like Config), not project-scoped - backs the Mobile Devices sett
 | `shell:getAvailable` | invoke | List available shells |
 | `shell:getDefault` | invoke | Get default shell |
 | `shell:openPath` | invoke | Open directory in file explorer |
-| `shell:openExternal` | invoke | Open URL in default browser |
+| `shell:openExternal` | invoke | Open URL in default browser (http/https/mailto only; other schemes are rejected) |
 | `shell:showItemInFolder` | invoke | Reveal a file or directory in the native file manager (Explorer on Windows, Finder on macOS); the path is normalized to platform separators before dispatch |
 | `shell:exec` | invoke | Execute shell command |
+
+### Fonts (1 channel)
+| Channel | Pattern | Purpose |
+|---------|---------|---------|
+| `font:getAvailable` | invoke | List detected system fonts (monospace-filtered when detectable) for the Terminal tab's Font Family picker |
 
 ### Git (12 channels)
 | Channel | Pattern | Purpose |
@@ -326,7 +338,7 @@ Machine-global (like Config), not project-scoped - backs the Mobile Devices sett
 | `window:maximize` | send | Maximize/restore the sending window |
 | `window:close` | send | Close the sending window |
 | `window:flashFrame` | send | Flash the sending window's taskbar icon to attract attention |
-| `window:isFocused` | invoke | Check if the sending window has focus (for notification gating) |
+| `window:isFocused` | invoke | Check if the sending window has focus (for the renderer's spawn-stall/plan-complete notification gating; the idle/crash desktop notifier resolves focus synchronously in main instead - see `src/main/notifications/desktop-notifier.ts`) |
 
 ### Pop-out Windows (6 channels)
 Detach a registered UI surface (usage stats, git changes, the task Browser pane) into its own OS-level `BrowserWindow`. See `src/shared/pop-out.ts` for the surface registry (`PopOutKind`, params, per-surface push fan-out) and `src/main/pop-out/` for the window manager + broadcast helper. Distinct from the in-app DOM window manager (`src/renderer/window-manager/`), which tiles movable panes inside the single main `BrowserWindow`.
@@ -442,7 +454,7 @@ Stores the project list. Tables:
 Created on project open. Stored in the global config directory (not inside the project). Tables:
 
 - **swimlanes** -- Kanban columns. Fields: id, name, role (`todo`/`done`/null), position, color, icon, is_archived, permission_mode, auto_spawn, auto_command, agent_override, model_override, effort_override, handoff_context, plan_exit_target_id, session_target, session_spawn_strategy, is_ghost, created_at
-- **tasks** -- Kanban cards. Fields: id, display_id, title, description, swimlane_id, position, agent, agent_override, model_override, effort_override, session_id, worktree_path, branch_name, pr_number, pr_url, pr_state, head_sha, base_branch, use_worktree, labels, priority, external_id, external_source, external_url, detail_view_state, archived_at, created_at, updated_at
+- **tasks** -- Kanban cards. Fields: id, display_id, title, description, swimlane_id, position, agent, agent_override, model_override, effort_override, permission_mode, auto_command, profile_id, run_mode, session_id, worktree_path, branch_name, pr_number, pr_url, pr_state, head_sha, base_branch, use_worktree, labels, priority, external_id, external_source, external_url, detail_view_state, archived_at, created_at, updated_at
 - **actions** -- Executable steps. Types: `spawn_agent`, `send_command`, `run_script`, `kill_session`, `create_worktree`, `cleanup_worktree`, `create_pr`, `webhook`. Config stored as JSON.
 - **swimlane_transitions** -- Maps lane pairs to action chains. Fields: from_swimlane_id (`*` = any), to_swimlane_id, action_id, execution_order
 - **sessions** -- Session persistence for recovery/resume. Fields: id, task_id, session_type, agent_session_id, command, cwd, permission_mode, prompt, status (`running`/`queued`/`suspended`/`exited`/`orphaned`), exit_code, timestamps
@@ -462,11 +474,37 @@ Repositories follow a simple pattern -- one class per table, all queries are syn
 `resolveTargetAgent()` determines which agent CLI to use when spawning a session. Resolution priority:
 
 1. **Task `agent_override`** - per-task override set at creation time (highest priority)
-2. **Column `agent_override`** - the target swimlane's per-column agent override (if set)
+2. **Column `agent_override`** - the target swimlane's per-column agent override, *after* the task's Board Profile has been folded over it (see below)
 3. **Project `default_agent`** - the project-level default agent setting
 4. **Global fallback** - `'claude'`
 
 This function is used by task-move (to detect cross-agent handoff), session-recovery (to respawn with the correct agent), and agent-spawn (to build the right CLI command).
+
+### Board Profiles (the column tier)
+
+Tier 2 is not read straight off the swimlane row. A task may carry a `profile_id` naming a **Board
+Profile**: a team-shared, named alternate set of per-column strategy settings, so one task runs
+Planning in Opus xhigh and Merge in Sonnet high while another runs the same board more cheaply. The
+profile's delta for the destination column is folded over the column's own settings before any tier
+above or below it applies.
+
+`src/main/transition-engine/column-strategy.ts` is the **single** place that fold happens
+(`resolveColumnStrategy` / `applyProfileToLane`), with `loadTaskProfile`
+(`src/main/ipc/helpers/task-profile.ts`) as the one accessor that reads the profile for a task.
+Everything is pure and total - it runs inside `runSpawnPreamble` on both spawn chokepoints, and a
+profile deleted by a teammate must degrade to the column's own settings rather than wedge an
+in-flight task.
+
+Centralising it is not tidiness. The `auto_command` split-brain it replaced shipped for real: the
+cold-spawn path honored the per-task tier while the warm live-injection path in `task-move.ts` read
+only the destination column, so the same task behaved differently depending on whether the
+destination already had a live session. `tests/unit/column-strategy-parity.test.ts` now fails the
+build on a spawn-path file that reads a lane's strategy fields without folding the profile first.
+
+Because a profile and the task's Advanced pins are mutually exclusive (enforced in
+`TaskRepository`), a profile task has no pins - so `lockAdvancedOverridesOnFirstSpawn` never fires
+for it and the ladder survives the task's whole life. See
+[Configuration > Board Profiles](configuration.md#board-profiles).
 
 ## Transition Engine
 
@@ -507,7 +545,7 @@ The transition engine uses the resolved `AgentAdapter` contract to `detect` the 
 | `create_pr` | Reserved. Not yet implemented. |
 | `webhook` | POST to URL with interpolated body |
 
-Template variables available: `{{title}}`, `{{description}}`, `{{task_xml}}`, `{{taskId}}`, `{{worktreePath}}`, `{{branchName}}`, `{{baseBranch}}`, `{{prUrl}}`, `{{prNumber}}`, `{{attachments}}`.
+Template variables available: `{{title}}`, `{{description}}`, `{{task_xml}}`, `{{taskId}}`, `{{worktreePath}}`, `{{branchName}}`, `{{baseBranch}}`, `{{prUrl}}`, `{{prNumber}}`, `{{attachments}}`. One declaration (`src/shared/task-template-vars.ts`) drives the `auto_command` field, the `spawn_agent` promptTemplate, and the Automation tab's chip list - see [Transition Engine](transition-engine.md#template-variables).
 
 ## PTY Session Manager
 
@@ -623,11 +661,11 @@ State: `sessions`, `activeSessionId`, `openTaskId`, `dialogSessionIds`, `session
 
 ### ConfigStore (`config-store.ts`)
 
-State: `config` (AppConfig), `globalConfig`, `appVersion`, `agentInfo`, `agentVersionNumber`, `gitInfo`, `settingsOpen`, `projectOverrides`
+State: `config` (AppConfig), `globalConfig`, `appVersion`, `agentList`, `gitInfo`, `settingsOpen`, `projectOverrides`
 
 - **Theme subscription** -- watches theme changes, updates `<html>` class for CSS variables.
 - **App version** -- `loadAppVersion()` fetches the Electron app version via IPC.
-- **Agent detection** -- `detectAgent()` finds CLI path and parses version string.
+- **Agent inventory** - `loadAgentList()` probes every registered agent adapter and returns per-agent found/path/version/displayName (`AgentDetectionInfo[]`); consumers look up their own agent's entry rather than reading a single Claude-only detection result.
 - **Git detection** -- `detectGit()` checks for git installation, version, and minimum version requirement.
 - **Project overrides** -- `loadProjectOverrides()`, `updateProjectOverride()`, `removeProjectOverride()` manage per-project config overrides by filesystem path.
 

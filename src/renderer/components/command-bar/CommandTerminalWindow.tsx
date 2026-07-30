@@ -19,7 +19,8 @@
 
 import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
-import { Circle, CircleStop, FolderOpen, FolderGit, GitBranch, GitCompare, Loader2, Maximize2, Minimize2, PictureInPicture2, SquareChevronRight, Zap } from 'lucide-react';
+import { CircleStop, FolderOpen, FolderGit, GitBranch, GitCompare, Loader2, Maximize2, Minimize2, PictureInPicture2, SquareChevronRight, Zap } from 'lucide-react';
+import { ActivityMark } from '../ActivityMark';
 import { BranchPicker } from '../dialogs/BranchPicker';
 import { LaunchOverlay } from '../LaunchOverlay';
 import { HeaderActionButton } from '../HeaderActionButton';
@@ -27,12 +28,10 @@ import { KebabMenu, KebabMenuItem, KebabMenuDivider } from '../KebabMenu';
 import { CommandPalettePopover } from '../dialogs/task-detail/CommandPalettePopover';
 import { useHeaderPillOverflow, type HeaderPillSpec } from '../dialogs/task-detail/useHeaderPillOverflow';
 import { WindowLayoutMenu } from '../dialogs/WindowLayoutMenu';
-import { TERMINAL_BACKGROUND, useTerminal } from '../../hooks/useTerminal';
-import { useTerminalRefit } from '../../hooks/useTerminalRefit';
+import { resolveTerminalBackground } from '../../hooks/useTerminal';
 import { useKeybinding, useFormattedCombo } from '../../hooks/useKeybinding';
-import { useTerminalFileDrop } from '../../hooks/useTerminalFileDrop';
-import { FileDropOverlay } from '../terminal/FileDropOverlay';
 import { ContextBar } from '../terminal/ContextBar';
+import { CommandTerminalPane, type TerminalGridGetter } from './CommandTerminalPane';
 import { useSessionStore } from '../../stores/session-store';
 import { transientKey } from '../../stores/session-store/transient-session-slice';
 import { commandTerminalChangesEntityId } from '../../stores/session-store/task-changes-panel-slice';
@@ -54,41 +53,26 @@ import { PanelErrorBoundary } from '../PanelErrorBoundary';
 const ChangesPanel = lazy(() => import('../dialogs/task-detail/changes/ChangesPanel').then((module) => ({ default: module.ChangesPanel })));
 
 /**
- * The centered stop glyph: one small rounded square, sized + colored to sit dead
- * center in the 20px activity ring (the stop counterpart to task-detail's
- * `PauseBars`). `colorClass` is a `bg-*` matching the ring.
- */
-function StopSquare({ colorClass }: { colorClass: string }): ReactNode {
-  return (
-    <span data-testid="stop-square" className="col-start-1 row-start-1 flex items-center justify-center">
-      <span className={`w-[8px] h-[8px] rounded-[2px] ${colorClass}`} />
-    </span>
-  );
-}
-
-/**
- * The Stop button glyph, carrying the same activity ring the task-detail header
- * folds into its pause button (`PauseButtonIcon`), but with a STOP square centered
- * instead of pause bars - the command terminal stops (kills the PTY); it never
- * pauses. Activity is encoded by the surrounding ring:
- *   - thinking (agent working): a spinning active ring around the stop square.
+ * The Stop button glyph, carrying the same activity ring the task-detail header folds into its
+ * pause button (`PauseButtonIcon`), but with a STOP square centered instead of pause bars - the
+ * command terminal stops (kills the PTY); it never pauses. Activity is encoded by the ring:
+ *   - thinking (agent working): a marching active ring around the stop square.
  *   - idle/permission (needs you): a static attention ring around the stop square.
  *   - not yet running / no activity: the plain red CircleStop (rest state).
+ *
+ * Ring and square are one packaged mark, so the hand-computed `47 16` dash that used to be
+ * duplicated here and in `TaskDetailHeader` is gone. See `PauseButtonIcon` for why 20 is the
+ * size that reproduces the old glyph exactly.
  */
 function StopButtonIcon({ isThinking, isIdle }: { isThinking: boolean; isIdle: boolean }): ReactNode {
-  if (isThinking) {
+  if (isThinking || isIdle) {
     return (
-      <span className="grid place-items-center">
-        <Circle size={20} className="col-start-1 row-start-1 text-active animate-spin [stroke-dasharray:47_16]" />
-        <StopSquare colorClass="bg-active" />
-      </span>
-    );
-  }
-  if (isIdle) {
-    return (
-      <span className="grid place-items-center">
-        <Circle size={20} className="col-start-1 row-start-1 text-attention" />
-        <StopSquare colorClass="bg-attention" />
+      <span className="grid place-items-center w-5 h-5">
+        <ActivityMark
+          mark={isThinking ? 'control-stop-working' : 'control-stop-idle'}
+          size={20}
+          className={isThinking ? 'text-active' : 'text-attention'}
+        />
       </span>
     );
   }
@@ -129,15 +113,10 @@ export function CommandTerminalWindow({ managedWindow, isMaximized, titleBarPoin
   const [showCommandPalette, setShowCommandPalette] = useState(false);
   const config = useConfigStore((s) => s.config);
   const rawProjectPath = useProjectStore((s) => s.currentProject?.path ?? null);
+  // Also the source for CommandTerminalPane's own pasteImageTemplate lookup
+  // (SESSION_INJECT_SETTINGS uses the same signal) - kept here too since
+  // ContextBar's agentFallback below needs it regardless of the pane.
   const projectAgent = useProjectStore((s) => s.currentProject?.default_agent ?? null);
-  // Adapter-declared: this agent needs an explicit reference (not a bare path) to
-  // reliably read a pasted/dropped image. A transient Command Terminal spawns the
-  // project's default agent (see transient-sessions.ts), so resolve the template by
-  // projectAgent - the same signal ContextBar's agentFallback and SESSION_INJECT_SETTINGS
-  // use here. Never branch on agent name - see .claude/rules/agent-adapters-boundary.md.
-  const pasteImageTemplate = useConfigStore(
-    (s) => s.agentList.find((a) => a.name === projectAgent)?.pastedImageReferenceTemplate,
-  );
   // Resolve to the main repo root if the current project is a worktree.
   const projectPath = useMemo(() => (rawProjectPath ? resolveProjectRoot(rawProjectPath) : null), [rawProjectPath]);
   const shortcuts = useBoardStore((s) => s.shortcuts);
@@ -301,99 +280,10 @@ export function CommandTerminalWindow({ managedWindow, isMaximized, titleBarPoin
   const isIdle = sessionRunning && requiresUserInteraction(activity);
   const showActivityRing = isThinking || isIdle;
 
-  const commandTerminalShell = useSessionStore(
-    useCallback(
-      (s: ReturnType<typeof useSessionStore.getState>) =>
-        sessionId ? s.sessions.find((session) => session.id === sessionId)?.shell : undefined,
-      [sessionId],
-    ),
-  );
-
-  const { terminalRef, initTerminal, fit, flushResize, focus } = useTerminal({
-    sessionId: effectiveSessionId,
-    projectId,
-    fontFamily: config.terminal.fontFamily,
-    fontSize: config.terminal.fontSize,
-    scrollbackLines: config.terminal.scrollbackLines,
-    cursorStyle: config.terminal.cursorStyle,
-    shellName: commandTerminalShell ?? undefined,
-    pasteImageTemplate,
-  });
-
-  const fileDrop = useTerminalFileDrop(effectiveSessionId, focus, commandTerminalShell ?? undefined, pasteImageTemplate);
-
-  // Init the terminal once the session is ready AND the container has dimensions.
-  const initialized = useRef(false);
-  useEffect(() => {
-    if (!effectiveSessionId) return;
-    const element = terminalRef.current;
-    if (!element) return;
-
-    const tryInit = () => {
-      if (initialized.current) return;
-      if (element.offsetWidth > 0 && element.offsetHeight > 0) {
-        initTerminal();
-        initialized.current = true;
-        fit();
-        focus();
-      }
-    };
-
-    tryInit();
-
-    let observer: ResizeObserver | null = null;
-    if (!initialized.current) {
-      observer = new ResizeObserver(() => {
-        tryInit();
-        if (initialized.current) observer?.disconnect();
-      });
-      observer.observe(element);
-    }
-
-    return () => {
-      observer?.disconnect();
-      initialized.current = false;
-    };
-  }, [effectiveSessionId, initTerminal, terminalRef, fit, focus]);
-
-  // Refit on any size change, shared with TerminalTab via useTerminalRefit so
-  // the two hosts cannot drift:
-  // - Engine commits (drag/resize/maximize/snap/tile) dispatch one coalesced
-  //   `terminal-panel-resize`, handled synchronously (fit + immediate SIGWINCH).
-  // - Container-only changes (the footer ContextBar growing as pills populate or
-  //   wrap, the Changes panel toggling the column width) are caught by the hook's
-  //   persistent ResizeObserver, which the old hand-rolled paths missed - that
-  //   gap clipped the fullscreen TUI's bottom rows under the pane edge.
-  useTerminalRefit({
-    terminalRef,
-    initializedRef: initialized,
-    fit,
-    flushResize,
-    immediatePanelResize: true,
-  });
-
-  // Restore terminal focus after a maximize/restore toggle (the button, Ctrl+Shift+M,
-  // and the header double-click all flip `isMaximized`), so the next keystroke lands
-  // in the terminal instead of the maximize button. The command terminal OWNS the
-  // xterm focus, so call `focus()` directly. Mirrors TaskDetailWindow's re-homing of
-  // the PR #33 fix; keys on the maximize toggle (not `terminal-panel-resize`, which
-  // also fires on drag/resize) and skips the initial mount.
-  const wasMaximizedRef = useRef(isMaximized);
-  useEffect(() => {
-    if (wasMaximizedRef.current === isMaximized) return;
-    wasMaximizedRef.current = isMaximized;
-    if (initialized.current) focus();
-  }, [isMaximized, focus]);
-
-  // Restore keyboard focus to the terminal after a maximize/restore toggle, so the
-  // next keystroke lands in the terminal instead of the maximize button (the button
-  // takes DOM focus when clicked; the panel.maximize keybinding and the header
-  // double-click also flip `isMaximized`). Keyed on `isMaximized`, deliberately NOT
-  // on `terminal-panel-resize` (which also fires on drag/snap/tile and would steal
-  // focus then).
-  useEffect(() => {
-    if (initialized.current) focus();
-  }, [isMaximized, focus]);
+  // Published by the mounted CommandTerminalPane; read by handleBranchChange
+  // before killing the old session so the respawn can seed the new PTY at the
+  // grid the user is already looking at (see spawnTransientSession's cols/rows).
+  const gridGetterRef = useRef<TerminalGridGetter | null>(null);
 
   const defaultBranch = config.git.defaultBaseBranch || 'main';
 
@@ -402,12 +292,15 @@ export function CommandTerminalWindow({ managedWindow, isMaximized, titleBarPoin
     const resolvedBranch = newBranch || defaultBranch;
     const currentProjectId = useProjectStore.getState().currentProject?.id ?? null;
     if (!currentProjectId) return;
+    // Read BEFORE the kill: the pane unmounts (and clears this ref) once
+    // sessionId flips to null below, and the awaited spawn IPC is not
+    // guaranteed to happen after that unmount commits.
+    const grid = gridGetterRef.current?.() ?? undefined;
     try {
       await useSessionStore.getState().killTransientSessionBySlot(currentProjectId, slot);
       setSessionId(null);
       setTerminalReady(false);
-      initialized.current = false;
-      const result = await useSessionStore.getState().spawnTransientSession(slot, resolvedBranch);
+      const result = await useSessionStore.getState().spawnTransientSession(slot, resolvedBranch, grid);
       setSessionId(result.session.id);
       setBranch(result.branch);
       if (result.checkoutError) {
@@ -689,14 +582,25 @@ export function CommandTerminalWindow({ managedWindow, isMaximized, titleBarPoin
             to the terminal's column width, so it overflows the window and fit() reads
             the stale (too-wide) size and never reduces columns. overflow-hidden clips
             the brief pre-fit overflow. Mirrors the Changes panel sibling. */}
-        <div className={`${changesOpen ? 'w-1/2' : 'flex-1'} relative min-w-0 overflow-hidden`} style={{ backgroundColor: TERMINAL_BACKGROUND }}>
-          {!terminalReady && <LaunchOverlay label="Starting Command Terminal..." />}
-          <FileDropOverlay {...fileDrop} />
-          <div
-            ref={terminalRef}
-            className="h-full"
-            data-testid="command-bar-terminal"
-          />
+        <div className={`${changesOpen ? 'w-1/2' : 'flex-1'} relative min-w-0 overflow-hidden`} style={{ backgroundColor: resolveTerminalBackground(config.terminal.colors) }}>
+          {!terminalReady && <LaunchOverlay label="Starting Command Terminal..." variant="terminal" />}
+          {/* Keyed (and gated, not just keyed) by session id: useTerminal is
+              unmount-only teardown, so a session swap on a live instance would
+              leave onData/onResize/clipboard/WebGL bound to the dead session.
+              Gating on effectiveSessionId (rather than keying an always-mounted
+              subtree) matters because effectiveSessionId goes null mid-switch
+              (see handleBranchChange) - a null key would mount a throwaway
+              Terminal with no onData/onResize, then tear it down. See
+              CommandTerminalPane.tsx. */}
+          {effectiveSessionId && (
+            <CommandTerminalPane
+              key={effectiveSessionId}
+              sessionId={effectiveSessionId}
+              projectId={projectId}
+              isMaximized={isMaximized}
+              gridGetterRef={gridGetterRef}
+            />
+          )}
         </div>
 
         {/* Changes panel */}

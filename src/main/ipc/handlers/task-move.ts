@@ -16,11 +16,10 @@ import {
   cleanupTaskResources,
   deleteTaskWorktree,
   spawnAgent,
-  buildAutoCommandVars,
 } from '../helpers';
 import { autoLinkPRForTask } from '../../pr/pr-linking';
 import { resolveProjectContext } from '../helpers/project-repos';
-import { interpolateTemplate } from '../../agent/shared';
+import { interpolateTaskTemplate, resolveTaskTemplateVars } from '../../agent/shared';
 import { trackEvent } from '../../analytics/analytics';
 import { parseModelId } from '../../../shared/model-id';
 import { captureSessionMetrics, refineTranscriptTokens, refineTranscriptToolCounts } from './session-metrics';
@@ -42,6 +41,8 @@ import {
 import { prepareInjectionPlan } from '../../transition-engine/injection-plan';
 import { prepareLiveSubmission } from '../../transition-engine/live-submission-eligibility';
 import { resolveIsolatedSwimlaneId, resolveForceFresh } from '../../transition-engine/session-isolation';
+import { resolveEffectiveAutoCommand, applyProfileToLane } from '../../transition-engine/column-strategy';
+import { loadTaskProfile } from '../helpers/task-profile';
 import type { AutoCommandImmediateOutcome, TaskMoveResult } from '../../../shared/auto-command-outcome';
 import type { Task, Swimlane, SessionRecord, TaskMoveInput } from '../../../shared/types';
 
@@ -267,14 +268,26 @@ export async function handleTaskMove(
       const resolvedProjectPath = projectPath !== undefined ? projectPath : context.currentProjectPath;
       if (!resolvedProjectId) throw new Error('No project is currently open');
 
-      const { tasks, swimlanes } = getProjectRepos(context, resolvedProjectId);
+      const { tasks, swimlanes, attachments } = getProjectRepos(context, resolvedProjectId);
       const task = tasks.getById(input.taskId);
       if (!task) throw new Error(`Task ${input.taskId} not found`);
 
       const fromSwimlaneId = task.swimlane_id;
       const originalPosition = task.position;
       const fromLane = swimlanes.getById(fromSwimlaneId);
-      const toLane = swimlanes.getById(input.targetSwimlaneId);
+      // Board Profiles: fold the task's profile over the destination column
+      // ONCE, here, so every read below (agent resolution, the injection plan's
+      // model/effort delta, the effort restart check, auto_command) sees the
+      // same profile-resolved strategy the cold spawn path uses.
+      //
+      // This path is the warm one - the destination already has a live session -
+      // and it is where a half-wired profile does its quiet damage: the delta
+      // check would compare the running session against the column's BASE model,
+      // see no change, and leave the PTY on the previous column's rung while
+      // spawnAgent would have switched it. Same task, different horsepower
+      // depending on whether a session happened to be live.
+      const rawToLane = swimlanes.getById(input.targetSwimlaneId);
+      const toLane = applyProfileToLane(rawToLane, loadTaskProfile(context, task, resolvedProjectPath)) ?? rawToLane;
 
       // Only send the full prompt template (title + description + attachments) when
       // starting from To Do. Non-To Do sources are resuming previously-started
@@ -649,9 +662,18 @@ export async function handleTaskMove(
           // prepareInjectionPlan so adapters own their slash syntax and the
           // model-restart policy stays in one place (agent-agnostic here).
           const adapter = task.agent ? agentRegistry.get(task.agent) : undefined;
-          const effectiveAutoCommand = task.auto_command ?? toLane?.auto_command;
+          // Resolve through the shared tier chain (task -> column) rather than
+          // reading the lane directly. Reading `toLane.auto_command` alone
+          // dropped a task's own auto_command on this path while the spawn path
+          // honored it, so the same task behaved differently on a cold spawn
+          // than on a warm move into a column with a live session.
+          const effectiveAutoCommand = resolveEffectiveAutoCommand(task.auto_command, toLane?.auto_command);
           const interpolatedAuto = effectiveAutoCommand?.trim()
-            ? interpolateTemplate(effectiveAutoCommand, buildAutoCommandVars(task))
+            ? interpolateTaskTemplate(effectiveAutoCommand, resolveTaskTemplateVars({
+                task,
+                defaultBaseBranch: effectiveDefaultBranch,
+                attachmentPaths: attachments.getPathsForTask(task.id),
+              }))
             : '';
           const capturedTaskAutoCommand = task.auto_command;
           const plan = prepareInjectionPlan({
@@ -829,7 +851,11 @@ export async function handleTaskMove(
                   capturedTaskAutoCommand,
                 );
                 const currentInterpolatedAuto = currentEffectiveAutoCommand?.trim()
-                  ? interpolateTemplate(currentEffectiveAutoCommand, buildAutoCommandVars(currentTask))
+                  ? interpolateTaskTemplate(currentEffectiveAutoCommand, resolveTaskTemplateVars({
+                      task: currentTask,
+                      defaultBaseBranch: effectiveDefaultBranch,
+                      attachmentPaths: attachments.getPathsForTask(currentTask.id),
+                    }))
                   : '';
                 const currentPlan = prepareInjectionPlan({
                   adapter: currentAdapter, sessionRepo: currentSessionRepo, sessionRecord: currentRecord,
@@ -957,7 +983,11 @@ export async function handleTaskMove(
                       capturedTaskAutoCommand,
                     );
                     const currentInterpolatedAuto = currentEffectiveAutoCommand?.trim()
-                      ? interpolateTemplate(currentEffectiveAutoCommand, buildAutoCommandVars(currentTask))
+                      ? interpolateTaskTemplate(currentEffectiveAutoCommand, resolveTaskTemplateVars({
+                          task: currentTask,
+                          defaultBaseBranch: effectiveDefaultBranch,
+                          attachmentPaths: attachments.getPathsForTask(currentTask.id),
+                        }))
                       : '';
                     const currentPlan = prepareInjectionPlan({
                       adapter: currentAdapter,
@@ -1224,7 +1254,7 @@ export async function handleTaskMove(
           const sessionRepoPhase3 = new SessionRepository(dbPhase3);
           const engine = createTransitionEngine(context, actionsPhase3, tasksPhase3, sessionRepoPhase3, attachmentsPhase3, resolvedProjectId, resolvedProjectPath);
           if (toLane) {
-            const autoCommand = await spawnAgent({ context, engine, tasks: tasksPhase3, sessionRepo: sessionRepoPhase3, task: current, fromSwimlaneId, toLane, skipPromptTemplate, signal, projectId: resolvedProjectId, projectPath: resolvedProjectPath, continuationPrompt, suppressAutoCommand, autoCommandLifecycle, settingsSourceLane: fromLane ?? null });
+            const autoCommand = await spawnAgent({ context, engine, tasks: tasksPhase3, sessionRepo: sessionRepoPhase3, task: current, fromSwimlaneId, toLane, skipPromptTemplate, signal, projectId: resolvedProjectId, projectPath: resolvedProjectPath, continuationPrompt, suppressAutoCommand, autoCommandLifecycle, settingsSourceLane: fromLane ?? null, attachments: attachmentsPhase3 });
             phaseThreeAutoCommand = autoCommand;
           }
         } finally {

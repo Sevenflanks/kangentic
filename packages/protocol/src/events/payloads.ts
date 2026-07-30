@@ -102,10 +102,16 @@ export interface TerminalDimensionsWire {
 /** Mirrors the desktop's ActivityState. 'permission' means the agent paused for user approval (incl. AskUserQuestion / ExitPlanMode pauses). */
 export type ActivityStateWire = 'thinking' | 'idle' | 'permission';
 
-/** Mirrors the desktop's ActivityReason discriminated union. */
+/**
+ * Mirrors the desktop's ActivityReason discriminated union. `since` (epoch ms
+ * the session first needed the user) is optional, additive-field style like
+ * `toolCallCount`/`effort` above: an older phone parsing a payload with the
+ * field missing still validates, and a desktop that has not yet learned a
+ * `since` for a phantom-state edge case can omit it.
+ */
 export type ActivityReasonWire =
-  | { kind: 'idle' }
-  | { kind: 'permission' }
+  | { kind: 'idle'; since?: number }
+  | { kind: 'permission'; since?: number }
   | { kind: 'tool'; pendingCount: number; currentTool: string | null }
   | { kind: 'subagent'; depth: number }
   | { kind: 'background-shell'; count: number; ids: string[] }
@@ -135,6 +141,45 @@ export interface SessionUsageWire {
     displayName: string;
     effort?: string;
   };
+}
+
+/**
+ * Phone-needed subset of the desktop's SessionSummary: what a task COST over
+ * its whole life, as opposed to SessionUsageWire's live snapshot of one
+ * running agent.
+ *
+ * Every figure is a lifetime aggregate across every session record of the
+ * task, which is what makes it meaningful for a completed one: a task worked
+ * across five `--resume` legs has five session rows, and reporting only the
+ * final leg would under-report everything. The desktop's getSummaryForTask
+ * owns those aggregation rules (SUM cost/duration/tool calls/lines, MAX files
+ * changed, and tokens taken as the latest row per session lineage so a
+ * resumed session is not double-counted) - they are not re-derived here.
+ *
+ * `sessionId` is the transcript ANCHOR, not a live session: it resolves
+ * through the desktop's session records, which outlive the agent, so it reads
+ * a finished task's conversation with nothing running. An archived task's
+ * `session_id` on the board is null by then, so this is the only handle to it.
+ */
+export interface SessionSummaryWire {
+  sessionId: string;
+  totalCostUsd: number;
+  totalInputTokens: number;
+  totalOutputTokens: number;
+  modelDisplayName: string;
+  durationMs: number;
+  toolCallCount: number;
+  compactionCount: number;
+  linesAdded: number;
+  linesRemoved: number;
+  filesChanged: number;
+  /** ISO 8601. The task's creation, which is where its timeline starts. */
+  taskCreatedAt: string;
+  /** ISO 8601. Earliest session start across every leg. */
+  startedAt: string;
+  /** ISO 8601, or null while a leg is still open. Latest exit or suspend. */
+  exitedAt: string | null;
+  exitCode: number | null;
 }
 
 /**
@@ -335,6 +380,7 @@ export function isActivityReasonWire(value: unknown): value is ActivityReasonWir
   switch (value.kind) {
     case 'idle':
     case 'permission':
+      return value.since === undefined || typeof value.since === 'number';
     case 'turn-active':
       return true;
     case 'tool':
@@ -376,6 +422,36 @@ export function parseSessionUsageWire(payload: JsonValue): SessionUsageWire {
       displayName: requireString(model, 'displayName', 'usage model'),
       ...(typeof model.effort === 'string' ? { effort: model.effort } : {}),
     },
+  };
+}
+
+/**
+ * Narrows a session-summary payload to SessionSummaryWire. Throws on a
+ * malformed required field.
+ *
+ * The numeric metrics are required rather than optional because the desktop
+ * COALESCEs each to 0 before it sends them, so "no data" arrives as a real
+ * zero. Making them optional here would invite a phone to render an em-dash
+ * where the honest answer is 0.
+ */
+export function parseSessionSummaryWire(payload: JsonValue): SessionSummaryWire {
+  if (!isRecord(payload)) throw new Error('session summary payload must be an object');
+  return {
+    sessionId: requireString(payload, 'sessionId', 'session summary'),
+    totalCostUsd: requireNumber(payload, 'totalCostUsd', 'session summary'),
+    totalInputTokens: requireNumber(payload, 'totalInputTokens', 'session summary'),
+    totalOutputTokens: requireNumber(payload, 'totalOutputTokens', 'session summary'),
+    modelDisplayName: requireString(payload, 'modelDisplayName', 'session summary'),
+    durationMs: requireNumber(payload, 'durationMs', 'session summary'),
+    toolCallCount: requireNumber(payload, 'toolCallCount', 'session summary'),
+    compactionCount: requireNumber(payload, 'compactionCount', 'session summary'),
+    linesAdded: requireNumber(payload, 'linesAdded', 'session summary'),
+    linesRemoved: requireNumber(payload, 'linesRemoved', 'session summary'),
+    filesChanged: requireNumber(payload, 'filesChanged', 'session summary'),
+    taskCreatedAt: requireString(payload, 'taskCreatedAt', 'session summary'),
+    startedAt: requireString(payload, 'startedAt', 'session summary'),
+    exitedAt: typeof payload.exitedAt === 'string' ? payload.exitedAt : null,
+    exitCode: typeof payload.exitCode === 'number' ? payload.exitCode : null,
   };
 }
 

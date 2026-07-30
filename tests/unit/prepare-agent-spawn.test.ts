@@ -16,6 +16,12 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { AgentAdapter, SpawnCommandOptions } from '../../src/main/agent/agent-adapter';
 import type { Task, Swimlane, AppConfig } from '../../src/shared/types';
+import { OpenCodeCommandBuilder, type OpenCodeCommandOptions } from '../../src/main/agent/adapters/opencode';
+import { CodexCommandBuilder, type CodexCommandOptions } from '../../src/main/agent/adapters/codex';
+import type { AgentLaunchOptionInfo } from '../../src/shared/types';
+// Type-only: erased at compile time, so importing it does not drag the heavy
+// mcp-http-server module graph (SDK, agent commands, ...) into this test.
+import type { McpHttpServerHandle } from '../../src/main/agent/mcp-http-server';
 
 // ---------------------------------------------------------------------------
 // Hoisted mock functions - all mocks that need to be referenced outside of
@@ -282,6 +288,11 @@ function makeCaptureAdapter(
   options: {
     name?: string;
     supportsCallerSessionId?: boolean;
+    /** Declared boolean launch-option toggles (AgentAdapter.launchOptions is
+     * readonly, so it must be set here at construction rather than assigned
+     * after the fact). Defaults to undefined, matching every adapter but
+     * Codex. */
+    launchOptions?: readonly AgentLaunchOptionInfo[];
   } = {},
 ): { adapter: AgentAdapter; capturedCommandOptions: SpawnCommandOptions[] } {
   const capturedCommandOptions: SpawnCommandOptions[] = [];
@@ -292,6 +303,7 @@ function makeCaptureAdapter(
     displayName: adapterName,
     sessionType: `${adapterName}_agent` as AgentAdapter['sessionType'],
     supportsCallerSessionId: options.supportsCallerSessionId ?? false,
+    launchOptions: options.launchOptions,
     permissions: [],
     defaultPermission: 'default',
     async detect(_overridePath?: string | null) {
@@ -593,5 +605,225 @@ describe('prepareAgentSpawn - extraEnv field', () => {
     // Strict reference equality: extraEnv must be the exact object returned by buildEnv,
     // not a copy. The function must not wrap or transform the returned value.
     expect(result.data.extraEnv).toBe(originalEnv);
+  });
+});
+
+describe('prepareAgentSpawn - remote OpenCode execution wiring', () => {
+  // Coverage hole: resolveExecutionTarget is called at this chokepoint
+  // (session-startup/prepare-spawn.ts) and threaded into
+  // commandOptions.executionTarget, but no prior test spawned through it with a
+  // remote-configured agent. Deleting that wiring (either the
+  // resolveExecutionTarget call or the executionTarget property on
+  // commandOptions) would silently fall back to a local spawn while every other
+  // test in this file kept passing, because they all leave
+  // config.agent.executionServers/execution unset.
+  //
+  // The capture adapter's buildCommand is swapped for the REAL
+  // OpenCodeCommandBuilder so the assertion exercises production attach-command
+  // logic, not a hand-rolled stub of "did executionTarget arrive".
+  it('threads resolveExecutionTarget into commandOptions.executionTarget, producing an attach command with the server URL', async () => {
+    const openCodeCommandBuilder = new OpenCodeCommandBuilder();
+    const { adapter, capturedCommandOptions } = makeCaptureAdapter({ name: 'opencode' });
+    adapter.buildCommand = (commandOptions: SpawnCommandOptions) => {
+      capturedCommandOptions.push(commandOptions);
+      return openCodeCommandBuilder.buildOpenCodeCommand(commandOptions as unknown as OpenCodeCommandOptions);
+    };
+    agentRegistryGetMock.mockReturnValue(adapter);
+
+    const configWithRemoteOpenCode = makeAppConfig({
+      agent: {
+        cliPaths: {},
+        permissionMode: 'default',
+        maxConcurrentSessions: 5,
+        queueOverflow: 'queue',
+        autoResumeSessionsOnRestart: true,
+        executionServers: {
+          opencode: { url: 'http://10.0.0.9:5100', auth: { kind: 'none' } },
+        },
+        execution: {
+          opencode: { mode: 'remote', workingDirectory: '/srv/remote-project' },
+        },
+      } as unknown as AppConfig['agent'],
+    });
+
+    const result = await prepareAgentSpawn(makeSpawnInput({ effectiveConfig: configWithRemoteOpenCode }));
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error('Expected ok:true');
+    expect(capturedCommandOptions).toHaveLength(1);
+    expect(capturedCommandOptions[0].executionTarget).toEqual({
+      url: 'http://10.0.0.9:5100',
+      auth: { kind: 'none' },
+      workingDirectory: '/srv/remote-project',
+    });
+    // Red: commenting out `executionTarget: resolveExecutionTarget(...)` in
+    // prepareAgentSpawn's commandOptions (prepare-spawn.ts) makes
+    // buildOpenCodeCommand take the local branch instead, and this command
+    // would be the plain binary path with no 'attach' token and no server URL.
+    expect(result.data.command).toContain('attach');
+    expect(result.data.command).toContain('http://10.0.0.9:5100');
+  });
+
+  it('does not thread an executionTarget when the project is not configured for remote mode', async () => {
+    // Plain capture stub (the default makeCaptureAdapter behavior), not the
+    // real OpenCodeCommandBuilder: this test only needs to see what
+    // commandOptions carried, not exercise the real attach-vs-local branch.
+    const { adapter, capturedCommandOptions } = makeCaptureAdapter({ name: 'opencode' });
+    agentRegistryGetMock.mockReturnValue(adapter);
+
+    // config.agent.executionServers/execution both default to unset via
+    // makeAppConfig, mirroring the common "no project has opted into remote"
+    // case.
+    const result = await prepareAgentSpawn(makeSpawnInput());
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error('Expected ok:true');
+    expect(capturedCommandOptions).toHaveLength(1);
+    expect(capturedCommandOptions[0].executionTarget).toBeUndefined();
+  });
+});
+
+describe('prepareAgentSpawn - Codex launch-option wiring', () => {
+  // Coverage hole: resolveLaunchOptions is called at this chokepoint
+  // (session-startup/prepare-spawn.ts) and threaded into
+  // commandOptions.launchOptions, but no prior test spawned through it with
+  // an adapter that declares launch options. Deleting that wiring (either the
+  // resolveLaunchOptions call or the launchOptions property on
+  // commandOptions) would silently drop the toggle while every other test in
+  // this file kept passing, because they all use adapters with no declared
+  // launchOptions.
+  //
+  // The capture adapter's buildCommand is swapped for the REAL
+  // CodexCommandBuilder so the assertion exercises production
+  // --disable-apps flag logic, not a hand-rolled stub of "did launchOptions
+  // arrive".
+  const codexLaunchOptions: readonly AgentLaunchOptionInfo[] = [{
+    id: 'disableApps',
+    label: 'Disable ChatGPT Apps',
+    description: "Skips the optional ChatGPT Apps connector.",
+    default: false,
+  }];
+
+  it('threads resolveLaunchOptions into commandOptions.launchOptions, producing a --disable apps flag', async () => {
+    const codexCommandBuilder = new CodexCommandBuilder();
+    const { adapter, capturedCommandOptions } = makeCaptureAdapter({
+      name: 'codex',
+      launchOptions: codexLaunchOptions,
+    });
+    adapter.buildCommand = (commandOptions: SpawnCommandOptions) => {
+      capturedCommandOptions.push(commandOptions);
+      const { agentPath, ...rest } = commandOptions;
+      return codexCommandBuilder.buildCodexCommand({ codexPath: agentPath, ...rest } as CodexCommandOptions);
+    };
+    agentRegistryGetMock.mockReturnValue(adapter);
+
+    const configWithLaunchOption = makeAppConfig({
+      agent: {
+        cliPaths: {},
+        permissionMode: 'default',
+        maxConcurrentSessions: 5,
+        queueOverflow: 'queue',
+        autoResumeSessionsOnRestart: true,
+        launchOptions: {
+          codex: { disableApps: true },
+        },
+      } as unknown as AppConfig['agent'],
+    });
+
+    const result = await prepareAgentSpawn(makeSpawnInput({ effectiveConfig: configWithLaunchOption }));
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error('Expected ok:true');
+    expect(capturedCommandOptions).toHaveLength(1);
+    expect(capturedCommandOptions[0].launchOptions).toEqual({ disableApps: true });
+    // Red: commenting out `launchOptions: resolveLaunchOptions(...)` in
+    // prepareAgentSpawn's commandOptions (prepare-spawn.ts) makes
+    // buildCodexCommand never see the flag, so this command would omit
+    // `--disable apps` entirely.
+    expect(result.data.command).toContain('--disable apps');
+  });
+
+  it('does not thread a launchOptions value when the adapter declares no launch options', async () => {
+    // Plain capture stub (the default makeCaptureAdapter behavior), not the
+    // real CodexCommandBuilder: this test only needs to see what
+    // commandOptions carried. launchOptions is left unset on the adapter even
+    // though a stored override IS configured below - resolveLaunchOptions
+    // must key off the ADAPTER's declared options, not the presence of
+    // stored config.
+    const { adapter, capturedCommandOptions } = makeCaptureAdapter({ name: 'codex' });
+    agentRegistryGetMock.mockReturnValue(adapter);
+
+    const configWithLaunchOption = makeAppConfig({
+      agent: {
+        cliPaths: {},
+        permissionMode: 'default',
+        maxConcurrentSessions: 5,
+        queueOverflow: 'queue',
+        autoResumeSessionsOnRestart: true,
+        launchOptions: {
+          codex: { disableApps: true },
+        },
+      } as unknown as AppConfig['agent'],
+    });
+
+    const result = await prepareAgentSpawn(makeSpawnInput({ effectiveConfig: configWithLaunchOption }));
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error('Expected ok:true');
+    expect(capturedCommandOptions).toHaveLength(1);
+    expect(capturedCommandOptions[0].launchOptions).toBeUndefined();
+  });
+});
+
+describe('prepareAgentSpawn - MCP caller-session URL stamping', () => {
+  // Coverage hole: prepareAgentSpawn wraps mcpServerUrl in
+  // `appendCallerSession(input.mcpServerHandle?.urlForProject(projectId), sessionRecordId)`
+  // so the MCP server can identify which session is calling (see
+  // caller-url.ts). Every existing test in this file passes
+  // mcpServerHandle: null (the makeSpawnInput default), so
+  // appendCallerSession(undefined, id) returns undefined either way and a
+  // regression to `input.mcpServerHandle?.urlForProject(projectId)` (dropping
+  // the appendCallerSession wrapper entirely) would fail nothing above.
+  function makeFakeMcpHandle(baseUrl: string): McpHttpServerHandle {
+    return {
+      baseUrl: `${baseUrl}/mcp`,
+      token: 'mcp-token',
+      urlForProject: (projectId: string) => `${baseUrl}/mcp/${projectId}`,
+      close: () => {},
+    };
+  }
+
+  it('stamps the spawned session record id as the third URL segment when an mcpServerHandle is supplied', async () => {
+    const { adapter, capturedCommandOptions } = makeCaptureAdapter();
+    agentRegistryGetMock.mockReturnValue(adapter);
+
+    const result = await prepareAgentSpawn(makeSpawnInput({
+      projectId: 'proj-caller-test',
+      mcpServerHandle: makeFakeMcpHandle('http://127.0.0.1:9999'),
+    }));
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error('Expected ok:true');
+    expect(capturedCommandOptions).toHaveLength(1);
+    // Red: reverting prepare-spawn.ts's
+    // `mcpServerUrl: appendCallerSession(input.mcpServerHandle?.urlForProject(projectId), sessionRecordId)`
+    // back to `input.mcpServerHandle?.urlForProject(projectId)` makes this
+    // 'http://127.0.0.1:9999/mcp/proj-caller-test' - no session segment.
+    expect(capturedCommandOptions[0].mcpServerUrl).toBe(
+      `http://127.0.0.1:9999/mcp/proj-caller-test/${FAKE_SESSION_RECORD_ID}`,
+    );
+    expect(result.data.sessionRecordId).toBe(FAKE_SESSION_RECORD_ID);
+  });
+
+  it('leaves mcpServerUrl undefined when no mcpServerHandle is supplied', async () => {
+    const { adapter, capturedCommandOptions } = makeCaptureAdapter();
+    agentRegistryGetMock.mockReturnValue(adapter);
+
+    const result = await prepareAgentSpawn(makeSpawnInput({ mcpServerHandle: null }));
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error('Expected ok:true');
+    expect(capturedCommandOptions).toHaveLength(1);
+    expect(capturedCommandOptions[0].mcpServerUrl).toBeUndefined();
   });
 });

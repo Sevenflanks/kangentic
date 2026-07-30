@@ -127,36 +127,24 @@ export function initUpdater(mainWindow: BrowserWindow): void {
     return;
   }
 
-  // We control the download -- don't auto-download on check
   autoUpdater.autoDownload = false;
-  // Install pending updates silently when the user quits normally
   autoUpdater.autoInstallOnAppQuit = true;
 
-  // macOS differential download reads a cached update.zip from
-  // ~/Library/Caches/<appId>-updater/pending/, which macOS evicts under
-  // disk pressure. That race produces a bare `ENOENT: no such file or
-  // directory, open '<path>'` error, historically our dominant updater
-  // failure. Full redownload is an acceptable tradeoff for eliminating
-  // the flakiness. See MacUpdater.js:88-103 for the cached-zip read
-  // path we are bypassing.
   if (process.platform === 'darwin') {
     autoUpdater.disableDifferentialDownload = true;
   }
 
-  // IPC handlers for renderer
   ipcMain.handle(IPC.UPDATE_CHECK, () => checkWithRetry());
 
   ipcMain.handle(IPC.UPDATE_INSTALL, () => {
     autoUpdater.quitAndInstall(true, true);
   });
 
-  // When an update is available, start downloading immediately (with retry).
   autoUpdater.on('update-available', () => {
     console.log('[UPDATER] Update available, downloading...');
     void downloadWithRetry();
   });
 
-  // When download completes, notify the renderer
   autoUpdater.on('update-downloaded', (info) => {
     console.log('[UPDATER] Update downloaded:', info.version);
     if (updaterWindow && !updaterWindow.isDestroyed()) {
@@ -164,10 +152,6 @@ export function initUpdater(mainWindow: BrowserWindow): void {
     }
   });
 
-  // Log errors but never surface to user. Skip analytics during retry to
-  // avoid double-counting transient failures that resolve on second attempt.
-  // Also filter known-transient failure classes so network blips and presigned
-  // URL expiries do not pollute the app_error signal.
   autoUpdater.on('error', (error) => {
     console.error('[UPDATER] Error:', error);
     if (checkRetrying || downloadRetrying) return;
@@ -183,7 +167,6 @@ export function initUpdater(mainWindow: BrowserWindow): void {
     });
   });
 
-  // Schedule checks
   checkTimeout = setTimeout(() => {
     console.log('[UPDATER] Checking for updates...');
     checkWithRetry();

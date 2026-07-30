@@ -642,6 +642,10 @@ test.describe('Command Terminal', () => {
         // The icon should reflect that, whether or not the bar is open.
         // Poll to allow the activity store to hydrate.
         await expect(icon).toHaveAttribute('data-activity', 'idle', { timeout: 5000 });
+        // Needs-you renders the static geometry. The branding set ships no `-rest` mark by
+        // design (rest is the `-idle` geometry in a muted tone), so both the 'idle' and 'rest'
+        // tones land on terminal-idle and only the color differs - pin that here.
+        await expect(icon).toHaveAttribute('data-mark', 'terminal-idle');
 
         // Open overlay and close it - session stays alive
         await sharedPage.keyboard.press('Control+Shift+P');
@@ -1128,10 +1132,9 @@ test.describe('Command Terminal', () => {
                 reason: string | null,
                 projectId: string,
                 taskId: string | null,
-                taskTitle: string | null,
               ) => void;
             };
-            win.__mockFireActivity(sessionId, 'thinking', null, projectId, null, null);
+            win.__mockFireActivity(sessionId, 'thinking', null, projectId, null);
           },
           { sessionId, projectId: MULTI_PROJECT_ID },
         );
@@ -1141,13 +1144,56 @@ test.describe('Command Terminal', () => {
         const toggleIcon = page.getByTestId('quick-session-icon');
         await expect(toggleIcon).toHaveAttribute('data-activity', 'thinking', { timeout: 3000 });
         await expect(toggleIcon).toHaveClass(/text-active/);
+        // Tone and geometry must agree. CommandTerminalIcon maps tone -> mark itself, so without
+        // this pairing a 'thinking' tone could render the static mark (or vice versa) and every
+        // data-activity and data-mark assertion elsewhere would still pass.
+        await expect(toggleIcon).toHaveAttribute('data-mark', 'terminal-working');
 
         // The "New terminal" icon must stay uncolored and report 'rest' regardless.
         const newTerminalIcon = page.getByTestId('quick-session-new-terminal-icon');
         await expect(newTerminalIcon).toHaveAttribute('data-activity', 'rest');
         await expect(newTerminalIcon).toHaveAttribute('data-plus', 'true');
+        // showPlus wins over tone: the action mark, which never marches.
+        await expect(newTerminalIcon).toHaveAttribute('data-mark', 'terminal-new');
         await expect(newTerminalIcon).not.toHaveClass(/text-active/);
         await expect(newTerminalIcon).not.toHaveClass(/text-attention/);
+      } finally {
+        await browser.close();
+      }
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Launch overlay (terminal variant) - CommandTerminalWindow.tsx passes
+  // variant="terminal" to LaunchOverlay so the pre-terminal shimmer is painted
+  // with the resolved terminal background instead of the theme's bg-surface (no
+  // flash when the overlay lifts and the real terminal is revealed). This is a
+  // SEPARATE call site from TerminalTab.tsx (covered by
+  // launch-overlay-terminal-surface.spec.ts) - reverting variant="terminal" here
+  // alone would go undetected by that spec.
+  // ---------------------------------------------------------------------------
+  test.describe('Launch overlay (terminal variant)', () => {
+    test('a cold command-terminal spawn paints the launch overlay with the resolved terminal background', async () => {
+      // multiTerminalPreConfig's spawnTransient never fires onFirstOutput or
+      // onUsage, so `terminalReady` (CommandTerminalWindow.tsx) stays false and
+      // the launch overlay stays mounted after the window opens - mirrors the
+      // cold-session setup in launch-overlay-terminal-surface.spec.ts.
+      const { browser, page } = await launchWithState(multiTerminalPreConfig());
+      try {
+        await page.locator('[data-swimlane-name="To Do"]').waitFor({ state: 'visible', timeout: 15000 });
+
+        await page.getByTestId('quick-session-button').click();
+        const commandWindow = page.getByTestId('command-terminal-window');
+        await expect(commandWindow).toBeVisible();
+
+        const overlay = commandWindow.locator('[data-testid="launch-overlay"]');
+        await expect(overlay).toBeVisible();
+
+        // Resolved default (#0c0c0c), not the theme-tracking bg-surface color -
+        // this is the property that goes red if variant="terminal" is dropped
+        // from the CommandTerminalWindow.tsx call site.
+        const overlayBackground = await overlay.evaluate((element) => getComputedStyle(element).backgroundColor);
+        expect(overlayBackground).toBe('rgb(12, 12, 12)');
       } finally {
         await browser.close();
       }
@@ -1921,9 +1967,13 @@ test.describe('Command Terminal', () => {
   // Stop activity ring - the Stop button in CommandTerminalWindow carries the
   // same ring affordance as the task-detail pause button, but with a stop square
   // instead of pause bars. Three ring states:
-  //   thinking (isActive)          -> spinning active Circle + active stop-square
-  //   idle/permission (requiresUI) -> static attention Circle + attention stop-square
-  //   no session / not running     -> plain CircleStop, no stop-square
+  //   thinking (isActive)          -> the control-stop-working mark, tinted text-active
+  //   idle/permission (requiresUI) -> the control-stop-idle mark, tinted text-attention
+  //   no session / not running     -> plain lucide CircleStop, no mark at all
+  //
+  // Ring and square are ONE packaged @kangentic/branding mark, so `data-mark` carries both
+  // "a ring is showing" and "which state it is": there is no separate stop-square element to
+  // assert, and no animate-spin class (the working mark marches via .kng-march instead).
   //
   // Each test uses a deterministic spawnTransient override (known session id) so
   // page.evaluate can call updateActivity + markFirstOutput on that exact id
@@ -2011,10 +2061,10 @@ test.describe('Command Terminal', () => {
       // We assert the activity-specific state in each individual test instead.
     }
 
-    test('thinking activity shows spinning active ring and active stop-square', async () => {
+    test('thinking activity shows the marching active stop ring', async () => {
       // Derives expected behavior from the contract in CommandTerminalWindow.tsx:
       //   isThinking = sessionRunning && isActive(activity)
-      //   -> spinning Circle with text-active animate-spin, plus StopSquare bg-active
+      //   -> the control-stop-working mark, tinted text-active
       const { browser, page } = await launchWithState(
         ringBasePreConfig() + deterministicSpawn
       );
@@ -2035,32 +2085,24 @@ test.describe('Command Terminal', () => {
 
         const stopButton = page.getByTestId('command-bar-terminate-button');
 
-        // stop-square must be present (the StopSquare inner span inside the ring)
-        await expect(stopButton.getByTestId('stop-square')).toBeVisible({ timeout: 3000 });
+        // The working mark: ring + stop square in one SVG, tinted active-green.
+        const ring = stopButton.locator('[data-mark="control-stop-working"]');
+        await expect(ring).toBeVisible({ timeout: 3000 });
+        await expect(ring).toHaveClass(/text-active/);
 
-        // The stop-square inner span carries bg-active for thinking
-        const squareInner = stopButton.getByTestId('stop-square').locator('span');
-        await expect(squareInner).toHaveClass(/bg-active/);
-
-        // The animated active ring (Circle svg) must also be present
-        // lucide-circle is the CSS class Lucide attaches to the Circle component
-        await expect(stopButton.locator('.lucide-circle')).toBeVisible();
-        const ringCircle = stopButton.locator('.lucide-circle');
-        await expect(ringCircle).toHaveClass(/text-active/);
-        await expect(ringCircle).toHaveClass(/animate-spin/);
-
-        // The plain rest-state icon (CircleStop) must NOT be present when thinking
+        // Neither the idle ring nor the plain rest-state icon may be present when thinking.
+        await expect(stopButton.locator('[data-mark="control-stop-idle"]')).toHaveCount(0);
         await expect(stopButton.locator('.lucide-circle-stop')).toHaveCount(0);
       } finally {
         await browser.close();
       }
     });
 
-    test('idle activity shows static attention ring and attention stop-square', async () => {
+    test('idle activity shows the static attention stop ring', async () => {
       // Derives expected behavior from the contract in CommandTerminalWindow.tsx:
       //   isIdle = sessionRunning && requiresUserInteraction(activity)
       //   requiresUserInteraction('idle') = true (ACTIVITY_DISPOSITION idle -> 'idle')
-      //   -> static Circle with text-attention (no animate-spin), plus StopSquare bg-attention
+      //   -> the control-stop-idle mark, tinted text-attention, with no march
       const { browser, page } = await launchWithState(
         ringBasePreConfig() + deterministicSpawn
       );
@@ -2081,20 +2123,14 @@ test.describe('Command Terminal', () => {
 
         const stopButton = page.getByTestId('command-bar-terminate-button');
 
-        // stop-square must be present for idle state
-        await expect(stopButton.getByTestId('stop-square')).toBeVisible({ timeout: 3000 });
+        // The idle mark: ring + stop square in one SVG, tinted attention-amber.
+        const ring = stopButton.locator('[data-mark="control-stop-idle"]');
+        await expect(ring).toBeVisible({ timeout: 3000 });
+        await expect(ring).toHaveClass(/text-attention/);
 
-        // The stop-square inner span carries bg-attention for idle
-        const squareInner = stopButton.getByTestId('stop-square').locator('span');
-        await expect(squareInner).toHaveClass(/bg-attention/);
-
-        // The static attention ring (Circle svg) must be present and NOT spinning
-        await expect(stopButton.locator('.lucide-circle')).toBeVisible();
-        const ringCircle = stopButton.locator('.lucide-circle');
-        await expect(ringCircle).toHaveClass(/text-attention/);
-        // Idle ring is static: no animate-spin class
-        const ringClass = await ringCircle.getAttribute('class');
-        expect(ringClass).not.toContain('animate-spin');
+        // Idle is static. The marching variant is a DIFFERENT mark, so its absence is the
+        // assertion - there is no motion class to check on the idle one.
+        await expect(stopButton.locator('[data-mark="control-stop-working"]')).toHaveCount(0);
 
         // The plain rest-state icon (CircleStop) must NOT be present when idle
         await expect(stopButton.locator('.lucide-circle-stop')).toHaveCount(0);
@@ -2128,18 +2164,12 @@ test.describe('Command Terminal', () => {
 
         const stopButton = page.getByTestId('command-bar-terminate-button');
 
-        // stop-square must be present for permission state
-        await expect(stopButton.getByTestId('stop-square')).toBeVisible({ timeout: 3000 });
-
-        // The stop-square inner span carries bg-attention for permission (same as idle)
-        const squareInner = stopButton.getByTestId('stop-square').locator('span');
-        await expect(squareInner).toHaveClass(/bg-attention/);
-
-        // Static attention ring (no spin) - permission maps to idle disposition
-        await expect(stopButton.locator('.lucide-circle')).toBeVisible();
-        const ringClass = await stopButton.locator('.lucide-circle').getAttribute('class');
-        expect(ringClass).toContain('text-attention');
-        expect(ringClass).not.toContain('animate-spin');
+        // Static attention ring - permission maps to the idle disposition, so it renders the
+        // SAME mark as idle, not the marching one.
+        const ring = stopButton.locator('[data-mark="control-stop-idle"]');
+        await expect(ring).toBeVisible({ timeout: 3000 });
+        await expect(ring).toHaveClass(/text-attention/);
+        await expect(stopButton.locator('[data-mark="control-stop-working"]')).toHaveCount(0);
 
         // No plain CircleStop for permission state
         await expect(stopButton.locator('.lucide-circle-stop')).toHaveCount(0);
@@ -2148,7 +2178,7 @@ test.describe('Command Terminal', () => {
       }
     });
 
-    test('no active session shows plain CircleStop (no stop-square, no ring)', async () => {
+    test('no active session shows plain CircleStop (no activity mark at all)', async () => {
       // When the session has not yet started (terminalReady=false, so sessionRunning=false),
       // or activity is undefined, StopButtonIcon renders the rest-state <CircleStop>.
       // This test opens the overlay WITHOUT calling markFirstOutput, so terminalReady
@@ -2174,11 +2204,11 @@ test.describe('Command Terminal', () => {
         // Plain rest-state icon must be present
         await expect(stopButton.locator('.lucide-circle-stop')).toBeVisible({ timeout: 3000 });
 
-        // No ring (no stop-square, no spinning/static Circle ring)
+        // No activity mark of either state.
         // Intentional fixed wait: we cannot poll for non-occurrence.
         // 800ms is enough for any pending microtask queue to flush.
         await page.waitForTimeout(800);
-        await expect(stopButton.getByTestId('stop-square')).toHaveCount(0);
+        await expect(stopButton.locator('[data-mark^="control-stop-"]')).toHaveCount(0);
       } finally {
         await browser.close();
       }
@@ -2617,6 +2647,260 @@ test.describe('Command Terminal', () => {
           () => (window as unknown as RefitInstrumentation).__panelResizeEventCount,
         );
         expect(panelResizeEvents).toBe(0);
+      } finally {
+        await browser.close();
+      }
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Branch switch (regression lock): CommandTerminalWindow used to swap
+  // sessionId in place on a live useTerminal instance, leaving onData/onResize
+  // permanently bound to the killed session (initTerminal's
+  // `if (xtermRef.current) return` guard). CommandTerminalPane now mounts
+  // keyed-and-gated by session id, so a branch switch remounts the xterm host
+  // instead. See CommandTerminalPane.tsx.
+  // ---------------------------------------------------------------------------
+  test.describe('Branch switch', () => {
+    const BRANCH_SWITCH_PROJECT_ID = 'proj-branch-switch';
+
+    /** One project; a counter-based deterministic spawnTransient that records
+     *  every input (for the cols/rows assertion) and never auto-fires first
+     *  output - the test drives that explicitly via markFirstOutput, mirroring
+     *  openCommandBarWithMountedTerminal above, for both the initial spawn and
+     *  the branch respawn. */
+    function branchSwitchPreConfig(): string {
+      return `
+        window.__mockPreConfigure(function (state) {
+          var ts = new Date().toISOString();
+          state.projects.push({
+            id: '${BRANCH_SWITCH_PROJECT_ID}',
+            name: 'Branch Switch Project',
+            path: '/mock/branch-switch-project',
+            github_url: null,
+            default_agent: 'claude',
+            last_opened: ts,
+            created_at: ts,
+          });
+          state.DEFAULT_SWIMLANES.forEach(function (s, i) {
+            state.swimlanes.push(Object.assign({}, s, {
+              id: 'lane-branch-switch-' + i,
+              position: i,
+              created_at: ts,
+            }));
+          });
+          return { currentProjectId: '${BRANCH_SWITCH_PROJECT_ID}' };
+        });
+
+        var branchSwitchSpawnCounter = 0;
+        window.__branchSwitchSpawnCalls = [];
+        window.electronAPI.sessions.spawnTransient = async function (input) {
+          branchSwitchSpawnCounter += 1;
+          var id = 'branch-switch-session-' + branchSwitchSpawnCounter;
+          window.__branchSwitchSpawnCalls.push(input);
+          var session = {
+            id: id,
+            taskId: id,
+            projectId: input.projectId,
+            pid: null,
+            status: 'running',
+            shell: '/bin/bash',
+            cwd: '/mock/branch-switch-project',
+            startedAt: new Date().toISOString(),
+            exitCode: null,
+            resuming: false,
+            transient: true,
+            isolatedSwimlaneId: null,
+            agentSessionId: null,
+          };
+          return { session: session, branch: input.branch || 'main' };
+        };
+      `;
+    }
+
+    /** Flip sessionFirstOutput for `sessionId` so CommandTerminalPane mounts
+     *  (see CommandTerminalWindow's terminalReady gate). Mirrors
+     *  openCommandBarWithMountedTerminal's injection above. */
+    async function markFirstOutput(page: Page, sessionId: string): Promise<void> {
+      await page.evaluate((id) => {
+        const stores = (window as unknown as {
+          __zustandStores?: { session?: { getState: () => { markFirstOutput: (id: string) => void } } };
+        }).__zustandStores;
+        stores?.session?.getState().markFirstOutput(id);
+      }, sessionId);
+    }
+
+    /** Every input passed to the mock's spawnTransient so far. */
+    async function branchSwitchSpawnCalls(page: Page): Promise<Array<{ branch?: string; cols?: number; rows?: number }>> {
+      return page.evaluate(() => (window as unknown as { __branchSwitchSpawnCalls: Array<{ branch?: string; cols?: number; rows?: number }> }).__branchSwitchSpawnCalls);
+    }
+
+    /** The most recent sessions.resize(sessionId, cols, rows) call recorded by
+     *  the mock for `sessionId`, or undefined if none yet. initTerminal calls
+     *  sessions.resize synchronously (before any await) right after fitting the
+     *  xterm host to its container, so the last entry for a mounted pane's
+     *  session id is that pane's live grid. */
+    async function lastResizeCallFor(
+      page: Page,
+      sessionId: string,
+    ): Promise<{ sessionId: string; cols: number; rows: number } | undefined> {
+      return page.evaluate((id) => {
+        const calls = (window as unknown as {
+          electronAPI: { sessions: { __resizeCalls: Array<{ sessionId: string; cols: number; rows: number }> } };
+        }).electronAPI.sessions.__resizeCalls;
+        return calls.filter((call) => call.sessionId === id).at(-1);
+      }, sessionId);
+    }
+
+    test('typing after a branch switch reaches the NEW session, not the killed one', async () => {
+      const { browser, page } = await launchWithState(branchSwitchPreConfig());
+      try {
+        await page.locator('[data-swimlane-name="To Do"]').waitFor({ state: 'visible', timeout: 15000 });
+
+        await page.keyboard.press('Control+Shift+P');
+        await expect(page.getByTestId('command-terminal-window')).toBeVisible();
+        await markFirstOutput(page, 'branch-switch-session-1');
+
+        const pane = page.getByTestId('command-bar-terminal-pane');
+        await expect(pane).toBeAttached({ timeout: 8000 });
+        await expect(pane).toHaveAttribute('data-session-id', 'branch-switch-session-1');
+
+        // Switch branch via the header chip.
+        await page.getByTestId('branch-picker-chip').click();
+        const developButton = page.locator('button:has-text("develop")');
+        await developButton.waitFor({ state: 'visible' });
+        await developButton.click();
+
+        // The store's transientSessions entry must carry the NEW session id
+        // before the pane can be expected to have remounted.
+        await expect.poll(async () => {
+          const entries = await transientEntriesFor(page, BRANCH_SWITCH_PROJECT_ID);
+          return entries[0]?.sessionId;
+        }, { timeout: 8000, intervals: [50, 100, 200, 500] }).toBe('branch-switch-session-2');
+
+        await markFirstOutput(page, 'branch-switch-session-2');
+
+        // The pane remounted (React key changed): data-session-id updates, and
+        // there is still exactly one xterm instance (the old one was disposed,
+        // not left running alongside a second one).
+        await expect(pane).toHaveAttribute('data-session-id', 'branch-switch-session-2', { timeout: 8000 });
+        await expect(page.getByTestId('command-terminal-window').locator('.xterm')).toHaveCount(1);
+
+        // Type into the terminal and assert the write landed on the NEW
+        // session id, not the killed one - the positive assertion the vacuous
+        // "no write to the old id" check would miss if the pane never mounted.
+        // .focus() (not a click) is deterministic - xterm's own focus() call
+        // happens inside initTerminal's requestAnimationFrame.
+        const textarea = pane.locator('.xterm-helper-textarea').first();
+        await expect(textarea).toBeAttached({ timeout: 8000 });
+        await page.evaluate(() => { window.electronAPI.sessions.__writeCalls.length = 0; });
+        await textarea.focus();
+        await page.keyboard.type('echo hi');
+
+        await expect.poll(async () => {
+          const calls = await page.evaluate(
+            () => (window as unknown as { electronAPI: { sessions: { __writeCalls: Array<{ sessionId: string; payload: string }> } } })
+              .electronAPI.sessions.__writeCalls,
+          );
+          const last = calls[calls.length - 1];
+          return last?.sessionId;
+        }, { timeout: 8000, intervals: [50, 100, 200, 500] }).toBe('branch-switch-session-2');
+      } finally {
+        await browser.close();
+      }
+    });
+
+    test('branch respawn seeds the new PTY with the pre-switch grid', async () => {
+      const { browser, page } = await launchWithState(branchSwitchPreConfig());
+      try {
+        await page.locator('[data-swimlane-name="To Do"]').waitFor({ state: 'visible', timeout: 15000 });
+
+        await page.keyboard.press('Control+Shift+P');
+        await expect(page.getByTestId('command-terminal-window')).toBeVisible();
+        await markFirstOutput(page, 'branch-switch-session-1');
+        await expect(page.getByTestId('command-terminal-window').locator('.xterm-helper-textarea').first())
+          .toBeAttached({ timeout: 8000 });
+
+        await page.getByTestId('branch-picker-chip').click();
+        const developButton = page.locator('button:has-text("develop")');
+        await developButton.waitFor({ state: 'visible' });
+
+        // Snapshot the pre-switch pane's live grid via the resize call its
+        // mount-time fit() already sent, immediately before triggering the
+        // switch. This is the SAME grid handleBranchChange reads via
+        // gridGetterRef right before the kill, so equating the two proves the
+        // respawn was seeded from the pane's ACTUAL live grid - not merely
+        // "some positive number" (a regression hardcoding {cols: 80, rows: 24}
+        // in handleBranchChange would pass the old >0 assertions unchanged,
+        // but fails this equality unless it coincidentally matched).
+        await expect.poll(
+          async () => (await lastResizeCallFor(page, 'branch-switch-session-1')) !== undefined,
+          { timeout: 8000, intervals: [50, 100, 200, 500] },
+        ).toBe(true);
+        const preSwitchGrid = await lastResizeCallFor(page, 'branch-switch-session-1');
+
+        await developButton.click();
+
+        await expect.poll(async () => (await branchSwitchSpawnCalls(page)).length, { timeout: 8000 }).toBe(2);
+
+        const calls = await branchSwitchSpawnCalls(page);
+        const respawnCall = calls[1];
+        expect(respawnCall.branch).toBe('develop');
+        // Grid was read from the still-mounted pane before the kill (see
+        // handleBranchChange), so it must equal the pre-switch pane's actual
+        // live grid, not merely be some positive number.
+        expect(preSwitchGrid).toBeDefined();
+        expect(respawnCall.cols).toBe(preSwitchGrid!.cols);
+        expect(respawnCall.rows).toBe(preSwitchGrid!.rows);
+      } finally {
+        await browser.close();
+      }
+    });
+
+    test('a branch switch never fires the dev-only session-swap-without-remount tripwire', async () => {
+      // useTerminal's dev-only tripwire (isSessionSwapWithoutRemount,
+      // useTerminal.ts) console.errors if a host's sessionId changes to a
+      // different LIVE session without remounting. UI specs run against the
+      // real Vite dev server, so import.meta.env.DEV is true here - the
+      // tripwire is live in this test the same way it is in `npm start`
+      // dogfooding. This is the wiring the pure-predicate unit test
+      // (terminal-session-swap-contract.test.ts) cannot reach: it exercises
+      // real refs across real re-renders, not a copy of the effect's logic.
+      const { browser, page } = await launchWithState(branchSwitchPreConfig());
+      const consoleErrors: string[] = [];
+      page.on('console', (message) => {
+        if (message.type() === 'error') consoleErrors.push(message.text());
+      });
+      try {
+        await page.locator('[data-swimlane-name="To Do"]').waitFor({ state: 'visible', timeout: 15000 });
+
+        await page.keyboard.press('Control+Shift+P');
+        await expect(page.getByTestId('command-terminal-window')).toBeVisible();
+        await markFirstOutput(page, 'branch-switch-session-1');
+        await expect(page.getByTestId('command-terminal-window').locator('.xterm-helper-textarea').first())
+          .toBeAttached({ timeout: 8000 });
+
+        await page.getByTestId('branch-picker-chip').click();
+        const developButton = page.locator('button:has-text("develop")');
+        await developButton.waitFor({ state: 'visible' });
+        await developButton.click();
+
+        await expect.poll(async () => {
+          const entries = await transientEntriesFor(page, BRANCH_SWITCH_PROJECT_ID);
+          return entries[0]?.sessionId;
+        }, { timeout: 8000, intervals: [50, 100, 200, 500] }).toBe('branch-switch-session-2');
+
+        await markFirstOutput(page, 'branch-switch-session-2');
+        await expect(page.getByTestId('command-terminal-window').locator('.xterm-helper-textarea').first())
+          .toBeAttached({ timeout: 8000 });
+
+        // Negative assertion, so a fixed budget rather than a poll: give the
+        // tripwire's effect (and any deferred console output) time to have
+        // fired by now if it was going to.
+        await page.waitForTimeout(500);
+
+        const tripwireErrors = consoleErrors.filter((text) => text.includes('[useTerminal] sessionId changed'));
+        expect(tripwireErrors).toEqual([]);
       } finally {
         await browser.close();
       }

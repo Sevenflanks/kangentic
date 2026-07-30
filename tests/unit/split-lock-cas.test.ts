@@ -120,7 +120,7 @@ const mockSpawnAgent = vi.fn(async () => ({ kind: 'not-applicable' } as const));
 const mockCreateTransitionEngine = vi.fn();
 const mockCleanupTaskResources = vi.fn(async () => {});
 const mockDeleteTaskWorktree = vi.fn(async () => true);
-const mockBuildAutoCommandVars = vi.fn(() => ({}));
+const mockResolveSpawnOverrides = vi.fn(() => ({}));
 
 vi.mock('../../src/main/ipc/helpers', () => ({
   getProjectRepos: (...args: unknown[]) => mockGetProjectRepos(...args),
@@ -130,7 +130,7 @@ vi.mock('../../src/main/ipc/helpers', () => ({
   createTransitionEngine: (...args: unknown[]) => mockCreateTransitionEngine(...args),
   cleanupTaskResources: (...args: unknown[]) => mockCleanupTaskResources(...args),
   deleteTaskWorktree: (...args: unknown[]) => mockDeleteTaskWorktree(...args),
-  buildAutoCommandVars: (...args: unknown[]) => mockBuildAutoCommandVars(...args),
+  resolveSpawnOverrides: (...args: unknown[]) => mockResolveSpawnOverrides(...args),
 }));
 
 // Import under test AFTER all mocks are registered
@@ -154,6 +154,8 @@ interface MockTask {
   branch_name: string | null;
   base_branch: string | null;
   agent: string;
+  agent_override: string | null;
+  profile_id: string | null;
 }
 
 interface MockSwimlane {
@@ -176,6 +178,8 @@ function createMockTask(id: string, overrides: Partial<MockTask> = {}): MockTask
     branch_name: null,
     base_branch: null,
     agent: 'claude',
+    agent_override: null,
+    profile_id: null,
     ...overrides,
   };
 }
@@ -225,6 +229,7 @@ function createMockContext() {
     },
     boardConfigManager: {
       getDefaultBaseBranch: vi.fn(() => null),
+      getBoardProfiles: vi.fn(() => []),
     },
     terminalSubmitScheduler: {
       scheduleKeystrokes: vi.fn(),
@@ -873,6 +878,36 @@ describe('SESSION_RESUME split-lock dedup', () => {
     // spawning a duplicate.
     expect(mockCreateTransitionEngine).not.toHaveBeenCalled();
     expect(result).toMatchObject({ id: 'sess-other' });
+  });
+
+  it('passes the Board Profile effective agent into an explicit resume fresh spawn', async () => {
+    doingLane = createMockSwimlane('lane-doing', { agent_override: 'claude' });
+    storedTask = {
+      ...storedTask,
+      agent: 'claude',
+      agent_override: null,
+      profile_id: 'profile-codex',
+    };
+    context.boardConfigManager.getBoardProfiles = vi.fn(() => [{
+      id: 'profile-codex',
+      name: 'Codex profile',
+      columns: { 'lane-doing': { agentOverride: 'codex' } },
+    }]);
+    mockSpawnAgent.mockImplementation(async (input: { task: MockTask }) => {
+      storedTask = { ...input.task, session_id: 'sess-fresh' };
+      return { kind: 'not-applicable' };
+    });
+    const handler = capturedHandlers.get(IPC.SESSION_RESUME);
+    if (!handler) throw new Error('SESSION_RESUME handler not registered');
+
+    await handler(null, 'task-2', 'Continue from the explicit resume');
+
+    expect(mockSpawnAgent).toHaveBeenCalledWith(expect.objectContaining({
+      fromSwimlaneId: 'lane-doing',
+      mode: { kind: 'explicit-resume', resumePrompt: 'Continue from the explicit resume' },
+      task: expect.objectContaining({ profile_id: 'profile-codex' }),
+      toLane: doingLane,
+    }));
   });
 });
 

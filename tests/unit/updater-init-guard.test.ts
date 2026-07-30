@@ -45,8 +45,6 @@ describe('initUpdater manifest guard', () => {
       value: '/fake/resources',
       configurable: true,
     });
-    // updater.ts short-circuits on Linux; pin platform so CI (ubuntu) runs
-    // the same wiring path as Windows/macOS hosts.
     Object.defineProperty(process, 'platform', {
       value: 'win32',
       configurable: true,

@@ -86,8 +86,9 @@
       fontSize: 14,
       showPreview: false,
       panelHeight: 250,
-      scrollbackLines: 5000,
       cursorStyle: 'block',
+      colors: {},
+      backspaceSendsCtrlH: false,
     },
     sidebar: {
       width: 224,
@@ -99,6 +100,9 @@
       queueOverflow: 'queue',
       idleTimeoutMinutes: 0,
       autoResumeSessionsOnRestart: false,
+      executionServers: {},
+      execution: {},
+      launchOptions: {},
     },
     git: {
       worktreesEnabled: true,
@@ -111,6 +115,7 @@
     },
     mcpServer: {
       enabled: true,
+      bindAddress: '127.0.0.1',
     },
     contextBar: {
       showShell: true,
@@ -155,6 +160,7 @@
     workspaceByProject: {},
     commandTerminalWorkspace: null,
     hasCompletedFirstRun: true,
+    lastSeenReleaseNotesVersion: '',
     skipDeleteConfirm: false,
     skipBoardConfigConfirm: false,
     autoFocusIdleSession: false,
@@ -176,6 +182,18 @@
 
   function now() {
     return new Date().toISOString();
+  }
+
+  /**
+   * Last path segment, either separator. The chained
+   * `split('/').pop() || split('\\').pop()` this replaces silently never reached its backslash
+   * branch: splitting a pure-Windows path on '/' yields a one-element array whose only member is
+   * the whole path, which is truthy. So a spec seeding a `C:\Users\dev\...` fixture path - the
+   * form cross-platform-parity.md tells tests to use - got the entire path back as the project
+   * name instead of the folder.
+   */
+  function basenameOf(inputPath) {
+    return String(inputPath).replace(/\\/g, '/').replace(/\/+$/, '').split('/').pop();
   }
 
   function getAttachmentCount(taskId) {
@@ -234,19 +252,15 @@
    *  KEEP IN SYNC with pickOverridableSubset() in src/main/config/config-manager.ts */
   function pickOverridableSubset(source) {
     source = source || {};
-    var terminal = source.terminal || {};
     var agent = source.agent || {};
     var git = source.git || {};
     var result = {};
     if (source.theme !== undefined) result.theme = source.theme;
-    var pickedTerminal = pruneUndefined({
-      shell: terminal.shell,
-      fontSize: terminal.fontSize,
-      fontFamily: terminal.fontFamily,
-      scrollbackLines: terminal.scrollbackLines,
-      cursorStyle: terminal.cursorStyle,
-    });
-    if (pickedTerminal) result.terminal = pickedTerminal;
+    // terminal.* (shell, fontSize, fontFamily, cursorStyle,
+    // backspaceSendsCtrlH) is global-only now - see the comment on
+    // pickOverridableSubset() in src/main/config/config-manager.ts.
+    // agent.execution is deliberately excluded - see the comment on
+    // pickOverridableSubset() in src/main/config/config-manager.ts.
     if (agent.permissionMode !== undefined) result.agent = { permissionMode: agent.permissionMode };
     var pickedGit = pruneUndefined({
       worktreesEnabled: git.worktreesEnabled,
@@ -318,12 +332,36 @@
 
   function noop() {}
 
+  // Board Profiles live in kangentic.json, not the DB, so the mock keeps them
+  // in a plain module-scope array. Declared here (alongside noop) rather than
+  // beside the boardConfig object, whose neighbouring `state` bindings belong to
+  // IIFEs that have already closed by that point.
+  let mockBoardProfiles = window.__mockBoardProfiles
+    ? JSON.parse(JSON.stringify(window.__mockBoardProfiles))
+    : [];
+
   // Test override conventions consumed below (set via addInitScript before this mock loads):
+  //   - window.__mockBoardProfiles: pre-seeded BoardProfile[] for boardConfig.getBoardProfiles()
   //   - window.__mockAgentListOverrides: per-agent override of agents.list() entries
   //   - window.__mockFolderPath: path returned by dialog.selectFolder() (consume-once)
   //   - window.__mockDefaultAgentOverride: default_agent for the next project created
   //     via projects.create() or projects.openByPath(); cleared after first use
   //     (used by agent-tab-auth-warning.spec.ts to seed projects with kimi/opencode/etc.)
+  // Notification-click test hook (App.tsx's `notifications.onClicked` handler,
+  // including the isCommandTerminal branch). Installed eagerly for the same
+  // reason as the update-downloaded hooks above. Unlike that hook, this one
+  // throws when fired with no listener registered: firing before App.tsx has
+  // mounted and subscribed would otherwise silently no-op into a confusing
+  // "nothing happened" failure downstream.
+  window.__mockNotificationClickListeners = [];
+  window.__mockFireNotificationClicked = function (projectId, taskId) {
+    var listeners = window.__mockNotificationClickListeners.slice();
+    if (listeners.length === 0) {
+      throw new Error('__mockFireNotificationClicked called with no onClicked listener registered');
+    }
+    listeners.forEach(function (fn) { fn(projectId, taskId); });
+  };
+
   window.electronAPI = {
     projects: {
       list: async function () {
@@ -373,7 +411,11 @@
           attachments = [];
         }
       },
+      // Call log for test assertions (mirrors clipboard.__writeTextCalls). Reset
+      // with window.electronAPI.projects.__openCalls.length = 0.
+      __openCalls: [],
       open: async function (id) {
+        window.electronAPI.projects.__openCalls.push(id);
         currentProjectId = id;
         // Create default swimlanes for this project if none exist
         if (swimlanes.length === 0) {
@@ -403,8 +445,8 @@
         // detects field mutations (e.g. default_agent changes after setDefaultAgent).
         return found ? Object.assign({}, found) : null;
       },
-      openByPath: async function (projectPath) {
-        var name = projectPath.split('/').pop() || projectPath.split('\\').pop() || 'project';
+      openByPath: async function (projectPath, overrides) {
+        var name = (overrides && overrides.name) || basenameOf(projectPath) || 'project';
         var existing = projects.find(function (p) { return p.path === projectPath; });
         if (existing) {
           currentProjectId = existing.id;
@@ -419,7 +461,7 @@
           name: name,
           path: projectPath,
           github_url: null,
-          default_agent: defaultAgentOverride || 'claude',
+          default_agent: (overrides && overrides.defaultAgent) || defaultAgentOverride || 'claude',
           default_model: null,
           default_effort: null,
           group_id: null,
@@ -443,6 +485,39 @@
           }
         }
         return project;
+      },
+      probePath: async function (projectPath) {
+        // Test hook: window.__mockProbePathOverrides merges over the defaults
+        // (e.g. { isGitRepo: false } to exercise the non-git-folder warning).
+        var overrides = window.__mockProbePathOverrides || {};
+        var name = basenameOf(projectPath) || 'project';
+        var existing = projects.find(function (p) { return p.path === projectPath; });
+        var defaults = {
+          exists: true,
+          isDirectory: true,
+          isGitRepo: true,
+          isInsideWorktree: false,
+          currentBranch: 'main',
+          suggestedName: name,
+          alreadyRegisteredProjectId: existing ? existing.id : null,
+        };
+        return Object.assign({}, defaults, overrides);
+      },
+      // Takes the folder path it ignores, matching the real signature the way `detect` and
+      // `selectFolder` do, so a spec can assert WHICH path git setup was attempted on.
+      ensureGit: async function (folderPath) {
+        // Test hook: window.__mockEnsureGitResult overrides the outcome, so a spec can
+        // exercise the "git could not be set up" warning without a real filesystem.
+        // Records calls so a spec can assert git setup was attempted at all.
+        window.__mockEnsureGitCalls = (window.__mockEnsureGitCalls || 0) + 1;
+        window.__mockEnsureGitLastPath = folderPath;
+        if (window.__mockEnsureGitResult) return window.__mockEnsureGitResult;
+        // created:false by default - "the folder was already a repo", the common case and
+        // the only one that raises no toast. Defaulting to created:true meant every spec
+        // that calls createProject() got the "Started a git repo in this folder" info toast,
+        // which broke unrelated specs asserting on a single `toast` testid. A spec that
+        // wants the freshly-created path sets __mockEnsureGitResult explicitly.
+        return { ok: true, created: false, error: null };
       },
       searchEntries: async function (input) {
         var normalizedQuery = normalizeEntryQuery(input.query);
@@ -629,6 +704,10 @@
     },
 
     tasks: {
+      // Call log for test assertions; see the `update` hook below for what is
+      // captured. Reset between tests via
+      // window.electronAPI.tasks.__updateCalls.length = 0.
+      __updateCalls: [],
       list: async function () {
         // Fixture tasks tagged with a projectId are scoped to the current project
         // (mirrors the real per-project DBs, where switching projects swaps the
@@ -685,6 +764,11 @@
           effort_override: input.effort_override || null,
           agent_override: input.agent_override || null,
           permission_mode: input.permission_mode || null,
+          // Deliberately a plain passthrough, NOT a copy of the repository's
+          // profile-vs-pin exclusivity: a dialog that sent both would then show
+          // up as a failure here instead of being silently corrected.
+          profile_id: input.profile_id || null,
+          run_mode: input.run_mode || 'column_settings',
           auto_command: input.auto_command || null,
           attachment_count: 0,
           archived_at: null,
@@ -715,6 +799,18 @@
         // Read via window.__mockTaskUpdateCallCount.
         if (typeof window !== 'undefined') {
           window.__mockTaskUpdateCallCount = (window.__mockTaskUpdateCallCount || 0) + 1;
+        }
+
+        // Test hook: call log of the raw update payload, so a spec can assert
+        // which keys were (or were NOT) sent - e.g. that the override fields
+        // (agent_override/model_override/effort_override/permission_mode/
+        // profile_id/run_mode) are omitted entirely when the save gate hides
+        // them (active session / archived task), rather than merely sent with
+        // an unchanged value. A shallow copy is pushed so later mutation of
+        // `input` by the caller can't retroactively change a captured entry.
+        // Reset between tests via window.electronAPI.tasks.__updateCalls.length = 0.
+        if (typeof window !== 'undefined') {
+          window.electronAPI.tasks.__updateCalls.push(Object.assign({}, input));
         }
 
         // Test hook: make tasks.update() return a controlled promise so the test
@@ -1385,7 +1481,14 @@
       writeFocusReport: async function (sessionId, report, projectId) {
         window.electronAPI.sessions.__focusReportCalls.push({ sessionId: sessionId, report: report, projectId: projectId });
       },
-      resize: async function () { return { colsChanged: false }; },
+      // Call log for test assertions. Each entry is { sessionId, cols, rows },
+      // in call order. Mirrors the __writeCalls log above. Reset between tests
+      // via window.electronAPI.sessions.__resizeCalls.length = 0.
+      __resizeCalls: [],
+      resize: async function (sessionId, cols, rows) {
+        window.electronAPI.sessions.__resizeCalls.push({ sessionId: sessionId, cols: cols, rows: rows });
+        return { colsChanged: false };
+      },
       list: async function () {
         return sessions;
       },
@@ -1509,13 +1612,13 @@
       },
       onActivity: function (callback) {
         // Tests can fire this via
-        // window.__mockFireActivity(sessionId, state, reason, projectId, taskId, taskTitle).
+        // window.__mockFireActivity(sessionId, state, reason, projectId, taskId).
         if (!window.__mockActivityListeners) window.__mockActivityListeners = [];
         window.__mockActivityListeners.push(callback);
         if (!window.__mockFireActivity) {
-          window.__mockFireActivity = function (sessionId, state, reason, projectId, taskId, taskTitle) {
+          window.__mockFireActivity = function (sessionId, state, reason, projectId, taskId) {
             var listeners = (window.__mockActivityListeners || []).slice();
-            for (var i = 0; i < listeners.length; i++) { listeners[i](sessionId, state, reason, projectId, taskId, taskTitle); }
+            for (var i = 0; i < listeners.length; i++) { listeners[i](sessionId, state, reason, projectId, taskId); }
           };
         }
         return function () {
@@ -1860,9 +1963,15 @@
         if (partial && Object.prototype.hasOwnProperty.call(partial, 'commandTerminalWorkspace')) {
           config.commandTerminalWorkspace = partial.commandTerminalWorkspace;
         }
+        // terminal.colors is a nested dictionary-style map (CONFIG_DICTIONARY_PATHS:
+        // 'terminal.colors'): the real save REPLACES it wholesale so resetting a
+        // single color slot (deleting its key) actually takes effect.
+        if (partial && partial.terminal && Object.prototype.hasOwnProperty.call(partial.terminal, 'colors')) {
+          config.terminal.colors = Object.assign({}, partial.terminal.colors);
+        }
       },
       // Synchronous sibling of set() for the quit/unload flush. Mirrors the real
-      // configManager.save dictionary-path replace semantics (hotkeyOverrides + workspaceByProject + commandTerminalWorkspace).
+      // configManager.save dictionary-path replace semantics (hotkeyOverrides + workspaceByProject + commandTerminalWorkspace + terminal.colors).
       setSync: function (partial) {
         config = deepMerge(config, partial);
         if (partial && Object.prototype.hasOwnProperty.call(partial, 'hotkeyOverrides')) {
@@ -1873,6 +1982,9 @@
         }
         if (partial && Object.prototype.hasOwnProperty.call(partial, 'commandTerminalWorkspace')) {
           config.commandTerminalWorkspace = partial.commandTerminalWorkspace;
+        }
+        if (partial && partial.terminal && Object.prototype.hasOwnProperty.call(partial.terminal, 'colors')) {
+          config.terminal.colors = Object.assign({}, partial.terminal.colors);
         }
       },
       getProjectOverrides: async function () {
@@ -1914,9 +2026,6 @@
     },
 
     agent: {
-      detect: async function () {
-        return { found: true, path: '/usr/bin/claude', version: '2.1.72 (Claude Code)' };
-      },
       listCommands: async function (/* cwd */) {
         return [
           { name: 'code-review', displayName: '/code-review', description: 'Review code for quality and conventions', argumentHint: '', source: 'command' },
@@ -1986,6 +2095,16 @@
             ],
             defaultPermission: 'acceptEdits',
             supportsSummarize: true,
+            // KEEP IN SYNC with CodexAdapter.launchOptions in
+            // src/main/agent/adapters/codex/codex-adapter.ts - the only agent
+            // that declares a launch option today, so the Agent tab's launch
+            // option row has exactly one agent to render it for in tests.
+            launchOptions: [{
+              id: 'disableApps',
+              label: 'Disable ChatGPT Apps',
+              description: "Skips Codex's optional ChatGPT Apps connector, which can hang startup. Doesn't touch your global config.",
+              default: false,
+            }],
           },
           {
             name: 'gemini', displayName: 'Gemini CLI', found: false, path: null, version: null,
@@ -2057,6 +2176,16 @@
             ],
             defaultPermission: 'acceptEdits',
             supportsSummarize: true,
+            // KEEP IN SYNC with OpenCodeAdapter.remoteExecution.info - the only
+            // agent that declares this capability today, so the Agent tab's
+            // remote-execution rows have exactly one agent to render them for
+            // in tests.
+            remoteExecution: {
+              urlPlaceholder: 'http://10.0.0.5:4096',
+              authKind: 'basic',
+              workingDirectoryScope: 'per-invocation',
+              remoteModeCaveat: 'The server is the authority for providers, models, and MCP tools in remote mode.',
+            },
           },
           {
             name: 'droid', displayName: 'Droid', found: false, path: null, version: null,
@@ -2089,6 +2218,14 @@
           return override ? Object.assign({}, agent, override) : agent;
         });
       },
+      // Tests can set window.__mockProbeExecutionServer = function (agentName) { ... }
+      // to control the "Test connection" result; default is a reachable stub.
+      probeExecutionServer: async function (agentName) {
+        if (typeof window !== 'undefined' && typeof window.__mockProbeExecutionServer === 'function') {
+          return window.__mockProbeExecutionServer(agentName);
+        }
+        return { reachable: true, version: '1.14.25' };
+      },
     },
 
     handoffs: {
@@ -2118,6 +2255,15 @@
         return '';
       },
       openExternal: async function () {
+        // Test hook: record external-open calls so a test can assert the URL.
+        // Shares window.__openedExternalUrls with the ad-hoc openExternal
+        // patches in pr-link-badge.spec.ts / settings-panel.spec.ts (both
+        // replace this function wholesale before use, so there is no
+        // double-recording risk).
+        if (typeof window !== 'undefined') {
+          window.__openedExternalUrls = window.__openedExternalUrls || [];
+          window.__openedExternalUrls.push(arguments[0]);
+        }
         return;
       },
       showItemInFolder: async function () {
@@ -2133,8 +2279,16 @@
       },
     },
 
+    font: {
+      getAvailable: async function () {
+        return ['Cascadia Code', 'Consolas', 'Courier New', 'Fira Code', 'JetBrains Mono', 'Menlo'];
+      },
+    },
+
     git: {
-      detect: async function () {
+      // forceRefresh is accepted to match the real API surface but ignored:
+      // the mock always returns the fixture, fresh or cached alike.
+      detect: async function (_forceRefresh) {
         return { found: true, path: '/usr/bin/git', version: '2.43.0', meetsMinimum: true };
       },
       listBranches: async function () {
@@ -2293,7 +2447,10 @@
     },
 
     dialog: {
-      selectFolder: async function () {
+      // options is accepted to match the real API surface (title, message,
+      // buttonLabel, defaultPath) but ignored: the mock always returns the
+      // fixture path, dialog chrome or not.
+      selectFolder: async function (_options) {
         var override = window.__mockFolderPath;
         if (override) {
           window.__mockFolderPath = null;
@@ -2405,6 +2562,17 @@
             use_worktree: null,
             labels: item.labels || [],
             priority: item.priority || 0,
+            agent_override: null,
+            model_override: null,
+            effort_override: null,
+            permission_mode: null,
+            auto_command: null,
+            profile_id: null,
+            // A promoted item has never been through the run-mode dialog, so it
+            // lands on the same default TaskRepository.create would write. Left
+            // undefined, the task-detail dialog would seed `runMode` from a
+            // missing field and neither radio would render checked.
+            run_mode: 'column_settings',
             attachment_count: 0,
             archived_at: null,
             detail_view_state: null,
@@ -2678,6 +2846,14 @@
     //   - window.__mockMobileBridgeStatus: shallow-merged onto getStatus()'s result
     //   - window.__mockMobileDevices: overrides listDevices()'s return value
     //   - window.__mockFireMobilePairingSas(payload) / __mockFireMobilePairingEnded(payload) / __mockFireMobileStateChanged()
+    //   - window.__mockCancelPairingCallCount: incremented on every cancelPairing()
+    //     call, so a spec can assert the tab's unmount cleanup actually fired one
+    //   - window.__mockCompleteMobilePairing(displayName): stands in for the
+    //     desktop auto-enrolling on the phone's confirm frame. Production
+    //     pairing is driven by a main-process PUSH (mobile:pairingConfirmed),
+    //     not a renderer-initiated confirm call, so this seeds a device with
+    //     the full ten-verb grant and fires that push directly, exactly as
+    //     MobileBridgeService does on a successful ceremony.
     mobile: (function () {
       var state = {
         enabled: false,
@@ -2688,18 +2864,63 @@
         pairingInProgress: false,
       };
       var sasListeners = [];
+      var pairingConfirmedListeners = [];
       var pairingEndedListeners = [];
       var stateChangedListeners = [];
+      var mockDeviceCounter = 0;
+
+      // Mirrors packages/protocol/src/capabilities/verbs.ts's CAPABILITY_VERBS -
+      // pairing grants all ten, not a read-only subset.
+      var FULL_CAPABILITY_SET = [
+        'read-stream', 'read-board', 'read-diff', 'send-user-message', 'move-task',
+        'answer-permission-prompt', 'interactive-terminal', 'board-tool-read',
+        'board-tool-write', 'register-push',
+      ];
 
       if (typeof window !== 'undefined') {
         window.__mockFireMobilePairingSas = function (payload) {
           sasListeners.forEach(function (listener) { listener(payload); });
         };
         window.__mockFireMobilePairingEnded = function (payload) {
+          // MobilePairingEndedPayload.kind is required (types.ts) and the tab
+          // branches on it (only 'failed' surfaces a message) - a spec that
+          // forgets to pass it would otherwise fail silently (no message ever
+          // shows, easy to misread as "the feature is broken") instead of
+          // loudly here.
+          if (payload.kind !== 'cancelled' && payload.kind !== 'failed') {
+            throw new Error('__mockFireMobilePairingEnded: payload.kind must be "cancelled" or "failed", got ' + JSON.stringify(payload.kind));
+          }
           pairingEndedListeners.forEach(function (listener) { listener(payload); });
         };
         window.__mockFireMobileStateChanged = function () {
           stateChangedListeners.forEach(function (listener) { listener(); });
+        };
+        window.__mockCompleteMobilePairing = function (displayName) {
+          mockDeviceCounter += 1;
+          // deviceId is production's phone static-public-key hex (64 hex
+          // chars), NOT an opaque label - formatKeyFingerprint() renders its
+          // first 16 chars, so a non-hex mock id would render as garbled
+          // text instead of a plausible fingerprint. Zero-padded so it stays
+          // valid hex and unique per call.
+          var deviceIdHex = ('0'.repeat(63) + mockDeviceCounter.toString(16)).slice(-64);
+          var device = {
+            deviceId: deviceIdHex,
+            displayName: displayName || 'Paired Device',
+            capabilities: FULL_CAPABILITY_SET.slice(),
+            pairedAt: new Date().toISOString(),
+            connectionState: 'connected',
+          };
+          state.devices.push(device);
+          state.pairingInProgress = false;
+          // Ordering mirrors production (mobile-bridge-service.ts's
+          // 'confirmed' handler): emitStateChanged() fires BEFORE
+          // 'pairingConfirmed', and it is stateChanged - not pairingConfirmed
+          // - that the tab answers with a devices re-fetch.
+          stateChangedListeners.forEach(function (listener) { listener(); });
+          pairingConfirmedListeners.forEach(function (listener) {
+            listener({ deviceId: device.deviceId, displayName: device.displayName });
+          });
+          return device;
         };
       }
 
@@ -2713,6 +2934,9 @@
             relayUrl: state.relayUrl,
             pairedDeviceCount: state.devices.length,
             pairingInProgress: state.pairingInProgress,
+            // No live transport in the mock, so 'idle' (no sessions) unless
+            // a spec overrides via window.__mockMobileBridgeStatus.
+            relayState: 'idle',
           }, overrides);
         },
         startPairing: async function () {
@@ -2722,23 +2946,27 @@
             expiresAt: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
           };
         },
-        confirmPairing: async function (displayName, capabilities) {
-          state.pairingInProgress = false;
-          state.devices.push({
-            deviceId: 'mock-device-' + (state.devices.length + 1),
-            displayName: displayName,
-            capabilities: capabilities || [],
-            pairedAt: new Date().toISOString(),
-          });
-        },
         cancelPairing: async function () {
           state.pairingInProgress = false;
+          // Call-count tracker so a spec can assert the tab's unmount cleanup
+          // actually invoked this (MobileDevicesTab.tsx's own-unmount-only
+          // effect), not just that no error was thrown.
+          if (typeof window !== 'undefined') {
+            window.__mockCancelPairingCallCount = (window.__mockCancelPairingCallCount || 0) + 1;
+          }
         },
         listDevices: async function () {
           return (typeof window !== 'undefined' && window.__mockMobileDevices) || state.devices;
         },
         revokeDevice: async function (deviceId) {
           state.devices = state.devices.filter(function (device) { return device.deviceId !== deviceId; });
+        },
+        renameDevice: async function (deviceId, displayName) {
+          // Reassign to a NEW array (see setDeviceCapabilities below) - the
+          // renderer's selector is reference-equality gated.
+          state.devices = state.devices.map(function (device) {
+            return device.deviceId === deviceId ? Object.assign({}, device, { displayName: displayName }) : device;
+          });
         },
         setDeviceCapabilities: async function (deviceId, capabilities) {
           // Reassign to a NEW array (like revokeDevice's .filter above), not an
@@ -2751,11 +2979,26 @@
             return device.deviceId === deviceId ? Object.assign({}, device, { capabilities: capabilities }) : device;
           });
         },
+        // Tests can set window.__mockTestRelay = function (relayUrl) { ... }
+        // to control the "Test connection" result; default is a reachable stub.
+        testRelay: async function (relayUrl) {
+          if (typeof window !== 'undefined' && typeof window.__mockTestRelay === 'function') {
+            return window.__mockTestRelay(relayUrl);
+          }
+          return { reachable: true, version: null };
+        },
         onPairingSas: function (callback) {
           sasListeners.push(callback);
           return function () {
             var index = sasListeners.indexOf(callback);
             if (index >= 0) sasListeners.splice(index, 1);
+          };
+        },
+        onPairingConfirmed: function (callback) {
+          pairingConfirmedListeners.push(callback);
+          return function () {
+            var index = pairingConfirmedListeners.indexOf(callback);
+            if (index >= 0) pairingConfirmedListeners.splice(index, 1);
           };
         },
         onPairingEnded: function (callback) {
@@ -2781,6 +3024,9 @@
       apply: async function (/* projectId */) { return []; },
       onChanged: function (/* callback(projectId) */) { return noop; },
       onShortcutsChanged: function (/* callback(projectId) */) { return noop; },
+      getBoardProfiles: async function () { return mockBoardProfiles; },
+      setBoardProfiles: async function (profiles) { mockBoardProfiles = profiles; },
+      onBoardProfilesChanged: function (/* callback(projectId) */) { return noop; },
       getShortcuts: async function () { return []; },
       setShortcuts: async function (/* actions, target */) {},
       setDefaultBaseBranch: async function (/* branch */) {},
@@ -2794,8 +3040,16 @@
 
     notifications: {
       show: noop,
-      onClicked: function () {
-        return noop;
+      onClicked: function (callback) {
+        // Tests fire the click push via `window.__mockFireNotificationClicked(projectId,
+        // taskId)`. The listener array and the fire hook itself are installed eagerly at
+        // mock-bootstrap time (see top of file), not lazily here.
+        window.__mockNotificationClickListeners.push(callback);
+        return function () {
+          var listeners = window.__mockNotificationClickListeners || [];
+          var idx = listeners.indexOf(callback);
+          if (idx >= 0) listeners.splice(idx, 1);
+        };
       },
     },
 

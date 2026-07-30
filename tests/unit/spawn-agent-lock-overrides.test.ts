@@ -4,14 +4,16 @@
  * (src/main/transition-engine/spawn-preamble.ts, wired in
  * src/main/ipc/helpers/agent-spawn.ts).
  *
- * A task that already carries at least one explicit Agent/Model/Effort/
- * Permission override but leaves the others on "inherit" gets ALL FOUR
- * fields locked, the moment it spawns for the very first time ever, to the
- * values the Advanced tab displayed when the user configured it: task
- * override -> the lane the task lived in at config time (the settings lane;
- * a drag move passes the SOURCE lane) -> project default / global permission
- * mode. The DESTINATION column's settings never leak into the locked
- * contract. A task with NO overrides at all is untouched.
+ * A task authored in Agent Override mode (`run_mode: 'agent_override'`) gets
+ * ALL FOUR of Agent/Model/Effort/Permission locked, the moment it spawns for
+ * the very first time ever, to the values the Advanced tab displayed when the
+ * user configured it: task override -> the lane the task lived in at config
+ * time (the settings lane; a drag move passes the SOURCE lane) -> project
+ * default / global permission mode. The DESTINATION column's settings never
+ * leak into the locked contract. A task in Column Settings mode is untouched.
+ *
+ * The gate is the persisted MODE, not "is any field pinned": override mode with
+ * all four left on inherit stores no pins at all and must still lock.
  *
  * Harness mirrors spawn-agent-continuation-prompt.test.ts: the real
  * spawnAgent runs end to end with injected engine/repos/context mocks. The
@@ -34,8 +36,15 @@ const TO_LANE_ID = 'lane-executing';
 const FROM_LANE_ID = 'lane-todo';
 const PROJECT_ID = 'project-001';
 
+/**
+ * `run_mode` defaults to whatever the repository would have derived for the
+ * given pins (`applyProfileExclusivity`: any pin implies override mode), so a
+ * fixture is always a row the repository could actually have written. Pass
+ * `run_mode` explicitly to build the case pins cannot express - override mode
+ * with all four still on inherit.
+ */
 function makeTask(overrides: Partial<Task> = {}): Task {
-  return {
+  const merged = {
     id: TASK_ID,
     display_id: 1,
     title: 'My Task',
@@ -62,6 +71,9 @@ function makeTask(overrides: Partial<Task> = {}): Task {
     updated_at: '2025-01-01T00:00:00.000Z',
     ...overrides,
   } as Task;
+  const pinsAnyField = merged.agent_override !== null || merged.model_override !== null
+    || merged.effort_override !== null || merged.permission_mode !== null;
+  return { run_mode: pinsAnyField ? 'agent_override' : 'column_settings', ...merged } as Task;
 }
 
 function makeSwimlane(overrides: Partial<Swimlane> = {}): Swimlane {
@@ -128,7 +140,21 @@ function makeDeps(args: { latestSession: unknown; task: Task }) {
     mainWindow: { isDestroyed: vi.fn(() => false), webContents: { send: vi.fn() } },
     terminalSubmitScheduler: { scheduleKeystrokes: vi.fn() },
     projectRepo: { getById: vi.fn(() => PROJECT_ROW) },
-    configManager: { getEffectiveConfig: vi.fn(() => ({ agent: { permissionMode: 'auto' } })) },
+    configManager: {
+      getEffectiveConfig: vi.fn(() => ({
+        agent: { permissionMode: 'auto' },
+        git: { defaultBaseBranch: 'main' },
+      })),
+    },
+    // resolveDefaultBaseBranch (git-stats-capture.ts) reads this for the
+    // team-shared board default; undefined falls through to the git config
+    // default above, matching resolveAutoCommandVars in agent-spawn.ts. No
+    // fixture here sets a truthy auto_command today, but every real spawnAgent
+    // context carries this shape - keep the mock honest.
+    boardConfigManager: {
+      getDefaultBaseBranch: vi.fn(() => undefined),
+      getBoardProfiles: vi.fn(() => []),
+    },
   };
   return { tasks, sessionRepo, engine, context };
 }
@@ -138,7 +164,11 @@ async function runSpawn(
   toLane: Swimlane,
   deps: ReturnType<typeof makeDeps>,
   settingsSourceLane?: Swimlane | null,
-  extraOptions: { skipPromptTemplate?: boolean; suppressAutoCommand?: boolean } = {},
+  extraOptions: {
+    skipPromptTemplate?: boolean;
+    suppressAutoCommand?: boolean;
+    mode?: { readonly kind: 'explicit-resume'; readonly resumePrompt?: string };
+  } = {},
 ) {
   await spawnAgent({
     context: deps.context as never,
@@ -249,8 +279,59 @@ describe('spawnAgent lock-Advanced-overrides-on-first-spawn', () => {
     });
   });
 
-  it('does not lock anything on first ever spawn when no override is set', async () => {
+  it('locks all four when the task is in override mode with nothing pinned', async () => {
+    // The regression this column exists for. Selecting Agent Override and
+    // leaving every field on inherit pins nothing, so the old "is any field
+    // set" gate skipped the lock and the task quietly followed the columns for
+    // its whole life. The persisted mode is the gate now, so it locks - to the
+    // SETTINGS lane's values, not the destination's.
+    const task = makeTask({ run_mode: 'agent_override' });
+    const sourceLane = makeSwimlane({
+      id: FROM_LANE_ID,
+      name: 'To Do',
+      role: 'todo',
+      auto_spawn: false,
+      model_override: 'fable-5',
+    });
+    const deps = makeDeps({ latestSession: undefined, task });
+
+    await runSpawn(task, makeDestinationLane(), deps, sourceLane);
+
+    expect(deps.tasks.update).toHaveBeenCalledWith({
+      id: TASK_ID,
+      agent_override: 'claude',
+      model_override: 'fable-5',
+      effort_override: 'xhigh',
+      permission_mode: 'auto',
+    });
+  });
+
+  it('does not lock anything on first ever spawn in column-settings mode', async () => {
     const task = makeTask();
+    const deps = makeDeps({ latestSession: undefined, task });
+
+    await runSpawn(task, makeDestinationLane(), deps, makeSwimlane({ id: FROM_LANE_ID, role: 'todo' }));
+
+    expect(deps.tasks.update).not.toHaveBeenCalled();
+  });
+
+  it('does not lock when run_mode is column_settings even though a field is pinned (gate reads the persisted MODE, not "is anything pinned")', async () => {
+    // This exact combination - a pin present but run_mode explicitly
+    // column_settings - is not reachable through TaskRepository: its
+    // exclusivity (applyProfileExclusivity) always derives run_mode from the
+    // pins on both create() and update(), so no normal write can produce it.
+    // It exists only via a hand-edited or drifted database row. The test
+    // documents the gate's discriminator rather than guarding a live bug: the
+    // old gate ("does the task have any of the four fields set") would have
+    // locked here, since permission_mode is pinned; the new gate keys on the
+    // persisted mode alone and must not.
+    //
+    // makeTask's spread order lets an explicit `run_mode` in `overrides` win
+    // over the pins-derived default (verified: `{ run_mode: computed,
+    // ...merged }`, and `merged` already carries the explicit override), so
+    // passing both `permission_mode` and `run_mode: 'column_settings'` here
+    // actually builds this state.
+    const task = makeTask({ permission_mode: 'plan', run_mode: 'column_settings' });
     const deps = makeDeps({ latestSession: undefined, task });
 
     await runSpawn(task, makeDestinationLane(), deps, makeSwimlane({ id: FROM_LANE_ID, role: 'todo' }));
@@ -314,5 +395,33 @@ describe('spawnAgent lock-Advanced-overrides-on-first-spawn', () => {
     expect(deps.engine.executeTransition.mock.calls[0][6]).toBe('claude');
     expect(deps.engine.resumeSuspendedSession).toHaveBeenCalledTimes(1);
     expect(deps.engine.resumeSuspendedSession.mock.calls[0][5]).toBe('claude');
+  });
+
+  it('explicit resume bypasses automatic guards while passing the Profile-resolved agent and prompt to the engine', async () => {
+    const task = makeTask({ agent: 'claude', profile_id: 'profile-codex' });
+    const lane = makeSwimlane({
+      auto_spawn: false,
+      auto_command: 'must not be injected',
+      agent_override: 'claude',
+    });
+    const deps = makeDeps({
+      latestSession: { status: 'suspended', suspended_by: 'user' },
+      task,
+    });
+    deps.context.boardConfigManager.getBoardProfiles.mockReturnValue([{
+      id: 'profile-codex',
+      name: 'Codex profile',
+      columns: { [TO_LANE_ID]: { agentOverride: 'codex' } },
+    }]);
+
+    await runSpawn(task, lane, deps, undefined, {
+      mode: { kind: 'explicit-resume', resumePrompt: 'Continue from the explicit resume' },
+    });
+
+    expect(deps.engine.executeTransition).not.toHaveBeenCalled();
+    expect(deps.engine.resumeSuspendedSession).toHaveBeenCalledTimes(1);
+    expect(deps.engine.resumeSuspendedSession.mock.calls[0][3]).toBe('Continue from the explicit resume');
+    expect(deps.engine.resumeSuspendedSession.mock.calls[0][5]).toBe('codex');
+    expect(deps.context.terminalSubmitScheduler.scheduleKeystrokes).not.toHaveBeenCalled();
   });
 });

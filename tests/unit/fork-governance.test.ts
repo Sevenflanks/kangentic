@@ -22,7 +22,7 @@ const branchPolicySchema = z.object({
   upstreamMirror: z.object({
     name: z.literal('main'),
     locked: z.literal(true),
-    remoteConfigured: z.literal(false),
+    remoteConfigured: z.literal(true),
   }),
   personalIntegration: z.object({
     name: z.literal('sevenflanks-main'),
@@ -163,7 +163,7 @@ describe('fork governance contract', () => {
 
     const policy = branchPolicySchema.parse(branches);
 
-    expect(policy.upstreamMirror).toEqual({ name: 'main', locked: true, remoteConfigured: false });
+    expect(policy.upstreamMirror).toEqual({ name: 'main', locked: true, remoteConfigured: true });
     expect(policy.personalIntegration).toEqual({
       name: 'sevenflanks-main',
       personalBranchesStartFrom: 'sevenflanks-main',

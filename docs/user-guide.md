@@ -34,17 +34,55 @@ Pasted screenshots are automatically compressed to fit Claude's per-image budget
 
 In the description field, type `@` to trigger file autocomplete. A dropdown lists files and directories from the project root, which you can navigate with arrow keys and select with Enter to insert the path.
 
-#### Advanced: Per-Task Agent / Model / Effort Override
+#### How this task runs: Column Settings or Agent Override
 
-Click **Advanced** in the New Task dialog (or in the task detail edit form for an existing task) to set per-task overrides:
+At the bottom of the New Task dialog (and the task detail edit form for an existing task) is a
+single either/or choice. The two options are mutually exclusive - picking one clears the other -
+because one varies settings per column while the other pins them for the task's whole life.
+
+| Option | Behavior |
+|--------|----------|
+| **Column Settings** | Each column applies its own settings as the task moves. A **Profile** dropdown picks *which* set: **Default** (the board as configured) or a named Board Profile. |
+| **Agent Override** | Pinned for the whole task, ignoring column settings. |
+
+**Board Profiles** are the answer to "I want Opus xhigh for Planning but Sonnet high for Merge."
+A profile is a named alternate set of per-column settings, so a heavy task and a light task can
+ride the same board at different tiers without either user changing the shared column config.
+Profiles are created and edited in **Edit Columns** (the Board Manager), where selecting one
+switches the column editors to that profile's values; column structure (which columns exist, their
+names and order) is shared across all profiles and is locked while a profile is selected. Profiles
+are saved to `kangentic.json`, so they reach teammates through git.
+
+The pencil button beside the Profile dropdown opens Edit Columns, which is the only place profiles
+are authored - so creating your first one and retuning an existing one are the same trip. Until a
+board has any, the dropdown shows **Default**, disabled: the concept stays visible without adding a
+second creation path to keep in sync.
+
+Choosing **Agent Override** reveals the per-task pins:
 
 | Field | Description |
 |-------|-------------|
 | **Agent** | Pick a specific supported agent adapter (Claude, Codex, Ollama, etc.) for this task. Defaults to the destination column's adapter override, then the project default. Hidden when only one adapter is detected on the machine. |
+| **Agent** | Pick a specific agent CLI (Claude, Codex, etc.) for this task. Defaults to the destination column's agent override, then the project default. Locked (shown disabled, on the one agent it has) when only one agent is detected on the machine. The pencil beside it opens Settings > Agent, where all four of these fields get their project defaults. |
 | **Model** | Adapter-specific model identifier (e.g. `opus`, `sonnet`, `claude-opus-4-8`). The dropdown is fed by the shared model cache. For Claude, the list is populated both by scanning past session transcripts and by harvesting the CLI's own `/model` picker through a hidden background probe, so newly shipped models surface without first being used in a session. |
 | **Effort** | Adapter-specific reasoning tier (Claude: `low`, `medium`, `high`, `xhigh`, `max`). Only shown when the agent reports effort levels. |
+| **Permission** | Permission mode for this task. A column that forces Plan mode still wins while the task is in that column - that is a safety guarantee, not an ordinary default. |
 
-A per-task pick **stays with the task across column moves** - column settings are ignored once a task carries its own override. Changing the Agent resets Model + Effort because the previous picks were valid for the previous agent's capability matrix.
+A per-task pin **stays with the task across column moves** - column settings are ignored once a task
+carries its own override. Changing the Agent resets Model + Effort because the previous picks were
+valid for the previous agent's capability matrix.
+
+You can also choose Agent Override and pick nothing at all. Each field then shows, in the muted
+placeholder weight, the value it resolves to today, and keeps resolving live until the task spawns
+for the first time - at which point all four lock to the values the dialog was showing. That is the
+point of the branch: "whatever this task would run right now, pin exactly that." Because it stores
+no pins, the choice itself is what is saved, so the branch is still selected when you reopen the
+task.
+
+Agents can read and edit Board Profiles too, including across projects, which is the practical way
+to keep them in sync as models change ("update every profile's Opus 4.8 to Opus 5", "copy this
+board's Heavy profile into project X"). See
+[MCP Server > Board Profiles](mcp-server.md#board-profiles).
 
 Before the first spawn, the task detail dialog also shows a slim **pre-spawn context bar** with the same Model and Effort pills. Set them there to avoid the spawn -> cancel -> restart loop: the picker writes the override to the DB, and `prepare-spawn` picks it up on the next agent launch.
 
@@ -148,7 +186,7 @@ Click a task card to open the detail dialog. From here you can:
   - **Edit** - switch to edit mode for title and description
   - **Open folder** - open the worktree or project directory in your file manager
   - **View conversation** - same as the header pill
-  - **View PR** - open the associated pull request. PR URLs are populated automatically when an agent runs `gh pr create` or `gh pr view` (GitHub), explicitly via the `kangentic_update_task` MCP tool (any platform), or manually through the PR URL field in edit mode. Also shown as a pill in the header bar and a clickable badge on the task card.
+  - **View PR** - open the associated pull request. PR URLs are populated automatically when an agent runs `gh pr create` or `gh pr view` (GitHub), explicitly via the `kangentic_create_task` / `kangentic_update_task` MCP tools (any platform), or manually through the PR URL field in edit mode. Those are the only ways to link a PR: writing a PR URL into the task description does not link it, so you can cite another task's PR as background without it being mistaken for this task's own. Also shown as a pill in the header bar and a clickable badge on the task card.
   - **Commands & Skills** - submenu of available Claude Code commands and skills (same as the header popover)
   - **Pause / Resume session** - manually suspend or resume the agent
   - **Move to** - submenu listing all other columns as move targets
@@ -258,7 +296,8 @@ Click **Import** in the backlog toolbar to pull tasks from external project mana
 
 **Importing items:**
 1. Click a saved source to open the import dialog
-2. Browse items with filtering by title, type, status, assignee, and labels
+2. Browse items with filtering by ID, title, type, status, assignee, and labels (the search box
+   matches only what a row displays, so every hit is explainable from the row itself)
 3. Use the "Imported" toggle to hide already-imported items (on by default)
 4. Click anywhere on a row to select it (or use the checkbox)
 5. Click **Import (N)** to pull selected items into the backlog
@@ -326,12 +365,12 @@ Columns can only be deleted when empty (no tasks).
 
 ## Settings
 
-Settings are accessed from two entry points:
+Settings are accessed from two entry points, both opening the same unified panel:
 
-- **App Settings** - click the gear icon in the title bar. This is the main settings panel with all app-wide and project-default settings.
-- **Project Settings** - click the gear icon on a project row in the sidebar. This shows only the per-project overridable subset.
+- **App Settings** - click the gear icon in the title bar. Scoped to the currently active project (or, if none is open, only the shared System tabs appear).
+- **Project Settings** - click the gear icon on a project row in the sidebar. Opens the same panel scoped to that project, with a project switcher dropdown in the header to jump between projects.
 
-Both panels use a VS Code-style layout: a sidebar with tab navigation on the left, and the active settings pane on the right. In App Settings, tabs above the separator (General, Theme, Terminal, Agent, Git, Browser, Shortcuts) are per-project settings; tabs below the separator (Layout, Behavior, Dictation, Memory, Hotkeys, MCP Server, Agent Browser, Notifications, Mobile Devices, Privacy, Developer) are shared across all projects. The General tab shows the project's location on disk with a "Move..." button (see [Moving a project](#moving-a-project)). When no project is open, only the shared tabs appear. Project Settings shows inherited defaults as hints, with reset buttons on any overridden value and a "Reset All" footer when overrides exist.
+Both panels use a VS Code-style layout: a sidebar with tab navigation on the left, and the active settings pane on the right. Tabs above the divider (General, Theme, Agent, Git, Browser, Shortcuts) are per-project settings; tabs below it (Board, Task, Changes, Terminal, Behavior, Hotkeys, Notifications, Dictation, Memory, MCP Server, Agent Browser, Mobile Devices, Privacy, Developer) are shared across all projects. The shared tabs are further grouped into Core (Board through Notifications, unlabeled), Advanced (Dictation through Mobile Devices), and Other (Privacy, Developer). The General tab shows the project's location on disk with a "Move..." button (see [Moving a project](#moving-a-project)); the Theme tab holds the interface color-scheme picker. The Task tab (Card Density, Ticket Numbers, Context Bar) holds settings for how an individual task presents itself, split out from Board and Terminal. Terminal (shell, font, cursor style, colors) is a shared tab, not per-project: nobody wants a different font per project, and the shell setting in particular was never reliably project-scoped under the hood. When no project is open, only the shared tabs appear.
 
 ### Moving a project
 
@@ -349,28 +388,45 @@ A search bar at the top of each panel filters settings by keyword. Type multiple
 
 ### Themes
 
-Choose from 10 themes:
+Choose from 10 themes in the Theme tab's dropdown (a per-project setting):
 - **Base:** Dark, Light
 - **Dark variants:** Moon, Forest, Ocean, Ember
 - **Light variants:** Sand, Mint, Sky, Peach
 
+### Terminal Colors
+
+The Terminal tab's **Colors** section (not the Theme tab's color-scheme picker - this is a global setting, not per-project) lets you customize the terminal's background, foreground, and cursor color. Click a swatch to open the color picker; any color left at its default shows the built-in value (near-black `#0c0c0c` background, `#e4e4e7` foreground/cursor). The preset grid offers the built-in default first, then a color matching your current app theme (skipped if it would duplicate the default), then curated generic presets. The 16-color ANSI palette (used by shell tools like `git diff` and `ls --color`) is a fixed scheme based on Windows Terminal's Campbell, not individually customizable. "Reset to default" clears every customization. Applies globally across all projects.
+
 ### Terminal Settings
+
+Applies to every project (Settings > Terminal, not a per-project override):
 
 | Setting | Description |
 |---------|-------------|
 | Shell | Override the auto-detected shell |
 | Font Size | Terminal text size in pixels |
-| Font Family | CSS font-family for the terminal |
-| Scrollback Lines | Lines kept in the visible scrollback (1000 to 100000, default 5000). Full session history is preserved for replay regardless of this value. |
+| Font Family | Terminal font, picked from your detected system fonts via an autocomplete field |
 | Cursor Style | Terminal cursor appearance (block, underline, or bar) |
+| Word Delete on Backspace | Backspace deletes the whole previous word instead of one character (off by default) |
+
+### Task Settings
+
+Applies to every project (Settings > Task, not a per-project override). These describe how an individual task presents itself, not board layout or terminal cosmetics:
+
+| Setting | Description |
+|---------|-------------|
+| Card Density | Amount of detail shown on task cards (compact, default, comfortable) |
+| Ticket Numbers | Show each task's `#N` number as a muted badge on its card (off by default) |
+
+The Task tab also holds the Context Bar toggles below.
 
 ### Context Bar
 
-The context bar is a status line displayed below the terminal showing session metadata. Each element can be individually toggled on or off in App Settings > Terminal.
+The context bar is a status line displayed below the terminal showing session metadata. Each element can be individually toggled on or off in App Settings > Task.
 
 | Toggle | What it shows |
 |--------|--------------|
-| Shell | The active shell name (e.g., pwsh, bash, zsh) |
+| Shell Name | The active shell name (e.g., pwsh, bash, zsh) |
 | Version | Agent CLI version |
 | Elapsed | Ticking wall-clock time since the session started |
 | Model | Active model name (e.g., Claude Sonnet 4) |
@@ -387,8 +443,10 @@ The context bar is a status line displayed below the terminal showing session me
 | Setting | Description |
 |---------|-------------|
 | Default Agent | Which supported agent adapter to use for new sessions in this project. Supported adapters: Claude Code, Codex CLI, Gemini CLI, Aider, Cursor CLI, Oz CLI, GitHub Copilot CLI, OpenCode, Qwen Code, Kimi Code, Droid, Ollama. Per-project setting. |
+| Default Agent | Which agent CLI to use for new sessions in this project. Supported agents: Claude Code, Codex CLI, Gemini CLI, Qwen Code, Kimi Code, OpenCode, Droid (Factory), Cursor CLI, GitHub Copilot CLI, Aider, Oz CLI (Warp), Ollama. Per-project setting. |
 | CLI Path | Path to agent CLI binary (auto-detected if empty) |
-| Idle Timeout (minutes) | Auto-suspend sessions after N minutes idle; 0 to disable |
+| Execution (remote) | For agents that support it (today OpenCode), attach to a server you run instead of spawning a local process: server URL, authentication, and the server-side working directory. Shown only when the selected agent declares remote execution. |
+| Launch Options | Agent-specific startup toggles (today Codex's "Disable ChatGPT Apps", which skips the optional cloud ChatGPT Apps connector that can hang startup). Shown only for agents that declare options. |
 | Permissions | Default permission mode for all sessions. Options vary by agent (e.g., Claude Code has Plan, Don't Ask, Default, Accept Edits, Auto, and Bypass; Aider has Interactive and Auto-Approve) |
 
 All permission modes are available in both the global App Settings dropdown and the per-column Edit Column dialog. The dropdown shows only the modes supported by the active adapter. Each column can override the project default adapter via the Edit Column dialog. Cross-agent history passthrough is opt in and follows the conditions described in [Column Management](#column-management).
@@ -428,10 +486,13 @@ These are global-only settings that apply to the entire app.
 |---------|-------------|
 | Max Concurrent Sessions | Limit how many agents can run at the same time |
 | When Max Sessions Reached | How new agent requests are handled when all slots are in use (Queue or Reject) |
-| Auto-Focus Idle Sessions | Automatically switch the bottom panel to idle sessions. Idle tabs are always highlighted regardless of this setting. |
-| Auto-Resume Agents on Restart | When a project opens, resume any agent sessions that were running at last close. When off, those sessions stay paused until you click Resume on each task. Turn off if resuming many agents at once slows your machine. |
-| Auto-Apply Board Config Changes | When a kangentic.json board change is detected (from a teammate or a pulled-back commit), apply it immediately instead of showing the confirmation dialog. |
+| Auto-Focus Idle Sessions | Automatically switch the bottom panel to idle sessions. Idle tabs stay highlighted either way. |
+| Auto-Resume Agents on Restart | Resume agent sessions that were running when the project last closed. Turn off if resuming many at once slows your machine. |
+| Idle Timeout (minutes) | Auto-suspend sessions after N minutes idle; 0 to disable |
 | Close on Outside Click | Click-outside (light-dismiss) policy for modeless task-detail windows. Closing a window does not kill its session. |
+| Restore Window Position | Remember window size and position between launches |
+
+The Board tab has its own Auto-Apply Board Config Changes toggle - see [Applying Changes](#applying-changes) below.
 
 ### MCP Server
 
@@ -467,7 +528,7 @@ Create a `kangentic.local.json` in the project root for personal customizations 
 
 ### Applying Changes
 
-When `kangentic.json` or `kangentic.local.json` changes on disk, a reconciliation banner appears at the top of the board. Click "Apply" to reconcile the file into your database, or dismiss to ignore. Enable `skipBoardConfigConfirm` in settings to apply changes automatically.
+When `kangentic.json` or `kangentic.local.json` changes on disk, a reconciliation banner appears at the top of the board. Click "Apply" to reconcile the file into your database, or dismiss to ignore. Enable Auto-Apply Board Config Changes in the Board settings tab to apply changes automatically instead.
 
 If a teammate removes a column that still has your tasks, the column becomes a "ghost" (hidden but preserved). Once you move all tasks out of the ghost column, it is automatically deleted.
 
@@ -511,6 +572,10 @@ If a project's folder is moved or renamed while Kangentic is closed, opening it 
 
 When an agent goes idle (waiting for input or stopped) on a non-active project, the sidebar shows a badge. This helps you notice when agents need attention across projects.
 
+### Command Terminal Indicator
+
+Command Terminals keep running when you hide the layer and when you switch projects, so a project you are not looking at can still be holding live terminals. Each project row shows a terminal glyph and a count when it has any, alongside the agent idle/thinking counts, colored the same way as the title-bar toggle: green while a terminal is working, amber when one is waiting on you, muted when it is just sitting there. It sits next to the agent idle/thinking counts rather than merging with them, since a Command Terminal is not a task agent. Click it to switch to that project and reopen its terminals. When the sidebar is collapsed, the rail shows the same state as a small dot on the project's initial.
+
 ### Notifications
 
 Desktop and toast notifications fire when an agent needs attention and the user can't already see it - either the window is minimized/unfocused, or a different project is active. Notification events: agent idle, permission-blocked idle (body shows "Needs permission"), session crash (non-zero exit), and plan-completion auto-moves. The task name is the title and the project name is the body. Clicking a desktop notification brings the window to the foreground, switches to the correct project, and opens the task detail dialog. The taskbar also flashes on Windows. A 10-second per-session cooldown prevents repeated desktop notifications from the same agent.
@@ -519,15 +584,15 @@ The Settings > Notifications panel exposes three configurable events: **Agent Id
 
 ### Mobile Devices
 
-The Mobile Devices tab is the desktop half of the mobile companion app's pairing link - global (applies to this desktop installation, not any one project) and off by default. Enable the **Mobile Bridge** toggle and set a **Relay Address** (a self-hosted or Kangentic-hosted relay) before pairing.
+The Mobile Devices tab is the desktop half of the mobile companion app's pairing link - global (applies to this desktop installation, not any one project) and off by default. Enable the **Mobile Bridge** toggle, then pick a **Relay**: *Kangentic Cloud* (the default hosted relay) or *Custom Relay* (your own self-hosted address, entered in the field that appears below). Dev builds also offer a *Local* option pointing at a relay on localhost. The address actually being dialed is shown beneath the picker, and **Test connection** probes it for reachability before you pair. The relay only ever sees encrypted traffic. A custom address must use `wss://`, or `ws://` for localhost only, since the phone refuses to pair over an untrusted transport.
 
-Click **Pair a Device** to display a QR code; scanning it with the Kangentic mobile app starts an end-to-end encrypted pairing handshake. Once the handshake completes, both the desktop and the phone show a short code and emoji sequence - confirm they match on both screens before tapping "Codes match" to finish pairing. This catches a photographed or relayed QR, since an attacker cannot make both sides show the same code. If the codes don't match, or you want to back out, cancel and start over.
+Click **Pair a Device** to display a QR code; scanning it with the Kangentic mobile app starts an end-to-end encrypted pairing handshake. Once the handshake completes, both the desktop and the phone show the same short code - compare them, then tap **Confirm** on the phone. The desktop auto-enrolls the device as soon as it hears back; there is no second confirmation to make on the desktop. This catches a photographed or relayed QR, since an attacker cannot make both sides show the same code. To back out, cancel on the phone (or close the desktop's pairing panel) before confirming.
 
-Paired devices appear in a list below, each with its granted capabilities. Revoking a device removes it from the desktop's signed roster immediately; a revoked phone must be paired again from scratch to reconnect. See [Mobile Bridge](mobile-bridge.md) for the underlying protocol, pairing ceremony, and security design.
+The phone is treated as an extension of your own desktop, not a separate integration to configure: pairing grants it full access to the same ten capabilities the protocol defines (there is no shell, file, or arbitrary-command access in the protocol at all). Paired devices appear in a list below, identified by a key fingerprint you can compare against the phone's own Settings > Devices screen, along with their connection status and paired date. Rename a device from that list, or revoke it - revoking removes it from the desktop's signed roster immediately, and a revoked phone must be paired again from scratch to reconnect. See [Mobile Bridge](mobile-bridge.md) for the underlying protocol, pairing ceremony, and security design.
 
 ### Privacy
 
-The Privacy tab shows what anonymous analytics Kangentic collects and how to opt out. Analytics are powered by Aptabase (no cookies, no persistent identifiers, GDPR-compliant). Set `KANGENTIC_TELEMETRY=0` as an environment variable to disable analytics entirely. This tab is informational only - there are no configurable settings.
+The Privacy tab shows what anonymous analytics Kangentic collects and how to opt out. Analytics are powered by Aptabase (no cookies, no persistent identifiers, GDPR-compliant). Set `KANGENTIC_TELEMETRY=0` as an environment variable to disable analytics entirely. For questions, use the fork's GitHub Discussions or Issues. This tab is informational only - there are no configurable settings.
 
 ### Developer
 

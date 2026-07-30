@@ -1,23 +1,28 @@
 /**
- * UI tests for TaskCard's board-card context-window trust gate.
+ * UI tests for TaskCard's board-card context-window render gate.
  *
  * TaskCard (src/renderer/components/board/TaskCard.tsx), the 'running'
  * bottom-bar case, computes the SAME gate as ContextBar but on its own
  * separate render path:
  *
- *   windowTrusted = contextWindowSize > 0 && usedTokens <= contextWindowSize
+ *   windowKnown = contextWindowSize > 0
+ *   overBudget = contextWindowSize > 0 && usedTokens > contextWindowSize
  *
- * When untrusted, the card footer renders `<div data-testid="usage-bar"
- * data-context-window="unknown"><span>{modelName}</span></div>` - model name
- * only, no "%" text, no bar track div. When trusted, it renders the model
- * name + `{pct}%` label + the bar track (`div.h-full.rounded-full`).
+ * When the window is unknown, the card footer renders `<div
+ * data-testid="usage-bar" data-context-window="unknown"><span>{modelName}
+ * </span></div>` with the bar reserved at 0% (stable card height) - no
+ * denominator to draw a real bar against. When the window is known but
+ * over budget (the near-full/auto-compaction state), the bar still renders,
+ * clamped to a full 100% critical bar. When usage fits comfortably, it
+ * renders the model name + `{pct}%` label + the bar track
+ * (`div.h-full.rounded-full`).
  *
  * The card must have already streamed a model displayName (else it shows the
  * "Starting agent..." spinner), so usage is seeded via a `sessions.getUsage`
  * override BEFORE mount - the same pattern task-activity-indicators.spec.ts
  * uses in its "ContextBar spinner pill" group (e.g. "shows model name with 0%
  * bar when usage exists but no tokens streamed yet"), which this spec's cases
- * extend to the impossible/consistent context-window pairing.
+ * extend to the over-budget/consistent context-window pairing.
  */
 import { test, expect } from '@playwright/test';
 import { chromium, type Browser, type Page } from '@playwright/test';
@@ -146,8 +151,8 @@ function makePreConfig(contextWindow: ContextWindowPatch): string {
   `;
 }
 
-test.describe('TaskCard context-window trust gate', () => {
-  test('impossible usage (usedTokens > contextWindowSize) shows a 0% bar, never the impossible percent', async () => {
+test.describe('TaskCard context-window render gate', () => {
+  test('over-budget usage (usedTokens > contextWindowSize) shows a full 100% critical bar', async () => {
     const { browser, page } = await launchWithState(makePreConfig({
       usedPercentage: 325,
       usedTokens: 650398,
@@ -163,12 +168,47 @@ test.describe('TaskCard context-window trust gate', () => {
       await expect(usageBar).toBeVisible({ timeout: 10000 });
 
       await expect(usageBar).toContainText('Opus 4.8');
-      // The bar layout is reserved (stable card height) at 0%, never the
-      // impossible 325% - the window is untrusted, so we do not divide by it.
-      await expect(usageBar).toContainText('0%');
+      // Over budget on a KNOWN window (200k) clamps to a full 100%, never the
+      // impossible 325% - this is a critical state to show, not a broken
+      // denominator to hide.
+      await expect(usageBar).toContainText('100%');
       await expect(usageBar).not.toContainText('325');
-      await expect(usageBar).toHaveAttribute('data-context-window', 'unknown');
-      await expect(usageBar.locator('div.h-full.rounded-full')).toHaveCount(1);
+      await expect(usageBar).not.toHaveAttribute('data-context-window', 'unknown');
+      const fillBar = usageBar.locator('div.h-full.rounded-full');
+      await expect(fillBar).toHaveCount(1);
+
+      // getProgressColor's own unit tests (tests/unit/progress-color.test.ts)
+      // prove the pure function returns 'var(--kng-danger)' at 100% and that
+      // index.css DECLARES the --kng-danger custom property. Neither proves
+      // the browser actually RESOLVES it: --kng-danger and --kng-warning are
+      // brand new tokens (unlike --kng-active, already load-bearing for the
+      // activity indicators) that have never rendered anywhere before this
+      // change. If the token failed to resolve, the inline backgroundColor
+      // would be invalid and the fill would paint transparent while every
+      // unit test stayed green - that gap is what this closes.
+      const fillColor = await fillBar.evaluate((el) => getComputedStyle(el).backgroundColor);
+      const expectedDangerColor = await page.evaluate(() => {
+        const probe = document.createElement('div');
+        probe.style.backgroundColor = 'var(--kng-danger)';
+        document.body.appendChild(probe);
+        const resolved = getComputedStyle(probe).backgroundColor;
+        probe.remove();
+        return resolved;
+      });
+      // The load-bearing assertion: if --kng-danger failed to resolve, BOTH
+      // the fill and the probe would come back as the same transparent
+      // default, and a bare equality check would pass for the wrong reason.
+      expect(fillColor).not.toBe('rgba(0, 0, 0, 0)');
+      expect(fillColor).toBe(expectedDangerColor);
+
+      // Cheap sibling coverage while the page is already up: confirm
+      // --kng-warning is also a live, non-empty custom property (its own
+      // color-band boundary is pinned by the unit test; this only proves the
+      // token resolves in a real browser, same failure mode as above).
+      const warningTokenValue = await page.evaluate(() =>
+        getComputedStyle(document.documentElement).getPropertyValue('--kng-warning').trim(),
+      );
+      expect(warningTokenValue).not.toBe('');
     } finally {
       await browser.close();
     }

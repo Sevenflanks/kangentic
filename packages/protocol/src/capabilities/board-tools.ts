@@ -23,10 +23,12 @@ export const BOARD_TOOL_READ_NAMES = [
   'list_sessions',
   'get_session_history',
   'get_column_detail',
+  'list_board_profiles',
   'get_handoff_context',
   'get_transcript',
   'get_session_files',
   'get_session_events',
+  'get_activity_intervals',
 ] as const;
 
 export const BOARD_TOOL_WRITE_NAMES = [
@@ -36,6 +38,9 @@ export const BOARD_TOOL_WRITE_NAMES = [
   'link_pr',
   'remove_attachment',
   'update_column',
+  'create_board_profile',
+  'update_board_profile',
+  'delete_board_profile',
   'create_backlog_task',
   'promote_backlog',
   'update_backlog_item',

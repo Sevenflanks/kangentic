@@ -168,11 +168,12 @@ Three parallel processes:
 2. **esbuild watch** -- bundles `src/main/index.ts` → `.vite/build/index.js` and `src/preload/preload.ts` → `.vite/build/preload.js`
 3. **Electron** -- launched with `MAIN_WINDOW_VITE_DEV_SERVER_URL` pointing to Vite
 
-Native modules (`better-sqlite3`, `node-pty`, `sherpa-onnx-node`, `simple-git`) are marked external in esbuild -- loaded at runtime from `node_modules`.
+Native modules (`better-sqlite3`, `node-pty`, `sherpa-onnx-node`, `font-list`, `simple-git`) are marked external in esbuild -- loaded at runtime from `node_modules`.
 
 Flags:
 - `--port=<n>` -- override Vite port
-- `--ephemeral` -- isolated data directory, auto-cleaned on exit (used for worktree previews)
+- `--ephemeral` -- isolated data directory, auto-cleaned on exit (used for worktree previews). The data directory is wiped on every boot, so a previous (possibly crashed) preview's clones never persist.
+- `--fresh` -- ephemeral preview with NO project pre-cloned or auto-opened, so the app starts on the Welcome Screen. Use it to exercise the first-launch experience (pick a folder, land on the board, onboarding checklist). Implies the same wipe as `--ephemeral`; without it, two projects are pre-cloned from the worktree and Project 1 is opened.
 
 ### Production (`npm run build` / `scripts/build.js`)
 
@@ -186,6 +187,8 @@ Flags:
 In worktrees, `dev.js` bypasses `vite.config.mts` and creates an inline Vite config. This avoids pattern-matching issues where `.kangentic/**` in the watch ignore would match the worktree's own path. It also gives worktree servers an isolated Vite dep cache (`<worktree>/.kangentic/vite-cache`; `vite.config.mts` uses `.kangentic/vite-cache-tests` when loaded from a worktree, e.g. Playwright's webServer), because the worktree's `node_modules` is a junction to the main repo's, and sharing the default `node_modules/.vite` would let a worktree server boot invalidate the running main server's cache and break its dynamic imports.
 
 `scripts/worktree-preview.js` creates a `node_modules` junction/symlink from the worktree to the repo root, then opens a native terminal running the dev server.
+
+`node scripts/worktree-preview.js --wait --port=<port>` blocks until that preview exits, then exits with a code that says why: `0` clean (terminal closed or `--stop`), `1` watcher usage/setup error, `2` crashed (dev server exited non-zero), `3` vanished (force-killed with no recorded exit). `dev.js`'s `cleanup()` writes a small `{ pid, exitCode }` record under `os.tmpdir()` (see `scripts/preview-exit-record.js`) as its first statement, since ephemeral mode removes the whole worktree `.kangentic/` directory on exit and nothing under the worktree would otherwise survive to tell the watcher how the server exited. The `/preview` skill runs this backgrounded by default so the harness delivers a task-notification when the preview exits.
 
 ## Testing
 
@@ -348,6 +351,7 @@ Native modules:
 - `better-sqlite3` -- rebuilt against Electron headers via `scripts/rebuild-native.js`
 - `node-pty` -- uses prebuilt NAPI binaries, no rebuild needed
 - `sherpa-onnx-node` -- prebuilt platform-specific binaries, no rebuild needed (voice dictation; unpacked from asar via the `sherpa-onnx-*` glob in `asarUnpack`)
+- `font-list` -- shells out to `fc-list` / a PowerShell script / a bundled macOS binary, no rebuild needed (Terminal Font Family picker; unpacked from asar via `asarUnpack` since the macOS binary is spawned via `child_process`)
 
 Security fuses enabled: no RunAsNode, no NodeOptions, no inspection, cookie encryption, ASAR integrity validation.
 

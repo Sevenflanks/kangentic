@@ -22,19 +22,27 @@
  * persisted prompts, and terminal-submit scheduling to verify interpolation
  * and adapter-capability routing without invoking a real CLI.
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { TransitionEngine } from '../../src/main/transition-engine/transition-engine';
 import { buildTaskXml } from '../../src/main/agent/shared/prompt-xml';
 import { sanitizeForPty } from '../../src/shared/paths';
 import { migrateResumeCwdIfRenamed } from '../../src/main/transition-engine/resume-cwd-migration';
+import { OpenCodeCommandBuilder, type OpenCodeCommandOptions } from '../../src/main/agent/adapters/opencode';
+import { CodexCommandBuilder, type CodexCommandOptions } from '../../src/main/agent/adapters/codex';
 import type {
   InitialPromptDelivery,
   InitialPromptInput,
   InitialPromptPreparation,
 } from '../../src/main/agent/agent-adapter';
-import type { SpawnSessionInput, SubmissionVerifier } from '../../src/shared/types';
+import type {
+  AgentExecutionServer,
+  AgentProjectExecution,
+  AgentLaunchOptionInfo,
+  SpawnSessionInput,
+  SubmissionVerifier,
+} from '../../src/shared/types';
 
 // ---------------------------------------------------------------------------
 // Minimal mock factories
@@ -152,6 +160,11 @@ const mockAdapter = {
   sessionType: 'claude_agent',
   supportsCallerSessionId: true,
   defaultPermission: 'default',
+  // Undefined by default, matching every adapter but Codex (see
+  // AgentAdapter.launchOptions). The launch-option wiring describe below
+  // sets this per-test and restores it to undefined afterward so later
+  // describe blocks in this file are unaffected.
+  launchOptions: undefined as readonly AgentLaunchOptionInfo[] | undefined,
   detect: vi.fn(async () => ({ found: true, path: '/usr/bin/claude', version: '1.0.0' })),
   ensureTrust: vi.fn(async () => {}),
   buildCommand: vi.fn((options: { prompt?: string }) => {
@@ -229,6 +242,21 @@ function makeEngine(options: {
   action?: ReturnType<typeof makeAction>;
   actions?: readonly ReturnType<typeof makeAction>[];
   includeSessionRepo?: boolean;
+  /** Global + per-project remote-execution config, keyed by agent name. Defaults
+   * to empty maps (local execution for every agent), matching every existing
+   * caller of makeEngine. */
+  executionServers?: Record<string, AgentExecutionServer>;
+  execution?: Record<string, AgentProjectExecution>;
+  /** Global, agent-keyed boolean launch-option toggles. Defaults to an empty
+   * map (no stored overrides), matching every existing caller of makeEngine. */
+  launchOptions?: Record<string, Record<string, boolean>>;
+  /** Override the default no-op terminalSubmit stub (e.g. send_command tests
+   * need submitKeystrokes to return a real Promise so its internal `.catch`
+   * doesn't throw). */
+  terminalSubmit?: ReturnType<typeof makeTerminalSubmit>;
+  /** Project-scoped MCP server URL (mirrors TransitionEngineConfig.mcpServerUrl).
+   * Defaults to undefined, matching every existing caller of makeEngine. */
+  mcpServerUrl?: string;
 }) {
   const sessionManager = options.sessionManager ?? makeSessionManager();
   const sessionRepo = options.includeSessionRepo === false
@@ -250,13 +278,16 @@ function makeEngine(options: {
       copyFiles: [],
     },
     mcpServerEnabled: false,
-    mcpServerUrl: undefined,
+    mcpServerUrl: options.mcpServerUrl,
     mcpServerToken: undefined,
     defaultAgent: 'claude',
     cliPathOverrides: {},
+    executionServers: options.executionServers ?? {},
+    execution: options.execution ?? {},
+    launchOptions: options.launchOptions ?? {},
   }));
 
-  const terminalSubmit = makeTerminalSubmit();
+  const terminalSubmit = options.terminalSubmit ?? makeTerminalSubmit();
   const terminalSubmitScheduler = makeTerminalSubmitScheduler();
   type EngineArgs = ConstructorParameters<typeof TransitionEngine>;
   const engine = new TransitionEngine(
@@ -270,7 +301,15 @@ function makeEngine(options: {
     attachmentRepo as unknown as EngineArgs[7],
   );
 
-  return { engine, sessionManager, sessionRepo, terminalSubmitScheduler, taskRepo, actionRepo };
+  return {
+    engine,
+    sessionManager,
+    sessionRepo,
+    terminalSubmitScheduler,
+    taskRepo,
+    actionRepo,
+    terminalSubmit,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -325,6 +364,42 @@ describe('TransitionEngine - capability-based initial prompt delivery', () => {
     ]]);
     expect(sessionRepo.insert.mock.invocationCallOrder[0]).toBeLessThan(
       terminalSubmitScheduler.scheduleContent.mock.invocationCallOrder[0],
+    );
+  });
+
+  it('uses an adapter preparation delivery override after a remote attach session is writable', async () => {
+    // Given
+    const task = makeTask();
+    const expectedPrompt = buildTaskXml({ title: task.title, description: task.description });
+    const preparation = vi.fn(() => ({ delivery: 'terminal-submit' as const }));
+    prepareInitialPrompt = preparation;
+    const { engine, terminalSubmitScheduler, sessionRepo } = makeEngine({
+      executionServers: {
+        claude: { url: 'http://10.0.0.9:5100', auth: { kind: 'none' } },
+      },
+      execution: {
+        claude: { mode: 'remote', workingDirectory: '/srv/remote-project' },
+      },
+    });
+
+    // When
+    await engine.resumeSuspendedSession(task as Parameters<typeof engine.resumeSuspendedSession>[0]);
+
+    // Then
+    expect(preparation).toHaveBeenCalledWith(expect.objectContaining({
+      executionTarget: {
+        url: 'http://10.0.0.9:5100',
+        auth: { kind: 'none' },
+        workingDirectory: '/srv/remote-project',
+      },
+    }));
+    expect(mockAdapter.buildCommand).toHaveBeenCalledWith(expect.objectContaining({ prompt: undefined }));
+    expect(sessionRepo.insert).toHaveBeenCalledWith(expect.objectContaining({ prompt: expectedPrompt }));
+    expect(terminalSubmitScheduler.scheduleContent).toHaveBeenCalledWith(
+      task.id,
+      'pty-session-1',
+      expectedPrompt,
+      { verifier: null },
     );
   });
 
@@ -1310,5 +1385,310 @@ describe('TransitionEngine - migrateResumeCwdIfRenamed wiring', () => {
         agentSessionId: 'agent-sess-uuid',
       }),
     );
+  });
+});
+
+describe('TransitionEngine - remote execution wiring (executeSpawnAgent chokepoint)', () => {
+  // Coverage hole: resolveExecutionTarget is called at this chokepoint
+  // (transition-engine.ts) and threaded into commandOptions.executionTarget, but
+  // no prior test spawned through it with a remote-configured agent. Deleting
+  // that wiring (either the resolveExecutionTarget call or the executionTarget
+  // property on commandOptions) would silently fall back to a local spawn while
+  // every other test here kept passing, because they all leave
+  // executionServers/execution empty.
+  //
+  // mockAdapter.buildCommand is swapped for the REAL OpenCodeCommandBuilder so
+  // the assertion exercises production attach-command logic, not a hand-rolled
+  // stub of "did executionTarget arrive". The agent name in this describe is
+  // still 'claude' (mockAdapter.name, appConfig.defaultAgent) - that identity is
+  // irrelevant to resolveExecutionTarget, which is agent-name-parameterized, not
+  // OpenCode-specific.
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('threads resolveExecutionTarget into commandOptions.executionTarget, producing an attach command with the server URL', async () => {
+    const openCodeCommandBuilder = new OpenCodeCommandBuilder();
+    mockAdapter.buildCommand.mockImplementation((options: { prompt?: string }) =>
+      openCodeCommandBuilder.buildOpenCodeCommand(options as unknown as OpenCodeCommandOptions),
+    );
+
+    const task = makeTask();
+    const sessionManager = makeSessionManager();
+    const { engine } = makeEngine({
+      sessionManager,
+      executionServers: {
+        claude: { url: 'http://10.0.0.9:5100', auth: { kind: 'none' } },
+      },
+      execution: {
+        claude: { mode: 'remote', workingDirectory: '/srv/remote-project' },
+      },
+    });
+
+    await engine.executeTransition(task as Parameters<typeof engine.executeTransition>[0], 'todo', 'doing');
+
+    expect(sessionManager.spawnedSessions).toHaveLength(1);
+    const command = sessionManager.spawnedSessions[0].command;
+    // Red: commenting out `executionTarget,` in executeSpawnAgent's
+    // commandOptions (transition-engine.ts) makes buildOpenCodeCommand take the
+    // local branch instead, and this command would be the plain binary path
+    // with no 'attach' token and no server URL.
+    expect(command).toContain('attach');
+    expect(command).toContain('http://10.0.0.9:5100');
+  });
+
+  it('does not thread an executionTarget when the agent is not configured for remote mode', async () => {
+    // Plain capture stub, not the real OpenCodeCommandBuilder: this test only
+    // needs to see what commandOptions carried, not exercise the real
+    // attach-vs-local branch (which would otherwise hit buildHooks's real
+    // filesystem side effect against the hardcoded /some/project cwd).
+    let capturedExecutionTarget: unknown;
+    mockAdapter.buildCommand.mockImplementation((options: { executionTarget?: unknown; prompt?: string }) => {
+      capturedExecutionTarget = options.executionTarget;
+      return `claude ${options.prompt ?? ''}`;
+    });
+
+    const task = makeTask();
+    // executionServers/execution both default to {} (local execution).
+    const { engine } = makeEngine({});
+
+    await engine.executeTransition(task as Parameters<typeof engine.executeTransition>[0], 'todo', 'doing');
+
+    expect(capturedExecutionTarget).toBeUndefined();
+  });
+});
+
+describe('TransitionEngine - launch-option wiring (executeSpawnAgent chokepoint)', () => {
+  // Coverage hole: resolveLaunchOptions is called at this chokepoint
+  // (transition-engine.ts) and threaded into commandOptions.launchOptions, but
+  // no prior test spawned through it with an adapter that declares launch
+  // options. Deleting that wiring (either the resolveLaunchOptions call or the
+  // launchOptions property on commandOptions) would silently drop the toggle
+  // while every other test here kept passing, because they all use
+  // mockAdapter with launchOptions left undefined (no adapter but Codex
+  // declares any).
+  //
+  // mockAdapter.buildCommand is swapped for the REAL CodexCommandBuilder so
+  // the assertion exercises production --disable-apps flag logic, not a
+  // hand-rolled stub of "did launchOptions arrive". mockAdapter.launchOptions
+  // is set to Codex's real declared option per-test and restored to
+  // undefined afterward so it does not leak into other describe blocks in
+  // this file.
+  const codexLaunchOptions: readonly AgentLaunchOptionInfo[] = [{
+    id: 'disableApps',
+    label: 'Disable ChatGPT Apps',
+    description: "Skips the optional ChatGPT Apps connector.",
+    default: false,
+  }];
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockAdapter.buildCommand.mockImplementation((options: { prompt?: string }) => {
+      return `claude ${options.prompt ?? ''}`;
+    });
+  });
+
+  afterEach(() => {
+    mockAdapter.launchOptions = undefined;
+  });
+
+  it('threads resolveLaunchOptions into commandOptions.launchOptions, producing a --disable apps flag', async () => {
+    mockAdapter.launchOptions = codexLaunchOptions;
+    const codexCommandBuilder = new CodexCommandBuilder();
+    mockAdapter.buildCommand.mockImplementation((options: { agentPath: string; prompt?: string }) => {
+      const { agentPath, ...rest } = options;
+      return codexCommandBuilder.buildCodexCommand({ codexPath: agentPath, ...rest } as CodexCommandOptions);
+    });
+
+    const task = makeTask();
+    const sessionManager = makeSessionManager();
+    const { engine } = makeEngine({
+      sessionManager,
+      launchOptions: {
+        claude: { disableApps: true },
+      },
+    });
+
+    await engine.executeTransition(task as Parameters<typeof engine.executeTransition>[0], 'todo', 'doing');
+
+    expect(sessionManager.spawnedSessions).toHaveLength(1);
+    const command = sessionManager.spawnedSessions[0].command;
+    // Red: commenting out `const launchOptions = resolveLaunchOptions(...)` or
+    // the `launchOptions,` key on executeSpawnAgent's commandOptions
+    // (transition-engine.ts) makes buildCodexCommand never see the flag, so
+    // this command would omit `--disable apps` entirely.
+    expect(command).toContain('--disable apps');
+  });
+
+  it('does not thread a launchOptions value when the adapter declares no launch options', async () => {
+    // mockAdapter.launchOptions stays undefined (default, mirrors every
+    // adapter but Codex), even though a stored override IS configured -
+    // resolveLaunchOptions must key off the ADAPTER's declared options, not
+    // the presence of stored config.
+    let capturedLaunchOptions: unknown;
+    mockAdapter.buildCommand.mockImplementation((options: { launchOptions?: unknown; prompt?: string }) => {
+      capturedLaunchOptions = options.launchOptions;
+      return `claude ${options.prompt ?? ''}`;
+    });
+
+    const task = makeTask();
+    const { engine } = makeEngine({
+      launchOptions: {
+        claude: { disableApps: true },
+      },
+    });
+
+    await engine.executeTransition(task as Parameters<typeof engine.executeTransition>[0], 'todo', 'doing');
+
+    expect(capturedLaunchOptions).toBeUndefined();
+  });
+});
+
+describe('TransitionEngine - executeAction builds ONE shared templateVars for every action type', () => {
+  // Coverage hole: executeAction resolves templateVars = resolveTaskTemplateVars(...) once and
+  // feeds spawn_agent, send_command, run_script, AND webhook from that single object (see
+  // Task-template parity rule: "only the interpolation MECHANICS are
+  // scoped, not the resolved VALUES"). Every existing test above only drives spawn_agent, so a
+  // regression on the OTHER three consumers (e.g. reverting {{baseBranch}} back to the old
+  // `task.base_branch || ''` behavior) fails nothing. This pins send_command specifically:
+  // task.base_branch is null, so {{baseBranch}} must resolve to the effective project default
+  // ('main', from getConfig().gitConfig.defaultBaseBranch) rather than an empty string.
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    // run_script/webhook tests below stub the global fetch; unstub
+    // unconditionally so a stub never leaks into an unrelated test file run
+    // in the same worker.
+    vi.unstubAllGlobals();
+  });
+
+  it('send_command: a null task.base_branch interpolates {{baseBranch}} to the effective project default, not empty', async () => {
+    const task = makeTask({ base_branch: null, session_id: 'sess-abc12345' });
+    const action = makeAction({
+      type: 'send_command',
+      config_json: JSON.stringify({ command: '/review {{baseBranch}}' }),
+    });
+    // submitKeystrokes must return a real Promise: executeSendCommand chains
+    // `.catch(...)` onto its return value, which throws synchronously against
+    // the file's default no-op `vi.fn()` stub (returns undefined).
+    const terminalSubmit = { submitKeystrokes: vi.fn(async () => {}) };
+
+    const { engine } = makeEngine({ action, terminalSubmit });
+    await engine.executeTransition(task as Parameters<typeof engine.executeTransition>[0], 'todo', 'doing');
+
+    // Red: reverting executeAction's templateVars to `{ baseBranch: task.base_branch || '' }`
+    // (the pre-refactor shape) makes this '/review' (empty, collapsed by sanitizeForPty),
+    // never '/review main'.
+    expect(terminalSubmit.submitKeystrokes).toHaveBeenCalledTimes(1);
+    expect(terminalSubmit.submitKeystrokes).toHaveBeenCalledWith(
+      'sess-abc12345',
+      ['/review main'],
+      { sendCtrlC: true, source: `send_command:${task.id.slice(0, 8)}` },
+    );
+  });
+
+  it('run_script: a null task.base_branch interpolates {{baseBranch}} to the effective project default, not empty', async () => {
+    // Guards the OTHER two consumers the comment above flags: run_script and
+    // webhook (this test + the next) both read the SAME executeAction-built
+    // templateVars as send_command, but a call-site-specific regression (e.g.
+    // someone passing a different/empty vars object into just this one
+    // switch-case line) would fail nothing without a dedicated assertion here.
+    const task = makeTask({ base_branch: null });
+    const action = makeAction({
+      type: 'run_script',
+      config_json: JSON.stringify({ script: 'deploy.sh {{baseBranch}}' }),
+    });
+    const sessionManager = makeSessionManager();
+
+    const { engine } = makeEngine({ action, sessionManager });
+    await engine.executeTransition(task as Parameters<typeof engine.executeTransition>[0], 'todo', 'doing');
+
+    // Red: reverting executeAction's templateVars to the pre-refactor
+    // `{ baseBranch: task.base_branch || '' }` shape makes this 'deploy.sh '
+    // (empty), never 'deploy.sh main'.
+    expect(sessionManager.spawnedSessions).toHaveLength(1);
+    expect(sessionManager.spawnedSessions[0].command).toBe('deploy.sh main');
+  });
+
+  it('webhook: a null task.base_branch interpolates {{baseBranch}} into both url and body, not empty', async () => {
+    const task = makeTask({ base_branch: null });
+    const action = makeAction({
+      type: 'webhook',
+      config_json: JSON.stringify({
+        url: 'https://example.test/notify?branch={{baseBranch}}',
+        body: JSON.stringify({ branch: '{{baseBranch}}' }),
+      }),
+    });
+    const fetchMock = vi.fn(async () => new Response(''));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const { engine } = makeEngine({ action });
+    await engine.executeTransition(task as Parameters<typeof engine.executeTransition>[0], 'todo', 'doing');
+
+    // Red: reverting executeAction's templateVars to the pre-refactor shape
+    // makes both of these resolve with an empty branch, never 'main'.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('https://example.test/notify?branch=main');
+    expect(init.body).toBe(JSON.stringify({ branch: 'main' }));
+  });
+});
+
+describe('TransitionEngine - MCP caller-session URL stamping (executeSpawnAgent chokepoint)', () => {
+  // Coverage hole: executeSpawnAgent wraps mcpServerUrl in
+  // `appendCallerSession(appConfig.mcpServerUrl, ptySessionId)` so the MCP
+  // server can identify which session is calling (see caller-url.ts). Every
+  // existing test in this file leaves mcpServerUrl undefined (the makeEngine
+  // default), so appendCallerSession(undefined, id) returns undefined either
+  // way and a regression to `appConfig.mcpServerUrl` (dropping the
+  // appendCallerSession wrapper) would fail nothing above. ptySessionId is a
+  // real crypto.randomUUID() generated inside executeSpawnAgent (this file
+  // does not mock node:crypto), so it is read back from the inserted session
+  // record rather than predicted.
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockAdapter.buildCommand.mockImplementation((options: { prompt?: string }) => {
+      return `claude ${options.prompt ?? ''}`;
+    });
+  });
+
+  it('stamps the spawned ptySessionId as the third URL segment when mcpServerUrl is configured', async () => {
+    let capturedOptions: { mcpServerUrl?: string } | undefined;
+    mockAdapter.buildCommand.mockImplementation((options: { mcpServerUrl?: string; prompt?: string }) => {
+      capturedOptions = options;
+      return `claude ${options.prompt ?? ''}`;
+    });
+
+    const task = makeTask();
+    const sessionRepo = makeSessionRepo();
+    const { engine } = makeEngine({ sessionRepo, mcpServerUrl: 'http://127.0.0.1:1234/mcp/proj-1' });
+
+    await engine.executeTransition(task as Parameters<typeof engine.executeTransition>[0], 'todo', 'doing');
+
+    expect(sessionRepo.insert).toHaveBeenCalledTimes(1);
+    const insertedId = (sessionRepo.insert.mock.calls[0][0] as { id: string }).id;
+    expect(insertedId).toBeTruthy();
+    // Red: reverting executeSpawnAgent's
+    // `mcpServerUrl: appendCallerSession(appConfig.mcpServerUrl, ptySessionId)`
+    // back to `appConfig.mcpServerUrl` makes this
+    // 'http://127.0.0.1:1234/mcp/proj-1' - no session segment.
+    expect(capturedOptions?.mcpServerUrl).toBe(`http://127.0.0.1:1234/mcp/proj-1/${insertedId}`);
+  });
+
+  it('leaves mcpServerUrl undefined when the project has no configured MCP server URL', async () => {
+    let capturedOptions: { mcpServerUrl?: string } | undefined;
+    mockAdapter.buildCommand.mockImplementation((options: { mcpServerUrl?: string; prompt?: string }) => {
+      capturedOptions = options;
+      return `claude ${options.prompt ?? ''}`;
+    });
+
+    const task = makeTask();
+    const { engine } = makeEngine({});
+
+    await engine.executeTransition(task as Parameters<typeof engine.executeTransition>[0], 'todo', 'doing');
+
+    expect(capturedOptions?.mcpServerUrl).toBeUndefined();
   });
 });

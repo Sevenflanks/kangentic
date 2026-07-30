@@ -56,11 +56,6 @@ const SOURCE_EXTENSIONS = new Set(['.ts', '.tsx']);
 const ENGINE_SINK_FILES: Record<string, string> = {
   'src/main/ipc/helpers/agent-spawn.ts':
     'spawnAgent: the shared board-spawn chokepoint itself; runs runSpawnPreamble before every engine call',
-  'src/main/ipc/handlers/sessions.ts':
-    'SESSION_RESUME: in-place resume of the task in its CURRENT lane; not a first-spawn entry point '
-    + '(agent stickiness comes from the session-type-scoped resume lookup). Known edge: with no '
-    + 'resumable record it fresh-spawns the default agent (agentOverride undefined) - pre-existing, '
-    + 'candidate follow-up',
   'src/main/ipc/handlers/session-reconcile.ts':
     'restartSessionForSettingsChange: suspend-and-respawn in place to apply CLI flags to an EXISTING '
     + 'session; not a first-spawn entry point',
@@ -144,6 +139,13 @@ describe('spawn entry-point parity: engine sinks', () => {
         + `Either route through spawnAgent / prepareAgentSpawn, or add a justified ENGINE_SINK_FILES `
         + `entry here and update ${ROOT_GUIDANCE_FILE}.`,
     ).toEqual([]);
+  });
+
+  it('SESSION_RESUME delegates to spawnAgent instead of calling the engine directly', () => {
+    const sessionHandlerSinks = collectSinkCalls(ENGINE_SINK_PATTERN)
+      .filter((call) => call.relativePath === 'src/main/ipc/handlers/sessions.ts')
+      .map((call) => call.location);
+    expect(sessionHandlerSinks).toEqual([]);
   });
 });
 

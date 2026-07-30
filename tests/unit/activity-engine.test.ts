@@ -82,6 +82,12 @@ function makeEngine(options: Partial<ActivityEngineOptions> = {}): {
       bgShellOnlyGraceMs: TEST_BG_SHELL_HATCH_MS,
       staleThinkingTimeoutMs: TEST_STALE_TIMEOUT_MS,
       staleAfterIdleHintMs: TEST_STALE_AFTER_IDLE_HINT_MS,
+      // Default to the same window as staleThinkingTimeoutMs so tests written
+      // before the heartbeat-forced short grace existed (e.g. the
+      // turnForcedByHeartbeat provenance suite below, which advances by
+      // TEST_STALE_TIMEOUT_MS expecting the stale-thinking hold to fire) are
+      // unaffected; the dedicated fast-heal test below overrides this per-case.
+      staleAfterHeartbeatForcedMs: TEST_STALE_TIMEOUT_MS,
       idleStabilityWindowMs: TEST_STABILITY_WINDOW_MS,
       ...options,
     },
@@ -220,6 +226,83 @@ describe('ActivityEngine', () => {
       // Post-dispose, processEvent is a no-op
       engine.processEvent(SESSION_ID, event(EventType.ToolStart));
       expect(transitions.length).toBe(transitionCountBeforeDispose);
+    });
+  });
+
+  describe('needsUserSince (elapsed-wait clock)', () => {
+    // Mirrors idleTimestamp's seed invariant (see the 'lifecycle' describe
+    // above), but needsUserSince spans BOTH needs-user states (idle and
+    // permission), not idle alone - see shapes.ts's field doc.
+    it('seed invariant: thinking seed leaves it null, idle seed stamps it', () => {
+      engine.initSession(SESSION_ID, true);
+      expect(engine.getState(SESSION_ID)?.needsUserSince).toBeNull();
+      engine.deleteSession(SESSION_ID);
+
+      engine.initSession(SESSION_ID, false);
+      expect(engine.getState(SESSION_ID)?.needsUserSince).not.toBeNull();
+    });
+
+    it('is stamped on entering idle from thinking, and cleared on leaving to thinking', () => {
+      engine.initSession(SESSION_ID);
+      transitions.length = 0;
+
+      engine.processEvent(SESSION_ID, event(EventType.Prompt));
+      expect(engine.getState(SESSION_ID)?.activity).toBe('thinking');
+      expect(engine.getState(SESSION_ID)?.needsUserSince).toBeNull();
+
+      engine.processEvent(SESSION_ID, event(EventType.Idle));
+      vi.advanceTimersByTime(TEST_STABILITY_WINDOW_MS + 10);
+      expect(engine.getState(SESSION_ID)?.activity).toBe('idle');
+      expect(engine.getState(SESSION_ID)?.needsUserSince).not.toBeNull();
+
+      engine.processEvent(SESSION_ID, event(EventType.Prompt));
+      expect(engine.getState(SESSION_ID)?.activity).toBe('thinking');
+      expect(engine.getState(SESSION_ID)?.needsUserSince).toBeNull();
+    });
+
+    it('is stamped on entering permission from thinking', () => {
+      engine.initSession(SESSION_ID);
+      transitions.length = 0;
+
+      engine.processEvent(SESSION_ID, event(EventType.Prompt));
+      expect(engine.getState(SESSION_ID)?.needsUserSince).toBeNull();
+
+      engine.processEvent(SESSION_ID, event(EventType.Idle, { detail: IdleReason.Permission }));
+      expect(engine.getState(SESSION_ID)?.activity).toBe('permission');
+      expect(engine.getState(SESSION_ID)?.needsUserSince).not.toBeNull();
+    });
+
+    it('a permission <-> idle crossing keeps the ORIGINAL park time - only leaving to thinking resets it', () => {
+      engine.initSession(SESSION_ID);
+      transitions.length = 0;
+
+      engine.processEvent(SESSION_ID, event(EventType.Prompt));
+      engine.processEvent(SESSION_ID, event(EventType.Idle, { detail: IdleReason.Permission }));
+      expect(engine.getState(SESSION_ID)?.activity).toBe('permission');
+      const parkedAt = engine.getState(SESSION_ID)?.needsUserSince;
+      expect(parkedAt).not.toBeNull();
+
+      // Advance the clock so a re-stamp (the bug this test guards against)
+      // would be observably different from the original park time.
+      vi.advanceTimersByTime(5_000);
+
+      // Non-permission Idle clears permissionPending and drops straight to
+      // idle (see event-handlers.ts's updatePermissionFlag) - no stability
+      // window applies, since the FROM state is 'permission', not 'thinking'.
+      engine.processEvent(SESSION_ID, event(EventType.Idle));
+      expect(engine.getState(SESSION_ID)?.activity).toBe('idle');
+      expect(engine.getState(SESSION_ID)?.needsUserSince).toBe(parkedAt);
+    });
+
+    it('ActivityReason.since matches needsUserSince for both idle and permission reasons', () => {
+      engine.initSession(SESSION_ID);
+      transitions.length = 0;
+
+      engine.processEvent(SESSION_ID, event(EventType.Prompt));
+      engine.processEvent(SESSION_ID, event(EventType.Idle, { detail: IdleReason.Permission }));
+      const reason = engine.getActivityReason(SESSION_ID);
+      expect(reason?.kind).toBe('permission');
+      expect((reason as { since: number }).since).toBe(engine.getState(SESSION_ID)?.needsUserSince);
     });
   });
 
@@ -2464,6 +2547,43 @@ describe('ActivityEngine', () => {
     });
   });
 
+  // Fast-heal follow-up (continuing #331/#364): the stale-thinking hold
+  // reclaims a heartbeat-forced turn on a SHORTER budget than a real turn.
+  // Uses distinct short/long values (unlike the outer beforeEach's engine,
+  // which defaults both to the same TEST_STALE_TIMEOUT_MS) so the two paths
+  // are provably different, not coincidentally equal.
+  describe('heartbeat-forced fast heal (staleAfterHeartbeatForcedMs)', () => {
+    const FAST_MS = 200;
+    const SLOW_MS = 2_000;
+
+    it('a heartbeat-forced turn (turnForcedByHeartbeat) reclaims at the SHORT grace, not the long stale-thinking timeout', () => {
+      const { engine: localEngine } = makeEngine({ staleThinkingTimeoutMs: SLOW_MS, staleAfterHeartbeatForcedMs: FAST_MS });
+      localEngine.initSession(SESSION_ID);
+      localEngine.forceThinking(SESSION_ID, true);
+      expect(localEngine.getState(SESSION_ID)?.turnForcedByHeartbeat).toBe(true);
+
+      vi.advanceTimersByTime(FAST_MS + 50);
+      expect(localEngine.getState(SESSION_ID)?.activity).toBe('idle');
+      localEngine.dispose();
+    });
+
+    it('a real turn (turnForcedByHeartbeat=false) still uses the long stale-thinking timeout, unaffected by the short grace (#246 guard)', () => {
+      const { engine: localEngine } = makeEngine({ staleThinkingTimeoutMs: SLOW_MS, staleAfterHeartbeatForcedMs: FAST_MS });
+      localEngine.initSession(SESSION_ID);
+      localEngine.processEvent(SESSION_ID, event(EventType.Prompt));
+      expect(localEngine.getState(SESSION_ID)?.turnForcedByHeartbeat).toBe(false);
+
+      // Past the short grace, but well short of the long timeout: a live
+      // long-generation turn (task #246) must not be fast-healed.
+      vi.advanceTimersByTime(FAST_MS + 50);
+      expect(localEngine.getState(SESSION_ID)?.activity).toBe('thinking');
+
+      vi.advanceTimersByTime(SLOW_MS);
+      expect(localEngine.getState(SESSION_ID)?.activity).toBe('idle');
+      localEngine.dispose();
+    });
+  });
+
   // Task #294 part 2 (defense-in-depth): once the agent reports waiting-for-input
   // (idle_hint), parked-TUI statusline repaints (PTY bytes) must stop deferring
   // the stale-thinking net, so a stuck turnActive self-heals at 180s. A live
@@ -2747,6 +2867,28 @@ describe('ActivityEngine', () => {
       expect(snapshot.turnActive).toBe(true);
       expect(snapshot.permissionPending).toBe(false);
       expect(snapshot.msSinceLastSignal).not.toBeNull();
+      // Thinking is not a needs-user state, so the snapshot's public
+      // needsUserSince must mirror the raw state's null - see the sibling
+      // test below for the parked-into-idle polarity.
+      expect(snapshot.needsUserSince).toBeNull();
+    });
+
+    it('needsUserSince mirrors the raw engine state once parked in idle', () => {
+      // Deleting `needsUserSince: state.needsUserSince,` from
+      // getStatsSnapshot() (activity-engine.ts) would leave this field
+      // undefined while engine.getState()?.needsUserSince stays populated -
+      // the two must agree. Drive thinking -> idle (not just the initSession
+      // seed) so this exercises the same freshly-parked stamp as the
+      // needsUserSince describe block above, through the public snapshot API.
+      engine.processEvent(SESSION_ID, event(EventType.Prompt));
+      expect(engine.getState(SESSION_ID)?.activity).toBe('thinking');
+      engine.processEvent(SESSION_ID, event(EventType.Idle));
+      vi.advanceTimersByTime(TEST_STABILITY_WINDOW_MS + 10);
+      expect(engine.getState(SESSION_ID)?.activity).toBe('idle');
+
+      const snapshot = engine.getStatsSnapshot(SESSION_ID)!;
+      expect(snapshot.needsUserSince).not.toBeNull();
+      expect(snapshot.needsUserSince).toBe(engine.getState(SESSION_ID)?.needsUserSince);
     });
 
     it('includes ring buffer of recent audit log entries (capped at 50)', () => {

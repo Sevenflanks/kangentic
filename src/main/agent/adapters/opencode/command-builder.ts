@@ -1,7 +1,7 @@
 import { quoteArg } from '../../../../shared/paths';
 import { interpolateTemplate } from '../../shared/template-utils';
 import { buildHooks } from './hook-manager';
-import type { PermissionMode } from '../../../../shared/types';
+import type { PermissionMode, ResolvedExecutionTarget } from '../../../../shared/types';
 
 export interface OpenCodeCommandOptions {
   opencodePath: string;
@@ -21,6 +21,8 @@ export interface OpenCodeCommandOptions {
   mcpServerToken?: string;
   model?: string;
   effort?: string;
+  /** Present only when this project's OpenCode execution mode is 'remote'. */
+  executionTarget?: ResolvedExecutionTarget;
 }
 
 /**
@@ -56,6 +58,16 @@ export interface OpenCodeCommandOptions {
 export class OpenCodeCommandBuilder {
   buildOpenCodeCommand(options: OpenCodeCommandOptions): string {
     const { shell } = options;
+
+    // Remote mode: attach to the user-run server instead of spawning a local
+    // session. The server owns providers/models/MCP/tools (per the task's
+    // acceptance criteria), so - unlike the local branch below - this never
+    // emits --model or installs the activity plugin (there is no local
+    // project directory to write it into; the server's filesystem is not
+    // ours to touch).
+    if (options.executionTarget) {
+      return buildOpenCodeAttachCommand(options, options.executionTarget, shell);
+    }
 
     // Install the activity-stream plugin into the PTY working directory's
     // `.opencode/plugins/` directory before the CLI launches. OpenCode
@@ -106,10 +118,26 @@ export class OpenCodeCommandBuilder {
    * `headers`. We pass the per-launch token via the `X-Kangentic-Token`
    * header that the in-process MCP HTTP server expects.
    *
-   * Returns `null` when MCP wiring is disabled or any of the required
-   * URL / token values are missing.
+   * This only wires MCP for a LOCAL spawn (`opencode [project]`), where
+   * the process we spawn is the server itself and legitimately reads its
+   * own `OPENCODE_CONFIG_CONTENT` at startup. Returns `null` when MCP
+   * wiring is disabled or any of the required URL / token values are
+   * missing.
    */
   buildOpenCodeEnv(options: OpenCodeCommandOptions): Record<string, string> | null {
+    // Remote mode (`options.executionTarget` set): the process Kangentic
+    // spawns is `opencode attach <url>`, a stateless HTTP client to a
+    // server that was started - and had its config, including any `mcp.*`
+    // entries, fixed - independently and earlier. `attach`'s CLI surface
+    // has no config-push flags (`--dir`, `--continue`, `--session`,
+    // `--fork`, `--username`, `--password` only; verified against
+    // `opencode attach --help`), so env vars set on the attach process,
+    // including OPENCODE_CONFIG_CONTENT, are never read by the already-
+    // running server and cannot wire MCP into it - this holds whether the
+    // target host is loopback or genuinely remote. There is currently no
+    // way for Kangentic to deliver its MCP tools to a remote OpenCode
+    // session; see the `remoteModeCaveat` on the adapter.
+    if (options.executionTarget) return null;
     if (!options.mcpServerEnabled) return null;
     if (!options.mcpServerUrl || !options.mcpServerToken) return null;
 
@@ -131,6 +159,60 @@ export class OpenCodeCommandBuilder {
 
   interpolateTemplate(template: string, variables: Record<string, string>): string {
     return interpolateTemplate(template, variables);
+  }
+}
+
+/**
+ * Build `opencode attach <url> [--dir <serverPath>] [--username u] [--password p]
+ * [--session <id>]`.
+ *
+ * Verified against the OpenCode CLI docs: `attach` accepts `--dir`,
+ * `--continue`/`-c`, `--session`/`-s`, `--fork`, `--username`/`-u`,
+ * `--password`/`-p`. Fresh prompts use the existing post-attach terminal
+ * submission path after the TUI is writable. Attach has no agent-selection
+ * flag, so a primary-agent request fails instead of being silently ignored.
+ *
+ * No `--model` is ever emitted here: per the task's acceptance criteria the
+ * remote server is the authority for providers and models.
+ */
+function buildOpenCodeAttachCommand(
+  options: OpenCodeCommandOptions,
+  target: ResolvedExecutionTarget,
+  shell?: string,
+): string {
+  const parts: string[] = [quoteArg(options.opencodePath, shell), 'attach', quoteArg(target.url, shell)];
+
+  if (target.workingDirectory) {
+    parts.push('--dir', quoteArg(target.workingDirectory, shell));
+  }
+  if (target.auth.kind === 'basic') {
+    parts.push('--username', quoteArg(target.auth.username, shell));
+    parts.push('--password', quoteArg(target.auth.password, shell));
+  }
+
+  if (options.resume && options.sessionId) {
+    parts.push('--session', quoteArg(options.sessionId, shell));
+    // No prompt on resume, mirroring the local --session resume convention.
+    return parts.join(' ');
+  }
+
+  const requestedAgent = mapPermissionModeToAgent(options.permissionMode);
+  if (requestedAgent) {
+    throw new RemoteOpenCodeAttachPrimaryAgentUnsupportedError(requestedAgent);
+  }
+
+  return parts.join(' ');
+}
+
+export class RemoteOpenCodeAttachPrimaryAgentUnsupportedError extends Error {
+  readonly name = 'RemoteOpenCodeAttachPrimaryAgentUnsupportedError';
+  readonly code = 'OPENCODE_REMOTE_ATTACH_PRIMARY_AGENT_UNSUPPORTED';
+
+  constructor(readonly requestedAgent: string) {
+    super(
+      `Remote OpenCode attach cannot select primary agent "${requestedAgent}". `
+      + 'Configure the remote server default agent and use Default permission mode in Kangentic.',
+    );
   }
 }
 

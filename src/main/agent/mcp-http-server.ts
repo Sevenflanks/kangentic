@@ -7,15 +7,37 @@
  * DB via the `commandHandlers` map -- no subprocess, no file bridge,
  * no offset tracking.
  *
- * URL shape: http://127.0.0.1:<port>/mcp/<projectId>
+ * URL shape: http://127.0.0.1:<port>/mcp/<projectId>[/<callerSessionId>]
+ *       The optional third segment identifies WHICH session is calling. It is
+ *       stamped into that session's own mcp.json at spawn, so it is correct by
+ *       construction and not settable through any tool parameter. It is not a
+ *       cryptographic identity: the bearer token is shared per launch and the
+ *       segment is not validated, so a process holding the token can dial any
+ *       id (see caller-url.ts). Absent for a human-driven client, the
+ *       per-project `.kangentic/mcp-config.json`, or a Command Terminal
+ *       session; steering then degrades to an unattributed caller rather than
+ *       refusing.
  * Auth: random per-launch token, validated via `X-Kangentic-Token` header
- * Bind: 127.0.0.1 only -- loopback skips Windows Defender Firewall
- *       prompts and is unreachable from other machines.
+ * Bind: 127.0.0.1 by default -- loopback skips Windows Defender Firewall
+ *       prompts and is unreachable from other machines. A user can widen
+ *       this by hand-editing `mcpServer.bindAddress` in the global
+ *       config.json (there is no Settings UI for it) to expose the server
+ *       on a LAN/VPN interface; `mcpServer.callbackHost` is allowlisted
+ *       alongside it so a real external request is not rejected by
+ *       DNS-rebinding protection. Both are opt-in and read once at
+ *       startup. `urlForProject`/`baseUrl` always stay loopback, which
+ *       keeps local consumers working for the default and for a wildcard
+ *       bind ('0.0.0.0' / '::' bind loopback too). A bind to one SPECIFIC
+ *       non-loopback interface does NOT bind loopback, so local agents
+ *       would get an unreachable URL - see docs/mcp-server.md's Network
+ *       Access section.
  *
- * Tool registrations live under ./mcp-http/:
- *   - task-tools.ts     - board/task/column mutations + related reads
- *   - session-tools.ts  - session inspection, backlog, read-only SQL
- *   - handler-helpers.ts - runHandler/callHandler + TaskCounter primitive
+ * Tool registrations live under ./mcp-http/, one `register*Tools` file per
+ * family - see the `register*Tools` imports below for the current set rather
+ * than an enumeration here, which drifts every time a family is added.
+ * `handler-helpers.ts` holds the shared runHandler/callHandler + TaskCounter
+ * primitives, and `session-send.ts` the delivery coordinator behind
+ * `steering-tools.ts`.
  */
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from 'node:http';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
@@ -23,12 +45,20 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { makeTaskCounter, type TaskCounter } from './mcp-http/handler-helpers';
 import { registerTaskTools } from './mcp-http/task-tools';
+import { registerProfileTools } from './mcp-http/profile-tools';
 import { registerSessionTools } from './mcp-http/session-tools';
 import { registerProjectTools } from './mcp-http/project-tools';
 import { registerSearchTools } from './mcp-http/search-tools';
 import { registerDiagnosticsTools } from './mcp-http/diagnostics-tools';
 import { registerUsageTools } from './mcp-http/usage-tools';
 import { registerBrowserTools, type AutomationConfigReader } from './mcp-http/browser-tools';
+import { registerSteeringTools, type SteeringToolDependencies, type SteeringSessionLookup } from './mcp-http/steering-tools';
+import {
+  createSessionSendCoordinator,
+  type SessionSendCoordinator,
+  type SessionSendSessionManager,
+  type SessionSendTerminalSubmit,
+} from './mcp-http/session-send';
 import { registerDevtoolsMcpTools } from '../../devtools/mcp/register';
 import { buildServerInstructions } from './mcp-http/server-instructions';
 import { logMcpToolArguments } from './mcp-http/tool-call-logging';
@@ -50,6 +80,21 @@ const SERVER_VERSION = '1.0.0';
  */
 export type ProjectContextFactory = (projectId: string) => RequestResolver | null;
 
+/** Network config for the MCP HTTP server, read once at startup. */
+export interface McpServerNetworkConfig {
+  /** Interface to bind. Default '127.0.0.1' (loopback only). */
+  bindAddress: string;
+  /**
+   * Host allowlisted alongside `bindAddress` for DNS-rebinding protection (see
+   * `buildAllowedHosts`), so a legitimate LAN/VPN request naming this host in its `Host`
+   * header is not rejected. There is no delivery mechanism that reads this to build a URL
+   * for an external client - the user reads their own reachable address from
+   * `.kangentic/mcp-config.json` (already written for every project) and substitutes it
+   * for that file's `127.0.0.1`.
+   */
+  callbackHost?: string;
+}
+
 export interface McpHttpServerHandle {
   /** Full URL with port substituted in. Pass to claude --mcp-config or write into mcp.json. */
   baseUrl: string;
@@ -62,19 +107,51 @@ export interface McpHttpServerHandle {
 }
 
 /**
+ * Main-process singletons the steering tools need. `CommandContext` carries
+ * only the project DB and board callbacks, so these are threaded in at
+ * registration time instead (the `browser-tools.ts` precedent). Read lazily
+ * per request because the MCP server starts before `createWindow`, so the IPC
+ * context does not exist yet at `startMcpHttpServer` time.
+ */
+export interface McpSteeringContext {
+  sessionManager: SessionSendSessionManager & SteeringSessionLookup;
+  terminalSubmit: SessionSendTerminalSubmit;
+}
+
+export type SteeringContextReader = () => McpSteeringContext | null;
+
+/**
  * Start the HTTP server. Resolves once it's listening; the OS picks a
  * free port via `.listen(0)`.
  */
 export async function startMcpHttpServer(
   buildContext: ProjectContextFactory,
   getBrowserAutomationConfig: AutomationConfigReader,
+  networkConfig: McpServerNetworkConfig,
+  getSteeringContext: SteeringContextReader = () => null,
 ): Promise<McpHttpServerHandle> {
   const token = randomBytes(32).toString('hex');
   const expectedTokenBuffer = Buffer.from(token, 'utf-8');
   const taskCounter = makeTaskCounter();
 
+  // One coordinator per server launch (its rate-limit windows, steer-chain
+  // depths and pending deferred deliveries are launch-scoped state), built on
+  // first use because the IPC context does not exist yet at startup.
+  let sessionSendCoordinator: SessionSendCoordinator | null = null;
+  const resolveSteering = (callerSessionId?: string): SteeringToolDependencies | null => {
+    const steeringContext = getSteeringContext();
+    if (!steeringContext) return null;
+    if (!sessionSendCoordinator) {
+      sessionSendCoordinator = createSessionSendCoordinator({
+        sessionManager: steeringContext.sessionManager,
+        terminalSubmit: steeringContext.terminalSubmit,
+      });
+    }
+    return { coordinator: sessionSendCoordinator, sessions: steeringContext.sessionManager, callerSessionId };
+  };
+
   const httpServer: Server = createServer((req, res) => {
-    handleHttpRequest(req, res, expectedTokenBuffer, buildContext, taskCounter, getBrowserAutomationConfig)
+    handleHttpRequest(req, res, expectedTokenBuffer, buildContext, taskCounter, getBrowserAutomationConfig, networkConfig, resolveSteering)
       .catch((error) => {
         console.error('[mcp-http] Request handler crashed:', error);
         if (!res.headersSent) {
@@ -93,14 +170,16 @@ export async function startMcpHttpServer(
     console.error('[mcp-http] Server error:', error);
   });
 
-  // Bind 127.0.0.1 explicitly. NOT 'localhost' (which can resolve to ::1
-  // on IPv6-preferring systems and miss the 127.0.0.1 binding) and NOT
-  // 0.0.0.0 (which exposes the port to the network and triggers a Windows
-  // Defender Firewall prompt). Loopback v4 works identically on Windows,
-  // macOS, and Linux.
+  // Bind the configured interface. Default '127.0.0.1' - NOT 'localhost'
+  // (which can resolve to ::1 on IPv6-preferring systems and miss the
+  // 127.0.0.1 binding) and NOT '0.0.0.0' unless the user explicitly opts
+  // in by hand-editing config.json (widening the bind triggers a Windows
+  // Defender Firewall prompt and makes the port LAN-reachable). Loopback
+  // v4 works identically on Windows, macOS, and Linux.
+  const bindAddress = networkConfig.bindAddress;
   await new Promise<void>((resolve, reject) => {
     httpServer.once('error', reject);
-    httpServer.listen(0, '127.0.0.1', () => {
+    httpServer.listen(0, bindAddress, () => {
       httpServer.removeListener('error', reject);
       resolve();
     });
@@ -111,15 +190,28 @@ export async function startMcpHttpServer(
     httpServer.close();
     throw new Error('[mcp-http] Failed to obtain HTTP server address after listen()');
   }
+  // baseUrl / urlForProject stay on loopback regardless of bindAddress. That
+  // holds for the default and for a wildcard bind ('0.0.0.0' / '::' bind
+  // loopback too), so every locally-spawned agent still reaches the server
+  // over 127.0.0.1. Known limitation: it does NOT hold for a bind to one
+  // specific non-loopback interface, which leaves loopback unbound and hands
+  // every local agent a URL nothing is listening on.
   const baseUrl = `http://127.0.0.1:${address.port}/mcp`;
 
-  console.log(`[mcp-http] Listening on ${baseUrl}`);
+  console.log(`[mcp-http] Listening on ${baseUrl} (bind ${bindAddress})`);
 
   return {
     baseUrl,
     token,
     urlForProject: (projectId: string) => `${baseUrl}/${projectId}`,
-    close: () => closeMcpHttpServerSafely(httpServer),
+    close: () => {
+      // Detach the SessionManager listeners the coordinator holds before the
+      // socket teardown, so a shutdown never leaves a live 'activity'/'exit'
+      // subscriber pointing at a disposed server.
+      sessionSendCoordinator?.dispose();
+      sessionSendCoordinator = null;
+      closeMcpHttpServerSafely(httpServer);
+    },
   };
 }
 
@@ -148,6 +240,61 @@ export function closeMcpHttpServerSafely(httpServer: Pick<Server, 'closeAllConne
 }
 
 /**
+ * Parse the request path into `{ projectId, callerSessionId }`. Expected shape:
+ * `/mcp/<projectId>` or, when the client is a Kangentic-spawned agent,
+ * `/mcp/<projectId>/<callerSessionId>`.
+ *
+ * `callerSessionId` (the third segment) is OPTIONAL by design and its absence
+ * is never an error: a human running `claude` outside Kangentic, an older
+ * session whose mcp.json predates the third segment, and the per-project
+ * `.kangentic/mcp-config.json` all legitimately dial the two-segment form.
+ * Steering degrades gracefully to an unattributed caller rather than refusing
+ * (see caller-url.ts). A fourth-and-later segment is ignored, matching the
+ * behavior before this was extracted (only segments[1]/segments[2] were ever
+ * read).
+ *
+ * Returns null when the path does not match `/mcp/<projectId>[/...]` at all.
+ *
+ * Exported as a pure function for unit-test isolation, mirroring
+ * `buildAllowedHosts` below - testing the URL-segment contract via a real HTTP
+ * request through `startMcpHttpServer` would require booting the full MCP
+ * module graph just to observe string parsing.
+ */
+export function parseMcpRequestPath(pathname: string): { projectId: string; callerSessionId?: string } | null {
+  const segments = pathname.split('/').filter(Boolean);
+  if (segments.length < 2 || segments[0] !== 'mcp') return null;
+  return { projectId: segments[1], callerSessionId: segments[2] };
+}
+
+/**
+ * Build the DNS-rebinding-protection allowlist for one request. Loopback and
+ * `req.socket.localPort` are always allowed. Widening `bindAddress` or
+ * configuring `callbackHost` expands who can legitimately dial in, so both
+ * must be allowlisted too - otherwise a real LAN/VPN request would bind
+ * successfully but still get rejected by DNS-rebinding protection.
+ *
+ * Entries are matched by the SDK against the raw `Host` header with an exact
+ * string compare, so an IPv6 literal has to be stored bracketed the way a
+ * client actually sends it (`Host: [2001:db8::1]:51234`, per RFC 3986 /
+ * RFC 7230). Hostnames and IPv4 literals never contain a colon, so the
+ * colon test below is a safe discriminator.
+ *
+ * Exported as a pure function for unit-test isolation - testing this via a
+ * real HTTP request through startMcpHttpServer would require booting the
+ * full MCP module graph.
+ */
+export function buildAllowedHosts(localPort: number | string, networkConfig: McpServerNetworkConfig): string[] {
+  const allowedHosts = ['127.0.0.1', `127.0.0.1:${localPort}`, 'localhost', '[::1]'];
+  for (const host of [networkConfig.bindAddress, networkConfig.callbackHost]) {
+    if (host && host !== '127.0.0.1') {
+      const hostAsSentInHeader = host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
+      allowedHosts.push(hostAsSentInHeader, `${hostAsSentInHeader}:${localPort}`);
+    }
+  }
+  return allowedHosts;
+}
+
+/**
  * Build a fully-configured per-request McpServer: instructions + every tool
  * family registered. Exported so the registration and policy gating are
  * unit-testable without booting the HTTP server.
@@ -165,6 +312,7 @@ export function buildConfiguredMcpServer(
   resolver: RequestResolver,
   taskCounter: TaskCounter,
   getBrowserAutomationConfig: AutomationConfigReader,
+  steering?: SteeringToolDependencies | null,
 ): McpServer {
   const browserAutomationEnabled = getBrowserAutomationConfig().enabled;
   const instructions = buildServerInstructions(resolver, browserAutomationEnabled);
@@ -173,6 +321,7 @@ export function buildConfiguredMcpServer(
     { instructions },
   );
   registerTaskTools(mcpServer, resolver, taskCounter);
+  registerProfileTools(mcpServer, resolver);
   registerSessionTools(mcpServer, resolver);
   registerProjectTools(mcpServer, resolver);
   registerSearchTools(mcpServer, resolver);
@@ -180,6 +329,12 @@ export function buildConfiguredMcpServer(
   registerDiagnosticsTools(mcpServer, resolver);
   if (browserAutomationEnabled) {
     registerBrowserTools(mcpServer, getBrowserAutomationConfig);
+  }
+  // Steering needs live main-process singletons. They are absent only before
+  // the IPC context exists (the server starts ahead of createWindow), which is
+  // strictly before any agent can be running to be steered.
+  if (steering) {
+    registerSteeringTools(mcpServer, resolver, steering);
   }
 
   // Dev-only: register the kangentic_devtools_* tools that drive the localhost
@@ -200,11 +355,14 @@ async function handleHttpRequest(
   buildContext: ProjectContextFactory,
   taskCounter: TaskCounter,
   getBrowserAutomationConfig: AutomationConfigReader,
+  networkConfig: McpServerNetworkConfig,
+  resolveSteering: (callerSessionId?: string) => SteeringToolDependencies | null,
 ): Promise<void> {
   // Token check first -- cheapest reject path. Constant-time compare so a
-  // local timing oracle can't byte-by-byte recover the token. Pure
-  // belt-and-suspenders since we already bind 127.0.0.1 only and the
-  // attacker would need same-machine code execution to even try.
+  // local timing oracle can't byte-by-byte recover the token. When bound to
+  // loopback only (the default), this is pure belt-and-suspenders since the
+  // attacker would need same-machine code execution to even try; it becomes
+  // the primary defense once a user opts into a wider `bindAddress`.
   const headerToken = req.headers['x-kangentic-token'];
   if (typeof headerToken !== 'string') {
     res.statusCode = 401;
@@ -221,16 +379,17 @@ async function handleHttpRequest(
     return;
   }
 
-  // Parse projectId from URL path. Expected: /mcp/<projectId>
-  // (the SDK transport handles JSON-RPC body parsing -- we just route).
+  // Parse the URL path (see parseMcpRequestPath's doc comment for the shape
+  // and the caller-segment-optional rationale). The SDK transport handles
+  // JSON-RPC body parsing -- we just route.
   const url = new URL(req.url ?? '/', 'http://127.0.0.1');
-  const segments = url.pathname.split('/').filter(Boolean);
-  if (segments.length < 2 || segments[0] !== 'mcp') {
+  const parsedPath = parseMcpRequestPath(url.pathname);
+  if (!parsedPath) {
     res.statusCode = 404;
     res.end();
     return;
   }
-  const projectId = segments[1];
+  const { projectId, callerSessionId } = parsedPath;
 
   const resolver = buildContext(projectId);
   if (!resolver) {
@@ -245,13 +404,18 @@ async function handleHttpRequest(
   // instructions (active-project name, registered-project list) and the
   // browser-tool gating reflect current DB / settings state (see
   // buildConfiguredMcpServer).
-  const mcpServer = buildConfiguredMcpServer(resolver, taskCounter, getBrowserAutomationConfig);
+  const mcpServer = buildConfiguredMcpServer(
+    resolver,
+    taskCounter,
+    getBrowserAutomationConfig,
+    resolveSteering(callerSessionId),
+  );
 
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
     enableJsonResponse: true,
     enableDnsRebindingProtection: true,
-    allowedHosts: ['127.0.0.1', `127.0.0.1:${req.socket.localPort ?? ''}`, 'localhost', '[::1]'],
+    allowedHosts: buildAllowedHosts(req.socket.localPort ?? '', networkConfig),
   });
 
   try {

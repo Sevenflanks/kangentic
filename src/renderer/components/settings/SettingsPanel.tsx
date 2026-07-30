@@ -9,10 +9,10 @@ import { APP_TABS, GLOBAL_ONLY_TABS, SettingsContent } from './AppSettingsPanel'
 import { SETTINGS_REGISTRY } from './settings-registry';
 
 /**
- * Unified settings panel. Shows all 7 tabs when a project is open,
- * or only the 3 shared tabs (Behavior, Notifications, Privacy) when
- * no project is selected. No scope toggle; each setting saves to
- * the correct target based on its position relative to the separator.
+ * Unified settings panel. Shows every Project + System tab when a project is
+ * open, or only the System-category tabs when none is selected. No scope
+ * toggle; each setting saves to the correct target based on its tab's
+ * category (see settings-tabs.ts).
  */
 export function SettingsPanel() {
   const setSettingsOpen = useConfigStore((state) => state.setSettingsOpen);
@@ -20,7 +20,6 @@ export function SettingsPanel() {
   const openProjectSettings = useConfigStore((state) => state.openProjectSettings);
   const currentProject = useProjectStore((state) => state.currentProject);
   const projects = useProjectStore((state) => state.projects);
-  const detectAgent = useConfigStore((state) => state.detectAgent);
   const loadAgentList = useConfigStore((state) => state.loadAgentList);
 
   // Determine if we have a project context (either from sidebar gear icon or current project)
@@ -37,13 +36,14 @@ export function SettingsPanel() {
 
   const setLastSettingsTab = useConfigStore((state) => state.setLastSettingsTab);
   const [shells, setShells] = useState<Array<{ name: string; path: string }>>([]);
+  const [fonts, setFonts] = useState<string[]>([]);
   const [activeTab, setActiveTab] = useState(() => {
     const state = useConfigStore.getState();
     // An explicit open-to-tab (sidebar) wins; otherwise resume the last viewed
     // tab so closing and reopening returns to the same section.
     if (state.projectSettingsInitialTab) return state.projectSettingsInitialTab;
     if (state.lastSettingsTab) return state.lastSettingsTab;
-    return hasProject ? 'theme' : tabs[0].id;
+    return hasProject ? 'general' : tabs[0].id;
   });
   const [searchQuery, setSearchQuery] = useState('');
 
@@ -55,14 +55,14 @@ export function SettingsPanel() {
 
   useEffect(() => {
     window.electronAPI.shell.getAvailable().then(setShells).catch(() => {});
-    // The store already holds the agent inventory and detected-agent info from
-    // app bootstrap (App.tsx), so opening Settings does not need to re-probe -
-    // only fetch when the store is empty (e.g. opened before bootstrap settled).
-    // The Agent tab's re-detect button is the explicit fresh path.
-    const { agentList, agentInfo } = useConfigStore.getState();
-    if (!agentInfo) detectAgent();
+    window.electronAPI.font.getAvailable().then(setFonts).catch(() => {});
+    // The store already holds the agent inventory from app bootstrap (App.tsx),
+    // so opening Settings does not need to re-probe - only fetch when the store
+    // is empty (e.g. opened before bootstrap settled). The Agent tab's re-detect
+    // button is the explicit fresh path.
+    const { agentList } = useConfigStore.getState();
     if (agentList.length === 0) loadAgentList();
-  }, [detectAgent, loadAgentList]);
+  }, [loadAgentList]);
 
   // When opening settings for a different project via sidebar gear icon,
   // pick up the initial tab if set.
@@ -126,6 +126,7 @@ export function SettingsPanel() {
     matchingTabs,
     navigateToTab,
     shells,
+    fonts,
   };
 
   // Project switcher dropdown: shown when projects exist, allows switching
