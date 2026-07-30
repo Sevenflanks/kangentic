@@ -70,6 +70,7 @@ const context = {
   boardConfigManager: {
     writeBack: vi.fn(), exists: vi.fn(), exportFromDb: vi.fn(), applyFileChange: vi.fn(),
     getShortcuts: vi.fn(), setShortcuts: vi.fn(), setDefaultBaseBranch: vi.fn(),
+    getBoardProfiles: vi.fn(() => []),
   },
   projectRepo: { getById: vi.fn(() => ({ id: 'project-board' })) },
   mainWindow: { isDestroyed: vi.fn(() => false), webContents: { send: vi.fn() } },

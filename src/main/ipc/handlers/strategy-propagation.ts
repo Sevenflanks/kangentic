@@ -112,6 +112,8 @@ export function propagateStrategyToLiveSessions(
       continue;
     }
 
+    if (!context.sessionManager.isWritable(task.session_id)) continue;
+
     context.terminalSubmitScheduler.scheduleKeystrokes(task.id, task.session_id, plan.sequence, {
       verifier: plan.verifier,
       verifiedPrefixLength: plan.verifiedPrefixLength,
