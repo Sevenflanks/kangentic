@@ -16,7 +16,7 @@ import { useProjectSwitchEffect } from './hooks/useProjectSwitchEffect';
 import { useAgentDrivenInvalidation } from './hooks/useAgentDrivenInvalidation';
 import { invalidateProject } from './stores/project-cache';
 import { resolveAutoFocusTarget } from './utils/auto-focus';
-import { requiresUserInteraction } from '../shared/activity-state';
+import { COMMAND_TERMINAL_NOTIFICATION_TASK_ID } from '../shared/notification-constants';
 import { bumpHmrGeneration } from './utils/hmr-generation';
 import { clearSnapPreviewDom } from './window-manager';
 import { setRebindCaptureActive } from './utils/rebind-state';
@@ -34,19 +34,13 @@ import {
   resetCoalescerForHmr,
 } from './lib/session-update-coalescer';
 
-/** Sentinel taskId used in notification round-trips for transient (Command Terminal)
- *  sessions, which have no associated task. The click handler routes this value
- *  through `setPendingOpenCommandTerminal` instead of opening a task detail dialog. */
-const COMMAND_TERMINAL_NOTIFICATION_TASK_ID = '__command_terminal__';
 const LIVE_DELIVERY_COMPLETE_DURATION_MS = 2000;
-
 export function App() {
   const loadProjects = useProjectStore((s) => s.loadProjects);
   const loadCurrent = useProjectStore((s) => s.loadCurrent);
   const currentProject = useProjectStore((s) => s.currentProject);
   const loadConfig = useConfigStore((s) => s.loadConfig);
   const loadAppVersion = useConfigStore((s) => s.loadAppVersion);
-  const detectAgent = useConfigStore((s) => s.detectAgent);
   const loadAgentList = useConfigStore((s) => s.loadAgentList);
   const detectGit = useConfigStore((s) => s.detectGit);
   const upsertSession = useSessionStore((s) => s.upsertSession);
@@ -57,16 +51,31 @@ export function App() {
     if (process.env.NODE_ENV !== 'production') {
       performance.mark('renderer-mount-start');
     }
-    loadConfig();
+    const configLoaded = loadConfig();
     loadAppVersion();
-    detectAgent();
     loadAgentList();
     detectGit();
-    loadProjects();
+    const projectsLoaded = loadProjects();
     useProjectStore.getState().loadGroups();
     // Restore the current project after a page reload (e.g. Vite HMR).
     // The main process retains currentProjectId across renderer reloads.
     loadCurrent();
+
+    // One-time upgrade backfill for onboardedProjectIds. The field starts
+    // undefined for every user (new or existing); this seeds every project
+    // already known at first hydration as onboarded, so an existing user never
+    // sees the Get started panel retroactively on a project they already use.
+    // A brand-new user has no known projects yet, so this simply writes `[]`,
+    // and their first real project starts un-onboarded as intended. Runs once
+    // on cold mount, not on every HMR tick, because this effect body only runs
+    // on genuine (re)mount.
+    Promise.all([configLoaded, projectsLoaded]).then(() => {
+      const { config, updateConfig } = useConfigStore.getState();
+      if (config.onboardedProjectIds === undefined) {
+        const allProjectIds = useProjectStore.getState().projects.map((project) => project.id);
+        updateConfig({ onboardedProjectIds: allProjectIds });
+      }
+    });
 
     // Measure after first paint via requestAnimationFrame
     let mountTimerRafId: number | undefined;
@@ -384,20 +393,9 @@ export function App() {
         // for the DB write; no-ops while the dashboard is closed).
         setTimeout(() => useUsageDashboardStore.getState().loadDashboardStats({ force: true }), 1000);
 
-        // Desktop notification for non-zero exit on non-visible projects
-        if (exitCode !== 0 && notifyConfig.desktop.onAgentCrash) {
-          const resolvedProjectId = projectId ?? currentSession?.projectId;
-          if (resolvedProjectId) {
-            shouldNotify(sessionId, resolvedProjectId).then((notify) => {
-              if (!notify) return;
-              const project = useProjectStore.getState().projects.find((p) => p.id === resolvedProjectId);
-              const task = useBoardStore.getState().tasks.find((t) => t.session_id === sessionId)
-                ?? useBoardStore.getState().tasks.find((t) => t.id === currentSession?.taskId);
-              const label = task?.title ?? sessionId.slice(0, 8);
-              sendNotification(sessionId, `Session crashed: ${label}`, project?.name ?? 'A project', resolvedProjectId, task?.id ?? '');
-            });
-          }
-        }
+        // The desktop crash notification for a non-zero exit on a non-visible
+        // project now lives in main (src/main/notifications/desktop-notifier.ts),
+        // which listens to SessionManager's 'exit' event directly.
       }));
     }
 
@@ -451,11 +449,11 @@ export function App() {
     // ALWAYS update activity (sidebar badges need cross-project data),
     // but only run auto-focus for current project.
     if (sessions.onActivity) {
-      cleanups.push(sessions.onActivity((sessionId, state, reason, projectId, taskId, taskTitle) => {
+      cleanups.push(sessions.onActivity((sessionId, state, reason, projectId) => {
         // Deferred whole through the coalescer (held during an active board
-        // drag). The auto-focus and notification side effects read getState()
-        // AFTER updateActivity, so the write and its reads must stay atomic -
-        // deferring the body as one thunk preserves that read-after-write.
+        // drag). The auto-focus effect reads getState() AFTER updateActivity,
+        // so the write and its reads must stay atomic - deferring the body as
+        // one thunk preserves that read-after-write.
         enqueueSessionUpdate(() => {
           updateActivity(sessionId, state, reason);
 
@@ -483,28 +481,11 @@ export function App() {
             }
           }
 
-          // OS notification + taskbar flash for sessions awaiting the user
-          // (idle or permission) that are not visible. Bucketing via
-          // shared/activity-state.ts; the permission-specific message text below
-          // still keys off the granular state.
-          if (requiresUserInteraction(state)) {
-            const notifyConfig = useConfigStore.getState().config.notifications;
-            if (notifyConfig.desktop.onAgentIdle) {
-              const session = sessionStore.sessions.find((s) => s.id === sessionId);
-              if (session) {
-                shouldNotify(sessionId, session.projectId).then((notify) => {
-                  if (!notify) return;
-                  const project = useProjectStore.getState().projects.find((p) => p.id === session.projectId);
-                  const projectName = project?.name ?? 'A project';
-                  const label = session.transient ? 'Command Terminal' : (taskTitle ?? 'A task');
-                  // activity-state-ok: granular permission-vs-idle message text, not an idle-vs-active bucket
-                  const body = state === 'permission' ? `Needs permission: ${projectName}` : projectName;
-                  const clickTaskId = session.transient ? COMMAND_TERMINAL_NOTIFICATION_TASK_ID : (taskId ?? '');
-                  sendNotification(sessionId, label, body, session.projectId, clickTaskId);
-                });
-              }
-            }
-          }
+          // The desktop OS-notification decision for idle/permission sessions
+          // (cooldown, focus gate, active-project gate, title assembly) now
+          // lives in main (src/main/notifications/desktop-notifier.ts), which
+          // listens to SessionManager's 'activity' event directly. That keeps
+          // it working even when this renderer is gone (window closed).
         });
       }));
     }
@@ -545,10 +526,23 @@ export function App() {
         const alreadyActive = useProjectStore.getState().currentProject?.id === projectId;
         const isCommandTerminal = taskId === COMMAND_TERMINAL_NOTIFICATION_TASK_ID;
         if (isCommandTerminal) {
-          useSessionStore.getState().setPendingOpenCommandTerminal(true);
-          if (!alreadyActive) {
-            useProjectStore.getState().openProject(projectId);
+          if (alreadyActive) {
+            useSessionStore.getState().setPendingOpenCommandTerminal(true);
+            return;
           }
+          // Arm the flag only once the switch is CONFIRMED, the same contract the
+          // sidebar indicator follows (`ProjectSidebar.handleOpenCommandTerminals`).
+          // Setting it up front let `useCommandBar`'s effect fire while the OUTGOING
+          // project was still current, opening the layer on the wrong project until
+          // the close-on-project-change effect tore it back down. `openProject` also
+          // RESOLVES without switching (a moved or renamed folder routes to the
+          // "Locate Folder" dialog), so confirm rather than merely sequence.
+          useProjectStore.getState().openProject(projectId)
+            .then(() => {
+              if (useProjectStore.getState().currentProject?.id !== projectId) return;
+              useSessionStore.getState().setPendingOpenCommandTerminal(true);
+            })
+            .catch(() => {});
           return;
         }
         if (taskId && alreadyActive) {
@@ -580,6 +574,22 @@ export function App() {
     if (boardConfig?.onShortcutsChanged) {
       cleanups.push(boardConfig.onShortcutsChanged(() => {
         useBoardStore.getState().loadShortcuts();
+      }));
+    }
+    if (boardConfig?.onBoardProfilesChanged) {
+      // An agent (MCP) rewrote the profiles. Unlike a column edit this raises no
+      // BOARD_CONFIG_CHANGED, so without this the live profile pickers
+      // (ProfilePicker, AdvancedOverridesSection) would keep showing the
+      // pre-edit list. An already-open Column Manager deliberately does NOT
+      // adopt the change - it snapshots its profile drafts once on mount so an
+      // external write cannot clobber in-progress edits.
+      //
+      // Filtered by project: an agent can retune a BACKGROUND project's
+      // profiles, and `getBoardProfiles()` always reads the ACTIVE board, so an
+      // unfiltered reload would refetch the wrong project's list for no reason.
+      cleanups.push(boardConfig.onBoardProfilesChanged((changedProjectId) => {
+        if (changedProjectId !== useProjectStore.getState().currentProject?.id) return;
+        useBoardStore.getState().loadBoardProfiles();
       }));
     }
 
@@ -724,7 +734,9 @@ if (import.meta.hot) {
     useProjectStore.getState().loadCurrent();
     useConfigStore.getState().loadConfig();
     useConfigStore.getState().loadAgentList();
+    useConfigStore.getState().detectGit();
     useBoardStore.getState().loadBoard();
+    useBoardStore.getState().loadBoardProfiles();
     useBacklogStore.getState().loadBacklog();
     useMobileStore.getState().loadStatus();
     useMobileStore.getState().loadDevices();

@@ -53,9 +53,12 @@ export {
   type ReadStreamSessionStatusWire,
   type TranscriptWindowResponsePayload,
   type ReadBoardRequestPayload,
+  type ReadBoardView,
   type ReadBoardProjectSummary,
+  type ReadBoardProjectGroup,
   type ReadBoardProjectListResponsePayload,
   type ReadBoardSnapshotResponsePayload,
+  type ReadBoardArchivedResponsePayload,
   type ReadBoardResponsePayload,
   type ReadDiffScope,
   type ReadDiffRequestPayload,
@@ -93,6 +96,10 @@ export {
   type PairingQrPayload,
 } from './pairing/qr';
 
+export { sealPairingConfirm, openPairingConfirm } from './pairing/confirm';
+
+export { MAX_RELAY_ADDRESS_LENGTH, isSecureRelayAddress } from './pairing/relay-address';
+
 export {
   signRosterEntry,
   verifyRosterEntry,
@@ -104,6 +111,8 @@ export {
   type RosterDeviceEntry,
   type DeviceRoster,
 } from './roster/roster';
+
+export { formatKeyFingerprint } from './roster/fingerprint';
 
 export {
   CAPABILITY_VERBS,
@@ -146,6 +155,7 @@ export {
   isActivityStateWire,
   isActivityReasonWire,
   parseSessionUsageWire,
+  parseSessionSummaryWire,
   parseSessionEventWire,
   parseTerminalDimensionsWire,
   parseBoardColumnWire,
@@ -160,6 +170,7 @@ export {
   type ActivityStateWire,
   type ActivityReasonWire,
   type SessionUsageWire,
+  type SessionSummaryWire,
   type SessionEventWire,
   type TerminalDimensionsWire,
   type BoardColumnWire,

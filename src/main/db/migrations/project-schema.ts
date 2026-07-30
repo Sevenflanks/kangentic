@@ -829,6 +829,98 @@ export function runProjectMigrations(db: Database.Database): void {
   db.exec('CREATE INDEX IF NOT EXISTS idx_turn_usage_session ON conversation_turn_usage(session_id)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_turn_usage_ts ON conversation_turn_usage(ts)');
 
+  // Durable activity-disposition-interval ledger: one row per continuous span
+  // a session spent in one `ActivityDisposition` bucket ('idle' - needing the
+  // user, covering both ActivityState idle and permission - or 'active' -
+  // the agent working on its own, ActivityState thinking; see
+  // shared/activity-state.ts's dispositionOf). The engine itself is
+  // in-memory only (recentTransitions is a debug-only bounded ring, wiped on
+  // deleteSession/dispose), and the one on-disk trace (events.jsonl) is
+  // neither faithful - it records raw hook events, not committed
+  // transitions, so a raw idle cancelled by the 400ms stability window still
+  // appears there with no matching UI change - nor reliably retained
+  // (truncated on session-dir reuse, deleted on cleanup). This table is the
+  // only durable, faithful record of the engine's committed transitions.
+  //
+  // Symmetric by design (both dispositions, not idle-only): deriving "active
+  // time" as (session lifetime) minus (idle time) is fragile - it needs
+  // exact session-boundary timestamps, breaks across a task's multiple
+  // sessions (resume) and suspend/resume gaps, and a crash-orphaned open
+  // interval (see below) would corrupt the subtraction silently. Recording
+  // both directly means "active time" and "idle time" are each a straight
+  // SUM over this table, no inverse math or session-boundary reconciliation
+  // needed.
+  //
+  // enter_trigger / exit_trigger carry the engine's own TransitionTrigger
+  // labels (activity-engine.ts) so a consumer can tell a hook-authoritative
+  // park (`event:idle`) from a watchdog guess (`timer:stale-thinking`,
+  // `timer:stuck-subagent`, `force-idle`), and a real human reply
+  // (`event:prompt` with no synthetic detail) from the agent resuming itself
+  // (`event:prompt:pty-activity`, `force-thinking`) - without those, an
+  // average "wait time" silently mixes in the engine's own known false-idle
+  // classes.
+  //
+  // One row per INTERVAL, not per transition: a permission<->idle crossing
+  // stays within the same 'idle'-disposition interval (both map to the same
+  // disposition, so nothing closes/reopens), so `duration_ms` is a stored
+  // column instead of requiring a self-join to reconstruct.
+  //
+  // KNOWN GAP - the seed span is NOT recorded. The window before a session's
+  // first DISPOSITION FLIP is skipped, since the engine's `initSession` seed
+  // carries no prior state to diff against. This is larger than it sounds:
+  // events within a turn (tool/subagent/bg-shell) keep the predicate at
+  // 'thinking' and commit no transition, so a fresh spawn's entire first
+  // active turn contributes 0ms to `activeMs`, and an idle-seeded session
+  // (resume) that is never answered produces NO ROW AT ALL - `getForTask`
+  // returns empty for exactly the "how long has this been waiting on me"
+  // question. The live board tooltip reads `needsUserSince` off the engine
+  // instead and is unaffected. Closing this needs the engine to announce its
+  // seed (an explicit onSessionSeeded hook), not a ring-shape heuristic.
+  //
+  // Deliberately NO sessions-DELETE cascade, matching conversation_turn_usage
+  // above - but for a different reason: that table's no-cascade protects a
+  // turn shared across a resume, which does not apply here (an interval
+  // belongs to exactly one session). This table's durability is the entire
+  // point: an interval must outlive the session row that produced it, the
+  // same way the token ledger outlives the transcript file it was read from.
+  // A session that crashes mid-interval leaves it permanently open
+  // (`ended_ms IS NULL`); consumers filter that out rather than the engine
+  // attempting reconciliation on restart.
+  // started_ms/ended_ms are the epoch-ms columns the store's duration_ms
+  // arithmetic and started_ms index actually use (matching
+  // conversation_turn_usage's `ts INTEGER` above). started_at/ended_at are a
+  // TEXT ISO 8601 MIRROR of those same two instants (per utc-timestamps.md),
+  // written by the store from the same input so the two representations can
+  // never drift - not independently sourced, not user-suppliable. They exist
+  // purely for readability: a human (or an agent) reading raw SQL via
+  // kangentic_query_db, or the kangentic_get_activity_intervals MCP tool's
+  // response, gets a real timestamp instead of having to convert epoch ms by
+  // hand. ended_at is NULL exactly when ended_ms is (the interval is open).
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS session_activity_intervals (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id TEXT NOT NULL,
+      task_id TEXT,
+      disposition TEXT NOT NULL,
+      state TEXT NOT NULL,
+      previous_state TEXT NOT NULL,
+      enter_trigger TEXT NOT NULL,
+      started_ms INTEGER NOT NULL,
+      started_at TEXT NOT NULL,
+      ended_ms INTEGER,
+      ended_at TEXT,
+      duration_ms INTEGER,
+      exit_trigger TEXT,
+      recorded_at TEXT NOT NULL
+    )
+  `);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_activity_intervals_task ON session_activity_intervals(task_id)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_activity_intervals_session ON session_activity_intervals(session_id)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_activity_intervals_started ON session_activity_intervals(started_ms)');
+  // Resolves the one open interval for a session (WHERE session_id = ? AND
+  // ended_ms IS NULL) without holding row ids in memory across a restart.
+  db.exec('CREATE INDEX IF NOT EXISTS idx_activity_intervals_open ON session_activity_intervals(session_id, ended_ms)');
+
   // Cascade cleanup when a session is deleted (mirrors trg_sessions_delete_transcript).
   db.exec(`
     CREATE TRIGGER IF NOT EXISTS trg_sessions_delete_memory
@@ -990,6 +1082,107 @@ export function runProjectMigrations(db: Database.Database): void {
     .some((col) => col.name === 'auto_command');
   if (!hasTaskAutoCommand) {
     db.exec('ALTER TABLE tasks ADD COLUMN auto_command TEXT DEFAULT NULL');
+  }
+
+  // Migration: record every message sent into a session via
+  // kangentic_send_session_message - by another agent, or by a human steering
+  // that session directly.
+  //
+  // The delivered text carries NO in-band marker: an attribution prefix costs
+  // tokens on every send and, empirically (2026-07-25), reads to the receiving
+  // agent as injected content asserting its own authority, which is the shape
+  // of a prompt injection - it refused messages sent this way rather than
+  // acting on them. So provenance lives here, out of the agent's context, where
+  // it costs nothing and cannot be forged by anything the agent writes.
+  // `message` is stored verbatim, which is exactly the transcript turn's
+  // content now that nothing is prepended, so a consumer can match a turn to
+  // the row that sent it.
+  //
+  // caller_session_id / caller_task_id are deliberately NOT foreign keys: a
+  // cross-project send originates in a different project's database, so the
+  // ids are not resolvable locally. They are null when a human sent the message
+  // with no Kangentic session of their own.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS session_messages_sent (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+      caller_session_id TEXT,
+      caller_task_id TEXT,
+      caller_project_id TEXT,
+      message TEXT NOT NULL,
+      status TEXT NOT NULL,
+      error TEXT,
+      created_at TEXT NOT NULL
+    )
+  `);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_session_messages_sent_session_id ON session_messages_sent(session_id)');
+
+  // `error` was added after the table shipped: a row records every
+  // ATTEMPT (delivered / queued / refused / failed), not just the ones that
+  // landed, so "did my message go through?" always has an answer. Guarded so a
+  // database created by the intermediate shape picks the column up.
+  const hasSentMessageError = (db.pragma('table_info(session_messages_sent)') as Array<{ name: string }>)
+    .some((col) => col.name === 'error');
+  if (!hasSentMessageError) {
+    db.exec('ALTER TABLE session_messages_sent ADD COLUMN error TEXT DEFAULT NULL');
+  }
+
+  // Migration: add per-task profile_id column. Points at a named Board Profile
+  // in kangentic.json's `profiles` array, whose per-column strategy deltas this
+  // task follows as it moves (e.g. Planning in Opus xhigh, Executing in Opus
+  // high, Merge in Sonnet high). NULL means the synthetic "Default" profile -
+  // the columns' own base settings - so existing tasks need no backfill and
+  // behavior is unchanged until someone creates a profile.
+  //
+  // Deliberately NOT a foreign key: profiles live in a checked-in config file,
+  // not this database, so a teammate deleting a profile must degrade to Default
+  // rather than fail a write. Resolution is total (see resolveColumnStrategy).
+  //
+  // Mutually exclusive with agent_override / model_override / effort_override /
+  // permission_mode, enforced in TaskRepository. That exclusivity is what keeps
+  // lockAdvancedOverridesOnFirstSpawn from freezing a profile task's ladder at
+  // its first column.
+  const hasTaskProfileId = (db.pragma('table_info(tasks)') as Array<{ name: string }>)
+    .some((col) => col.name === 'profile_id');
+  if (!hasTaskProfileId) {
+    db.exec('ALTER TABLE tasks ADD COLUMN profile_id TEXT DEFAULT NULL');
+  }
+
+  // Migration: add per-task run_mode column. Which of the two dialog branches
+  // ("Column Settings" vs "Agent Override") the user chose, persisted instead of
+  // derived. It has to be stored, because "Agent Override with all four fields
+  // left on inherit" writes exactly the same five nulls as "Column Settings"
+  // while meaning the opposite: the first locks agent/model/effort/permission at
+  // first spawn, the second follows the columns forever. Deriving it silently
+  // dropped the user's choice on every save.
+  //
+  // The backfill reproduces the old `hasAnyOverrideSet` derivation exactly, so
+  // every existing row keeps its current behavior: any of the four pins set means
+  // the task was authored in override mode. auto_command is deliberately excluded
+  // (it is an MCP escape hatch, not an Advanced pin - see ADVANCED_PIN_FIELDS in
+  // task-repository.ts). The `profile_id IS NULL` clause is belt-and-braces: a
+  // profile task cannot carry a pin (TaskRepository has enforced that since
+  // profile_id shipped), so the clause changes no row today - but it makes the
+  // backfill correct by construction rather than by trusting an invariant
+  // enforced in another file, and a row claiming both a profile and override
+  // mode is exactly what the first-spawn lock must never see.
+  //
+  // ALTER + backfill run in ONE transaction because the guard above tests only
+  // for the column's existence. A crash between the two would leave the column
+  // present and the guard satisfied, so the backfill would never run again and
+  // every already-pinned task on that database would be stuck reporting
+  // 'column_settings' forever.
+  const hasTaskRunMode = (db.pragma('table_info(tasks)') as Array<{ name: string }>)
+    .some((column) => column.name === 'run_mode');
+  if (!hasTaskRunMode) {
+    const addRunModeTransaction = db.transaction(() => {
+      db.exec("ALTER TABLE tasks ADD COLUMN run_mode TEXT NOT NULL DEFAULT 'column_settings'");
+      db.exec(`UPDATE tasks SET run_mode = 'agent_override'
+        WHERE profile_id IS NULL
+          AND (agent_override IS NOT NULL OR model_override IS NOT NULL
+            OR effort_override IS NOT NULL OR permission_mode IS NOT NULL)`);
+    });
+    addRunModeTransaction();
   }
 
   // Seed default swimlanes if empty (must run after all ALTER TABLE migrations)

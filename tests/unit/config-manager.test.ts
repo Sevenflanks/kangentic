@@ -127,6 +127,53 @@ describe('Config Manager -- Permission Mode Migration', () => {
   });
 });
 
+describe('Config Manager -- mobileBridge relay resolution across the default merge', () => {
+  // Regression: DEFAULT_CONFIG.mobileBridge used to seed relayMode: 'hosted'.
+  // mobileBridge is not a CONFIG_DICTIONARY_PATHS entry, so load() merges it
+  // key-by-key with the parsed file rather than replacing it wholesale - which
+  // meant that seeded 'hosted' filled in over a config written before
+  // relayMode existed, defeating resolveRelayUrl's "relayMode missing but
+  // relayUrl set => custom" inference and silently moving every upgrading
+  // self-hoster onto the Kangentic-hosted relay.
+  //
+  // These assert through ConfigManager.load() on purpose. tests/unit/relay-url.test.ts
+  // covers the same inference, but it hand-builds the mobileBridge object and so
+  // never sees the default merge - it stayed green while the shipped path was broken.
+
+  it('keeps dialing a pre-relayMode custom relay after the default merge', async () => {
+    fs.writeFileSync(configPath, JSON.stringify({
+      mobileBridge: { enabled: true, relayUrl: 'wss://self-hosted.example.com' },
+    }));
+
+    const cm = await createConfigManager();
+    const config = cm.load();
+    const { resolveRelayUrl } = await import('../../src/shared/relay');
+
+    expect(config.mobileBridge?.relayMode).toBeUndefined();
+    expect(resolveRelayUrl(config.mobileBridge)).toBe('wss://self-hosted.example.com/');
+  });
+
+  it('resolves to the hosted relay for a fresh config with no relay settings', async () => {
+    const cm = await createConfigManager();
+    const config = cm.load();
+    const { KANGENTIC_HOSTED_RELAY_URL, resolveRelayUrl } = await import('../../src/shared/relay');
+
+    expect(resolveRelayUrl(config.mobileBridge)).toBe(KANGENTIC_HOSTED_RELAY_URL);
+  });
+
+  it('honors an explicit hosted choice even when a stale relayUrl is still on disk', async () => {
+    fs.writeFileSync(configPath, JSON.stringify({
+      mobileBridge: { enabled: true, relayMode: 'hosted', relayUrl: 'wss://self-hosted.example.com' },
+    }));
+
+    const cm = await createConfigManager();
+    const config = cm.load();
+    const { KANGENTIC_HOSTED_RELAY_URL, resolveRelayUrl } = await import('../../src/shared/relay');
+
+    expect(resolveRelayUrl(config.mobileBridge)).toBe(KANGENTIC_HOSTED_RELAY_URL);
+  });
+});
+
 describe('Config Manager -- claude.* to agent.* namespace migration', () => {
   it('migrates legacy claude.* to agent.* on load', async () => {
     fs.writeFileSync(configPath, JSON.stringify({
@@ -189,6 +236,101 @@ describe('Config Manager -- claude.* to agent.* namespace migration', () => {
 
     expect(config.agent.cliPaths).toEqual({ gemini: '/usr/bin/gemini' });
     expect(config.agent.maxConcurrentSessions).toBe(4);
+  });
+});
+
+describe('Config Manager -- terminal.* project-override migration', () => {
+  // terminal.{shell,fontFamily,fontSize,scrollbackLines,cursorStyle} moved from
+  // project-overridable to global-only (see AppConfig['terminal'] doc comments
+  // in shared/types.ts). loadProjectOverrides() must strip any of these a
+  // project already has on disk rather than silently keep applying them with
+  // no UI left to see or clear them.
+  function projectOverridesPath(projectDir: string): string {
+    return path.join(projectDir, '.kangentic', 'config.json');
+  }
+
+  function writeProjectOverrides(projectDir: string, overrides: Record<string, unknown>): void {
+    fs.mkdirSync(path.join(projectDir, '.kangentic'), { recursive: true });
+    fs.writeFileSync(projectOverridesPath(projectDir), JSON.stringify(overrides));
+  }
+
+  it('strips the migrated keys but keeps other terminal.* and non-terminal settings', async () => {
+    const projectDir = path.join(tmpDir, 'proj-a');
+    writeProjectOverrides(projectDir, {
+      theme: 'forest',
+      terminal: { shell: 'pwsh.exe', fontSize: 16, colors: { background: '#111' } },
+      git: { worktreesEnabled: true },
+    });
+
+    const cm = await createConfigManager();
+    const overrides = cm.loadProjectOverrides(projectDir);
+
+    expect(overrides?.theme).toBe('forest');
+    expect(overrides?.git).toEqual({ worktreesEnabled: true });
+    expect(overrides?.terminal).toEqual({ colors: { background: '#111' } });
+
+    const raw = JSON.parse(fs.readFileSync(projectOverridesPath(projectDir), 'utf-8'));
+    expect(raw.terminal).toEqual({ colors: { background: '#111' } });
+  });
+
+  it('deletes the terminal key entirely when nothing survives the strip', async () => {
+    const projectDir = path.join(tmpDir, 'proj-b');
+    writeProjectOverrides(projectDir, {
+      theme: 'ember',
+      terminal: { shell: 'bash', fontFamily: 'Consolas', scrollbackLines: 2000, cursorStyle: 'bar' },
+    });
+
+    const cm = await createConfigManager();
+    const overrides = cm.loadProjectOverrides(projectDir);
+
+    expect(overrides).not.toHaveProperty('terminal');
+
+    const raw = JSON.parse(fs.readFileSync(projectOverridesPath(projectDir), 'utf-8'));
+    expect(raw).not.toHaveProperty('terminal');
+  });
+
+  it('does not rewrite the file when there is nothing to migrate', async () => {
+    const projectDir = path.join(tmpDir, 'proj-c');
+    writeProjectOverrides(projectDir, { theme: 'sky', terminal: { colors: { background: '#222' } } });
+    const before = fs.statSync(projectOverridesPath(projectDir)).mtimeMs;
+
+    const cm = await createConfigManager();
+    cm.loadProjectOverrides(projectDir);
+
+    const after = fs.statSync(projectOverridesPath(projectDir)).mtimeMs;
+    expect(after).toBe(before);
+  });
+
+  it('does not re-migrate on a second load (idempotent)', async () => {
+    const projectDir = path.join(tmpDir, 'proj-d');
+    writeProjectOverrides(projectDir, { terminal: { shell: 'zsh' } });
+
+    const cm = await createConfigManager();
+    cm.loadProjectOverrides(projectDir);
+    const overrides = cm.loadProjectOverrides(projectDir);
+
+    expect(overrides).not.toHaveProperty('terminal');
+  });
+
+  it('strips a legacy terminal.backspaceSendsCtrlH override in isolation, keeping its sibling terminal.* key', async () => {
+    // backspaceSendsCtrlH joined the other 5 legacy keys (shell/fontFamily/
+    // fontSize/scrollbackLines/cursorStyle) as global-only in this same
+    // change (it was merged in from an upstream PR as project-scoped and
+    // rescoped during conflict resolution). Isolate it from its siblings so
+    // this test only goes red if backspaceSendsCtrlH specifically falls out
+    // of the migration's droppedKeys list, not if some other key does.
+    const projectDir = path.join(tmpDir, 'proj-e');
+    writeProjectOverrides(projectDir, {
+      terminal: { backspaceSendsCtrlH: false, colors: { background: '#333' } },
+    });
+
+    const cm = await createConfigManager();
+    const overrides = cm.loadProjectOverrides(projectDir);
+
+    expect(overrides?.terminal).toEqual({ colors: { background: '#333' } });
+
+    const raw = JSON.parse(fs.readFileSync(projectOverridesPath(projectDir), 'utf-8'));
+    expect(raw.terminal).toEqual({ colors: { background: '#333' } });
   });
 });
 
@@ -265,5 +407,138 @@ describe('Config Manager -- commandTerminalWorkspace replace semantics', () => {
     expect(raw.commandTerminalWorkspace._staleKey).toBeUndefined();
     // The new focusedTaskId must reflect the second write.
     expect(raw.commandTerminalWorkspace.focusedTaskId).toBe('slot-new');
+  });
+});
+
+describe('Config Manager -- agent.launchOptions replace semantics', () => {
+  // Coverage hole: 'agent.launchOptions' is a CONFIG_DICTIONARY_PATHS entry
+  // (config-manager.ts), which makes save() REPLACE the whole two-level
+  // agent-name -> option-id -> enabled map wholesale instead of deep-merging
+  // it, so deleting a previously-stored agent's entry actually works. No prior
+  // test in this file (or deep-merge.test.ts, which only exercises the
+  // generic deepMerge mechanism with a hand-supplied dictionaryPaths list
+  // decoupled from this constant) drives a save() call through this specific
+  // entry, so removing 'agent.launchOptions' from CONFIG_DICTIONARY_PATHS
+  // currently goes undetected.
+  it('save({ agent: { launchOptions } }) REPLACES the previous two-level map, not deep-merges it', async () => {
+    const cm = await createConfigManager();
+
+    // First write: two agents both carry a launchOptions entry, plus a
+    // sibling agent.* field (cliPaths) that must survive the second write.
+    cm.save({
+      agent: {
+        cliPaths: { claude: '/usr/bin/claude' },
+        launchOptions: {
+          claude: { foo: true },
+          codex: { disableApps: false },
+        },
+      } as Parameters<typeof cm.save>[0]['agent'],
+    });
+    const afterFirstWrite = cm.load();
+    expect(afterFirstWrite.agent.launchOptions).toEqual({
+      claude: { foo: true },
+      codex: { disableApps: false },
+    });
+
+    // Second write: only codex.disableApps is mentioned. With deep-merge
+    // semantics the prior 'claude' entry would survive; with replace
+    // semantics the whole map is swapped out and 'claude' is gone.
+    cm.save({
+      agent: {
+        launchOptions: {
+          codex: { disableApps: true },
+        },
+      } as Parameters<typeof cm.save>[0]['agent'],
+    });
+    const afterSecondWrite = cm.load();
+
+    // Red: commenting out 'agent.launchOptions' in CONFIG_DICTIONARY_PATHS
+    // (config-manager.ts) makes this deep-merge instead, so the 'claude'
+    // entry from the first write survives and this fails.
+    expect(afterSecondWrite.agent.launchOptions).toEqual({ codex: { disableApps: true } });
+    expect('claude' in afterSecondWrite.agent.launchOptions).toBe(false);
+
+    // Sibling agent.* fields (untouched by the second, launchOptions-only
+    // save) must survive: cliPaths from the first write, permissionMode from
+    // DEFAULT_CONFIG.
+    expect(afterSecondWrite.agent.cliPaths).toEqual({ claude: '/usr/bin/claude' });
+    expect(afterSecondWrite.agent.permissionMode).toBe('acceptEdits');
+
+    // Verify the on-disk file also reflects replace semantics, not the
+    // previous map.
+    const raw = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    expect(raw.agent.launchOptions).toEqual({ codex: { disableApps: true } });
+    expect('claude' in raw.agent.launchOptions).toBe(false);
+  });
+});
+
+describe('Config Manager -- terminal.scrollbackLines global migration', () => {
+  // The scrollbackLines setting was removed; the live xterm scrollback cap
+  // is now a fixed internal constant (TERMINAL_SCROLLBACK_LINES in
+  // useTerminal.ts). load() must one-time-strip a stale global
+  // terminal.scrollbackLines left over from before the removal.
+
+  it('strips scrollbackLines from the loaded config and rewrites the file, keeping sibling terminal.* keys', async () => {
+    fs.writeFileSync(configPath, JSON.stringify({
+      terminal: { scrollbackLines: 5000, cursorStyle: 'underline' },
+    }));
+
+    const cm = await createConfigManager();
+    const config = cm.load();
+
+    expect(config.terminal).not.toHaveProperty('scrollbackLines');
+    expect(config.terminal.cursorStyle).toBe('underline');
+
+    const raw = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    expect(raw.terminal).not.toHaveProperty('scrollbackLines');
+    expect(raw.terminal.cursorStyle).toBe('underline');
+  });
+
+  it('does not re-migrate on a second load of the already-clean file', async () => {
+    fs.writeFileSync(configPath, JSON.stringify({
+      terminal: { scrollbackLines: 3000, cursorStyle: 'block' },
+    }));
+
+    const cm = await createConfigManager();
+    cm.load();
+    const config = cm.load();
+
+    expect(config.terminal).not.toHaveProperty('scrollbackLines');
+    expect(config.terminal.cursorStyle).toBe('block');
+  });
+});
+
+describe('Config Manager -- terminal.colors replace semantics', () => {
+  it('removing a slot key from a later save() actually clears it, not deep-merges it back', async () => {
+    const cm = await createConfigManager();
+
+    cm.save({ terminal: { colors: { background: '#fff', foreground: '#000' } } });
+    const afterFirstWrite = cm.load();
+    expect(afterFirstWrite.terminal.colors).toEqual({ background: '#fff', foreground: '#000' });
+
+    // Save again WITHOUT foreground. With dictionaryPaths replace semantics the
+    // whole terminal.colors map is swapped out, so foreground is gone. With
+    // deep-merge semantics (replaceFlatMaps: false, no dictionaryPaths entry)
+    // the previous foreground would survive the merge instead.
+    cm.save({ terminal: { colors: { background: '#fff' } } });
+    const afterSecondWrite = cm.load();
+    expect(afterSecondWrite.terminal.colors.foreground).toBeUndefined();
+    expect(afterSecondWrite.terminal.colors.background).toBe('#fff');
+
+    const raw = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    expect(raw.terminal.colors).not.toHaveProperty('foreground');
+  });
+
+  it('saving an empty colors map clears every previously-set slot', async () => {
+    const cm = await createConfigManager();
+
+    cm.save({ terminal: { colors: { background: '#fff', foreground: '#000', cursor: '#abc' } } });
+    cm.save({ terminal: { colors: {} } });
+
+    const config = cm.load();
+    expect(config.terminal.colors).toEqual({});
+
+    const raw = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    expect(raw.terminal.colors).toEqual({});
   });
 });

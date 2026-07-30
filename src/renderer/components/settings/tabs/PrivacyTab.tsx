@@ -2,6 +2,9 @@ import { ShieldAlert } from 'lucide-react';
 import { Pill } from '../../Pill';
 import { SectionHeader } from '../shared';
 
+const FORK_DISCUSSIONS_URL = 'https://github.com/Sevenflanks/kangentic/discussions';
+const FORK_ISSUES_URL = 'https://github.com/Sevenflanks/kangentic/issues';
+
 export function PrivacyTab() {
   return (
     <div className="space-y-4">
@@ -42,6 +45,29 @@ export function PrivacyTab() {
       <SectionHeader label="How to Opt Out" />
       <p className="text-sm text-fg-muted leading-relaxed">
         Set <code className="font-mono">KANGENTIC_TELEMETRY=0</code> as an environment variable to disable analytics.
+      </p>
+
+      <SectionHeader label="Questions" />
+      <p className="text-sm text-fg-muted leading-relaxed">
+        Ask questions in{' '}
+        <button
+          type="button"
+          data-testid="privacy-contact-discussions"
+          onClick={() => void window.electronAPI.shell.openExternal(FORK_DISCUSSIONS_URL)}
+          className="text-fg-secondary underline underline-offset-2 hover:text-fg transition-colors cursor-pointer"
+        >
+          GitHub Discussions
+        </button>
+        {' '}or report a bug in{' '}
+        <button
+          type="button"
+          data-testid="privacy-contact-issues"
+          onClick={() => void window.electronAPI.shell.openExternal(FORK_ISSUES_URL)}
+          className="text-fg-secondary underline underline-offset-2 hover:text-fg transition-colors cursor-pointer"
+        >
+          GitHub Issues
+        </button>
+        .
       </p>
     </div>
   );

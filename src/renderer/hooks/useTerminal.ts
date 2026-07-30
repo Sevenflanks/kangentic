@@ -1,8 +1,9 @@
 import { useEffect, useRef, useCallback } from 'react';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '../addons/fit-addon';
-import { attachWebglRenderer } from '../utils/terminal-webgl';
+import { attachWebglRenderer, notifyFontChanged } from '../utils/terminal-webgl';
 import { copySelectionToClipboard, enableTerminalClipboard, stripOsc52Sequences } from '../utils/terminal-clipboard';
+import { createTerminalLinkHandler } from '../utils/terminal-link-handler';
 import { createWriteBatcher, type WriteBatcher } from '../utils/write-batcher';
 import { routeTerminalData } from '../utils/terminal-data-router';
 import { createIncomingWriteQueue, writeChunkedToTerminal } from '../utils/incoming-write-queue';
@@ -10,6 +11,7 @@ import { isBoardDragActive, onBoardDragEnd } from '../lib/session-update-coalesc
 import { isTerminalParked, onTerminalReveal } from '../utils/parked-terminals';
 import { noteTerminalFocus } from '../utils/dictation-target';
 import { registerTerminalCapture, unregisterTerminalCapture, type TerminalCaptureReader } from '../utils/terminal-capture-registry';
+import type { TerminalColorOverrides } from '../../shared/types';
 import '@xterm/xterm/css/xterm.css';
 
 /** Delay before forwarding a resize to the PTY. Coalesces rapid resizes
@@ -23,6 +25,14 @@ const PTY_RESIZE_DEBOUNCE_MS = 200;
  *  Comfortably above a healthy replay (repaint-settle caps at 400ms, plus a
  *  512KB chunked write) and far below a pathological hang. */
 const SCROLLBACK_WATCHDOG_MS = 5000;
+
+/** Live xterm scrollback cap (lines), applied to every session terminal.
+ *  Every terminal (re)creation - mount, tab/window switch, resize,
+ *  park-then-reveal, ownership handoff - refills the visible buffer from the
+ *  main-process 512KB raw-ANSI ring (MAX_SCROLLBACK in pty-buffer-manager.ts)
+ *  regardless of this cap, so it only bounds a continuously-mounted,
+ *  actively-streaming terminal's in-place scroll depth between replays. */
+const TERMINAL_SCROLLBACK_LINES = 5000;
 
 /** Scroll positions saved before xterm dispose, keyed by session ID.
  *  Preserved across HMR via import.meta.hot.data so terminals restore
@@ -47,46 +57,69 @@ function nextTransientRendererKey(): number {
   return transientRendererKeyCounter;
 }
 
-/** Fixed terminal background, exported for surfaces that must match it exactly
- *  (e.g. TerminalTab's replay veil). NOT a theme token: the terminal stays dark
- *  on every app theme, so a veil using a theme surface color would flash. */
-export const TERMINAL_BACKGROUND = '#18181b';
-
-/** Fixed dark terminal theme -- Claude Code's TUI is designed for dark backgrounds. */
-const TERMINAL_THEME = {
-  background: TERMINAL_BACKGROUND,
+/** Built-in terminal colors, used whenever the user hasn't customized a given
+ *  slot (see TerminalColorOverrides in shared/types.ts). The ANSI 16 default to
+ *  Windows Terminal's real "Campbell" scheme (learn.microsoft.com/windows/terminal
+ *  /customize-settings/color-schemes) so an unconfigured terminal still reads as
+ *  a real terminal, not an app panel with text in it. `black` is deliberately
+ *  NOT Campbell's native black (`#0C0C0C`, identical to the default background):
+ *  that would make black-on-default text and black fills invisible, so it's
+ *  kept at the old zinc-900 tone instead, subdued but present. */
+export const TERMINAL_DEFAULT_COLORS = {
+  background: '#0c0c0c',
   foreground: '#e4e4e7',
-  // Light cursor. It was the background color (#18181b) - i.e. invisible - which is
-  // why no cursor ever showed. cursorAccent is the dark background so the character
-  // under a block cursor stays readable (dark glyph on the light block).
   cursor: '#e4e4e7',
-  cursorAccent: '#18181b',
   selectionBackground: 'rgba(58, 130, 246, 0.35)',
   black: '#18181b',
-  red: '#ef4444',
-  green: '#22c55e',
-  yellow: '#eab308',
-  blue: '#3b82f6',
-  magenta: '#a855f7',
-  cyan: '#06b6d4',
-  white: '#e4e4e7',
-  brightBlack: '#52525b',
-  brightRed: '#f87171',
-  brightGreen: '#4ade80',
-  brightYellow: '#facc15',
-  brightBlue: '#60a5fa',
-  brightMagenta: '#c084fc',
-  brightCyan: '#22d3ee',
-  brightWhite: '#fafafa',
+  red: '#C50F1F', green: '#13A10E', yellow: '#C19C00', blue: '#0037DA', magenta: '#881798', cyan: '#3A96DD', white: '#CCCCCC',
+  brightBlack: '#767676', brightRed: '#E74856', brightGreen: '#16C60C', brightYellow: '#F9F1A5', brightBlue: '#3B78FF', brightMagenta: '#B4009E', brightCyan: '#61D6D6', brightWhite: '#F2F2F2',
 } as const;
+
+/** Resolves the effective terminal background: the user's custom override, or
+ *  the built-in default. Exported so surfaces that must paint the identical
+ *  color BEFORE (or independent of) the xterm instance itself - the host
+ *  container, the replay veil - stay in lockstep with whatever the user has
+ *  configured, instead of drifting from a stale fixed constant. A veil or
+ *  container using a different color than the live xterm theme would show a
+ *  visible seam/flash; see TerminalTab.tsx and CommandTerminalWindow.tsx. */
+export function resolveTerminalBackground(colors: TerminalColorOverrides | undefined): string {
+  return colors?.background || TERMINAL_DEFAULT_COLORS.background;
+}
+
+/** Resolves the effective terminal foreground: the user's custom override, or
+ *  the built-in default. Mirrors resolveTerminalBackground so a surface that
+ *  must paint terminal-matching text (e.g. LaunchOverlay's terminal variant)
+ *  stays in lockstep with the live xterm theme instead of a stale constant. */
+export function resolveTerminalForeground(colors: TerminalColorOverrides | undefined): string {
+  return colors?.foreground || TERMINAL_DEFAULT_COLORS.foreground;
+}
+
+/** Builds the full xterm theme: background/foreground/cursor layer the user's
+ *  overrides over the defaults; the 16-color ANSI palette is always the fixed
+ *  built-in scheme (not user-customizable - see TerminalColorOverrides).
+ *  `cursorAccent` always tracks the resolved `background` (not a fixed value)
+ *  so the glyph under a block cursor stays legible even when the user picks a
+ *  custom background. */
+export function buildTerminalTheme(colors: TerminalColorOverrides | undefined) {
+  const background = resolveTerminalBackground(colors);
+  return {
+    ...TERMINAL_DEFAULT_COLORS,
+    background,
+    foreground: resolveTerminalForeground(colors),
+    cursor: colors?.cursor || TERMINAL_DEFAULT_COLORS.cursor,
+    cursorAccent: background,
+  };
+}
 
 interface UseTerminalOptions {
   sessionId: string | null;
   projectId: string | null;
   fontFamily?: string;
   fontSize?: number;
-  scrollbackLines?: number;
   cursorStyle?: 'block' | 'underline' | 'bar';
+  /** Global-only setting: per-slot custom terminal colors. Any unset slot
+   *  falls back to TERMINAL_DEFAULT_COLORS. */
+  colors?: TerminalColorOverrides;
   shellName?: string;
   /** Let Escape bubble (to close the containing dialog) when the mouse pointer
    *  is outside the terminal. Used by the task detail dialog. */
@@ -96,6 +129,11 @@ interface UseTerminalOptions {
    *  a ref (not captured at attach time) since the agent list loads asynchronously and can
    *  resolve after `enableTerminalClipboard` has already attached its key handler. */
   pasteImageTemplate?: string;
+  /** When true, plain Backspace sends Ctrl+H (0x08) instead of xterm's default
+   *  DEL (0x7f), matching native Windows conhost so Claude Code's TUI deletes
+   *  the previous word. Read live via a ref (same pattern as
+   *  pasteImageTemplate) so a settings toggle applies without remount. */
+  backspaceSendsCtrlH?: boolean;
   /** Fired every time a scrollback operation (mount replay, reload, watchdog
    *  force-recovery, or IPC-rejection recovery) settles, i.e. whenever
    *  scrollbackPendingRef flips back to false. TerminalTab uses the first
@@ -118,6 +156,27 @@ function restoreScrollPosition(terminal: Terminal, sessionId: string | null): bo
   }
   terminal.scrollToBottom();
   return true;
+}
+
+/** Pure predicate for the hook's host contract (see the unmount-only dispose
+ *  effect's eslint-disable below): a host must remount (key={sessionId})
+ *  rather than swap `options.sessionId` to a different live session on the
+ *  same instance. Swapping in place leaves `initTerminal`'s
+ *  `if (xtermRef.current) return` guard permanently short-circuited, so
+ *  onData/onResize/clipboard/WebGL stay bound to the dead session - the exact
+ *  bug a Command Terminal branch switch shipped. Exported so the contract is
+ *  unit-testable without mounting a real Terminal. */
+export function isSessionSwapWithoutRemount(
+  previousSessionId: string | null,
+  nextSessionId: string | null,
+  hasLiveTerminal: boolean,
+): boolean {
+  return (
+    hasLiveTerminal
+    && previousSessionId !== null
+    && nextSessionId !== null
+    && previousSessionId !== nextSessionId
+  );
 }
 
 export function useTerminal(options: UseTerminalOptions) {
@@ -147,11 +206,24 @@ export function useTerminal(options: UseTerminalOptions) {
   const writeBatcherRef = useRef<WriteBatcher | null>(null);
   /** Tears down the WebGL renderer attachment (cancels retries, disposes addon). */
   const disposeWebglRef = useRef<(() => void) | null>(null);
+  /** This terminal's key in the WebGL renderer report, so the font-family
+   *  effect can force a fresh glyph rasterization after a live font change
+   *  (see terminal-webgl.ts's notifyFontChanged). */
+  const rendererKeyRef = useRef<string | null>(null);
+  /** The font family/size last applied to xterm, so the apply effect can tell
+   *  an actual font change (which needs the document.fonts.load race guard and
+   *  a glyph-atlas re-rasterization) apart from a cursor/scrollback/color-only
+   *  change (which reuses the existing atlas and applies synchronously). */
+  const lastAppliedFontRef = useRef<{ family: string; size: number } | null>(null);
   /** Updated every render so the paste handler (attached once by initTerminal)
    *  always reads the current template, even though the agent list resolves
    *  asynchronously after the terminal has already initialized. */
   const pasteImageTemplateRef = useRef(options.pasteImageTemplate);
   pasteImageTemplateRef.current = options.pasteImageTemplate;
+  /** Updated every render (same pattern as pasteImageTemplateRef) so the key
+   *  handler attached once by initTerminal always reads the current setting. */
+  const backspaceSendsCtrlHRef = useRef(options.backspaceSendsCtrlH);
+  backspaceSendsCtrlHRef.current = options.backspaceSendsCtrlH;
   /** Updated every render (same pattern as pasteImageTemplateRef) so the settle
    *  paths attached by initTerminal/reloadScrollback always call the caller's
    *  current callback. */
@@ -171,16 +243,51 @@ export function useTerminal(options: UseTerminalOptions) {
     onScrollbackSettledRef.current?.();
   }, []);
 
+  // Dev-only host-contract tripwire (compiled out of production, where
+  // import.meta.env.DEV is statically false). Registered before any effect the
+  // host itself declares (useTerminal()'s own hooks always run first within a
+  // render, since the host calls useTerminal() before its own useEffect
+  // calls), so it observes xtermRef.current from the PRIOR commit - still the
+  // old session's terminal - the same instant the host's init effect would.
+  // Never fires for a correctly-keyed host (see isSessionSwapWithoutRemount).
+  const lastNonNullSessionIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    // @ts-expect-error -- Vite defines import.meta.env; tsc's "module": "commonjs" doesn't support it
+    if (import.meta.env?.DEV && isSessionSwapWithoutRemount(lastNonNullSessionIdRef.current, options.sessionId, xtermRef.current !== null)) {
+      console.error(
+        `[useTerminal] sessionId changed from ${lastNonNullSessionIdRef.current} to ${options.sessionId} on a live terminal instance. `
+        + 'A host must remount (key={sessionId}) instead of swapping sessionId in place - see the unmount-only dispose effect below.',
+      );
+    }
+    if (options.sessionId !== null) lastNonNullSessionIdRef.current = options.sessionId;
+  }, [options.sessionId]);
+
+  // Destructured to PRIMITIVES, deliberately: `config.terminal.colors` is a
+  // fresh object on every config refetch (updateConfig -> refreshConfigs
+  // re-fetches the whole tree over IPC), so depending on the OBJECT would churn
+  // initTerminal's identity on any unrelated settings write - including
+  // background ones like model-discovery telemetry - and retrigger the callers'
+  // mount effects (overlay flash + scrollback reload in TerminalTab, focus theft
+  // in CommandTerminalWindow). Every other entry in those dep arrays is already
+  // a primitive for the same reason.
+  const customBackground = options.colors?.background;
+  const customForeground = options.colors?.foreground;
+  const customCursor = options.colors?.cursor;
+
   const initTerminal = useCallback(() => {
     if (!terminalRef.current || xtermRef.current) return;
 
-    const xtermTheme = TERMINAL_THEME;
+    const xtermTheme = buildTerminalTheme({
+      background: customBackground,
+      foreground: customForeground,
+      cursor: customCursor,
+    });
 
     const terminal = new Terminal({
       fontFamily: options.fontFamily || 'Menlo, Consolas, "Courier New", monospace',
       fontSize: options.fontSize || 14,
       theme: xtermTheme,
-      scrollback: options.scrollbackLines || 5000,
+      scrollback: TERMINAL_SCROLLBACK_LINES,
       cursorBlink: true,
       cursorStyle: options.cursorStyle || 'block',
       // HIDE the cursor when this terminal is BLURRED. Only the focused pane (where
@@ -189,6 +296,7 @@ export function useTerminal(options: UseTerminalOptions) {
       // the "which window is selected" cue for the unfocused panes.
       cursorInactiveStyle: 'none',
       allowProposedApi: true,
+      linkHandler: createTerminalLinkHandler((url) => window.electronAPI.shell.openExternal(url)),
     });
 
     const fitAddon = new FitAddon();
@@ -226,6 +334,7 @@ export function useTerminal(options: UseTerminalOptions) {
       options.sessionId ?? undefined,
       options.releaseEscapeWhenPointerOutside,
       () => pasteImageTemplateRef.current,
+      () => backspaceSendsCtrlHRef.current ?? false,
     );
 
     terminal.onScroll(() => {
@@ -238,6 +347,7 @@ export function useTerminal(options: UseTerminalOptions) {
     // key for a session-less pane so the devtools report can distinguish them.
     const rendererKey = options.sessionId ?? `transient-${nextTransientRendererKey()}`;
     disposeWebglRef.current = attachWebglRenderer(terminal, rendererKey);
+    rendererKeyRef.current = rendererKey;
 
     xtermRef.current = terminal;
     fitAddonRef.current = fitAddon;
@@ -339,7 +449,16 @@ export function useTerminal(options: UseTerminalOptions) {
           if (scrollback && xtermRef.current) {
             // Chunked so a 512KB replay doesn't parse in one synchronous write.
             // Strip OSC 52 so replaying recorded output never clobbers the live clipboard.
-            writeChunkedToTerminal(xtermRef.current, stripOsc52Sequences(scrollback), afterWrite);
+            // shouldAbort: a newer replay (reveal catch-up, reloadScrollback) may
+            // start and bump the generation while this chunked write is still
+            // draining; abandon rather than write a stale frame over the new one.
+            writeChunkedToTerminal(
+              xtermRef.current,
+              stripOsc52Sequences(scrollback),
+              afterWrite,
+              undefined,
+              () => scrollbackGenerationRef.current !== scrollbackGeneration,
+            );
           } else {
             afterWrite();
           }
@@ -358,7 +477,7 @@ export function useTerminal(options: UseTerminalOptions) {
       // No session -- just fit immediately
       fitAddon.fit();
     }
-  }, [options.sessionId, options.projectId, options.fontFamily, options.fontSize, options.scrollbackLines, options.cursorStyle, options.shellName, options.releaseEscapeWhenPointerOutside, settleScrollback]);
+  }, [options.sessionId, options.projectId, options.fontFamily, options.fontSize, options.cursorStyle, customBackground, customForeground, customCursor, options.shellName, options.releaseEscapeWhenPointerOutside, settleScrollback]);
 
   // Set up data listener. Inbound PTY data flows through a bounded queue that
   // writes capped slices paced by xterm.write's completion callback, yielding
@@ -470,6 +589,8 @@ export function useTerminal(options: UseTerminalOptions) {
       // before disposing the terminal it is attached to.
       disposeWebglRef.current?.();
       disposeWebglRef.current = null;
+      rendererKeyRef.current = null;
+      lastAppliedFontRef.current = null;
       xtermRef.current?.dispose();
       xtermRef.current = null;
       fitAddonRef.current = null;
@@ -521,6 +642,86 @@ export function useTerminal(options: UseTerminalOptions) {
       xtermRef.current.scrollToBottom();
     }
   }, []);
+
+  // Live-apply display settings to an already-mounted terminal, mirroring how
+  // an app theme change applies immediately (rather than requiring the
+  // terminal to be reopened). xterm.js exposes `options` as a live-settable
+  // object post-construction; `theme` specifically needs a FRESH object on
+  // every assignment (a reference-equal object is a no-op per xterm's docs),
+  // which buildTerminalTheme always returns. A no-op (xtermRef.current is
+  // null) before initTerminal has run; initTerminal reads the same options
+  // directly, so there is no gap once it does. Re-fit goes through the shared
+  // fit() (not the raw addon) so a terminal pinned to the bottom stays pinned
+  // when a font-size change alters the row count, and it picks up the cell-size
+  // change through the existing debounced onResize -> PTY resize path (a no-op
+  // if cols/rows did not change). Declared AFTER fit() so the callback is
+  // initialized before this effect's dependency array references it. `shell` is
+  // deliberately excluded: switching it means killing and respawning the PTY
+  // process, not a rendering change, and is out of scope here.
+  useEffect(() => {
+    if (!xtermRef.current) return;
+    const fontFamily = options.fontFamily || 'Menlo, Consolas, "Courier New", monospace';
+    const fontSize = options.fontSize || 14;
+    // Only an actual font family/size change needs the document.fonts.load
+    // race guard and the glyph-atlas re-rasterization below. A cursor,
+    // scrollback, or color change reuses the current font metrics and atlas,
+    // so it applies synchronously with no load round trip and no atlas clear -
+    // which also stops per-keystroke atlas thrash while a font name is being
+    // typed in Settings (onChange commits per character, across every mounted
+    // terminal).
+    const fontChanged =
+      !lastAppliedFontRef.current ||
+      lastAppliedFontRef.current.family !== fontFamily ||
+      lastAppliedFontRef.current.size !== fontSize;
+    let cancelled = false;
+
+    const applyOptions = () => {
+      // Dropped if a newer font change superseded this one while the load
+      // below was in flight (see the cleanup below), or if the terminal was
+      // torn down in the meantime.
+      if (cancelled || !xtermRef.current) return;
+      xtermRef.current.options = {
+        fontFamily,
+        fontSize,
+        cursorStyle: options.cursorStyle || 'block',
+        scrollback: TERMINAL_SCROLLBACK_LINES,
+        theme: buildTerminalTheme({
+          background: customBackground,
+          foreground: customForeground,
+          cursor: customCursor,
+        }),
+      };
+      fit();
+      if (fontChanged) {
+        lastAppliedFontRef.current = { family: fontFamily, size: fontSize };
+        // xterm re-measures character size as soon as `options.fontFamily` is
+        // assigned above. Force the WebGL renderer to re-rasterize every glyph
+        // under the new metrics rather than risk it reusing a stale cache entry
+        // from the previous font.
+        if (rendererKeyRef.current) notifyFontChanged(rendererKeyRef.current);
+      }
+    };
+
+    if (fontChanged) {
+      // Make sure the browser has actually resolved/loaded this font BEFORE
+      // letting xterm measure character size against it. Re-measuring mid-load
+      // is what produces a transient 0-width glyph cell, which the WebGL
+      // addon's texture-atlas rasterization then throws IndexSizeError on
+      // ("source width is 0") - this closes that race, most reachable by
+      // clicking rapidly through the Font Family picker's suggestions.
+      // document.fonts.load() can reject (a font that fails to resolve
+      // entirely); the options are applied either way rather than left stale.
+      document.fonts.load(`${fontSize}px ${fontFamily}`).then(applyOptions, applyOptions);
+    } else {
+      // No font change: apply synchronously, exactly as before this effect
+      // grew its font-load path.
+      applyOptions();
+    }
+
+    return () => {
+      cancelled = true;
+    };
+  }, [options.fontFamily, options.fontSize, options.cursorStyle, customBackground, customForeground, customCursor, fit]);
 
   // Flush a pending (debounced) PTY resize immediately, instead of waiting out
   // PTY_RESIZE_DEBOUNCE_MS. Window-hosted terminals fit synchronously on the
@@ -628,7 +829,14 @@ export function useTerminal(options: UseTerminalOptions) {
           // Chunked so a 512KB replay (tab/window switch, resize) doesn't parse
           // in one synchronous write that stalls the renderer mid-drag.
           // Strip OSC 52 so replaying recorded output never clobbers the live clipboard.
-          writeChunkedToTerminal(xtermRef.current, stripOsc52Sequences(scrollback), afterWrite);
+          // shouldAbort: see the matching call in initTerminal above.
+          writeChunkedToTerminal(
+            xtermRef.current,
+            stripOsc52Sequences(scrollback),
+            afterWrite,
+            undefined,
+            () => scrollbackGenerationRef.current !== scrollbackGeneration,
+          );
         } else {
           afterWrite();
         }
@@ -665,6 +873,15 @@ export function useTerminal(options: UseTerminalOptions) {
     xtermRef.current?.focus();
   }, []);
 
+  // The terminal's current grid, read live off the xterm instance (the same
+  // read flushResize already does). Used to seed a respawned PTY's dimensions
+  // (e.g. a Command Terminal branch switch) so the new session starts at the
+  // grid the user is already looking at instead of the spawn defaults.
+  const getDimensions = useCallback((): { cols: number; rows: number } | null => {
+    if (!xtermRef.current) return null;
+    return { cols: xtermRef.current.cols, rows: xtermRef.current.rows };
+  }, []);
+
   return {
     terminalRef,
     initTerminal,
@@ -674,5 +891,6 @@ export function useTerminal(options: UseTerminalOptions) {
     reloadScrollback,
     scrollbackPending: scrollbackPendingRef,
     suppressDataRef,
+    getDimensions,
   };
 }

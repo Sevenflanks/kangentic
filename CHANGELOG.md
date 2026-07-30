@@ -6,6 +6,82 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 <!-- releases -->
 
+## [v0.31.0] - 2026-07-24
+
+### Breaking Changes
+
+- Mobile protocol (dev-only, not enabled in production builds): five-category push taxonomy and wake-channel seam (5d4a67eb)
+
+### Features
+
+- Near-black terminal background, a real ANSI palette, and custom terminal colors (4f4dcc5f)
+- New Task settings tab and a system font picker for the terminal (1ff1b00c)
+- Word-delete on Backspace setting for the terminal (67c0cd26)
+- Remove Scrollback Lines as a user setting (f950e430)
+- Setting to disable Codex's ChatGPT Apps connector (e3474f61)
+- Support remote OpenCode servers for task workers (4c036d2f)
+- Make the MCP HTTP server bind address configurable (4a1acc4e)
+- Live idle-wait duration and durable active/idle interval history (a187cbdd)
+- Fast-heal hook-less resume-picker turns before the 180s stale-thinking net (7b0eb9a7)
+- PTY resize origins, dims getters, and a pty-resize event (638cfbf6)
+- Mobile bridge (dev-only): resolved relay default with custom and local override (8c608c1e)
+- Mobile bridge (dev-only): push registration store, register-push handler, and Expo push notifier (de481945)
+- Mobile bridge (dev-only): session lifecycle board feed and honest session-ended push (0ca3d319)
+- Mobile bridge (dev-only): publish pending prompt option labels (6bd95d03)
+- Mobile bridge (dev-only): project accent color in read-board (52937709)
+- Mobile bridge (dev-only): stream PTY dims so the phone fits the grid (39d32ce7)
+- Mobile bridge (dev-only): instant pairing for the mobile dev rig (0e0259cb)
+- Mobile bridge (dev-only): copy pairing link and gate the bridge to dev builds (347b56be)
+- Mobile protocol: board snapshot carries the Ticket Numbers setting (67c56254)
+- Mobile protocol: additive prompt option-label fields (4e126bd3)
+- Mobile protocol: optional project accent color on board payloads (2b3f78c2)
+- Mobile protocol: register-push verb and E2E push envelope crypto (6bc5a489)
+- Mobile protocol: session-ended activity payload and read-stream sessionStatus (1560539b)
+- Mobile protocol: terminal dimensions on the wire (52e73d03)
+- Mobile protocol and bridge: chunked delta transcript streaming, windowed history, compression (68afad59)
+
+### Fixes
+
+- Clamp the usage context bar to 100% instead of hiding it near auto-compaction (a96544c0)
+- Paint the terminal LaunchOverlay with the resolved terminal background (8cb31cf0)
+- Resolve {{baseBranch}} to the effective default and unify task template vars (acf16b07)
+- Linux: use soname capabilities for rpm dependencies (cad16b57)
+- Mobile bridge (dev-only): option probe rejects wrapped and unanchored dialogs (8d95f964)
+- Mobile bridge (dev-only): roster sessions survive a relay that is not up yet (6260c748)
+- Mobile bridge (dev-only): seed the phone from a serialized grid, not a byte replay (faee3181)
+- Mobile bridge (dev-only): re-initiate KK handshake on transport reconnect (f0ad5e0a)
+- Mobile protocol: accept terminal-resize in the envelope decoder (3c07b517)
+- Mobile protocol: classify get_activity_intervals as a board-tool-read (eed683d8)
+- Bridge the PTY flush window before the first scrollback read in E2E (783932fc)
+- Stop expecting terminal.* to seed into new projects (5b1598d0)
+- Decouple the terminal-image-paste-reference test from the bg-surface (72fd0402)
+- Add boardConfigManager to spawnAgent test context mocks (063eaac8)
+
+### Other
+
+- Reorganize the Settings panel into Project vs System tabs (0f657ad5)
+- Move desktop idle/crash notification policy to the main process (e2802fec)
+- Document the theme-match preset in Terminal Colors (4c8bfb2a)
+- Fix stale two-panel wording in the Settings Panel docs (fdc9fa1f)
+- Add a brief-accurate settings/UI copy convention rule (9268a105)
+- Mobile protocol: document the cross-repo local-dev strategy (9dedcdf7)
+- Mobile bridge (dev-only): register-push verb, E2E push pipeline, lifecycle feed, and project colors docs (ee3d455b)
+- Mobile protocol releases 0.5.0 through v0.7.0 (1c65678c, 1ff54b12)
+- Direct unit coverage for terminal theme-build and preset helpers (944d9d70)
+- Cover the font-change race guard in useTerminal's live-apply effect (1b929adf)
+- Cover the Word delete on Backspace toggle and backspace migration (2073c5ba, dc7a9eb8)
+- Cover the usage display-percent boundary and replace-path fill wiring (4ad8c08f)
+- Cover LaunchOverlay's default surface variant (58cda2b6)
+- Cover MCP bindAddress passthrough to httpServer.listen (885f475b)
+- Close baseBranch coverage gaps in run_script/webhook and live-inject (ef96b89e)
+- Cover OpenCode remote-execution coverage holes (3b3cfcbc)
+- Cover notifications register-all wiring and start() idempotency (c4e3d988)
+- Update register-all listener-count assertions for ActivityIntervalRecorder (1e31a843)
+- Pin Scrollback Lines row absence in the Terminal tab (d5381096)
+- Derive the mobile capability toggle count from MOBILE_CAPABILITY_VERBS (cb4516fe)
+- Mobile bridge (dev-only): pin empty-categories and cooldown-key isolation, fix reconcile-wiring pins (d9906b61, 72c79b71)
+- De-flake changes-panel lazy-retry, changes-file-history, and usage KPI tests (e772978d, 3b055db3, f395b465)
+
 ## [v0.30.0] - 2026-07-14
 
 ### Features

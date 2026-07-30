@@ -105,7 +105,90 @@ export interface AgentDetectionInfo {
   supportsSummarize?: boolean;
   /** Discovered at detection time; absent for adapters that do not implement discovery. */
   capabilities?: AgentCapabilities;
+  /** Present when the adapter can attach to a user-run server instead of spawning locally.
+   *  Absent = this agent has no remote-execution capability; the Agent settings tab never
+   *  renders remote rows for it. */
+  remoteExecution?: AgentRemoteExecutionInfo;
+  /** Optional boolean startup toggles this agent CLI exposes (e.g. Codex's "Disable ChatGPT
+   *  Apps"). Absent/empty = this agent declares none; the Agent settings tab renders nothing. */
+  launchOptions?: readonly AgentLaunchOptionInfo[];
 }
+
+/**
+ * Renderer-facing description of a single adapter-declared launch-option toggle
+ * (`AgentAdapter.launchOptions`). Declares shape and copy only - never a value - so the Agent
+ * settings tab can render a toggle for any agent without branching on agent name
+ * (agent-adapters-boundary.md). The adapter interprets `id` into whatever CLI flag it needs;
+ * nothing outside the adapter knows the mapping.
+ */
+export interface AgentLaunchOptionInfo {
+  /** Stable id, used as the config key under `agent.launchOptions[agentName]`. Never renamed. */
+  id: string;
+  label: string;
+  description: string;
+  /** Value used when the user has not set one. */
+  default: boolean;
+}
+
+/**
+ * Renderer-facing description of an adapter's remote-execution capability
+ * (`AgentAdapter.remoteExecution`, mirrored here by `agent-list.ts`). Declares
+ * shape only - never a value - so the Agent settings tab can render the
+ * right fields without branching on agent name.
+ */
+export interface AgentRemoteExecutionInfo {
+  /** Placeholder text for the Server URL field (e.g. "http://10.0.0.5:4096"). */
+  urlPlaceholder: string;
+  authKind: 'basic' | 'bearerEnv' | 'none';
+  /** Whether the server working directory is supplied per-invocation (OpenCode's
+   *  `--dir`) or fixed when the server itself starts (Qwen's `--workspace`). A
+   *  'server-bound' agent can serve only one directory per running server. */
+  workingDirectoryScope: 'per-invocation' | 'server-bound';
+  /** Optional adapter-authored caveat shown under the remote fields (e.g. which
+   *  Kangentic features are unavailable in remote mode). Renderer just renders
+   *  whatever string is present - never branches on agent name to decide the
+   *  copy (agent-adapters-boundary.md). Mirrors `AgentLiveTelemetryUnsupported`'s
+   *  adapter-declared-copy shape. */
+  remoteModeCaveat?: string;
+}
+
+/** Credentials for reaching an agent's remote execution server. Shape is a
+ *  discriminated union because different agents authenticate differently
+ *  (OpenCode: HTTP basic; Codex: a bearer token supplied via an env var NAME,
+ *  never the value itself, so the secret never leaves the user's own shell). */
+export type AgentExecutionServerAuth =
+  | { kind: 'none' }
+  | { kind: 'basic'; username: string; password: string }
+  | { kind: 'bearerEnv'; envVarName: string };
+
+/** Global, agent-keyed server identity - "where does this agent's remote server
+ *  live and how do I authenticate to it". Machine-scoped: not project-overridable,
+ *  mirrors `agent.cliPaths`. */
+export interface AgentExecutionServer {
+  url: string | null;
+  auth: AgentExecutionServerAuth;
+}
+
+/** Per-project, agent-keyed usage of that server - "does THIS project run this
+ *  agent locally or remotely, and if remote, in which server-side directory". */
+export interface AgentProjectExecution {
+  mode: 'local' | 'remote';
+  /** Path on the server. Ignored/unused for a 'server-bound' agent's workingDirectoryScope. */
+  workingDirectory: string | null;
+}
+
+/** The flattened value threaded through a spawn once a project resolves to
+ *  remote mode for an agent - global server identity + this project's directory. */
+export interface ResolvedExecutionTarget {
+  url: string;
+  auth: AgentExecutionServerAuth;
+  workingDirectory: string | null;
+}
+
+/** Result of probing a remote execution server for reachability. */
+export type RemoteServerStatus =
+  | { reachable: true; version: string | null }
+  | { reachable: false; reason: string };
 
 export interface AgentSummarizeInput {
   /** Free-form text to summarize into a short task title. */
@@ -186,6 +269,25 @@ export type PRState = 'open' | 'draft' | 'merged' | 'closed';
  */
 export type PRLinkStatus = 'linked' | 'unchanged' | 'not-found' | 'no-anchor' | 'resolver-unavailable' | 'transient-error';
 
+/**
+ * How a task gets its agent settings. Exactly one mode is live at a time, and
+ * the choice is explicit rather than derived from "are any pins set" - those
+ * are two different behaviours even when every field reads as inherited:
+ *
+ *   - `'column_settings'` - the task follows each column it moves through, for
+ *     its whole life. `profile_id` selects WHICH set of column settings applies
+ *     (null = the board as configured, non-null = that Board Profile's ladder).
+ *   - `'agent_override'` - agent / model / effort / permission are pinned for
+ *     the task. Fields left on inherit are still resolved dynamically until the
+ *     task's first ever spawn, which locks all four
+ *     (`lockAdvancedOverridesOnFirstSpawn`).
+ *
+ * Named for the two radio labels the New Task / Edit dialog shows, so the stored
+ * value and the control the user clicked read the same. Deriving the mode from
+ * the pins used to lose "Agent Override with everything inherited" on every save.
+ */
+export type TaskRunMode = 'column_settings' | 'agent_override';
+
 export interface Task {
   id: string;
   display_id: number;
@@ -219,8 +321,36 @@ export interface Task {
   agent_override: string | null;
   /** Per-task permission mode override. Takes precedence over the swimlane's `permission_mode` and the project's default permission mode, same as `model_override`/`effort_override` - EXCEPT when the destination swimlane forces `permission_mode: 'plan'`, which always wins regardless of this field: plan mode is a genuine safety guarantee (never let a task's Auto-Classifier/Accept-Edits pin bypass a deliberate read-only phase), not just an ordinary column default like every other permission mode. Null inherits. Set via the New Task dialog's Advanced section / the task-detail edit form, or locked at first spawn alongside agent/model/effort (`lockAdvancedOverridesOnFirstSpawn`) so a task with ANY Advanced override runs under the permission the dialog displayed, not the destination column's. */
   permission_mode: PermissionMode | null;
-  /** Per-task initial command, injected once the agent spawns for this task. MCP-only (set via `kangentic_create_task`'s `autoCommand` param); not surfaced in the UI. Takes precedence over the swimlane's `auto_command` for this task only; null inherits the swimlane. */
+  /** Per-task initial command, injected once the agent spawns for this task. MCP-only (set via `kangentic_create_task`'s `autoCommand` param); not surfaced in the UI. Takes precedence over the profile's and then the swimlane's `auto_command` for this task only; null inherits. Deliberately NOT part of the profile/direct-override exclusivity set (it is an MCP escape hatch, not an Advanced pin), so a task may carry both this and `profile_id`. */
   auto_command: string | null;
+  /**
+   * The Board Profile (`kangentic.json` `profiles`) whose per-column strategy
+   * deltas this task follows as it moves across the board. Null = the synthetic
+   * "Default" profile, i.e. the columns' own base settings.
+   *
+   * MUTUALLY EXCLUSIVE with the four Advanced pins (`agent_override`,
+   * `model_override`, `effort_override`, `permission_mode`), enforced in
+   * `TaskRepository`: a task either pins one set of values for its whole life OR
+   * rides a per-column ladder, never both. Setting this therefore also forces
+   * `run_mode` to `'column_settings'` and clears all four pins, in the same
+   * write (`applyProfileExclusivity`). That exclusivity is load-bearing - a
+   * profile task never reaches `lockAdvancedOverridesOnFirstSpawn`, which is
+   * what stops the first-spawn lock from freezing the ladder at column 1.
+   *
+   * An id naming no known profile degrades to Default rather than throwing: the
+   * profiles live in a checked-in file while this column lives in the local DB,
+   * so a teammate deleting a profile must never wedge an in-flight task.
+   */
+  profile_id: string | null;
+  /**
+   * Which of the two run modes the user chose (see `TaskRunMode`). Persisted
+   * rather than derived, because "Agent Override with all four fields left on
+   * inherit" and "Column Settings" store an identical set of nulls, yet mean
+   * opposite things: the first locks all four at first spawn, the second never
+   * locks. Mutually exclusive with `profile_id` in the same sense the pins are -
+   * `'agent_override'` clears it, and setting it forces `'column_settings'`.
+   */
+  run_mode: TaskRunMode;
   attachment_count: number;
   /** Serialized `TaskDetailViewState` (JSON) persisting the task-detail dialog's layout across restarts. null until the user changes the layout once. */
   detail_view_state: string | null;
@@ -518,6 +648,53 @@ export interface HandoffRecord {
   created_at: string;
 }
 
+/**
+ * Outcome of one `kangentic_send_session_message` ATTEMPT. Declared here rather
+ * than beside the coordinator so the row type and the code that writes it share
+ * one definition, with the dependency running shared -> main (never the
+ * reverse). `delivered` and `queued` produced a turn; `refused` and `failed`
+ * record an attempt only.
+ */
+export type SentSessionMessageStatus = 'delivered' | 'queued' | 'refused' | 'failed';
+
+/**
+ * One message sent into a session via `kangentic_send_session_message`, by
+ * another agent or by a human steering it directly.
+ *
+ * The delivered text carries no in-band marker, so this row is the ONLY record
+ * that a given turn arrived through the tool rather than being typed at the
+ * keyboard. `message` is stored as the caller supplied it, which matches the
+ * transcript turn it produced for ordinary prose - the paste path normalizes CR
+ * to LF and strips C0 control characters, so a message containing those differs
+ * from the delivered text by exactly that normalization.
+ *
+ * The caller fields are null when a human sent it with no Kangentic session of
+ * their own, and are plain ids (not foreign keys) because a cross-project send
+ * originates in a different project's database.
+ */
+export interface SentSessionMessage {
+  id: string;
+  /** The session that RECEIVED the message. */
+  session_id: string;
+  caller_session_id: string | null;
+  caller_task_id: string | null;
+  caller_project_id: string | null;
+  message: string;
+  /**
+   * The attempt's outcome, not just its successes:
+   * `delivered` (sent straight through), `queued` (held for the next idle
+   * transition), `refused` (a guard rejected it - no turn produced), or
+   * `failed` (delivery threw; whether a turn was produced is unknown).
+   *
+   * Reconstructing "which turns arrived this way" means filtering to
+   * `delivered` / `queued`. The other two record an attempt, not a turn.
+   */
+  status: SentSessionMessageStatus;
+  /** Refusal or failure detail. Null for a successful delivery. */
+  error: string | null;
+  created_at: string;
+}
+
 export interface SessionSummary {
   sessionId: string;
   totalCostUsd: number;
@@ -568,10 +745,16 @@ export type ActivityState = 'thinking' | 'idle' | 'permission';
  * Kinds where the predicate is `'thinking'`: tool, subagent,
  * background-shell, turn-active. Others map to `'permission'` or
  * `'idle'`.
+ *
+ * `since` on the `idle`/`permission` variants is the epoch ms the session
+ * FIRST needed the user (`SessionEngineState.needsUserSince`) - spans both
+ * variants, so a `thinking -> permission -> idle` run reports the original
+ * park time rather than resetting when permission resolves into idle. Lets
+ * the UI render elapsed wait time next to the mail affordance.
  */
 export type ActivityReason =
-  | { kind: 'idle' }
-  | { kind: 'permission' }
+  | { kind: 'idle'; since: number }
+  | { kind: 'permission'; since: number }
   | {
       kind: 'tool';
       pendingCount: number;
@@ -625,6 +808,9 @@ export interface ActivityStatsSnapshot {
   /** ms since the most recent PTY output chunk, or null when no chunk yet. */
   msSincePtyOutput: number | null;
   pendingIdleArmed: boolean;
+  /** Wall-clock ms since the session first needed the user (idle or
+   *  permission), or null while thinking. See `ActivityReason`'s `since`. */
+  needsUserSince: number | null;
   /**
    * True between an `idle_hint` ("waiting for your input") notification and the
    * next genuine turn-initiating event. While set, the stuck-subagent and
@@ -1588,6 +1774,18 @@ export const THEME_BACKGROUNDS: Record<ThemeMode, string> = {
   sand: '#f5f0e8', mint: '#eef5f0', sky: '#edf3f8', peach: '#f8f0ec',
 };
 
+/** Per-theme foreground color (mirrors index.css's `--kng-fg-secondary`,
+ *  renderer-only need so not read live from CSS). Used by the Terminal settings
+ *  tab's Colors section to offer "match my current app theme" as a terminal color preset:
+ *  the terminal's foreground/cursor default (#e4e4e7) is byte-identical to
+ *  the dark theme's value here, since that is literally where it came from
+ *  before the terminal had its own fixed color scheme. */
+export const THEME_FOREGROUNDS: Record<ThemeMode, string> = {
+  dark: '#e4e4e7', light: '#292524',
+  moon: '#c6c8d0', forest: '#c6cac4', ocean: '#c0c6ce', ember: '#ccc8c4',
+  sand: '#3d3228', mint: '#1e3028', sky: '#1a2a3a', peach: '#3a2520',
+};
+
 /** UI metadata for the settings dropdown. */
 export const NAMED_THEMES: { id: ThemeMode; label: string; base: 'dark' | 'light' }[] = [
   { id: 'moon', label: 'Moon', base: 'dark' },
@@ -1599,6 +1797,27 @@ export const NAMED_THEMES: { id: ThemeMode; label: string; base: 'dark' | 'light
   { id: 'sky', label: 'Sky', base: 'light' },
   { id: 'peach', label: 'Peach', base: 'light' },
 ];
+
+/** Custom terminal color overrides, editable in the Terminal settings tab's
+ *  Colors section. Any
+ *  slot left unset falls back to the built-in default (see
+ *  TERMINAL_DEFAULT_COLORS in useTerminal.ts, renderer-only since only xterm
+ *  rendering needs the concrete hex values). Deliberately just these three:
+ *  the 16-color ANSI palette (used by shell tools like `git diff`/`ls
+ *  --color`) is a fixed built-in scheme, not exposed for per-color editing -
+ *  most users want to set their overall look, not tune individual ANSI
+ *  slots. `cursorAccent` and `selectionBackground` are also NOT here:
+ *  cursorAccent always tracks whatever `background` resolves to (so the
+ *  glyph under a block cursor stays legible), and selectionBackground is a
+ *  fixed app accent, not a terminal color a user would pick independently.
+ *  A dictionary-style field (CONFIG_DICTIONARY_PATHS in config-manager.ts):
+ *  saved wholesale so resetting a slot (deleting its key) actually takes
+ *  effect. Global-only. */
+export interface TerminalColorOverrides {
+  background?: string;
+  foreground?: string;
+  cursor?: string;
+}
 
 /** Recursively makes all properties optional. Arrays are kept whole (not element-partial). */
 export type DeepPartial<T> = {
@@ -1761,6 +1980,42 @@ export interface DictationAudioChunk {
  *  a platform with no mic. */
 export type DictationMicPermission = 'granted' | 'denied' | 'unavailable';
 
+/** The five onboarding checklist steps, in the order they are presented. Lives here rather
+ *  than beside the hook so the config store can reference it without importing a renderer
+ *  hook that imports the config store back. */
+export type OnboardingStepKey =
+  | 'defaultsChosen'
+  | 'boardShaped'
+  | 'taskCreated'
+  | 'draggedToAutoSpawnLane'
+  | 'taskDetailOpened';
+
+/**
+ * Snapshot of the settings the onboarding checklist watches, taken on first checklist
+ * OPEN (WelcomeChecklistDialog's mount effect is the only writer). Steps 1 and 2 tick when
+ * live state DIFFERS from this, so a user who opens Settings or Board manager and closes it
+ * again gets no checkmark - only a real change earns one.
+ *
+ * Note the four "defaults" a user picks do not live together: `default_agent` /
+ * `default_model` / `default_effort` are columns on the project row, while
+ * `permissionMode` is global config (`agent.permissionMode`). This snapshot flattens
+ * both so the comparison has a single shape.
+ */
+export interface OnboardingBaseline {
+  /** Project row `default_agent`. Always populated, so it needs a baseline to be meaningful. */
+  defaultAgent: string;
+  /** Project row `default_model`. Null means no project preference was set. */
+  defaultModel: string | null;
+  /** Project row `default_effort`. Null means no project preference was set. */
+  defaultEffort: string | null;
+  /** Effective `agent.permissionMode` at capture time. Always populated. */
+  permissionMode: PermissionMode;
+  /** Stable string encoding of the board's shape - see buildSwimlaneSignature. Not a hash: it
+   *  is the lane fields joined with separators, compared only for equality. Deliberately excludes
+   *  `position` (it is rewritten by any reorder, including one the user undoes). */
+  swimlaneSignature: string;
+}
+
 export interface AppConfig {
   theme: ThemeMode;
   sidebarVisible: boolean;
@@ -1779,14 +2034,15 @@ export interface AppConfig {
   diffFlatList: boolean; // Changes panel file list: flat full-path list vs nested directory tree
 
   terminal: {
-    shell: string | null; // null = auto-detect
-    fontFamily: string;
-    fontSize: number;
+    shell: string | null; // null = auto-detect. Global-only: applies across every project.
+    fontFamily: string; // global-only: applies across every project
+    fontSize: number; // global-only: applies across every project
     showPreview: boolean;
     panelHeight: number; // persisted terminal panel height in px
     panelCollapsed: boolean; // persisted collapsed state
-    scrollbackLines: number;
-    cursorStyle: 'block' | 'underline' | 'bar';
+    cursorStyle: 'block' | 'underline' | 'bar'; // global-only: applies across every project
+    colors: TerminalColorOverrides; // global-only: applies across every project
+    backspaceSendsCtrlH: boolean; // send Ctrl+H (0x08) instead of DEL (0x7f) on plain Backspace; opt-in, default false, all platforms
   };
 
   agent: {
@@ -1796,6 +2052,14 @@ export interface AppConfig {
     queueOverflow: 'queue' | 'reject';
     idleTimeoutMinutes: number; // 0 = disabled
     autoResumeSessionsOnRestart: boolean; // when false, sessions stay paused after restart and require a manual Resume click
+    /** Global, agent-keyed remote-server identity (url + auth). Machine-scoped, mirrors cliPaths. */
+    executionServers: Record<string, AgentExecutionServer>;
+    /** Per-project, agent-keyed local/remote choice + server working directory. Project-overridable. */
+    execution: Record<string, AgentProjectExecution>;
+    /** Global, agent-keyed boolean launch-option toggles (agent name -> option id -> enabled).
+     *  Machine-scoped, mirrors cliPaths - not project-overridable. An absent entry falls back
+     *  to the adapter's declared `AgentLaunchOptionInfo.default`. */
+    launchOptions: Record<string, Record<string, boolean>>;
   };
 
   sidebar: {
@@ -1816,6 +2080,16 @@ export interface AppConfig {
 
   mcpServer: {
     enabled: boolean;
+    /** Interface the in-process MCP HTTP server listens on. Default '127.0.0.1' (loopback only). */
+    bindAddress: string;
+    /**
+     * Extra host allowlisted alongside `bindAddress` for the MCP server's DNS-rebinding
+     * protection, so an external client naming it in its `Host` header is not rejected.
+     * Kangentic never advertises or pushes this value anywhere: to point an external
+     * client at the server the user substitutes it by hand for the `127.0.0.1` in
+     * `.kangentic/mcp-config.json`. Unset means loopback only.
+     */
+    callbackHost?: string;
   };
 
   contextBar: {
@@ -1997,11 +2271,45 @@ export interface AppConfig {
   mobileBridge?: {
     /** Master switch. When false, no relay connection is held and pairing is unavailable. Default false. */
     enabled?: boolean;
-    /** The relay address to dial (self-hosted or Kangentic's hosted relay), e.g. "wss://relay.kangentic.com". */
+    /**
+     * 'hosted' dials the Kangentic-hosted relay; 'local' dials a relay
+     * running on 127.0.0.1 (dev builds only - see src/shared/relay.ts's
+     * LOCAL_DEV_RELAY_URL); 'custom' uses relayUrl. Default 'hosted'.
+     */
+    relayMode?: 'hosted' | 'local' | 'custom';
+    /** The relay address to dial. Only consulted when relayMode === 'custom'; resolve through src/shared/relay.ts's resolveRelayUrl rather than reading this directly. */
     relayUrl?: string;
   };
 
   hasCompletedFirstRun: boolean;
+  /** Project ids whose onboarding checklist the user has dismissed. Global (per-machine)
+   *  memory keyed by project id, like `lastActiveTaskByProject`. `undefined` means the
+   *  one-time upgrade backfill (App.tsx, on first hydration) has not run yet; `[]` means
+   *  it has run and nothing is dismissed. The backfill seeds every project the user already
+   *  had open so existing users never see the checklist on projects they already use.
+   *
+   *  EMPTINESS is the load-bearing signal, not membership: the checklist auto-opens only
+   *  while this list is empty. The walkthrough teaches the app rather than a repo, so it is
+   *  install-scoped - a newly added project has a brand-new id and would otherwise replay
+   *  the whole thing on an established install. The list becomes non-empty by exactly three
+   *  routes, all of which mean "not a first run": the backfill finding at least one existing
+   *  project, a real dismissal (WelcomeChecklistDialog), or all five steps completed
+   *  (AppLayout). Membership itself is now only a record of which projects were retired.
+   *
+   *  Distinct from the legacy `hasCompletedFirstRun`, which means first TASK creation - that
+   *  is step 3 of the walkthrough, so it would retire onboarding mid-flow. */
+  onboardedProjectIds?: string[];
+  /** Per-project snapshot of the settings the onboarding checklist watches, captured on first
+   *  checklist OPEN. `WelcomeChecklistDialog`'s mount effect is the only writer, and AppLayout
+   *  mounts that dialog only while `onboardingChecklistOpen`, so adding a project does NOT
+   *  capture one: now that the auto-open gate is install-scoped (see `onboardedProjectIds`), a
+   *  second project has no baseline until the title-bar button opens the checklist there.
+   *  Steps 1 and 2 tick by comparing live state against this, so opening a settings screen and
+   *  closing it again ticks nothing - only a real change does. Both are guarded on
+   *  `baseline !== undefined`, so a baseline-less project reports them un-ticked rather than
+   *  spuriously complete. Keyed by project id; listed in CONFIG_DICTIONARY_PATHS so
+   *  per-project removal is not swallowed by the deep merge. */
+  onboardingBaseline?: Record<string, OnboardingBaseline>;
   skipDeleteConfirm: boolean;
   skipBoardConfigConfirm: boolean;
   autoFocusIdleSession: boolean;
@@ -2138,8 +2446,9 @@ export const DEFAULT_CONFIG: AppConfig = {
     showPreview: false,
     panelHeight: 250,
     panelCollapsed: false,
-    scrollbackLines: 5000,
     cursorStyle: 'block',
+    colors: {},
+    backspaceSendsCtrlH: false,
   },
   agent: {
     permissionMode: 'acceptEdits',
@@ -2148,6 +2457,9 @@ export const DEFAULT_CONFIG: AppConfig = {
     queueOverflow: 'queue',
     idleTimeoutMinutes: 0,
     autoResumeSessionsOnRestart: true,
+    executionServers: {},
+    execution: {},
+    launchOptions: {},
   },
   sidebar: {
     width: 400,
@@ -2163,6 +2475,7 @@ export const DEFAULT_CONFIG: AppConfig = {
   },
   mcpServer: {
     enabled: true,
+    bindAddress: '127.0.0.1',
   },
   contextBar: {
     showShell: true,
@@ -2245,6 +2558,18 @@ export const DEFAULT_CONFIG: AppConfig = {
     experience: 'popup',
   },
   mobileBridge: {
+    // relayMode is deliberately ABSENT, not 'hosted'. ConfigManager.load()
+    // deep-merges this default with the parsed config file key-by-key
+    // (mobileBridge is not a CONFIG_DICTIONARY_PATHS entry, so it is not
+    // replaced wholesale), which means any value set here fills in over a
+    // config written before relayMode existed. Seeding 'hosted' therefore
+    // defeated resolveRelayUrl's "relayMode missing but relayUrl set =>
+    // custom" compat inference (src/shared/relay.ts) for exactly the users it
+    // was written for: a self-hoster upgrading from the pre-relayMode schema
+    // would silently be switched onto the Kangentic-hosted relay. Leaving it
+    // undefined lets that inference run. An explicit user choice still
+    // persists a concrete mode, and a fresh config with no relayUrl resolves
+    // to hosted anyway.
     enabled: false,
     relayUrl: '',
   },
@@ -2489,7 +2814,32 @@ export interface MobileBridgeStatus {
   relayUrl: string;
   pairedDeviceCount: number;
   pairingInProgress: boolean;
+  /**
+   * Aggregate transport state across every paired device's live relay
+   * connection: 'connected' if any is connected, else 'connecting' if any
+   * is connecting, else 'reconnecting' if any is reconnecting, else
+   * 'closed' if any is closed, else 'idle' when there are no sessions.
+   * Excludes the ephemeral pairing transport, which has its own error
+   * surface via the pairingEnded event. So a paired device whose relay is
+   * unreachable does not render as healthy.
+   */
+  relayState: MobileBridgeTransportState;
 }
+
+/** Mirrors @kangentic/protocol's TransportState - re-declared here (not re-exported) so src/shared/types.ts stays free of a protocol-package runtime dependency; only the string union shape needs to match. */
+export type MobileBridgeTransportState = 'idle' | 'connecting' | 'connected' | 'reconnecting' | 'closed';
+
+/**
+ * What one paired device's row reports. Every transport state plus 'offline':
+ * the relay slot is up but no phone is attached to it (no live Noise KK
+ * session), which the transport alone cannot express - it reads 'connected'
+ * whenever the relay is reachable, phone powered off or not.
+ *
+ * 'offline' is a presence conclusion, NOT a transport state, so it is
+ * deliberately absent from the @kangentic/protocol mirror above; that union
+ * must keep matching the package exactly.
+ */
+export type MobileDeviceConnectionState = MobileBridgeTransportState | 'offline';
 
 export interface MobileStartPairingResult {
   /** The `kangentic-pair://...` URI to render as a QR code. */
@@ -2504,18 +2854,28 @@ export interface MobilePairedDevice {
   capabilities: MobileCapabilityVerb[];
   /** ISO 8601. */
   pairedAt: string;
+  /** Live, not persisted - this device's own connection state (transport refined by whether the phone is actually attached), not the panel-wide aggregate. */
+  connectionState: MobileDeviceConnectionState;
 }
 
 export interface MobilePairingSasPayload {
-  /** 6-digit short authentication string, shown alongside `emoji` for the user to compare against the phone's screen. */
+  /** 6-digit short authentication string for the user to compare against the phone's screen. No emoji: the digits alone already carry the full transcript-hash comparison. */
   digits: string;
-  emoji: string[];
   /** Hex-encoded, for display only -- the roster entry itself is signed and persisted main-side. */
   phoneStaticPublicKeyHex: string;
 }
 
+/** Fired once the phone's sealed confirm frame opens and the device is auto-enrolled - see @kangentic/protocol's pairing/confirm.ts for what that frame does and does not prove. */
+export interface MobilePairingConfirmedPayload {
+  deviceId: string;
+  /** The phone-supplied device name from the pairing handshake, not user-entered - renaming afterward is a separate action (mobile:renameDevice). */
+  displayName: string;
+}
+
 export interface MobilePairingEndedPayload {
   reason: string;
+  /** 'cancelled' is a deliberate user action (Cancel, or the panel closing mid-ceremony) - already obvious from the UI transition back to idle, so the desktop does not surface its reason as a message. Only 'failed' (mismatch, timeout, handshake error) is shown. */
+  kind: 'cancelled' | 'failed';
 }
 
 // === IPC API Types ===
@@ -2535,6 +2895,10 @@ export interface TaskCreateInput {
   permission_mode?: PermissionMode | null;
   /** MCP-only initial command, injected once the agent spawns for this task. Not surfaced in the New Task dialog. */
   auto_command?: string | null;
+  /** Board Profile to ride (see `Task.profile_id`). Setting this clears the four Advanced pins; they are mutually exclusive. */
+  profile_id?: string | null;
+  /** Which run mode the task was authored in (see `Task.run_mode`). Omitted defaults to `'column_settings'`, except that pinning any of the four Advanced fields implies `'agent_override'`. */
+  run_mode?: TaskRunMode;
   /** External origin carried through when promoting an imported backlog item, so import dedup survives promotion. */
   externalId?: string;
   externalSource?: string;
@@ -2570,6 +2934,10 @@ export interface TaskUpdateInput {
   effort_override?: string | null;
   agent_override?: string | null;
   permission_mode?: PermissionMode | null;
+  /** Board Profile to ride (see `Task.profile_id`). Setting this clears the four Advanced pins, and setting any of those four clears this. */
+  profile_id?: string | null;
+  /** Which run mode the task runs in (see `Task.run_mode`). `'agent_override'` clears `profile_id`; `'column_settings'` clears the four pins. Omitted leaves the stored mode alone, unless a pin or profile in the same write implies one. */
+  run_mode?: TaskRunMode;
 }
 
 /** Result of `IPC.TASK_RESOLVE_PR` - the on-demand branch->PR resolver. */
@@ -2735,6 +3103,53 @@ export interface ProjectCreateInput {
   default_agent?: string;
   default_model?: string | null;
   default_effort?: string | null;
+}
+
+/** Optional overrides for project creation at open-by-path time (the Add project dialog). */
+export interface ProjectOpenByPathOverrides {
+  name?: string;
+  defaultAgent?: string;
+}
+
+/** Optional native folder-picker dialog customization (dialog.selectFolder). */
+export interface SelectFolderOptions {
+  title?: string;
+  buttonLabel?: string;
+  /** macOS only; ignored on Windows/Linux. */
+  message?: string;
+  defaultPath?: string;
+}
+
+/**
+ * Read-only probe of a candidate project folder, returned by
+ * `projects.probePath`. Drives the Add project dialog's git verdict and
+ * already-registered branch before any project is actually created.
+ */
+export interface ProjectPathProbe {
+  exists: boolean;
+  isDirectory: boolean;
+  isGitRepo: boolean;
+  isInsideWorktree: boolean;
+  /** Current branch name, or null when not a git repo or HEAD is unreadable. */
+  currentBranch: string | null;
+  /** The folder's basename, offered as the dialog's default project name. */
+  suggestedName: string;
+  /** id of an already-registered project at this exact path, or null. */
+  alreadyRegisteredProjectId: string | null;
+}
+
+/**
+ * Outcome of `projects.ensureGit`.
+ *
+ * `ok` is false only for a genuine failure (git missing, permission denied). A folder
+ * that was already covered by a repo - its own or a parent's - is `ok: true` with
+ * `created: false`, so the caller can stay silent instead of reporting a non-problem.
+ */
+export interface ProjectEnsureGitResult {
+  ok: boolean;
+  /** True only when `git init` actually ran. */
+  created: boolean;
+  error: string | null;
 }
 
 /** Minimal parsing interface for agent-specific runtime behavior. */
@@ -3207,12 +3622,23 @@ export interface SpawnSessionInput {
    * Isolated. Defaults to null when omitted.
    */
   isolatedSwimlaneId?: string | null;
+  /**
+   * Caller-known PTY grid to spawn at, when available (e.g. a Command
+   * Terminal branch respawn reusing the still-mounted xterm's current size).
+   * Falls back to `takePendingResize` (a resize that beat the spawn), then to
+   * DEFAULT_PTY_COLS/ROWS - see session-spawn-flow.ts.
+   */
+  cols?: number;
+  rows?: number;
 }
 
 export interface SpawnTransientSessionInput {
   projectId: string;
   /** Branch to checkout before spawning. If omitted, uses the project's default base branch. */
   branch?: string;
+  /** See `SpawnSessionInput.cols`/`rows` - the same seed-the-real-grid escape hatch. */
+  cols?: number;
+  rows?: number;
 }
 
 export interface NotificationInput {
@@ -3272,12 +3698,88 @@ export interface ShortcutConfig {
   display?: ShortcutDisplay; // where the shortcut appears (default: 'both')
 }
 
+/**
+ * One column's strategy delta inside a Board Profile.
+ *
+ * SPARSE BY DESIGN, with three states per field - consumers MUST branch on key
+ * PRESENCE (`'modelOverride' in entry`), never `entry.modelOverride ?? lane.x`:
+ *
+ *   key absent         -> inherit the column's own base value
+ *   key present, null  -> clear to the agent default (no CLI flag), even when
+ *                         the base column pins one
+ *   key present, value -> use that value
+ *
+ * The middle state is why `??` is wrong: a profile must be able to say "Executing
+ * runs the agent's default model" against a base column that pins Opus. Sparse
+ * (rather than a full copy of every field) means adding a column, or editing a
+ * base column, does not silently rot every profile.
+ *
+ * `JSON.stringify` drops `undefined` and keeps `null`, so a writer that emits
+ * `undefined` for inherit and `null` for clear serializes correctly for free.
+ */
+export interface BoardProfileEntry {
+  agentOverride?: string | null;
+  modelOverride?: string | null;
+  effortOverride?: string | null;
+  permissionMode?: PermissionMode | null;
+  autoCommand?: string | null;
+  autoSpawn?: boolean;
+  handoffContext?: boolean;
+  sessionTarget?: SessionTarget;
+  sessionSpawnStrategy?: SessionSpawnStrategy;
+  /**
+   * Name of the target column (NOT a uuid), matching `BoardColumnConfig.planExitTarget`.
+   * This one field keeps the by-name convention it already round-trips under; it is
+   * resolved to a swimlane id at read time.
+   */
+  planExitTarget?: string;
+}
+
+/**
+ * A named alternate ladder of per-column STRATEGY settings, so a task can ride
+ * different horsepower per column (e.g. Planning in Opus xhigh, Executing in
+ * Opus high, Merge in Sonnet high) without changing the shared board for
+ * everyone else.
+ *
+ * Column IDENTITY (which columns exist, their name, order, role, color, icon) is
+ * singular across profiles - only strategy is profile-scoped.
+ *
+ * Lives only in `kangentic.json` / `kangentic.local.json`, following the
+ * `ShortcutConfig` pattern: no DB table and no migration, with team/local scoping
+ * for free. A task's ASSIGNMENT to a profile is separate per-machine state
+ * (`tasks.profile_id`).
+ *
+ * `id` is a stable uuid and is what `tasks.profile_id` stores; `name` is display
+ * only, so a teammate renaming a profile never detaches in-flight tasks. Entries
+ * are keyed by swimlane uuid for the same reason - a column RENAME is far more
+ * common than a uuid regeneration, and name-keying would silently detach every
+ * entry on a rename with no error.
+ */
+export interface BoardProfile {
+  /** UUID, assigned on write-back (mirrors `ShortcutConfig.id`). */
+  id: string;
+  /** Unique display name. */
+  name: string;
+  description?: string;
+  /** Per-column deltas, keyed by swimlane uuid. A column with no entry inherits its base config verbatim. */
+  columns: Record<string, BoardProfileEntry>;
+}
+
 export interface BoardConfig {
   version: number;
   columns: BoardColumnConfig[];
   actions: BoardActionConfig[];
   transitions: BoardTransitionConfig[];
   shortcuts?: ShortcutConfig[];
+  /**
+   * Named alternate strategy ladders (see BoardProfile). Absent / empty means
+   * every task runs the columns' own settings, i.e. the synthetic "Default"
+   * profile, which is deliberately NOT stored here.
+   *
+   * Like `shortcuts`, this key has no DB representation, so `buildBoardConfigFromDb`
+   * must carry it across from the existing team config or a column edit destroys it.
+   */
+  profiles?: BoardProfile[];
   defaultBaseBranch?: string;
   _modifiedBy?: string;
 }
@@ -3389,7 +3891,11 @@ export interface ElectronAPI {
     delete: (id: string) => Promise<void>;
     open: (id: string) => Promise<void>;
     getCurrent: () => Promise<Project | null>;
-    openByPath: (path: string) => Promise<Project>;
+    openByPath: (path: string, overrides?: ProjectOpenByPathOverrides) => Promise<Project>;
+    probePath: (path: string) => Promise<ProjectPathProbe>;
+    /** Make sure a picked folder is covered by git, initialising a repo when it is not.
+     *  A folder already inside a repo is a no-op success, not an error. */
+    ensureGit: (path: string) => Promise<ProjectEnsureGitResult>;
     searchEntries: (input: ProjectSearchEntriesInput) => Promise<ProjectSearchEntriesResult>;
     rename: (id: string, name: string) => Promise<Project>;
     setDefaultAgent: (id: string, agentName: string) => Promise<Project>;
@@ -3544,7 +4050,7 @@ export interface ElectronAPI {
     onLiveDeliveryStatus: (callback: (status: LiveDeliveryStatus) => void) => () => void;
     onUsage: (callback: (sessionId: string, data: SessionUsage, projectId?: string) => void) => () => void;
     getActivity: (projectId?: string) => Promise<Record<string, ActivityState>>;
-    onActivity: (callback: (sessionId: string, state: ActivityState, reason: ActivityReason, projectId?: string, taskId?: string, taskTitle?: string) => void) => () => void;
+    onActivity: (callback: (sessionId: string, state: ActivityState, reason: ActivityReason, projectId?: string, taskId?: string) => void) => () => void;
     getActivityReason: (sessionId: string) => Promise<ActivityReason | null>;
     getActivityReasons: (projectId?: string) => Promise<Record<string, ActivityReason>>;
     getActivityStats: (sessionId: string) => Promise<ActivityStatsSnapshot | null>;
@@ -3675,9 +4181,8 @@ export interface ElectronAPI {
     probeGlobal: (combos: string[]) => Promise<Record<string, 'available' | 'taken' | 'unsupported'>>;
   };
 
-  // Agent detection & commands
+  // Agent commands
   agent: {
-    detect: () => Promise<{ found: boolean; path: string | null; version: string | null }>;
     listCommands: (cwd?: string) => Promise<AgentCommand[]>;
     summarize: (input: AgentSummarizeInput) => Promise<AgentSummarizeResult>;
   };
@@ -3687,6 +4192,11 @@ export interface ElectronAPI {
     // forceRefresh bypasses the main-process cache and re-probes detection
     // (the Agent settings "re-detect" button); omit/false uses the cache.
     list: (forceRefresh?: boolean) => Promise<AgentDetectionInfo[]>;
+    /** Reachability probe for an agent's configured remote execution server
+     *  ("Test connection" in the Agent settings tab). Reads the server
+     *  record directly from config rather than accepting one as an argument,
+     *  since the password never needs to round-trip through the renderer. */
+    probeExecutionServer: (agentName: string) => Promise<RemoteServerStatus>;
   };
 
   // Handoffs
@@ -3704,9 +4214,14 @@ export interface ElectronAPI {
     exec: (command: string, cwd: string) => Promise<{ pid: number | undefined }>;
   };
 
+  // Fonts
+  font: {
+    getAvailable: () => Promise<string[]>;
+  };
+
   // Git
   git: {
-    detect: () => Promise<{ found: boolean; path: string | null; version: string | null; meetsMinimum: boolean }>;
+    detect: (forceRefresh?: boolean) => Promise<{ found: boolean; path: string | null; version: string | null; meetsMinimum: boolean }>;
     listBranches: () => Promise<string[]>;
     diffFiles: (input: GitDiffFilesInput) => Promise<GitDiffFilesResult>;
     fileContent: (input: GitFileContentInput) => Promise<GitFileContentResult>;
@@ -3722,7 +4237,7 @@ export interface ElectronAPI {
 
   // Dialog
   dialog: {
-    selectFolder: () => Promise<string | null>;
+    selectFolder: (options?: SelectFolderOptions) => Promise<string | null>;
   };
 
   // Notifications
@@ -3813,12 +4328,17 @@ export interface ElectronAPI {
   mobile: {
     getStatus: () => Promise<MobileBridgeStatus>;
     startPairing: () => Promise<MobileStartPairingResult>;
-    confirmPairing: (displayName: string, capabilities?: MobileCapabilityVerb[]) => Promise<void>;
     cancelPairing: () => Promise<void>;
     listDevices: () => Promise<MobilePairedDevice[]>;
     revokeDevice: (deviceId: string) => Promise<void>;
+    renameDevice: (deviceId: string, displayName: string) => Promise<void>;
     setDeviceCapabilities: (deviceId: string, capabilities: MobileCapabilityVerb[]) => Promise<void>;
+    /** Reachability probe for a candidate relay URL ("Test connection" in the Mobile Devices
+     *  tab). Takes the URL as an argument rather than reading it from config, since testing
+     *  BEFORE committing a save is the point; never throws. */
+    testRelay: (relayUrl: string) => Promise<RemoteServerStatus>;
     onPairingSas: (callback: (payload: MobilePairingSasPayload) => void) => () => void;
+    onPairingConfirmed: (callback: (payload: MobilePairingConfirmedPayload) => void) => () => void;
     onPairingEnded: (callback: (payload: MobilePairingEndedPayload) => void) => () => void;
     onStateChanged: (callback: () => void) => () => void;
   };
@@ -3830,6 +4350,12 @@ export interface ElectronAPI {
     apply: (projectId: string) => Promise<string[]>;
     onChanged: (callback: (projectId: string) => void) => () => void;
     onShortcutsChanged: (callback: (projectId: string) => void) => () => void;
+    /** The board's named Board Profiles (see `BoardProfile`). Empty when the board has none. */
+    getBoardProfiles: () => Promise<BoardProfile[]>;
+    /** Replace the board's Board Profiles. Team-scoped: `tasks.profile_id` is resolved on every machine that opens the board. */
+    setBoardProfiles: (profiles: BoardProfile[]) => Promise<void>;
+    /** An agent (MCP) rewrote this project's Board Profiles; re-read them. */
+    onBoardProfilesChanged: (callback: (projectId: string) => void) => () => void;
     getShortcuts: () => Promise<(ShortcutConfig & { source: 'team' | 'local' })[]>;
     setShortcuts: (actions: ShortcutConfig[], target: 'team' | 'local') => Promise<void>;
     setDefaultBaseBranch: (branch: string) => Promise<void>;

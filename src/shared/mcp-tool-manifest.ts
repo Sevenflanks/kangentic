@@ -56,7 +56,7 @@ export const MCP_TOOL_MANIFEST: McpToolManifestEntry[] = [
   { name: 'kangentic_find_task', label: 'Find Task', blurb: 'look up a task by ID, branch, title, or PR number', category: 'tasks' },
   { name: 'kangentic_get_current_task', label: 'Current Task', blurb: 'resolve the task for the current directory or branch', category: 'tasks' },
   { name: 'kangentic_get_task_stats', label: 'Task Stats', blurb: 'token usage, cost, duration, and lines changed per task', category: 'tasks' },
-  { name: 'kangentic_update_task', label: 'Update Task', blurb: 'edit title, description (full, in-place find/replace, or append), PR info, agent, model, effort, permission mode, priority, labels, base branch, worktree, and attachments', category: 'tasks' },
+  { name: 'kangentic_update_task', label: 'Update Task', blurb: 'edit title, description (full, in-place find/replace, or append), PR info, agent, model, effort, permission mode, run mode, priority, labels, base branch, worktree, and attachments', category: 'tasks' },
   { name: 'kangentic_move_task', label: 'Move Task', blurb: 'move a task between columns, running the same lifecycle as a drag', category: 'tasks' },
   { name: 'kangentic_move_task_to_project', label: 'Move Task to Project', blurb: 'relocate a To Do task to another project\'s board', category: 'tasks' },
   { name: 'kangentic_link_pr', label: 'Link PR', blurb: 'resolve and attach a task pull request via the gh CLI', category: 'tasks' },
@@ -67,6 +67,10 @@ export const MCP_TOOL_MANIFEST: McpToolManifestEntry[] = [
   { name: 'kangentic_list_columns', label: 'List Columns', blurb: 'see every board column with its task counts', category: 'board' },
   { name: 'kangentic_get_column_detail', label: 'Column Detail', blurb: 'automation, permission mode, and config for a column', category: 'board' },
   { name: 'kangentic_update_column', label: 'Update Column', blurb: 'rename, recolor, and configure a column automation', category: 'board' },
+  { name: 'kangentic_list_board_profiles', label: 'List Board Profiles', blurb: 'see the board\'s named per-column agent/model/effort presets', category: 'board' },
+  { name: 'kangentic_create_board_profile', label: 'Create Board Profile', blurb: 'add a named preset of per-column agent/model/effort settings', category: 'board' },
+  { name: 'kangentic_update_board_profile', label: 'Update Board Profile', blurb: 'rename a profile or retune its per-column settings, across projects', category: 'board' },
+  { name: 'kangentic_delete_board_profile', label: 'Delete Board Profile', blurb: 'remove a profile; tasks riding it fall back to each column\'s own settings', category: 'board' },
   { name: 'kangentic_board_summary', label: 'Board Summary', blurb: 'counts, active sessions, and aggregate cost across the board', category: 'board' },
   { name: 'kangentic_get_usage_stats', label: 'Usage Stats', blurb: 'tokens, cost, burn rate, and by-model / by-agent usage for a project or all projects over a time range', category: 'board' },
   { name: 'kangentic_list_backlog', label: 'List Backlog', blurb: 'see items staged in the backlog', category: 'board' },
@@ -76,13 +80,17 @@ export const MCP_TOOL_MANIFEST: McpToolManifestEntry[] = [
   { name: 'kangentic_list_projects', label: 'List Projects', blurb: 'every Kangentic project registered on this machine', category: 'board' },
   { name: 'kangentic_search', label: 'Search', blurb: 'unified search across tasks, backlog, session events, projects, and past conversations (keyword or semantic)', category: 'board' },
 
-  // ── Sessions (session-tools.ts) - per-task session history, transcripts, and handoff ──
+  // ── Sessions (session-tools.ts, steering-tools.ts) - per-task session history,
+  //    transcripts, handoff, and the one write-side tool that steers a live session ──
   { name: 'kangentic_list_sessions', label: 'List Sessions', blurb: 'session records for a task with timings, cost, and exit info', category: 'sessions' },
   { name: 'kangentic_get_session_history', label: 'Session History', blurb: 'read the native agent session transcript file for a task', category: 'sessions' },
   { name: 'kangentic_get_session_files', label: 'Session Files', blurb: 'absolute paths to a session activity, status, and history files', category: 'sessions' },
   { name: 'kangentic_get_session_events', label: 'Session Events', blurb: 'parsed activity events from a session log', category: 'sessions' },
+  { name: 'kangentic_get_activity_intervals', label: 'Activity Intervals', blurb: 'durable history of active vs idle time for a task or session', category: 'sessions' },
   { name: 'kangentic_get_handoff_context', label: 'Handoff Context', blurb: 'the most recent cross-agent handoff record for a task', category: 'sessions' },
   { name: 'kangentic_get_transcript', label: 'Get Transcript', blurb: 'read what the agent on another task or project said', category: 'sessions' },
+  { name: 'kangentic_send_session_message', label: 'Send Session Message', blurb: 'send a message to another task\'s running agent to steer it', category: 'sessions' },
+  { name: 'kangentic_get_session_messages_sent', label: 'Sent Session Messages', blurb: 'log of messages sent into a session, and whether each landed', category: 'sessions' },
 
   // ── Browser Automation (browser-tools.ts) ──
   { name: 'kangentic_browser_list_panes', label: 'List Browser Panes', blurb: 'open embedded Browser panes and their URLs', category: 'browser' },

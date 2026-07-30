@@ -3,4 +3,7 @@ export { GroupHeader } from './GroupHeader';
 export { ProjectContextMenu } from './ProjectContextMenu';
 export { GroupContextMenu } from './GroupContextMenu';
 export { SidebarActivityCounts } from './SidebarActivityCounts';
+export { SidebarCommandTerminalIndicator } from './SidebarCommandTerminalIndicator';
+export { SidebarFooterActions } from './SidebarFooterActions';
+export { SidebarBackgroundMenu } from './SidebarBackgroundMenu';
 export { useSidebarDragDrop } from './useSidebarDragDrop';

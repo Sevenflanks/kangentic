@@ -1,6 +1,6 @@
 const PROCESS_START = performance.now();
 
-import { app, BrowserWindow, clipboard, Menu, nativeImage, powerMonitor, session } from 'electron';
+import { app, BrowserWindow, clipboard, Menu, nativeImage, powerMonitor, session, shell } from 'electron';
 import path from 'node:path';
 import { registerAllIpc, getSessionManager, getTerminalSubmitScheduler, getBoardConfigManager, getCurrentProjectId, getOptionalIpcContext, openProjectByPath, deleteProjectFromIndex, pruneStaleWorktreeProjects, activateAllProjects, getLastOpenedProject } from './ipc/register-all';
 import { installDiagnostics } from './diagnostics/install';
@@ -39,6 +39,8 @@ import { restoreShellEnv } from './shell-env';
 import { isFirstPartyPermissionAllowed } from './permission-policy';
 import { MIN_ZOOM, MAX_ZOOM } from '../shared/zoom-steps';
 import { defaultDeveloperFlag, type DeveloperFlagKey } from '../shared/developer-flag-defaults';
+import { createExternalWindowOpenHandler } from './window-open-policy';
+import { initUpdater, updateUpdaterWindow, stopUpdaterTimers } from './updater';
 
 initStartupTimer(PROCESS_START);
 mark('process_start');
@@ -164,7 +166,6 @@ process.on('unhandledRejection', (reason) => {
   }
 });
 
-import { initUpdater, updateUpdaterWindow, stopUpdaterTimers } from './updater';
 import { ensureSpawnHelperPermissions } from './pty/spawn/spawn-helper-permissions';
 
 // Initialize anonymous analytics BEFORE app.whenReady() -- the SDK requires this
@@ -202,8 +203,19 @@ const isE2ETest = process.env.NODE_ENV === 'test';
 let cachedPreviewTaskTitle: string | null | undefined;
 function getPreviewTaskTitle(): string | null {
   if (cachedPreviewTaskTitle === undefined) {
-    cachedPreviewTaskTitle =
-      __KANGENTIC_DEV__ && isEphemeral ? resolvePreviewTaskTitle(getCwdArg() ?? '') : null;
+    // `--cwd` is the usual source, but `/preview --fresh` deliberately omits it so the app
+    // opens on the Welcome Screen with no project - which used to drop the title pill and
+    // leave a fresh preview window unidentifiable next to the others. The app still RUNS
+    // from inside the worktree either way, so fall back to the process cwd and then the
+    // app path. Resolution is a pure path/DB lookup, so trying several costs nothing and
+    // each one independently returns null when it does not look like a worktree.
+    const worktreeCandidates = __KANGENTIC_DEV__ && isEphemeral
+      ? [getCwdArg(), process.cwd(), app.getAppPath()]
+      : [];
+    cachedPreviewTaskTitle = worktreeCandidates.reduce<string | null>(
+      (resolved, candidate) => resolved ?? (candidate ? resolvePreviewTaskTitle(candidate) : null),
+      null,
+    );
   }
   return cachedPreviewTaskTitle;
 }
@@ -246,8 +258,13 @@ app.on('web-contents-created', (_event, contents) => {
     }
   });
 
-  // The remaining handlers apply only to webview contents themselves.
-  if (contents.getType() !== 'webview') return;
+  // Non-webview contents (the main window, and any pop-out window - both fire
+  // web-contents-created) get the shared external-window-open policy (see
+  // createExternalWindowOpenHandler for the full rationale).
+  if (contents.getType() !== 'webview') {
+    contents.setWindowOpenHandler(createExternalWindowOpenHandler((url) => shell.openExternal(url)));
+    return;
+  }
 
   contents.setWindowOpenHandler(() => ({ action: 'deny' }));
 
@@ -350,7 +367,7 @@ function getCwdArg(): string | null {
   return null;
 }
 
-// Re-export for external consumers (e.g. updater module)
+// Re-export for external consumers.
 export { resolveIconPath } from './window-utils';
 
 // Build and show the standard (non-image) right-click context menu with Copy,
@@ -802,7 +819,10 @@ app.whenReady().then(async () => {
   // Start the in-process MCP HTTP server BEFORE createWindow so the URL
   // is available when projects.ts writes per-project mcp-config.json
   // and command-builder writes per-session mcp.json. Bound to 127.0.0.1
-  // only -- no firewall prompt, no exposure to other machines.
+  // by default - no firewall prompt, no exposure to other machines -
+  // unless the user opts into a wider bindAddress by hand-editing the
+  // global config.json (there is no Settings UI for it). Network config
+  // is read once here, at startup; changing it requires an app restart.
   //
   // The factory passed in here is the only path that resolves a project
   // ID to a CommandContext. It returns null if (a) the IPC context is
@@ -813,6 +833,7 @@ app.whenReady().then(async () => {
   // from before the toggle was flipped off can never grant access at
   // runtime.
   try {
+    const startupMcpServerConfig = windowConfigManager.load().mcpServer;
     mcpServerHandle = await startMcpHttpServer(
       (projectId) => {
         const ctx = getOptionalIpcContext();
@@ -822,6 +843,19 @@ app.whenReady().then(async () => {
         return createRequestResolver(ctx, projectId);
       },
       () => readBrowserAutomationConfig(getOptionalIpcContext()?.configManager ?? windowConfigManager),
+      {
+        bindAddress: startupMcpServerConfig?.bindAddress ?? '127.0.0.1',
+        callbackHost: startupMcpServerConfig?.callbackHost,
+      },
+      // Steering (kangentic_send_session_message) needs the live PTY
+      // singletons, which do not exist until the IPC context is built. Read
+      // lazily per request; null just means the tool is not registered yet,
+      // which is only true before any agent could be running.
+      () => {
+        const ctx = getOptionalIpcContext();
+        if (!ctx) return null;
+        return { sessionManager: ctx.sessionManager, terminalSubmit: ctx.terminalSubmit };
+      },
     );
   } catch (err) {
     console.error('[APP] Failed to start MCP HTTP server:', err);
@@ -1045,6 +1079,10 @@ function getShutdownDependencies() {
       // backoff) are already .unref()'d, but dispose() clears them
       // explicitly so nothing fires mid-shutdown.
       getOptionalIpcContext()?.mobileBridgeService.dispose();
+      // Synchronously detach the desktop notifier's SessionManager listeners.
+      // It holds no timers, so this is a pure listener-leak guard, not a
+      // functional requirement of shutdown.
+      getOptionalIpcContext()?.desktopNotifier.dispose();
     },
     isEphemeral,
   };

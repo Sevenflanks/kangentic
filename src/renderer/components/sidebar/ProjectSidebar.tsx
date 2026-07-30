@@ -5,13 +5,15 @@ import {
 } from '@dnd-kit/core';
 import { SortableContext, rectSortingStrategy, arrayMove } from '@dnd-kit/sortable';
 import {
-  Folder, ChevronsLeft, FolderPlus, FolderTree, Search, X,
+  Folder, ChevronsLeft, FolderTree, Search, X,
 } from 'lucide-react';
 import { useProjectStore } from '../../stores/project-store';
 import { useConfigStore } from '../../stores/config-store';
+import { useSessionStore } from '../../stores/session-store';
 import { useToastStore } from '../../stores/toast-store';
 import { useHmrGeneration } from '../../utils/hmr-generation';
 import { useFormattedCombo } from '../../hooks/useKeybinding';
+import { useAddProject } from '../../hooks/useAddProject';
 import { ConfirmDialog } from '../dialogs/ConfirmDialog';
 import { CountBadge } from '../CountBadge';
 import type { Project, ProjectGroup } from '../../../shared/types';
@@ -20,6 +22,8 @@ import {
   GroupHeader,
   ProjectContextMenu,
   GroupContextMenu,
+  SidebarFooterActions,
+  SidebarBackgroundMenu,
   useSidebarDragDrop,
 } from './project-sidebar';
 
@@ -43,8 +47,8 @@ export function ProjectSidebar({ onToggleSidebar }: ProjectSidebarProps) {
   const reorderGroups = useProjectStore((s) => s.reorderGroups);
   const toggleGroupCollapsed = useProjectStore((s) => s.toggleGroupCollapsed);
   const openProjectSettings = useConfigStore((state) => state.openProjectSettings);
-  const openProjectByPath = useProjectStore((s) => s.openProjectByPath);
   const sidebarCombo = useFormattedCombo('view.toggleSidebar');
+  const { startAddProject } = useAddProject();
 
   const renameProject = useProjectStore((s) => s.renameProject);
   const [projectToDelete, setProjectToDelete] = useState<Project | null>(null);
@@ -54,6 +58,7 @@ export function ProjectSidebar({ onToggleSidebar }: ProjectSidebarProps) {
   const newGroupInputRef = useRef<HTMLInputElement>(null);
   const [contextMenu, setContextMenu] = useState<{ position: { x: number; y: number }; project: Project } | null>(null);
   const [groupContextMenu, setGroupContextMenu] = useState<{ position: { x: number; y: number }; group: ProjectGroup } | null>(null);
+  const [backgroundMenu, setBackgroundMenu] = useState<{ x: number; y: number } | null>(null);
   const [renamingProjectId, setRenamingProjectId] = useState<string | null>(null);
   const [renamingGroupId, setRenamingGroupId] = useState<string | null>(null);
   const [search, setSearch] = useState('');
@@ -114,20 +119,6 @@ export function ProjectSidebar({ onToggleSidebar }: ProjectSidebarProps) {
       newGroupInputRef.current.focus();
     }
   }, [creatingGroup]);
-
-  const handleNewProject = async () => {
-    const selectedPath = await window.electronAPI.dialog.selectFolder();
-    if (!selectedPath) return;
-
-    const project = await openProjectByPath(selectedPath);
-    const wasExisting = projects.some(
-      (p) => p.path.replace(/\\/g, '/') === selectedPath.replace(/\\/g, '/'),
-    );
-    useToastStore.getState().addToast({
-      message: wasExisting ? `Opened project "${project.name}"` : `Created project "${project.name}"`,
-      variant: 'info',
-    });
-  };
 
   const handleNewGroup = () => {
     setCreatingGroup(!creatingGroup);
@@ -191,6 +182,37 @@ export function ProjectSidebar({ onToggleSidebar }: ProjectSidebarProps) {
     reorderGroups(reordered.map((g) => g.id));
   }, [sortedGroups, reorderGroups]);
 
+  /**
+   * Jump to a project and reopen its Command Terminal layer, from the row's
+   * terminal indicator. Routes through the same one-shot flag the notification
+   * click path uses; `useCommandBar` consumes it once `currentProjectId` settles.
+   *
+   * The flag is armed only once the switch is CONFIRMED, not merely awaited.
+   * Awaiting alone is not enough: `openProject` also RESOLVES without switching
+   * (a moved or renamed folder is caught internally and routed to the "Locate
+   * Folder" dialog), and it re-throws every other failure. Arming on either path
+   * would let `useCommandBar`'s effect open the layer on the OUTGOING project.
+   * Re-reading the store afterwards covers all of those arms at once.
+   *
+   * Reads the current project from the store instead of closing over it so this
+   * callback stays referentially stable. It is passed to every memoized
+   * `ProjectListItem`, so a new identity on each project switch would defeat
+   * `memo` for the whole list.
+   */
+  const handleOpenCommandTerminals = useCallback(async (projectId: string) => {
+    if (useProjectStore.getState().currentProject?.id !== projectId) {
+      try {
+        await openProject(projectId);
+      } catch {
+        // The store surfaces its own failure (toast / missing-path dialog);
+        // there is nothing to open, so leave the flag disarmed.
+        return;
+      }
+      if (useProjectStore.getState().currentProject?.id !== projectId) return;
+    }
+    useSessionStore.getState().setPendingOpenCommandTerminal(true);
+  }, [openProject]);
+
   const handleContextMenu = useCallback((event: React.MouseEvent, project: Project) => {
     event.preventDefault();
     event.stopPropagation();
@@ -236,6 +258,7 @@ export function ProjectSidebar({ onToggleSidebar }: ProjectSidebarProps) {
         onContextMenu={handleContextMenu}
         onRename={handleRenameProject}
         onCancelRename={handleCancelRename}
+        onOpenCommandTerminals={handleOpenCommandTerminals}
       />
     );
   };
@@ -295,7 +318,18 @@ export function ProjectSidebar({ onToggleSidebar }: ProjectSidebarProps) {
         </div>
       </div>
 
-      <div className="flex-1 overflow-y-auto">
+      {/* Right-clicking the list's empty space used to fall through to
+          Electron's native Copy / Paste / Select All menu, which offers nothing
+          a project list can act on. Rows and group headers stopPropagation in
+          their own handlers, so this only fires on genuine dead space. */}
+      <div
+        className="flex-1 overflow-y-auto"
+        data-testid="sidebar-project-list"
+        onContextMenu={(event) => {
+          event.preventDefault();
+          setBackgroundMenu({ x: event.clientX, y: event.clientY });
+        }}
+      >
         <DndContext
           key={hmrGeneration}
           sensors={sensors}
@@ -344,6 +378,9 @@ export function ProjectSidebar({ onToggleSidebar }: ProjectSidebarProps) {
                   ref={newGroupInputRef}
                   value={newGroupName}
                   onChange={(e) => setNewGroupName(e.target.value)}
+                  // Keeps the native Copy / Paste menu on the text field: the
+                  // list container's own handler would otherwise swallow it.
+                  onContextMenu={(event) => event.stopPropagation()}
                   onBlur={() => {
                     setCreatingGroup(false);
                     setNewGroupName('');
@@ -384,7 +421,7 @@ export function ProjectSidebar({ onToggleSidebar }: ProjectSidebarProps) {
           <div className="p-6 text-center">
             <Folder size={32} className="mx-auto text-fg-disabled mb-2" />
             <div className="text-sm text-fg-faint">No projects yet</div>
-            <div className="text-xs text-fg-disabled mt-1">Use the buttons below to open a folder</div>
+            <div className="text-xs text-fg-disabled mt-1">Use Add project below to open a folder</div>
           </div>
         )}
         {projects.length > 0 && isSearching && totalFilteredCount === 0 && (
@@ -396,29 +433,16 @@ export function ProjectSidebar({ onToggleSidebar }: ProjectSidebarProps) {
         )}
       </div>
 
-      <div className="px-3 py-2 border-t border-edge flex items-center gap-1.5">
-        <button
-          type="button"
-          onClick={handleNewProject}
-          className="flex-1 inline-flex items-center justify-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md border border-edge/60 text-fg-muted hover:text-fg hover:bg-surface-hover/40 hover:border-edge transition-colors"
-          title="Open folder as project"
-          data-testid="sidebar-new-project-button"
-        >
-          <FolderPlus size={14} />
-          Add Project
-        </button>
-        <button
-          type="button"
-          onMouseDown={(e: React.MouseEvent) => e.preventDefault()}
-          onClick={handleNewGroup}
-          className="flex-shrink-0 inline-flex items-center justify-center w-8 h-[30px] rounded-md border border-edge/60 text-fg-muted hover:text-fg hover:bg-surface-hover/40 hover:border-edge transition-colors"
-          title="New group"
-          data-testid="sidebar-new-group-button"
-          aria-label="New group"
-        >
-          <FolderTree size={14} />
-        </button>
-      </div>
+      <SidebarFooterActions onAddProject={startAddProject} onNewGroup={handleNewGroup} />
+
+      {backgroundMenu && (
+        <SidebarBackgroundMenu
+          position={backgroundMenu}
+          onAddProject={startAddProject}
+          onNewGroup={handleNewGroup}
+          onClose={() => setBackgroundMenu(null)}
+        />
+      )}
 
       {/* Project context menu */}
       {contextMenu && (

@@ -4,6 +4,7 @@ const fs = require('fs');
 const esbuild = require('esbuild');
 const rendererOptimizeDeps = require('./renderer-optimize-deps.json');
 const { copyExternalScripts } = require('./copy-external-scripts');
+const { writeExitRecord } = require('./preview-exit-record');
 
 const projectDir = path.resolve(__dirname, '..');
 
@@ -63,7 +64,7 @@ const esbuildCommon = {
   platform: 'node',
   target: 'node24',
   format: 'cjs',
-  external: ['electron', 'better-sqlite3', 'node-pty', 'sherpa-onnx-node', 'sqlite-vec', '@huggingface/transformers'],
+  external: ['electron', 'better-sqlite3', 'node-pty', 'sherpa-onnx-node', 'sqlite-vec', '@huggingface/transformers', 'font-list'],
   conditions: ['require'],
   define: {
     'MAIN_WINDOW_VITE_DEV_SERVER_URL': JSON.stringify(`http://localhost:${port}`),
@@ -90,19 +91,25 @@ async function start() {
   const resolvedTarget = targetDir ? path.resolve(targetDir) : projectDir;
   const ephemeralDataDir = ephemeral ? path.join(resolvedTarget, '.kangentic', 'data') : null;
   let previewClonePromise = Promise.resolve();
-  if (ephemeral && !fresh && ephemeralDataDir) {
+  if (ephemeral && ephemeralDataDir) {
     // Fresh data dir every boot so a previous (possibly crashed) preview's clones
     // never persist. The node_modules junction lives OUTSIDE .kangentic/ and clones
     // are source-only (no junctions), so this rm is safe.
     // force suppresses ENOENT but not EBUSY/EPERM from a still-locked handle a
     // previous (crashed) preview left behind; retry briefly, then degrade to a
     // warning rather than crashing the dev server before the build starts.
+    //
+    // This runs for --fresh TOO. It used to be skipped there, which made --fresh the one
+    // mode that INHERITED whatever the last preview left behind: the flag exists to test
+    // the first-launch experience, and it was the only launch that could not show it.
     try {
       fs.rmSync(ephemeralDataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
     } catch (rmError) {
       console.warn('[dev] could not fully clear the ephemeral data dir (a previous preview may still hold a lock):', rmError);
     }
     fs.mkdirSync(ephemeralDataDir, { recursive: true });
+  }
+  if (ephemeral && !fresh && ephemeralDataDir) {
     fs.writeFileSync(path.join(ephemeralDataDir, 'config.json'), JSON.stringify({ hasCompletedFirstRun: true }, null, 2));
     const preClone = (cloneDir) => new Promise((resolve) => {
       const cloneProc = spawn('git', ['clone', '--no-checkout', '--local', resolvedTarget, cloneDir], { stdio: 'inherit', windowsHide: true });
@@ -283,7 +290,25 @@ async function start() {
   });
 }
 
+let cleaningUp = false;
+
 function cleanup(exitCode) {
+  // Re-entrancy guard. Today the process.exit() at the end wins the race
+  // against any second trigger, but only incidentally: adding a single await
+  // above it would let the electronProc 'close' event (or an exception raised
+  // while cleaning up) re-enter and write a SECOND, contradictory exit record.
+  if (cleaningUp) return;
+  cleaningUp = true;
+
+  // FIRST action, with nothing but the re-entrancy guard above it: the
+  // ephemeral cleanup below removes the worktree's entire .kangentic/
+  // directory (including the PID file), so a --wait watcher polling for
+  // "PID file gone" must already find this record on disk by the time that
+  // happens, or it misclassifies a clean exit as vanished. See
+  // scripts/preview-exit-record.js and the --wait loop in
+  // scripts/worktree-preview.js.
+  writeExitRecord(projectDir, port, { pid: process.pid, exitCode });
+
   if (viteServer) {
     viteServer.close().catch(() => {});
     viteServer = null;
@@ -333,6 +358,23 @@ process.on('SIGTERM', () => cleanup(0));
 // for the next launch to misreport. cleanup() is comfortably faster than the
 // grace window (sync kills + fs removals).
 process.on('SIGHUP', () => cleanup(0));
+
+// A post-start crash (a rejected promise in a Vite callback, a throw from an
+// event listener registered during start()) otherwise takes Node's default
+// fatal path, which never runs cleanup() and so never writes an exit record.
+// A --wait watcher would then read the absence of a record as 'vanished'
+// (force-killed) instead of 'crashed', pointing the user at the wrong cause.
+function exitOnFatal(label, fatalError) {
+  console.error(`[dev] ${label}:`, fatalError);
+  cleanup(1);
+  // cleanup() short-circuits when it is already running, and its own
+  // process.exit() then never fires. Exit here too, so a throw raised from
+  // inside cleanup (the case these handlers exist to catch) cannot leave a
+  // half-cleaned dev server alive still holding the port.
+  process.exit(1);
+}
+process.on('uncaughtException', (uncaughtError) => exitOnFatal('Uncaught exception', uncaughtError));
+process.on('unhandledRejection', (rejectionReason) => exitOnFatal('Unhandled rejection', rejectionReason));
 
 start().catch((err) => {
   console.error('[dev] Fatal error:', err);

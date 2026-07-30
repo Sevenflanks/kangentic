@@ -1,17 +1,16 @@
 ## What's New
 
-- **Usage statistics dashboard** - a new project-level and app-wide view of token usage, cost, and session activity, with live and cumulative breakdowns.
-- **Mobile companion bridge** - pair a mobile device over a secure relay transport to watch and drive your boards, backed by a typed protocol package.
-- **Detachable panes** - pop the Stats, Changes, and Browser surfaces out into their own movable, resizable windows.
-- **Refreshed branding** - new Warm Craft desktop app icons and a theme-adaptive title-bar mark.
+- **Terminal color overhaul** - a near-black background, a real 16-color ANSI palette, and fully custom background/foreground/cursor colors, including a one-click preset that matches your app theme.
+- **Task settings tab** - task-presentation settings now live in their own tab, and the terminal font is picked from your detected system fonts via an autocomplete.
+- **Word-delete on Backspace** - an opt-in terminal setting so Backspace deletes the previous word instead of a single character.
+- **Disable Codex's ChatGPT Apps connector** - a per-agent launch toggle that skips the optional cloud connector that can hang Codex startup.
+- **Remote OpenCode servers** - point a task's worker at an OpenCode server you run instead of spawning a local process.
+- **Configurable MCP server bind address** - choose the address the built-in MCP HTTP server listens on.
+- **Better activity tracking** - a live idle-wait countdown, a durable history of active/idle intervals, and faster recovery from resume-picker turns.
 
 ## Bug Fixes
 
-- Command Terminal now refits its content on container-only size changes and settles scrollback cleanly on repaint.
-- Advanced per-task overrides lock reliably at first spawn from every entry point.
-- Usage stats capture git churn on every finalization and merge live sessions correctly; the Live view's cost cards and sparkline are fixed.
-- The Changes panel shows diffs for tasks without a worktree, and its state is scoped per window.
-- Pasted or dropped images now inject an agent-readable reference.
-- Orphaned background shells drain via transcript instead of a dead hook.
-- Restored the pointer cursor on buttons after a Tailwind v4 regression.
-- Board task-detail windows hide correctly over the Backlog view.
+- The usage context bar now clamps to 100% instead of disappearing as you approach auto-compaction.
+- The terminal launch overlay paints with the resolved terminal background, so there is no color flash on spawn.
+- Linux rpm packages declare soname capabilities, so they install across distributions instead of failing on package-name mismatches.
+- The `{{baseBranch}}` task-template variable now resolves to the effective default branch.

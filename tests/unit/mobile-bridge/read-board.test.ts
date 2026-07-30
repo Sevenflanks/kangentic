@@ -42,15 +42,26 @@ describe('handleReadBoard', () => {
     backlogList.mockReset().mockReturnValue([{ id: 'b-1', external_metadata: { secret: true } }]);
   });
 
-  it('with no projectId, returns the project bootstrap list (with derived accent colors) and never touches repos', async () => {
-    const projectRepoList = vi.fn(() => [{ id: 'proj-1', name: 'Alpha' }]);
-    const context = { projectRepo: { list: projectRepoList, getById: vi.fn() } } as unknown as IpcContext;
+  it('with no projectId, returns the project bootstrap list (with derived accent colors, group and position) and never touches task repos', async () => {
+    const projectRepoList = vi.fn(() => [{ id: 'proj-1', name: 'Alpha', group_id: 'grp-1', position: 0 }]);
+    const projectGroupList = vi.fn(() => [{ id: 'grp-1', name: 'Kangentic', position: 0, is_collapsed: false }]);
+    const context = {
+      projectRepo: { list: projectRepoList, getById: vi.fn() },
+      projectGroupRepo: { list: projectGroupList },
+    } as unknown as IpcContext;
     const subscriptions = new SubscriptionRegistry();
 
     const response = await handleReadBoard(fakeRequest({}), fakeSession(), context, subscriptions);
 
     expect(response.ok).toBe(true);
-    expect(response.payload).toEqual({ projects: [{ id: 'proj-1', name: 'Alpha', color: deriveProjectAccentColor('proj-1') }] });
+    expect(response.payload).toEqual({
+      projects: [
+        { id: 'proj-1', name: 'Alpha', color: deriveProjectAccentColor('proj-1'), groupId: 'grp-1', position: 0 },
+      ],
+      // is_collapsed stays desktop-internal: the phone's sheet is scrolled,
+      // not collapsed, so a collapse flag would describe nothing it renders.
+      groups: [{ id: 'grp-1', name: 'Kangentic', position: 0 }],
+    });
     const listed = (response.payload as { projects: Array<{ color: string }> }).projects[0];
     expect(PROJECT_ACCENT_PALETTE).toContain(listed.color);
     expect(tasksList).not.toHaveBeenCalled();
@@ -59,7 +70,10 @@ describe('handleReadBoard', () => {
   it('rejects an unsubscribe with no projectId as a no-op success (nothing to tear down)', async () => {
     // action alone with no projectId falls through to the project-list branch
     // since there is no per-project subscription to identify.
-    const context = { projectRepo: { list: vi.fn(() => []), getById: vi.fn() } } as unknown as IpcContext;
+    const context = {
+      projectRepo: { list: vi.fn(() => []), getById: vi.fn() },
+      projectGroupRepo: { list: vi.fn(() => []) },
+    } as unknown as IpcContext;
     const response = await handleReadBoard(fakeRequest({ action: 'unsubscribe' }), fakeSession(), context, new SubscriptionRegistry());
     expect(response.ok).toBe(true);
   });
@@ -78,8 +92,9 @@ describe('handleReadBoard', () => {
       return vi.fn();
     });
     const context = {
-      projectRepo: { getById: vi.fn(() => ({ id: 'proj-1', name: 'Alpha' })) },
+      projectRepo: { getById: vi.fn(() => ({ id: 'proj-1', name: 'Alpha', path: 'C:/projects/alpha' })) },
       boardEvents: { onBoardChanged },
+      configManager: { getEffectiveConfig: vi.fn(() => ({ showTaskNumbers: false })) },
     } as unknown as IpcContext;
     const subscriptions = new SubscriptionRegistry();
     const session = fakeSession();
@@ -93,6 +108,7 @@ describe('handleReadBoard', () => {
       tasks: [{ id: 't-1', session_id: 'sess-1' }],
       backlog: [{ id: 'b-1' }],
       projectColor: deriveProjectAccentColor('proj-1'),
+      showTicketNumbers: false,
     });
     const snapshot = response.payload as { columns: object[]; tasks: object[]; backlog: object[] };
     expect(snapshot.tasks[0]).not.toHaveProperty('detail_view_state');
@@ -112,11 +128,81 @@ describe('handleReadBoard', () => {
     });
   });
 
+  describe('view projections (protocol 0.9.0)', () => {
+    function boardContext(): IpcContext {
+      return {
+        projectRepo: { getById: vi.fn(() => ({ id: 'proj-1', name: 'Alpha', path: 'C:/projects/alpha' })) },
+        boardEvents: { onBoardChanged: vi.fn(() => vi.fn()) },
+        configManager: { getEffectiveConfig: vi.fn(() => ({ showTaskNumbers: true })) },
+      } as unknown as IpcContext;
+    }
+
+    beforeEach(() => {
+      tasksList.mockReturnValue([
+        { id: 't-1', swimlane_id: 'lane-1', session_id: 'sess-1' },
+        { id: 't-2', swimlane_id: 'lane-1', session_id: null },
+        { id: 't-3', swimlane_id: 'lane-2', session_id: null },
+      ]);
+    });
+
+    it("'sessions' returns only session-bearing tasks, with real per-column counts and no backlog", async () => {
+      const response = await handleReadBoard(
+        fakeRequest({ projectId: 'proj-1', view: 'sessions' }),
+        fakeSession(),
+        boardContext(),
+        new SubscriptionRegistry(),
+      );
+
+      const snapshot = response.payload as {
+        tasks: Array<{ id: string }>;
+        view: string;
+        taskCountsByColumnId: Record<string, number>;
+      };
+      expect(snapshot.tasks.map((task) => task.id)).toEqual(['t-1']);
+      expect(snapshot.view).toBe('sessions');
+      // Counts describe the WHOLE column, not the filtered list - appending a
+      // card to lane-1 has to land after t-2, not on top of it.
+      expect(snapshot.taskCountsByColumnId).toEqual({ 'lane-1': 2, 'lane-2': 1 });
+      expect(response.payload).not.toHaveProperty('backlog');
+      expect(backlogList).not.toHaveBeenCalled();
+    });
+
+    it("'full' returns every task but still drops the backlog, and sends no counts", async () => {
+      const response = await handleReadBoard(
+        fakeRequest({ projectId: 'proj-1', view: 'full' }),
+        fakeSession(),
+        boardContext(),
+        new SubscriptionRegistry(),
+      );
+
+      const snapshot = response.payload as { tasks: Array<{ id: string }>; view: string };
+      expect(snapshot.tasks.map((task) => task.id)).toEqual(['t-1', 't-2', 't-3']);
+      expect(snapshot.view).toBe('full');
+      expect(response.payload).not.toHaveProperty('backlog');
+      expect(response.payload).not.toHaveProperty('taskCountsByColumnId');
+      expect(backlogList).not.toHaveBeenCalled();
+    });
+
+    it('a request with no view keeps the pre-0.9.0 payload, backlog included', async () => {
+      const response = await handleReadBoard(
+        fakeRequest({ projectId: 'proj-1' }),
+        fakeSession(),
+        boardContext(),
+        new SubscriptionRegistry(),
+      );
+
+      expect(response.payload).toHaveProperty('backlog');
+      expect(response.payload).not.toHaveProperty('view');
+      expect(backlogList).toHaveBeenCalledTimes(1);
+    });
+  });
+
   it('unsubscribe tears down the board subscription', async () => {
     const unsubscribe = vi.fn();
     const context = {
-      projectRepo: { getById: vi.fn(() => ({ id: 'proj-1', name: 'Alpha' })) },
+      projectRepo: { getById: vi.fn(() => ({ id: 'proj-1', name: 'Alpha', path: 'C:/projects/alpha' })) },
       boardEvents: { onBoardChanged: vi.fn(() => unsubscribe) },
+      configManager: { getEffectiveConfig: vi.fn(() => ({ showTaskNumbers: true })) },
     } as unknown as IpcContext;
     const subscriptions = new SubscriptionRegistry();
     const session = fakeSession();

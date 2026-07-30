@@ -6,10 +6,13 @@ import { sanitizeForPty } from '../../shared/paths';
 import { SessionManager } from '../pty/session-manager';
 import type { TerminalSubmit } from '../pty/terminal-submit';
 import type { TerminalSubmitScheduler } from './terminal-submit-scheduler';
-import { interpolateTemplate, buildTaskXml } from '../agent/shared';
+import { disposeSpawnCleanup, removeAdapterHooks } from '../pty/lifecycle/adapter-lifecycle';
+import { interpolateTemplate, resolveTaskTemplateVars } from '../agent/shared';
+import { resolveExecutionTarget } from '../agent/shared/execution-target';
+import { resolveLaunchOptions } from '../agent/shared/launch-options';
 import { WorktreeManager, prepareWorktreeForRemoval, GitQueuePriority } from '../git/worktree-manager';
 import { agentRegistry } from '../agent/agent-registry';
-import { disposeSpawnCleanup, removeAdapterHooks } from '../pty/lifecycle/adapter-lifecycle';
+import { appendCallerSession } from '../agent/mcp-http/caller-url';
 import { retireRecord, markRecordSuspended } from './session-lifecycle';
 import { resolveEffectivePermissionMode } from './spawn-preamble';
 import { resolveSpawnIntent } from './spawn-intent';
@@ -41,6 +44,12 @@ interface TransitionEngineConfig {
   mcpServerToken?: string;
   defaultAgent: string;
   cliPathOverrides: Record<string, string | null>;
+  /** Global, agent-keyed remote-server identity (url + auth). */
+  executionServers: AppConfig['agent']['executionServers'];
+  /** Per-project, agent-keyed local/remote choice + server working directory. */
+  execution: AppConfig['agent']['execution'];
+  /** Global, agent-keyed boolean launch-option toggles (agent name -> option id -> enabled). */
+  launchOptions: AppConfig['agent']['launchOptions'];
 }
 
 /**
@@ -83,28 +92,20 @@ export class TransitionEngine {
   async resumeSuspendedSession(task: Task, permissionOverride?: PermissionMode | null, skipPromptTemplate?: boolean, resumePrompt?: string, signal?: AbortSignal, agentOverride?: string, handoffPromptPrefix?: string, spawnOverrides?: SpawnOverrides): Promise<void> {
     signal?.throwIfAborted();
     const attachmentPaths = this.attachmentRepo?.getPathsForTask(task.id) ?? [];
-    const cleanTitle = sanitizeForPty(task.title);
-    const cleanDesc = sanitizeForPty(task.description);
     // {{task_xml}} wraps title/description in a <task> envelope (Anthropic +
     // OpenAI guidance for clear data/instruction boundaries). The XML body
     // uses the RAW description so multi-line markdown content survives end
     // to end - quoteArg's `multiline: true` opt-in keeps newlines through
     // shell delivery. The legacy `{{description}}` prose var stays sanitized
     // so user-customized single-line templates don't break.
+    const templateVars = resolveTaskTemplateVars({
+      task,
+      defaultBaseBranch: this.getConfig().gitConfig.defaultBaseBranch,
+      attachmentPaths,
+    });
     await this.executeSpawnAgent({
       promptTemplate: skipPromptTemplate ? undefined : '{{task_xml}}{{attachments}}',
-    }, task, {
-      task_xml: buildTaskXml({ title: cleanTitle, description: task.description }),
-      title: cleanTitle,
-      description: cleanDesc ? `: ${cleanDesc}` : '',
-      taskId: task.id,
-      worktreePath: task.worktree_path || '',
-      branchName: task.branch_name || '',
-      baseBranch: task.base_branch || '',
-      attachments: attachmentPaths.length > 0
-        ? `\n${attachmentPaths.join('\n')}`
-        : '',
-    }, permissionOverride, resumePrompt, signal, agentOverride, handoffPromptPrefix, spawnOverrides);
+    }, task, templateVars, permissionOverride, resumePrompt, signal, agentOverride, handoffPromptPrefix, spawnOverrides);
   }
 
   async executeTransition(task: Task, fromSwimlaneId: string, toSwimlaneId: string, permissionOverride?: PermissionMode | null, skipPromptTemplate?: boolean, signal?: AbortSignal, agentOverride?: string, spawnOverrides?: SpawnOverrides, onProgress?: (phase: string) => void, onSpawnLifecycle?: SpawnLifecycleObserver, continuationPrompt?: string): Promise<void> {
@@ -129,24 +130,13 @@ export class TransitionEngine {
       return; // skip action with malformed config
     }
     const attachmentPaths = this.attachmentRepo?.getPathsForTask(task.id) ?? [];
-    const cleanTitle = sanitizeForPty(task.title);
-    const cleanDesc = sanitizeForPty(task.description);
     // task_xml gets the RAW description so multi-line markdown survives;
     // {{description}} stays sanitized for legacy single-line prose templates.
-    const templateVars: Record<string, string> = {
-      task_xml: buildTaskXml({ title: cleanTitle, description: task.description }),
-      title: cleanTitle,
-      description: cleanDesc ? `: ${cleanDesc}` : '',
-      taskId: task.id,
-      worktreePath: task.worktree_path || '',
-      branchName: task.branch_name || '',
-      baseBranch: task.base_branch || '',
-      prUrl: task.pr_url || '',
-      prNumber: task.pr_number ? String(task.pr_number) : '',
-      attachments: attachmentPaths.length > 0
-        ? `\n${attachmentPaths.join('\n')}`
-        : '',
-    };
+    const templateVars = resolveTaskTemplateVars({
+      task,
+      defaultBaseBranch: this.getConfig().gitConfig.defaultBaseBranch,
+      attachmentPaths,
+    });
 
     switch (action.type) {
       case 'spawn_agent': {
@@ -289,7 +279,8 @@ export class TransitionEngine {
         : handoffPromptPrefix;
     }
     const intendedPrompt = prompt;
-    const initialPromptDelivery = adapter.initialPromptDelivery ?? 'command-argument';
+    const defaultInitialPromptDelivery = adapter.initialPromptDelivery ?? 'command-argument';
+    let initialPromptDelivery = defaultInitialPromptDelivery;
 
     // Ensure the per-session directory exists and compute output paths.
     // Directory is named by ptySessionId (internal), NOT agentSessionId (CLI-specific).
@@ -304,6 +295,8 @@ export class TransitionEngine {
     const { statusOutputPath, eventsOutputPath } = sessionOutputPaths(sessionDir);
 
     const shell = await this.sessionManager.getShell();
+    const executionTarget = resolveExecutionTarget(agentName, appConfig.executionServers, appConfig.execution) ?? undefined;
+    const launchOptions = resolveLaunchOptions(adapter, appConfig.launchOptions);
     const commandOptions = {
       agentPath: detection.path,
       taskId: task.id,
@@ -318,10 +311,14 @@ export class TransitionEngine {
       eventsOutputPath,
       shell,
       mcpServerEnabled: appConfig.mcpServerEnabled,
-      mcpServerUrl: appConfig.mcpServerUrl,
+      // Carries this session's own id so the MCP server can identify the caller
+      // (see appendCallerSession). Stamped, never looked up, so it cannot drift.
+      mcpServerUrl: appendCallerSession(appConfig.mcpServerUrl, ptySessionId),
       mcpServerToken: appConfig.mcpServerToken,
       model: spawnOverrides?.model ?? undefined,
       effort: spawnOverrides?.effort ?? undefined,
+      executionTarget,
+      launchOptions,
     };
     let preparation: InitialPromptPreparation | undefined;
     const preparationCleanupOwner: { spawnCleanup?: InitialPromptPreparation['cleanup'] } = {};
@@ -341,6 +338,7 @@ export class TransitionEngine {
             sessionDirectory: sessionDir,
             permissionMode,
             ...(spawnOverrides?.model ? { model: spawnOverrides.model } : {}),
+            ...(executionTarget ? { executionTarget } : {}),
             resume: true,
             sessionId: nativeSessionId,
           };
@@ -350,17 +348,19 @@ export class TransitionEngine {
             sessionDirectory: sessionDir,
             permissionMode,
             ...(spawnOverrides?.model ? { model: spawnOverrides.model } : {}),
+            ...(executionTarget ? { executionTarget } : {}),
             resume: false,
           };
         }
 
         preparation = adapter.prepareInitialPrompt?.(preparationInput)
-          ?? (initialPromptDelivery === 'terminal-submit'
+          ?? (defaultInitialPromptDelivery === 'terminal-submit'
             ? undefined
             : { commandPrompt: intendedPrompt });
         preparationCleanupOwner.spawnCleanup = preparation?.cleanup;
       }
 
+      initialPromptDelivery = preparation?.delivery ?? defaultInitialPromptDelivery;
       const preparedCommandOptions = {
         ...commandOptions,
         prompt: preparation?.commandPrompt,

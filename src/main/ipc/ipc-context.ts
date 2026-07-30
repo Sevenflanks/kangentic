@@ -7,12 +7,14 @@ import type { BoardConfigManager } from '../config/board-config-manager';
 import type { DiffWatcher } from '../git/diff-watcher';
 import type { GitDetector } from '../git/git-detector';
 import type { ShellResolver } from '../pty/spawn/shell-resolver';
+import type { FontResolver } from '../font-resolver';
 import type { TerminalSubmitScheduler } from '../transition-engine/terminal-submit-scheduler';
 import type { TerminalSubmit } from '../pty/terminal-submit';
 import type { McpHttpServerHandle } from '../agent/mcp-http-server';
 import type { TranscriptionService } from '../transcription/transcription-service';
 import type { MobileBridgeService } from '../mobile-bridge/mobile-bridge-service';
 import type { BoardEventBus } from '../mobile-bridge/board-event-bus';
+import type { DesktopNotifier } from '../notifications/desktop-notifier';
 
 export interface IpcContext {
   mainWindow: BrowserWindow;
@@ -30,6 +32,7 @@ export interface IpcContext {
   diffWatcher: DiffWatcher;
   gitDetector: GitDetector;
   shellResolver: ShellResolver;
+  fontResolver: FontResolver;
   /**
    * Task-keyed lifecycle wrapper around `TerminalSubmit.submitKeystrokes`.
    * Owns: cancel-on-rerun, fresh-spawn `'thinking'` wait, drag-burst
@@ -93,4 +96,11 @@ export interface IpcContext {
    * See src/main/mobile-bridge/board-event-bus.ts.
    */
   boardEvents: BoardEventBus;
+  /**
+   * Owns the desktop idle/crash notification policy (cooldown, focus gate,
+   * active-project gate, title assembly), listening to SessionManager's own
+   * events rather than a renderer round-trip. See
+   * src/main/notifications/desktop-notifier.ts.
+   */
+  desktopNotifier: DesktopNotifier;
 }

@@ -42,7 +42,7 @@ const context = {
   currentProjectId: 'project-board', currentProjectPath: '/project-board',
   sessionManager: { getSession: vi.fn(() => ({ status: 'running' })) },
   terminalSubmitScheduler: scheduler,
-  boardConfigManager: { writeBack: vi.fn(), exists: vi.fn(), exportFromDb: vi.fn(), applyFileChange: vi.fn(), getShortcuts: vi.fn(), setShortcuts: vi.fn(), setDefaultBaseBranch: vi.fn() },
+  boardConfigManager: { writeBack: vi.fn(), exists: vi.fn(), exportFromDb: vi.fn(), applyFileChange: vi.fn(), getShortcuts: vi.fn(), setShortcuts: vi.fn(), setDefaultBaseBranch: vi.fn(), getBoardProfiles: vi.fn(() => []) },
   projectRepo: { getById: vi.fn(() => ({ id: 'project-board' })) },
   mainWindow: { isDestroyed: vi.fn(() => false), webContents: { send: vi.fn() } },
 };

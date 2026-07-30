@@ -6,6 +6,8 @@ export const IPC = {
   PROJECT_OPEN: 'project:open',
   PROJECT_GET_CURRENT: 'project:getCurrent',
   PROJECT_OPEN_BY_PATH: 'project:openByPath',
+  PROJECT_PROBE_PATH: 'project:probePath',
+  PROJECT_ENSURE_GIT: 'project:ensureGit',
   PROJECT_SEARCH_ENTRIES: 'project:searchEntries',
   PROJECT_REORDER: 'project:reorder',
   PROJECT_SET_GROUP: 'project:setGroup',
@@ -145,12 +147,12 @@ export const IPC = {
   KEYBINDINGS_PROBE_GLOBAL: 'keybindings:probeGlobal',
 
   // Agent
-  AGENT_DETECT: 'agent:detect',
   AGENT_LIST_COMMANDS: 'agent:listCommands',
   AGENT_SUMMARIZE: 'agent:summarize',
 
   // Agents
   AGENT_LIST: 'agent:list',
+  AGENT_PROBE_EXECUTION_SERVER: 'agent:probeExecutionServer',
 
   // Handoffs
   HANDOFF_LIST: 'handoff:list',
@@ -158,6 +160,9 @@ export const IPC = {
   // Shell
   SHELL_GET_AVAILABLE: 'shell:getAvailable',
   SHELL_GET_DEFAULT: 'shell:getDefault',
+
+  // Fonts
+  FONT_GET_AVAILABLE: 'font:getAvailable',
 
   // Shell utilities
   SHELL_OPEN_PATH: 'shell:openPath',
@@ -213,6 +218,9 @@ export const IPC = {
   BOARD_CONFIG_EXPORT: 'boardConfig:export',
   BOARD_CONFIG_APPLY: 'boardConfig:apply',
   BOARD_CONFIG_CHANGED: 'boardConfig:changed',
+  BOARD_CONFIG_GET_BOARD_PROFILES: 'boardConfig:getBoardProfiles',
+  BOARD_CONFIG_SET_BOARD_PROFILES: 'boardConfig:setBoardProfiles',
+  BOARD_CONFIG_BOARD_PROFILES_CHANGED: 'boardConfig:boardProfilesChanged',
   BOARD_CONFIG_GET_SHORTCUTS: 'boardConfig:getShortcuts',
   BOARD_CONFIG_SET_SHORTCUTS: 'boardConfig:setShortcuts',
   BOARD_CONFIG_SHORTCUTS_CHANGED: 'boardConfig:shortcutsChanged',
@@ -221,12 +229,14 @@ export const IPC = {
   // Mobile Bridge -- machine-global (like config), not project-scoped.
   MOBILE_GET_STATUS: 'mobile:getStatus',
   MOBILE_START_PAIRING: 'mobile:startPairing',
-  MOBILE_CONFIRM_PAIRING: 'mobile:confirmPairing',
   MOBILE_CANCEL_PAIRING: 'mobile:cancelPairing',
   MOBILE_LIST_DEVICES: 'mobile:listDevices',
   MOBILE_REVOKE_DEVICE: 'mobile:revokeDevice',
+  MOBILE_RENAME_DEVICE: 'mobile:renameDevice',
   MOBILE_SET_DEVICE_CAPABILITIES: 'mobile:setDeviceCapabilities',
+  MOBILE_TEST_RELAY: 'mobile:testRelay',
   MOBILE_PAIRING_SAS: 'mobile:pairingSas',
+  MOBILE_PAIRING_CONFIRMED: 'mobile:pairingConfirmed',
   MOBILE_PAIRING_ENDED: 'mobile:pairingEnded',
   MOBILE_STATE_CHANGED: 'mobile:stateChanged',
 

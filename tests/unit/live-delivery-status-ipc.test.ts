@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { EventEmitter } from 'node:events';
 import type { LiveDeliveryStatus } from '../../src/shared/live-delivery-status';
 import type { ElectronAPI } from '../../src/shared/types';
 import { loadLiveDeliveryStatusMockHarness } from './helpers/live-delivery-status-mock-harness';
@@ -42,7 +43,9 @@ vi.mock('../../src/main/transition-engine/terminal-submit-scheduler', () => ({
     }
   },
 }));
-vi.mock('../../src/main/pty/session-manager', () => ({ SessionManager: class {} }));
+vi.mock('../../src/main/pty/session-manager', () => ({
+  SessionManager: class extends EventEmitter {},
+}));
 vi.mock('../../src/main/pty/paste-engine', () => ({ createPasteEngine: vi.fn(() => ({})) }));
 vi.mock('../../src/main/pty/terminal-submit', () => ({ TerminalSubmit: class {} }));
 vi.mock('../../src/main/config/config-manager', () => ({

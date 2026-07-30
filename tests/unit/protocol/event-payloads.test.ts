@@ -104,6 +104,22 @@ describe('parseActivityEventPayload', () => {
     expect(parseActivityEventPayload(payload)).toEqual(payload);
   });
 
+  it('parses idle/permission reasons carrying the optional since field', () => {
+    const idlePayload: JsonValue = { type: 'activity', state: 'idle', reason: { kind: 'idle', since: 1700000000000 } };
+    expect(parseActivityEventPayload(idlePayload)).toEqual(idlePayload);
+    const permissionPayload: JsonValue = { type: 'activity', state: 'permission', reason: { kind: 'permission', since: 1700000000000 } };
+    expect(parseActivityEventPayload(permissionPayload)).toEqual(permissionPayload);
+  });
+
+  it('parses idle/permission reasons with since OMITTED - additive-field compatibility with an older desktop', () => {
+    const payload: JsonValue = { type: 'activity', state: 'idle', reason: { kind: 'idle' } };
+    expect(parseActivityEventPayload(payload)).toEqual(payload);
+  });
+
+  it('rejects an idle/permission reason whose since is not a number', () => {
+    expect(() => parseActivityEventPayload({ type: 'activity', state: 'idle', reason: { kind: 'idle', since: '1700000000000' } })).toThrow(/reason/);
+  });
+
   it('parses a usage payload', () => {
     expect(parseActivityEventPayload({ type: 'usage', usage: usageFixture })).toEqual({ type: 'usage', usage: usageFixture });
   });
@@ -116,6 +132,28 @@ describe('parseActivityEventPayload', () => {
   it('parses a permission payload', () => {
     const payload: JsonValue = { type: 'permission', promptId: 'sess-1:tool-1', pending: true };
     expect(parseActivityEventPayload(payload)).toEqual(payload);
+  });
+
+  it('parses a permission payload with option labels, preserving their keystroke order', () => {
+    const payload: JsonValue = {
+      type: 'permission',
+      promptId: 'sess-1:tool-1',
+      pending: true,
+      options: ['Yes', "Yes, and don't ask again for this command", 'No, and tell Claude what to do differently'],
+    };
+    expect(parseActivityEventPayload(payload)).toEqual(payload);
+  });
+
+  it('a permission payload without options stays options-less (pre-0.6.0 desktop)', () => {
+    const parsed = parseActivityEventPayload({ type: 'permission', promptId: 'sess-1:tool-1', pending: true });
+    expect('options' in parsed).toBe(false);
+  });
+
+  it('rejects a permission payload with malformed options', () => {
+    expect(() => parseActivityEventPayload({ type: 'permission', promptId: 'p', pending: true, options: 'Yes' })).toThrow(/options/);
+    expect(() => parseActivityEventPayload({ type: 'permission', promptId: 'p', pending: true, options: [1, 2] })).toThrow(/options/);
+    expect(() => parseActivityEventPayload({ type: 'permission', promptId: 'p', pending: true, options: ['Yes', null] })).toThrow(/options/);
+    expect(() => parseActivityEventPayload({ type: 'permission', promptId: 'p', pending: true, options: null })).toThrow(/options/);
   });
 
   it('parses a session-ended payload with either intentional value', () => {
@@ -277,6 +315,28 @@ describe('read-* response parsers', () => {
     );
   });
 
+  it('carries awaitedPromptOptions (array or explicit null), tolerates absence (pre-0.6.0 desktop), and rejects malformed values', () => {
+    const base: Record<string, JsonValue> = {
+      scrollback: '',
+      activity: { state: 'permission', reason: { kind: 'permission' } },
+      usage: null,
+      awaitedPromptId: 'sess-1:tool-1',
+    };
+    const options = ['Yes', "Yes, and don't ask again for this command", 'No, and tell Claude what to do differently'];
+    expect(parseReadStreamResponsePayload({ ...base, awaitedPromptOptions: options }).awaitedPromptOptions).toEqual(options);
+
+    // Explicit null (a pending prompt whose dialog could not be parsed) survives.
+    expect(parseReadStreamResponsePayload({ ...base, awaitedPromptOptions: null }).awaitedPromptOptions).toBeNull();
+
+    const withoutOptions = parseReadStreamResponsePayload(base);
+    expect('awaitedPromptOptions' in withoutOptions).toBe(false);
+
+    expect(() => parseReadStreamResponsePayload({ ...base, awaitedPromptOptions: 'Yes' })).toThrow(/awaitedPromptOptions/);
+    expect(() => parseReadStreamResponsePayload({ ...base, awaitedPromptOptions: [1, 2] })).toThrow(/awaitedPromptOptions/);
+    expect(() => parseReadStreamResponsePayload({ ...base, awaitedPromptOptions: ['Yes', null] })).toThrow(/awaitedPromptOptions/);
+    expect(() => parseReadStreamResponsePayload({ ...base, awaitedPromptOptions: { first: 'Yes' } })).toThrow(/awaitedPromptOptions/);
+  });
+
   it('carries ptyDimensions when present and omits the field when absent (pre-0.4.0 desktop)', () => {
     const withDims = parseReadStreamResponsePayload({
       scrollback: '',
@@ -358,6 +418,16 @@ describe('read-* response parsers', () => {
     expect('projectColor' in bareSnapshot).toBe(false);
   });
 
+  it('carries showTicketNumbers when present, tolerating absence (pre-0.6.0 desktop)', () => {
+    const snapshot = parseReadBoardResponsePayload({ projectId: 'p-1', columns: [], tasks: [], backlog: [], showTicketNumbers: false });
+    expect(snapshot).toEqual({ projectId: 'p-1', columns: [], tasks: [], backlog: [], showTicketNumbers: false });
+    const bareSnapshot = parseReadBoardResponsePayload({ projectId: 'p-1', columns: [], tasks: [], backlog: [] });
+    expect('showTicketNumbers' in bareSnapshot).toBe(false);
+    expect(() =>
+      parseReadBoardResponsePayload({ projectId: 'p-1', columns: [], tasks: [], backlog: [], showTicketNumbers: 'yes' }),
+    ).toThrow(/showTicketNumbers/);
+  });
+
   it('rejects a malformed accent color on either read-board shape', () => {
     expect(() => parseReadBoardResponsePayload({ projects: [{ id: 'p-1', name: 'Alpha', color: 'amber' }] })).toThrow(/accent color/);
     expect(() => parseReadBoardResponsePayload({ projects: [{ id: 'p-1', name: 'Alpha', color: '#12345' }] })).toThrow(/accent color/);
@@ -422,6 +492,9 @@ describe('isBridgeEvent', () => {
     ).toBe(true);
     expect(isBridgeEvent({ kind: 'transcript', sessionId: 's', taskId: 't', payload: { mode: 'reset', revision: 2, totalEntries: 0 } })).toBe(true);
     expect(isBridgeEvent({ kind: 'activity', sessionId: 's', taskId: 't', payload: { type: 'permission', promptId: 'p', pending: true } })).toBe(true);
+    expect(
+      isBridgeEvent({ kind: 'activity', sessionId: 's', taskId: 't', payload: { type: 'permission', promptId: 'p', pending: true, options: ['Yes', 'No'] } }),
+    ).toBe(true);
     expect(isBridgeEvent({ kind: 'activity', sessionId: 's', taskId: 't', payload: { type: 'session-ended', intentional: false } })).toBe(true);
     expect(isBridgeEvent({ kind: 'terminal', sessionId: 's', taskId: 't', payload: { data: 'bytes' } })).toBe(true);
     expect(isBridgeEvent({ kind: 'terminal-resize', sessionId: 's', taskId: 't', payload: { cols: 48, rows: 26 } })).toBe(true);
@@ -434,6 +507,9 @@ describe('isBridgeEvent', () => {
     expect(isBridgeEvent({ kind: 'transcript', sessionId: 's', taskId: 't', payload: 'not-a-delta' })).toBe(false);
     expect(isBridgeEvent({ kind: 'transcript', sessionId: 's', taskId: 't', payload: [{ kind: 'user', uuid: 'u', ts: 1, text: 'x' }] })).toBe(false);
     expect(isBridgeEvent({ kind: 'activity', sessionId: 's', taskId: 't', payload: { type: 'activity', state: 'busy', reason: { kind: 'idle' } } })).toBe(false);
+    expect(
+      isBridgeEvent({ kind: 'activity', sessionId: 's', taskId: 't', payload: { type: 'permission', promptId: 'p', pending: true, options: [1] } }),
+    ).toBe(false);
     expect(isBridgeEvent({ kind: 'terminal', sessionId: 's', taskId: 't', payload: { data: 42 } })).toBe(false);
     expect(isBridgeEvent({ kind: 'terminal-resize', sessionId: 's', taskId: 't', payload: { cols: 0, rows: 26 } })).toBe(false);
     expect(isBridgeEvent({ kind: 'terminal-resize', sessionId: 's', payload: { cols: 48, rows: 26 } })).toBe(false);

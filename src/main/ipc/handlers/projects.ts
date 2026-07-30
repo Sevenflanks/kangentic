@@ -10,7 +10,8 @@ import { cleanupStaleResourcesAsync, pruneOrphanedWorktreeTasks } from '../../tr
 import { SwimlaneRepository } from '../../db/repositories/swimlane-repository';
 import { TranscriptRepository } from '../../db/repositories/transcript-repository';
 import { WorktreeManager } from '../../git/worktree-manager';
-import { isGitRepo, isInsideWorktree, isKangenticWorktree } from '../../git/git-checks';
+import { isGitRepo, isInsideWorktree, isKangenticWorktree, ensureGitRepo } from '../../git/git-checks';
+import { readWorktreeHeadUnqueued } from '../../git/worktree-head';
 import { agentRegistry } from '../../agent/agent-registry';
 import { getProjectDb, closeProjectDb } from '../../db/database';
 import { PATHS } from '../../config/paths';
@@ -23,7 +24,7 @@ import { runWithProjectLogContext } from '../../diagnostics/project-log-context'
 import { prRefreshScheduler } from '../../pr/pr-refresh-scheduler';
 import { retrievalService } from '../../retrieval/retrieval-service';
 import { DEFAULT_AGENT } from '../../../shared/types';
-import type { Project, Task, AppConfig, ProjectSearchEntriesInput, ProjectRelocateOptions } from '../../../shared/types';
+import type { Project, Task, AppConfig, ProjectSearchEntriesInput, ProjectRelocateOptions, ProjectPathProbe, ProjectEnsureGitResult, ProjectOpenByPathOverrides } from '../../../shared/types';
 import type { IpcContext } from '../ipc-context';
 import type { ProjectRepository } from '../../db/repositories/project-repository';
 import type { ConfigManager } from '../../config/config-manager';
@@ -284,8 +285,9 @@ export async function pruneStaleWorktreeProjects(context: IpcContext): Promise<v
  * settings from the last configured project rather than from global defaults.
  * Falls back to getProjectOverridableDefaults() if no projects have overrides.
  *
- * Only the project-overridable subset (theme/terminal/git/permissionMode) is
- * returned - never project-specific data that also lives in config.json such as
+ * Only the project-overridable subset (theme/git/permissionMode - terminal.* is
+ * global-only, see pickOverridableSubset) is returned - never project-specific
+ * data that also lives in config.json such as
  * `importSources` or `browser.defaultUrl`. Cloning the raw config.json here is
  * what previously leaked one project's import sources into every project created
  * after it.
@@ -305,6 +307,41 @@ function getLastProjectOverrides(
     if (Object.keys(subset).length > 0) return subset;
   }
   return configManager.getProjectOverridableDefaults();
+}
+
+/**
+ * The model / effort defaults a NEW project should start with, taken from the
+ * most recently opened project that has either set.
+ *
+ * These live on the `projects` row, not in `.kangentic/config.json`, so
+ * `getLastProjectOverrides` above never covered them and a new project always
+ * started at "Agent default" - visibly different from every existing project
+ * even when the user had configured the same preference everywhere. It shows up
+ * most sharply in an ephemeral `/preview` project, where the placeholders in the
+ * New Task dialog read differently than in the instance being previewed.
+ *
+ * Same inheritance rule as the config subset: prefer the last configured
+ * project, fall back to nothing (which resolves to the agent's own default).
+ * `default_agent` is deliberately NOT inherited here - it is resolved by
+ * detection (`resolveDefaultAgent`), so an installed-agent change is picked up
+ * rather than a stale name being copied forward.
+ */
+export function getLastProjectAgentDefaults(
+  projectRepo: Pick<ProjectRepository, 'list'>,
+  excludePath?: string,
+): { default_model: string | null; default_effort: string | null } {
+  const projects = projectRepo.list()
+    .sort((a, b) => (b.last_opened || '').localeCompare(a.last_opened || ''));
+  for (const project of projects) {
+    if (project.path === excludePath) continue;
+    if (project.default_model || project.default_effort) {
+      return {
+        default_model: project.default_model ?? null,
+        default_effort: project.default_effort ?? null,
+      };
+    }
+  }
+  return { default_model: null, default_effort: null };
 }
 
 /**
@@ -383,7 +420,7 @@ function deferBoardConfigReconcile(context: IpcContext, projectId: string, proje
  * Find an existing project by path, or create one and open it.
  * Returns the project object.
  */
-export async function openProjectByPath(context: IpcContext, projectPath: string) {
+export async function openProjectByPath(context: IpcContext, projectPath: string, overrides?: ProjectOpenByPathOverrides) {
   // Normalize the path for comparison
   const normalized = path.resolve(projectPath);
 
@@ -404,10 +441,18 @@ export async function openProjectByPath(context: IpcContext, projectPath: string
   }
 
   if (!project) {
-    // Create a new project using the directory name
-    const name = path.basename(normalized);
-    const defaultAgent = await resolveDefaultAgent(context.configManager);
-    project = context.projectRepo.create({ name, path: normalized, default_agent: defaultAgent });
+    // Create a new project. overrides comes from the Add project dialog
+    // (editable name, chosen default agent); falls back to the folder's
+    // basename and detection-order resolution when absent (e.g. the
+    // sidebar's direct-open flow, which skips the dialog).
+    const name = overrides?.name?.trim() || path.basename(normalized);
+    const defaultAgent = overrides?.defaultAgent ?? await resolveDefaultAgent(context.configManager);
+    project = context.projectRepo.create({
+      name,
+      path: normalized,
+      default_agent: defaultAgent,
+      ...getLastProjectAgentDefaults(context.projectRepo, normalized),
+    });
     // Initialize the project database (creates tables + default swimlanes)
     getProjectDb(project.id);
     // Clone settings from the last modified project (or global defaults if none).
@@ -468,10 +513,10 @@ export async function openProjectByPath(context: IpcContext, projectPath: string
         .then(() => {
           cleanupStaleResourcesAsync(openedProject.path, taskRepo, swimlaneRepo, sessionRepo, context.sessionManager)
             .catch((error) => console.error(`[PROJECT_OPEN] Resource cleanup failed for ${openedProject.name}:`, error));
-          return resumeSuspendedSessions(openedProject.id, openedProject.path, context.sessionManager, context.configManager, openedProject.default_agent, context.mcpServerHandle, openedProject.default_model, openedProject.default_effort);
+          return resumeSuspendedSessions(openedProject.id, openedProject.path, context.sessionManager, context.configManager, openedProject.default_agent, context.mcpServerHandle, openedProject.default_model, openedProject.default_effort, context.boardConfigManager.getBoardProfiles(openedProject.path));
         })
         .catch((err) => console.error('[PROJECT_OPEN] Session recovery failed:', err))
-        .then(() => autoSpawnTasks(openedProject.id, openedProject.path, context.sessionManager, context.configManager, openedProject.default_agent, context.mcpServerHandle, openedProject.default_model, openedProject.default_effort))
+        .then(() => autoSpawnTasks(openedProject.id, openedProject.path, context.sessionManager, context.configManager, openedProject.default_agent, context.mcpServerHandle, openedProject.default_model, openedProject.default_effort, context.boardConfigManager.getBoardProfiles(openedProject.path)))
         .catch((err) => console.error('[PROJECT_OPEN] Session reconciliation failed:', err)),
     );
   }
@@ -528,8 +573,8 @@ export async function activateAllProjects(context: IpcContext): Promise<void> {
       cleanupStaleResourcesAsync(project.path, taskRepo, swimlaneRepo, sessionRepo, context.sessionManager)
         .catch((err) => console.error(`[PROJECT_OPEN] Resource cleanup failed for ${project.name}:`, err));
 
-      await resumeSuspendedSessions(project.id, project.path, context.sessionManager, context.configManager, project.default_agent, context.mcpServerHandle, project.default_model, project.default_effort);
-      await autoSpawnTasks(project.id, project.path, context.sessionManager, context.configManager, project.default_agent, context.mcpServerHandle, project.default_model, project.default_effort);
+      await resumeSuspendedSessions(project.id, project.path, context.sessionManager, context.configManager, project.default_agent, context.mcpServerHandle, project.default_model, project.default_effort, context.boardConfigManager.getBoardProfiles(project.path));
+      await autoSpawnTasks(project.id, project.path, context.sessionManager, context.configManager, project.default_agent, context.mcpServerHandle, project.default_model, project.default_effort, context.boardConfigManager.getBoardProfiles(project.path));
       // Deliberately AFTER the chain (unlike the open paths, which mark up
       // front to guard rapid double-opens): a failed background activation
       // stays cold, so the user's next explicit open retries recovery.
@@ -552,7 +597,11 @@ export function registerProjectHandlers(context: IpcContext): void {
   ipcMain.handle(IPC.PROJECT_LIST, () => context.projectRepo.list());
 
   ipcMain.handle(IPC.PROJECT_CREATE, (_, input) => {
-    const project = context.projectRepo.create(input);
+    // Explicit input wins; the inherited defaults only fill what it left unset.
+    const project = context.projectRepo.create({
+      ...getLastProjectAgentDefaults(context.projectRepo, input.path),
+      ...input,
+    });
     // Initialize the project database (creates tables + default swimlanes)
     getProjectDb(project.id);
     // Clone settings from the last modified project (or global defaults if none).
@@ -640,9 +689,9 @@ export function registerProjectHandlers(context: IpcContext): void {
           cleanupStaleResourcesAsync(project.path, taskRepo, swimlaneRepo, sessionRepo, context.sessionManager)
             .catch((error) => console.error(`[PROJECT_OPEN] Resource cleanup failed for ${project.name}:`, error));
 
-          await resumeSuspendedSessions(id, project.path, context.sessionManager, context.configManager, project.default_agent, context.mcpServerHandle, project.default_model, project.default_effort)
+          await resumeSuspendedSessions(id, project.path, context.sessionManager, context.configManager, project.default_agent, context.mcpServerHandle, project.default_model, project.default_effort, context.boardConfigManager.getBoardProfiles(project.path))
             .catch((error) => console.error('[PROJECT_OPEN] Session recovery failed:', error));
-          await autoSpawnTasks(id, project.path, context.sessionManager, context.configManager, project.default_agent, context.mcpServerHandle, project.default_model, project.default_effort)
+          await autoSpawnTasks(id, project.path, context.sessionManager, context.configManager, project.default_agent, context.mcpServerHandle, project.default_model, project.default_effort, context.boardConfigManager.getBoardProfiles(project.path))
             .catch((error) => console.error('[PROJECT_OPEN] Session reconciliation failed:', error));
         });
       });
@@ -686,8 +735,35 @@ export function registerProjectHandlers(context: IpcContext): void {
     return context.projectRepo.setDefaultEffort(id, effort);
   });
 
-  ipcMain.handle(IPC.PROJECT_OPEN_BY_PATH, async (_, projectPath: string) => {
-    return openProjectByPath(context, projectPath);
+  ipcMain.handle(IPC.PROJECT_OPEN_BY_PATH, async (_, projectPath: string, overrides?: ProjectOpenByPathOverrides) => {
+    return openProjectByPath(context, projectPath, overrides);
+  });
+
+  const probeFolder = async (folderPath: string): Promise<ProjectPathProbe> => {
+    const normalized = path.resolve(folderPath);
+    const exists = fs.existsSync(normalized);
+    const isDirectory = exists && fs.statSync(normalized).isDirectory();
+    const isGit = isDirectory && isGitRepo(normalized);
+    const insideWorktree = isDirectory && isInsideWorktree(normalized);
+    const { branch } = isGit ? await readWorktreeHeadUnqueued(normalized) : { branch: null };
+    const existingProject = context.projectRepo.list().find((p) => path.resolve(p.path) === normalized);
+    return {
+      exists,
+      isDirectory,
+      isGitRepo: isGit,
+      isInsideWorktree: insideWorktree,
+      currentBranch: branch,
+      suggestedName: path.basename(normalized),
+      alreadyRegisteredProjectId: existingProject?.id ?? null,
+    };
+  };
+
+  ipcMain.handle(IPC.PROJECT_PROBE_PATH, async (_, folderPath: string): Promise<ProjectPathProbe> => {
+    return probeFolder(folderPath);
+  });
+
+  ipcMain.handle(IPC.PROJECT_ENSURE_GIT, async (_, folderPath: string): Promise<ProjectEnsureGitResult> => {
+    return ensureGitRepo(path.resolve(folderPath));
   });
 
   ipcMain.handle(IPC.PROJECT_SEARCH_ENTRIES, async (_, input: ProjectSearchEntriesInput) => {

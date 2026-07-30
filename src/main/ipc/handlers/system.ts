@@ -13,7 +13,10 @@ import { HandoffRepository } from '../../db/repositories/handoff-repository';
 import { syncProjectMcpConfig } from './projects';
 import { applyRuntimeConfig } from '../../config/apply-runtime-config';
 import { listAgents, invalidateAgentListCache } from '../../agent/agent-list';
+import { agentRegistry } from '../../agent/agent-registry';
 import { broadcast } from '../../pop-out/window-broadcast';
+import { resolveRelayUrl } from '../../../shared/relay';
+import { EXTERNAL_OPEN_SCHEMES, isAllowedExternalUrl } from '../../../shared/external-url';
 import type {
   NotificationInput,
   AgentCommand,
@@ -21,8 +24,66 @@ import type {
   AgentSummarizeInput,
   AgentSummarizeResult,
   HandoffRecord,
+  RemoteServerStatus,
+  SelectFolderOptions,
 } from '../../../shared/types';
 import type { IpcContext } from '../ipc-context';
+
+// Held only so a shown Notification is not garbage-collected before the user
+// interacts with it (Electron's Notification has no other owner).
+const activeNotifications = new Set<Notification>();
+
+/**
+ * Shows a native OS notification and wires its click round-trip back to the
+ * renderer (restore/show/focus, then NOTIFICATION_CLICKED once the window is
+ * focused). Shared by the renderer-driven NOTIFICATION_SHOW IPC channel
+ * (spawn-stall, plan-complete) and the main-process desktop notifier
+ * (src/main/notifications/desktop-notifier.ts, idle and crash), which decides
+ * to notify without an IPC round-trip and calls this directly.
+ */
+export function showDesktopNotification(context: IpcContext, input: NotificationInput): void {
+  if (!Notification.isSupported()) {
+    console.warn('[NOTIFICATION] Notifications not supported on this system');
+    return;
+  }
+
+  const notification = new Notification({
+    title: input.title,
+    body: input.body,
+  });
+
+  activeNotifications.add(notification);
+
+  const cleanup = () => {
+    activeNotifications.delete(notification);
+  };
+
+  notification.on('click', () => {
+    cleanup();
+
+    const mainWindow = context.mainWindow;
+    if (mainWindow.isDestroyed()) return;
+    if (mainWindow.isMinimized()) {
+      mainWindow.restore();
+    }
+    mainWindow.show();
+    mainWindow.focus();
+
+    const sendClickEvent = () => {
+      mainWindow.webContents.send(IPC.NOTIFICATION_CLICKED, input.projectId, input.taskId);
+    };
+
+    if (mainWindow.isFocused()) {
+      sendClickEvent();
+    } else {
+      mainWindow.once('focus', sendClickEvent);
+    }
+  });
+
+  notification.on('close', cleanup);
+
+  notification.show();
+}
 
 export function registerSystemHandlers(context: IpcContext): void {
   // === App ===
@@ -78,7 +139,7 @@ export function registerSystemHandlers(context: IpcContext): void {
       context.mobileBridgeService.reconcile({
         // Dev-only until the mobile app launches (mirrors register-all.ts).
         enabled: __KANGENTIC_DEV__ && (effectiveConfig.mobileBridge?.enabled ?? false),
-        relayUrl: effectiveConfig.mobileBridge?.relayUrl ?? '',
+        relayUrl: resolveRelayUrl(effectiveConfig.mobileBridge),
       });
     }
     // Bare-signal broadcast so every open pop-out window re-fetches via config:get and
@@ -204,15 +265,6 @@ export function registerSystemHandlers(context: IpcContext): void {
     },
   );
 
-  // === Agent ===
-  ipcMain.handle(IPC.AGENT_DETECT, async () => {
-    const { agentRegistry } = await import('../../agent/agent-registry');
-    const config = context.configManager.load();
-    const claudeAdapter = agentRegistry.get('claude');
-    if (!claudeAdapter) return { found: false, path: null, version: null };
-    return claudeAdapter.detect(config.agent.cliPaths.claude ?? null);
-  });
-
   // === Agents ===
   // The inventory is cached across calls (bootstrap, welcome screen, Settings,
   // and the column manager all request it) and rebuilt only on agent-config
@@ -221,6 +273,29 @@ export function registerSystemHandlers(context: IpcContext): void {
   ipcMain.handle(IPC.AGENT_LIST, async (_event, forceRefresh?: boolean): Promise<AgentDetectionInfo[]> => {
     const config = context.configManager.load();
     return listAgents(config.agent.cliPaths, forceRefresh ?? false);
+  });
+
+  // "Test connection" in the Agent settings tab. Reads the server record
+  // (url + auth, including the password) directly from config rather than
+  // accepting one from the renderer, so the password never has to round-trip
+  // through the renderer process. Never throws: an agent with no
+  // remoteExecution capability, or no configured server, reports unreachable
+  // with a clear reason instead of an IPC error.
+  ipcMain.handle(IPC.AGENT_PROBE_EXECUTION_SERVER, async (_event, agentName: string): Promise<RemoteServerStatus> => {
+    const adapter = agentRegistry.get(agentName);
+    if (!adapter?.remoteExecution) {
+      return { reachable: false, reason: `${agentName} does not support remote execution` };
+    }
+    const config = context.configManager.load();
+    const server = config.agent.executionServers[agentName];
+    if (!server) {
+      return { reachable: false, reason: 'No server configured' };
+    }
+    try {
+      return await adapter.remoteExecution.probeServer(server);
+    } catch (error) {
+      return { reachable: false, reason: error instanceof Error ? error.message : 'Unknown error' };
+    }
   });
 
   // Sliding-window rate limit for summarize calls. Each entry is a Date.now()
@@ -450,11 +525,27 @@ export function registerSystemHandlers(context: IpcContext): void {
   // === Shell ===
   ipcMain.handle(IPC.SHELL_GET_AVAILABLE, () => context.shellResolver.getAvailableShells());
   ipcMain.handle(IPC.SHELL_GET_DEFAULT, () => context.shellResolver.getDefaultShell());
+
+  // === Fonts ===
+  ipcMain.handle(IPC.FONT_GET_AVAILABLE, () => context.fontResolver.getAvailableFonts());
+
   // Normalize so a path the renderer joined with forward slashes (git paths use
   // '/') opens correctly on Windows, which needs native backslash separators -
   // matching the SHELL_SHOW_ITEM_IN_FOLDER handler below.
   ipcMain.handle(IPC.SHELL_OPEN_PATH, (_, dirPath: string) => shell.openPath(path.normalize(dirPath)));
-  ipcMain.handle(IPC.SHELL_OPEN_EXTERNAL, (_, url: string) => shell.openExternal(url));
+  // shell.openExternal is ShellExecute on Windows and will launch any
+  // registered protocol handler, so this is a process trust boundary -
+  // reject anything outside the allowlist instead of passing it straight to
+  // the OS. A rejected URL is silently inert (warn + no-op) rather than
+  // thrown, because several callers invoke this as a bare `void` with no
+  // .catch (e.g. MarkdownRenderer's link handler on agent-authored markdown).
+  ipcMain.handle(IPC.SHELL_OPEN_EXTERNAL, (_, url: string) => {
+    if (!isAllowedExternalUrl(url, EXTERNAL_OPEN_SCHEMES)) {
+      console.warn(`[SHELL_OPEN_EXTERNAL] Blocked disallowed URL: ${url}`);
+      return;
+    }
+    return shell.openExternal(url);
+  });
   // Normalize so a worktree-relative path joined with forward slashes in the
   // renderer (git paths use '/') resolves correctly on Windows, where
   // showItemInFolder needs native backslash separators.
@@ -480,7 +571,10 @@ export function registerSystemHandlers(context: IpcContext): void {
   });
 
   // === Git ===
-  ipcMain.handle(IPC.GIT_DETECT, () => context.gitDetector.detect());
+  ipcMain.handle(IPC.GIT_DETECT, (_event, forceRefresh?: boolean) => {
+    if (forceRefresh) context.gitDetector.invalidateCache();
+    return context.gitDetector.detect();
+  });
 
   ipcMain.handle(IPC.GIT_LIST_BRANCHES, async () => {
     if (!context.currentProjectPath || !isGitRepo(context.currentProjectPath)) return [];
@@ -491,9 +585,18 @@ export function registerSystemHandlers(context: IpcContext): void {
   });
 
   // === Dialog ===
-  ipcMain.handle(IPC.DIALOG_SELECT_FOLDER, async () => {
+  ipcMain.handle(IPC.DIALOG_SELECT_FOLDER, async (_event, options?: SelectFolderOptions) => {
+    // Both additions are scoped to callers that actually pass options (today: Add project).
+    // The no-argument callers - relocating a project, locating one whose folder moved - are
+    // pointing at a folder that already exists, so starting them at $HOME every time discards
+    // the location the OS remembered, and offering "New folder" there invites creating an empty
+    // directory that cannot be the thing they were asked to find.
     const result = await dialog.showOpenDialog(context.mainWindow, {
-      properties: ['openDirectory'],
+      properties: options ? ['openDirectory', 'createDirectory'] : ['openDirectory'],
+      title: options?.title,
+      buttonLabel: options?.buttonLabel,
+      message: options?.message,
+      defaultPath: options ? (options.defaultPath ?? app.getPath('home')) : undefined,
     });
     if (result.canceled || result.filePaths.length === 0) return null;
     return result.filePaths[0];
@@ -522,51 +625,7 @@ export function registerSystemHandlers(context: IpcContext): void {
   ipcMain.handle(IPC.WINDOW_IS_FOCUSED, (event) => resolveSenderWindow(event).isFocused());
 
   // === Notifications ===
-  const activeNotifications = new Set<Notification>();
-
-  ipcMain.on(IPC.NOTIFICATION_SHOW, (_event, input: NotificationInput) => {
-    if (!Notification.isSupported()) {
-      console.warn('[NOTIFICATION] Notifications not supported on this system');
-      return;
-    }
-
-    const notification = new Notification({
-      title: input.title,
-      body: input.body,
-    });
-
-    activeNotifications.add(notification);
-
-    const cleanup = () => {
-      activeNotifications.delete(notification);
-    };
-
-    notification.on('click', () => {
-      cleanup();
-
-      const mainWindow = context.mainWindow;
-      if (mainWindow.isDestroyed()) return;
-      if (mainWindow.isMinimized()) {
-        mainWindow.restore();
-      }
-      mainWindow.show();
-      mainWindow.focus();
-
-      const sendClickEvent = () => {
-        mainWindow.webContents.send(IPC.NOTIFICATION_CLICKED, input.projectId, input.taskId);
-      };
-
-      if (mainWindow.isFocused()) {
-        sendClickEvent();
-      } else {
-        mainWindow.once('focus', sendClickEvent);
-      }
-    });
-
-    notification.on('close', cleanup);
-
-    notification.show();
-  });
+  ipcMain.on(IPC.NOTIFICATION_SHOW, (_event, input: NotificationInput) => showDesktopNotification(context, input));
 
   // === Clipboard ===
   // Read the clipboard image natively in the main process rather than via the web

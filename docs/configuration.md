@@ -16,26 +16,29 @@ The config directory (`<configDir>`) is platform-specific:
 - **macOS:** `~/Library/Application Support/kangentic/`
 - **Linux:** `~/.config/kangentic/`
 
-## Settings Panels
+## Settings Panel
 
-Both panels use a VS Code-style layout: a sidebar with tab navigation on the left and the active settings pane on the right. A search bar at the top filters settings by keyword. Search uses multi-token matching (all tokens must appear in the setting name or description). Results are grouped by tab with match count badges on the sidebar; tabs with zero matches are dimmed. Press Ctrl+F (Cmd+F on macOS) to focus the search bar, Escape to clear the filter.
+The panel uses a VS Code-style layout: a sidebar with tab navigation on the left and the active settings pane on the right. A search bar at the top filters settings by keyword. Search uses multi-token matching (all tokens must appear in the setting name or description). Results are grouped by tab with match count badges on the sidebar; tabs with zero matches are dimmed. Press Ctrl+F (Cmd+F on macOS) to focus the search bar, Escape to clear the filter.
 
-- **Settings Panel** -- opened via the titlebar gear icon or the gear icon on each project row in the sidebar. A project switcher dropdown in the header allows switching between projects. Sidebar tabs: General, Theme, Terminal, Agent, Git, Browser, Shortcuts, Layout, Behavior, Dictation, Memory, Hotkeys, MCP Server, Agent Browser, Notifications, Mobile Devices, Privacy, Developer. The first seven tabs (above the separator) are per-project settings. Five of them (Theme, Terminal, Agent, Git, Browser) save to `.kangentic/config.json`, Shortcuts saves to the board config files (`kangentic.json` and `kangentic.local.json`), and the General tab edits the project record in the global index database. The General tab exposes the `project.location` setting -- the folder on disk the project points at -- with a "Change..." button to re-point the project after its folder is moved or renamed; because tasks and history are keyed by project id, they are preserved across a relocation. The Agent tab exposes the `project.defaultAgent` setting (the "Agent" combobox) -- the agent CLI used for new sessions in this project -- along with `project.defaultModel` and `project.defaultEffort` (the "Model" and "Effort" comboboxes), the project-level model and reasoning-effort defaults applied when no column or task override is set. Like `project.location`, all three are stored on the project record in the global index database rather than in `AppConfig`. The last eleven (Layout, Behavior, Dictation, Memory, Hotkeys, MCP Server, Agent Browser, Notifications, Mobile Devices, Privacy, Developer) are shared settings that apply across all projects, saved to the global config. When no project is open, only the 11 shared tabs appear. Changes save immediately. New projects inherit only the seeded settings subset (`theme`, `terminal.*`, `agent.permissionMode`, `git.*`) from the most recently configured project, falling back to defaults if none exist. Project-specific data such as `browser.defaultUrl` and `importSources` is stored per-project and is never cloned into a new project.
+- **Settings Panel** - opened via the titlebar gear icon or the gear icon on each project row in the sidebar. A project switcher dropdown in the header allows switching between projects. Sidebar tabs are grouped by category (`SETTINGS_TABS` in `settings-tabs.ts`): the `'project'` group (General, Theme, Agent, Git, Browser, Shortcuts) is per-project settings, hidden when no project is open; the `'system'` group (Board, Task, Changes, Terminal, Behavior, Hotkeys, Notifications, Dictation, Memory, MCP Server, Agent Browser, Mobile Devices, Privacy, Developer) is shared settings that apply across all projects and remain fully usable with no project open. The system group is further split into sidebar tiers (`tier` on each tab): Core (Board through Notifications, unlabeled - the default group), Advanced (Dictation through Mobile Devices), and Other (Privacy, Developer); order within each group is curated by frequency/concept rather than alphabetical, since the search bar already covers fast lookup-by-name. The Task tab holds task-presentation settings that used to live under Board (Card Density, Ticket Numbers) and Terminal (the whole Context Bar section), grouping controls that describe how an individual task presents itself rather than board layout or terminal cosmetics; Board keeps `columnWidth` and board-level Config Sync/Window settings, and Terminal keeps shell/font/cursor/colors. Terminal is global-only (shell, font, cursor style, colors): shell in particular was never reliably project-scoped at the PTY-spawn level (`SessionManager` caches a single `configuredShell` keyed to whichever project is currently focused - `src/main/pty/session-manager.ts`), so a background project's spawn/resume could silently pick up the wrong shell. See `` for why a setting's tab must match its persistence scope. Within the project group, General saves `project.location` to the project record in the global index database via a "Change..." button that re-points the project after its folder is moved or renamed, preserving tasks and history which are keyed by project id; Theme saves `theme` to `.kangentic/config.json`; Agent, Git, and Browser also save to `.kangentic/config.json`; Shortcuts saves to the board config files (`kangentic.json` and `kangentic.local.json`). The Agent tab exposes the `project.defaultAgent` setting (the "Agent" combobox), the agent CLI used for new sessions in this project, along with `project.defaultModel` and `project.defaultEffort` (the "Model" and "Effort" comboboxes), the project-level model and reasoning-effort defaults applied when no column or task override is set. Like `project.location`, all three are stored on the project record in the global index database rather than in `AppConfig`. When the selected agent declares remote-execution support (today: OpenCode only), the Agent tab also shows an Execution mode row right below the CLI Path row, letting the project run that agent locally (the default) or attach to a server it declares support for - see [Remote Execution](#remote-execution) below; an agent without the capability shows none of these rows. The system-group tabs save to the global config. When no project is open, only the system tabs appear. Changes save immediately. New projects inherit only the seeded settings subset (`theme`, `agent.permissionMode`, `git.*`) from the most recently configured project, falling back to defaults if none exist. Project-specific data such as `browser.defaultUrl`, `importSources`, and `agent.execution` (a remote server's working directory is specific to the project it was configured for) is stored per-project and is never cloned into a new project.
 
 ### App-Only Settings
 
 These settings appear only in App Settings and cannot be overridden per-project:
 
 - `sidebarVisible`, `boardLayout`, `sidebar.width`
-- `cardDensity`, `columnWidth`, `showTaskNumbers`, `terminalPanelVisible`, `animationsEnabled`, `statusBarVisible`, `diffViewMode`
+- `columnWidth`, `terminalPanelVisible`, `animationsEnabled`, `statusBarVisible`, `diffViewMode`
+- `cardDensity`, `showTaskNumbers` (Task tab)
 - `diffDefaultScope`, `diffIgnoreWhitespace`, `diffCollapseUnchanged`, `diffFileSort`, `diffFlatList`
 - `restoreWindowPosition`
 - `agent.cliPaths`, `agent.maxConcurrentSessions`, `agent.queueOverflow`, `agent.autoResumeSessionsOnRestart`
-- `terminal.panelHeight`, `terminal.showPreview`
+- `agent.executionServers` (per-agent remote-server url + auth; the Agent tab's Server URL / Authentication fields, shown when the selected agent declares remote-execution support)
+- `agent.launchOptions` (per-agent boolean startup toggles; the Agent tab's Launch Options rows, shown when the selected agent declares launch-option capability)
+- `terminal.*` (shell, font size, font family, cursor style, panel height, show preview, colors - the whole namespace is global-only)
 - `autoFocusIdleSession`
 - `skipBoardConfigConfirm`
 - `windowLightDismiss`
-- `contextBar.*` (all context bar visibility toggles)
+- `contextBar.*` (all context bar visibility toggles; Task tab)
 - `notifications.*` (all notification settings)
 - `agent.idleTimeoutMinutes`
 - `developer.activityDebugOverlay`, `developer.persistConsoleLogs`, `developer.recordIpcTraffic`, `developer.previewInspectionServer`, `developer.previewEvalEnabled`
@@ -50,12 +53,12 @@ These settings appear only in App Settings and cannot be overridden per-project:
 These settings appear in both App Settings (as defaults) and Project Settings (as overrides):
 
 - `theme`
-- `terminal.shell`, `terminal.fontSize`, `terminal.fontFamily`, `terminal.scrollbackLines`, `terminal.cursorStyle`
 - `agent.permissionMode`
 - `git.worktreesEnabled`, `git.autoCleanup`, `git.defaultBaseBranch`, `git.copyFiles`, `git.initScript`, `git.linkNodeModules`, `git.prRefreshIntervalMinutes`
 - `browser.enabled`, `browser.defaultUrl`
+- `agent.execution` (per-agent local/remote mode + server working directory; editable inline in the Agent tab for the currently-selected agent, but NOT seeded into new projects - see below)
 
-> **Seeded vs. stored.** All settings above are stored per-project in `.kangentic/config.json` and editable in Project Settings. When a *new* project is created it is seeded with only `theme`, `terminal.*`, `agent.permissionMode`, and `git.*` (via `pickOverridableSubset` in `config-manager.ts`). `browser.*`, and non-setting project data such as `importSources`, are kept per-project and never cloned, so one project's dev-server URL or import sources cannot leak into another.
+> **Seeded vs. stored.** All settings above are stored per-project in `.kangentic/config.json` and editable in Project Settings. When a *new* project is created it is seeded with only `theme`, `agent.permissionMode`, and `git.*` (via `pickOverridableSubset` in `config-manager.ts`). `browser.*`, `agent.execution`, and non-setting project data such as `importSources`, are kept per-project and never cloned, so one project's dev-server URL, remote-server directory, or import sources cannot leak into another. `terminal.*` used to be seeded here too; it moved to global-only, and `loadProjectOverrides()` (`config-manager.ts`) one-time-migrates any pre-existing per-project `terminal.{shell,fontFamily,fontSize,scrollbackLines,cursorStyle,backspaceSendsCtrlH}` out of `.kangentic/config.json` (dropped, not promoted to global) the first time that project loads.
 
 ## Full AppConfig Reference
 
@@ -72,9 +75,9 @@ These settings appear in both App Settings (as defaults) and Project Settings (a
 | `terminalPanelVisible` | boolean | `true` | Show the terminal panel below the board. Global-only. |
 | `animationsEnabled` | boolean | `true` | Enable CSS keyframe animations (idle pulse, dialog fades, status bar pulses). Global-only. |
 | `statusBarVisible` | boolean | `true` | Show the status bar at the bottom of the window. Global-only. |
-| `diffViewMode` | `'split'` \| `'inline'` | `'split'` | Default layout for Git file diffs in the Changes panel (`split` = side by side, `inline` = unified). The in-diff toggle and the Layout settings tab write this same key, so the choice sticks. Global-only. |
+| `diffViewMode` | `'split'` \| `'inline'` | `'split'` | Default layout for Git file diffs in the Changes panel (`split` = side by side, `inline` = unified). The in-diff toggle and the Changes settings tab write this same key, so the choice sticks. Global-only. |
 | `diffDefaultScope` | `'working'` \| `'staged'` \| `'branch'` | `'working'` | Which changes a freshly opened Changes panel shows: `working` (uncommitted edits vs the index), `staged` (index vs HEAD), or `branch` (the whole branch vs its base). The in-panel scope control overrides it per session. Global-only. |
-| `diffIgnoreWhitespace` | boolean | `false` | Hide whitespace-only changes in the diff to filter reformatting noise. The in-diff toggle and the Layout tab write this key. Global-only. |
+| `diffIgnoreWhitespace` | boolean | `false` | Hide whitespace-only changes in the diff to filter reformatting noise. The in-diff toggle and the Changes tab write this key. Global-only. |
 | `diffCollapseUnchanged` | boolean | `false` | Fold away large unchanged regions so only changed hunks (with a little surrounding context) are shown. Global-only. |
 | `diffFileSort` | `'name'` \| `'status'` \| `'size'` | `'name'` | How the Changes panel orders files: by name, by status (added / modified / deleted), or by size (most changes first). Global-only. |
 | `diffFlatList` | boolean | `false` | Show changed files as a flat list of full paths instead of a nested directory tree. Global-only. |
@@ -82,7 +85,9 @@ These settings appear in both App Settings (as defaults) and Project Settings (a
 | `autoFocusIdleSession` | boolean | `false` | Auto-switch to session tab when agent goes idle. Idle tabs are always highlighted regardless of this setting. |
 | `windowLightDismiss` | `'off'` \| `'single'` \| `'focused'` \| `'all'` | `'single'` | Click-outside (light-dismiss) policy for modeless task-detail windows. `off` disables; `single` closes the lone window (any state); `focused` closes the focused window (any state); `all` closes every window. Closing a window does not kill its session. Global-only. |
 | `restoreWindowPosition` | boolean | `true` | Remember window size and position between launches. Global-only. |
-| `hasCompletedFirstRun` | boolean | `false` | Whether the user has completed first-run onboarding. Auto-set, not shown in UI. |
+| `hasCompletedFirstRun` | boolean | `false` | Legacy: set true on first task creation, kept for schema/fixture compatibility. No onboarding UI reads it, and it is not the walkthrough gate: creating a task is step 3 of the walkthrough, so this flips mid-flow. The walkthrough is suppressed once `onboardedProjectIds` is non-empty. Auto-set, not shown in UI. |
+| `onboardedProjectIds` | string[] \| undefined | `undefined` | Project ids whose onboarding checklist the user has dismissed. `undefined` means the one-time upgrade backfill (on first app hydration) has not run yet; `[]` means it has run and nothing is dismissed. Global, keyed by project id like `lastActiveTaskByProject`. **Emptiness, not membership, gates the walkthrough:** the checklist auto-opens only while this list is empty, because the walkthrough teaches the app rather than a repo and must not replay on every newly added project. It becomes non-empty by three routes, all meaning "not a first run": the backfill finding an existing project, a real dismissal, or all five steps completed. Auto-set, not shown in UI. |
+| `onboardingBaseline` | Record\<string, object\> \| undefined | `undefined` | Per-project snapshot of the settings the onboarding checklist watches (`defaultAgent`, `defaultModel`, `defaultEffort`, `permissionMode`, and a `swimlaneSignature` string encoding of the board's shape), captured on first checklist open. Adding a project does not capture one: the auto-open gate is install-scoped, so a second project has no baseline until the checklist is opened there by hand. Checklist steps 1 and 2 tick when live state DIFFERS from this, so opening a settings screen and closing it unchanged earns no checkmark. Both are guarded on the baseline existing, so a baseline-less project reports them un-ticked rather than complete. Keyed by project id; replaced wholesale on write (a `CONFIG_DICTIONARY_PATHS` entry). Auto-set, not shown in UI. |
 | `windowBounds` | object \| null | `null` | Persisted window bounds `{x, y, width, height}`. Auto-saved, not shown in UI. |
 | `windowMaximized` | boolean | `false` | Whether the window was maximized at last close. Auto-saved, not shown in UI. |
 | `popOutBounds` | object | `{}` | Persisted bounds + last target display id for each detached pop-out surface (usage stats, git changes, the Browser pane), keyed by `PopOutKind` so a surface reopens on the monitor it was last placed on. Auto-saved, not shown in UI. |
@@ -103,14 +108,15 @@ These settings appear in both App Settings (as defaults) and Project Settings (a
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `terminal.shell` | string \| null | `null` | Shell executable path. `null` = auto-detect. |
-| `terminal.fontFamily` | string | `'Menlo, Consolas, "Courier New", monospace'` | Terminal font family |
-| `terminal.fontSize` | number | `14` | Terminal font size (px) |
+| `terminal.shell` | string \| null | `null` | Shell executable path. `null` = auto-detect. Global-only: `SessionManager` caches a single configured shell keyed to whichever project is currently focused, so per-project scoping was never reliable at the PTY-spawn level. |
+| `terminal.fontFamily` | string | `'Menlo, Consolas, "Courier New", monospace'` | Terminal font family. Global-only. |
+| `terminal.fontSize` | number | `14` | Terminal font size (px). Global-only. |
 | `terminal.showPreview` | boolean | `false` | Show terminal preview in task cards. Global-only. |
 | `terminal.panelHeight` | number | `250` | Bottom panel height (px). Global-only. |
 | `terminal.panelCollapsed` | boolean | `false` | Whether the bottom terminal panel is collapsed. Global-only. |
-| `terminal.scrollbackLines` | number | `5000` | Lines kept in the visible xterm scrollback (1000-100000). Full session history is preserved separately by the main-process PTY buffer for replay regardless of this value. |
-| `terminal.cursorStyle` | `'block'` \| `'underline'` \| `'bar'` | `'block'` | Terminal cursor appearance |
+| `terminal.cursorStyle` | `'block'` \| `'underline'` \| `'bar'` | `'block'` | Terminal cursor appearance. Global-only. |
+| `terminal.backspaceSendsCtrlH` | boolean | `false` | When enabled, plain Backspace sends Ctrl+H (`0x08`) instead of xterm's default Delete (`0x7f`), so Claude Code's TUI deletes the previous word instead of one character (Claude reads `0x08` as a modified backspace regardless of platform; `0x08` is the byte native Windows conhost happens to send for plain Backspace, but the behavior is not Windows-specific). Settings panel label: "Word delete on Backspace". Opt-in (off by default on all platforms) so existing users are never surprised by a Backspace behavior change; Ctrl+W, Alt+Backspace, and Ctrl+Backspace already word-delete regardless of this setting. Global-only. |
+| `terminal.colors` | `TerminalColorOverrides` | `{}` | Custom terminal background, foreground, and cursor color, edited via color swatches in the Terminal settings tab's Colors section. Any slot left unset falls back to the built-in default: background `#0c0c0c`, foreground/cursor `#e4e4e7`. The 16-color ANSI palette (based on Windows Terminal's "Campbell" scheme) is a fixed built-in scheme, not exposed for per-color editing. `cursorAccent` always tracks the resolved background (for cursor legibility) and `selectionBackground` is a fixed app accent; neither is user-customizable. A dictionary-style field (`CONFIG_DICTIONARY_PATHS`): saved wholesale so resetting a slot actually deletes it. Global-only. |
 
 ### agent.*
 
@@ -122,6 +128,9 @@ These settings appear in both App Settings (as defaults) and Project Settings (a
 | `agent.queueOverflow` | `'queue'` \| `'reject'` | `'queue'` | What to do when max sessions reached. Global-only. |
 | `agent.idleTimeoutMinutes` | number | `0` | Auto-suspend sessions after this many minutes idle. 0 = disabled. Global-only. |
 | `agent.autoResumeSessionsOnRestart` | boolean | `true` | When true, agent sessions that were running at last close auto-resume when Kangentic restarts. When false, sessions stay paused and require a manual Resume click on each task. Turn off if auto-resuming many agents at once overwhelms your machine. Global-only. |
+| `agent.executionServers` | Record\<string, AgentExecutionServer\> | `{}` | Global, agent-keyed remote-server identity: `{ url, auth }`. `auth` is `{kind:'none'}`, `{kind:'basic', username, password}`, or `{kind:'bearerEnv', envVarName}`. Machine-scoped like `agent.cliPaths` - names a server, not a project. Global-only. |
+| `agent.execution` | Record\<string, AgentProjectExecution\> | `{}` | Per-project, agent-keyed: `{ mode: 'local' \| 'remote', workingDirectory }`. An absent entry means local. `workingDirectory` is a path ON THE SERVER for this project's tasks. See [Remote Execution](#remote-execution). |
+| `agent.launchOptions` | Record\<string, Record\<string, boolean\>\> | `{}` | Global, agent-keyed boolean startup toggles: agent name -> option id -> enabled. An absent entry falls back to the adapter's declared default. Machine-scoped like `agent.cliPaths`. Global-only. Today only Codex declares one option, `disableApps` (launches with `--disable apps` to skip the optional cloud ChatGPT Apps MCP connector, which can hang startup at "Booting MCP server: codex_apps"). |
 
 PermissionMode values:
 
@@ -133,6 +142,24 @@ PermissionMode values:
 - `bypassPermissions` -- `--dangerously-skip-permissions` (no prompts at all)
 
 All six modes are available in both the global App Settings "Permissions" dropdown and the per-column Edit Column dialog. The dropdown shows only the modes supported by the active agent (e.g., Cursor CLI only exposes Interactive and Non-Interactive; Oz CLI exposes Plan, Default, and Auto via Warp agent profiles).
+
+### Remote Execution
+
+An agent adapter can declare `remoteExecution` on `AgentAdapter` (`src/main/agent/agent-adapter.ts`) to support attaching to a server the user runs, instead of always spawning a local process. Today only OpenCode declares it (`opencode attach <url> --dir <serverPath>`). The fields live inline in the Agent settings tab, right after the CLI Path row, and render only when the currently-selected agent declares the capability (`AgentExecutionFields` in `src/renderer/components/settings/tabs/agent-execution-fields.tsx`) - an agent without it (everyone else) shows none of these rows, since the Agent tab only ever displays the one currently-selected agent.
+
+The configuration splits along a scope seam:
+
+- **`agent.executionServers[name]`** (global) is the server's identity - URL and auth. It is machine-scoped, like `agent.cliPaths`: the same server is available to every project on this machine.
+- **`agent.execution[name]`** (per-project) is this project's use of that server - `local` or `remote`, and if remote, the working directory ON THE SERVER for this project's tasks. It is intentionally excluded from new-project seeding (see the seeding note above) - a remote server's directory is specific to the project it was configured for.
+
+At spawn time, `resolveExecutionTarget()` (`src/main/agent/shared/execution-target.ts`) combines both into a single `ResolvedExecutionTarget` and threads it through `CommandOptions.executionTarget`, populated at both spawn chokepoints (`transition-engine.ts`, `session-startup/prepare-spawn.ts`) per `spawn-entry-point-parity.md`. It throws (rather than silently spawning locally) if a project's mode is `remote` but no server URL is configured.
+
+An adapter may also set `AgentRemoteExecutionInfo.remoteModeCaveat` - a short string shown under the remote fields (e.g. which Kangentic features, like MCP or the activity plugin, are unavailable in remote mode for that agent). The renderer only ever renders whatever string the adapter provides; it never branches on agent name to decide the copy, per `agent-adapters-boundary.md`.
+
+When a project's mode for an agent is `remote`:
+
+- `ensureTaskWorktree` (`src/main/ipc/helpers/task-git.ts`) skips creating a local git worktree - the task's `worktree_path` stays `null`, and the configured server-side directory travels separately via `executionTarget`, never through `cwd`.
+- For OpenCode specifically: the local `probeAuth()` (reads `~/.local/share/opencode/auth.json`) is bypassed in favor of a `GET /global/health` reachability probe (`remoteExecution.probeServer`, surfaced to the renderer's "Test connection" button via the `agent:probeExecutionServer` IPC channel); the transcript is read over HTTP (`GET /session/:id/message`) instead of the local SQLite database; the activity plugin is not installed (the server's filesystem is not local); and the Kangentic MCP server is not wired in. This is not a reachability problem `mcpServer.callbackHost` can fix: `opencode attach <url>` is a stateless HTTP client to a server that was started, and had its config fixed, independently and earlier - its CLI surface has no config-push flags, so env vars Kangentic sets on the spawned attach process are never read by the already-running server, whether that server is local or genuinely remote. See [MCP Server > Network Access](mcp-server.md) for the full reasoning and the (non-durable, since port/token rotate on restart) manual workaround. PTY-silence activity detection and PTY-output session-ID capture both continue to work unchanged, since `opencode attach` still runs a real TUI over the local PTY.
 
 ### git.*
 
@@ -166,11 +193,68 @@ Template variables available in shortcut commands (defined in `src/shared/templa
 
 IPC channels for shortcuts are in the Board Config group: `boardConfig:getShortcuts`, `boardConfig:setShortcuts`, `boardConfig:shortcutsChanged`.
 
+### Board Profiles
+
+A **Board Profile** is a named alternate set of per-column strategy settings (agent, model, effort,
+permission mode, auto-command, auto-spawn, handoff context, session target, session spawn strategy,
+plan-exit target). A task selects one and rides its ladder as it moves - so one task can run Planning
+in Opus xhigh and Merge in Sonnet high while another runs the same board more cheaply. Column
+*identity* (which columns exist, their name, order, role, color, icon) is singular across profiles;
+only strategy is profile-scoped.
+
+Profiles are authored in the Board Manager (Edit Columns) and stored under a `profiles` key in
+`kangentic.json`. Unlike shortcuts they are **team-only** - never `kangentic.local.json` - because
+`tasks.profile_id` is resolved on every machine that opens the board, so a personal-only profile
+would leave teammates with tasks pointing at an id they cannot resolve. Boards with no profiles omit
+the key entirely.
+
+```json
+"profiles": [
+  {
+    "id": "6f3d9c21-...",
+    "name": "Heavy",
+    "columns": {
+      "<swimlane-uuid>": { "modelOverride": "opus", "effortOverride": "xhigh" },
+      "<swimlane-uuid>": { "modelOverride": null }
+    }
+  }
+]
+```
+
+Entries are keyed by **swimlane uuid** (a rename must not detach in-flight tasks) and are **sparse**,
+with three distinct states per setting:
+
+| Form | Meaning |
+|------|---------|
+| key omitted | Inherit the column's own setting |
+| key set to `null` | Clear to the agent default, overriding the column's own pin |
+| key set to a value | Use that value in this column |
+
+That third state is why the resolver (`src/main/transition-engine/column-strategy.ts`) branches on
+key *presence* and never `??`: under `??`, "run the agent default here even though the column pins
+one" is indistinguishable from "inherit", and a profile could only ever add pins, never remove them.
+
+A task's assignment lives in the per-project database (`tasks.profile_id`), not in config: the
+profile *definition* is team-shared, the *assignment* is per-task local runtime state. A task
+pointing at a profile a teammate deleted degrades to the columns' own settings and logs once. The
+same is true of `tasks.run_mode`, which records which of the dialog's two branches the task is on
+(see [Database > tasks table](database.md#tasks-table)).
+
+Profiles are mutually exclusive with the task's Advanced agent/model/effort/permission pins and with
+`run_mode: 'agent_override'`, enforced at write time in `TaskRepository`.
+
+IPC channels are in the Board Config group: `boardConfig:getBoardProfiles`,
+`boardConfig:setBoardProfiles`, `boardConfig:boardProfilesChanged`. Agents can read and edit
+profiles (including across projects) via the `kangentic_*_board_profile` MCP tools - see
+[MCP Server > Board Profiles](mcp-server.md#board-profiles).
+
 ### mcpServer.*
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `mcpServer.enabled` | boolean | `true` | Allow agents to create and query tasks via MCP tools. When disabled, no kangentic MCP server is injected into sessions. See [MCP Server](mcp-server.md). |
+| `mcpServer.bindAddress` | string | `'127.0.0.1'` | Interface the in-process MCP HTTP server listens on. Not exposed in Settings UI - edit `config.json` directly. Widening past loopback exposes the server to other machines; read once at startup. Use a wildcard (`0.0.0.0`), which binds loopback too - binding one specific non-loopback interface leaves loopback unbound and breaks every local agent. See [MCP Server > Network Access](mcp-server.md). |
+| `mcpServer.callbackHost` | string \| undefined | unset | Not exposed in Settings UI - edit `config.json` directly. Allowlisted alongside `bindAddress` for DNS-rebinding-protection so a real external request is not rejected. Does not auto-wire a remote OpenCode session (see [MCP Server > Network Access](mcp-server.md)). |
 
 ### notifications.*
 
@@ -302,10 +386,11 @@ The Mobile Devices tab hosts the desktop half of the mobile companion app's pair
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `mobileBridge.enabled` | boolean | `false` | Master switch. When `false`, no relay connection is held and pairing is unavailable; the relay URL input and pairing controls are disabled in the UI. |
-| `mobileBridge.relayUrl` | string | `''` | The relay address to dial (self-hosted or Kangentic's hosted relay), e.g. `wss://relay.kangentic.com`. |
+| `mobileBridge.enabled` | boolean | `false` | Master switch. When `false`, no relay connection is held and pairing is unavailable; the relay Select and pairing controls are disabled in the UI. |
+| `mobileBridge.relayMode` | `'hosted' \| 'local' \| 'custom'` | `'hosted'` | `'hosted'` always dials the Kangentic-hosted relay (`wss://relay.kangentic.com`), in every build. `'local'` dials `ws://127.0.0.1:8080` - a dev-only option, only offered by the Select in a dev build (see `src/shared/relay.ts`'s `LOCAL_DEV_RELAY_URL`). `'custom'` dials `relayUrl` instead, for self-hosters. |
+| `mobileBridge.relayUrl` | string | `''` | The self-hosted relay to dial. Only consulted when `relayMode === 'custom'`; resolve the actual dial address through `resolveRelayUrl()` rather than reading this key directly - it normalizes the value and falls back to the hosted relay if this is empty or fails validation, so it never resolves to `''`. |
 
-**Actions (not config keys):** the Mobile Devices tab also exposes two settings-registry entries that are UI surfaces, not `AppConfig` keys: **Pair a Device** (registry id `mobileBridge.pairing`) starts the QR pairing ceremony described in [Mobile Bridge](mobile-bridge.md#pairing-ceremony), and **Paired Devices** (registry id `mobileBridge.devices`) lists currently paired phones with their granted capabilities and a revoke action. Both are backed by the `mobile:*` IPC channels and the signed device roster (`src/main/mobile-bridge/roster-store.ts`), not persisted in `AppConfig`.
+**Actions (not config keys):** the Mobile Devices tab also exposes two settings-registry entries that are UI surfaces, not `AppConfig` keys: **Pair a Device** (registry id `mobileBridge.pairing`) starts the QR pairing ceremony described in [Mobile Bridge](mobile-bridge.md#pairing-ceremony), and **Paired Devices** (registry id `mobileBridge.devices`) lists currently paired phones, identified by key fingerprint, with rename and revoke actions - pairing grants all ten capability verbs uniformly, so there is no per-device capability control. Both are backed by the `mobile:*` IPC channels and the signed device roster (`src/main/mobile-bridge/roster-store.ts`), not persisted in `AppConfig`.
 
 ### Privacy
 
@@ -404,6 +489,15 @@ Ghost columns are invisible on the board but still exist in the database. Once a
   ],
   "defaultBaseBranch": "main",
   "shortcuts": [],
+  "profiles": [
+    {
+      "id": "uuid",
+      "name": "Heavy",
+      "columns": {
+        "<swimlane-uuid>": { "modelOverride": "opus", "effortOverride": "xhigh" }
+      }
+    }
+  ],
   "actions": [
     {
       "id": "uuid",
@@ -454,6 +548,12 @@ Config files written by hand (without `id` fields on columns) are treated as add
 | `boardConfig:export` | Export current board state to `kangentic.json` (auto-runs on project open) |
 | `boardConfig:apply` | Apply pending config file changes (reconcile file into DB) |
 | `boardConfig:changed` | Event: `kangentic.json` or `kangentic.local.json` changed on disk |
+| `boardConfig:getBoardProfiles` | Get the board's [Board Profiles](#board-profiles) |
+| `boardConfig:setBoardProfiles` | Replace the board's Board Profiles (team-scoped) |
+| `boardConfig:boardProfilesChanged` | Event: an agent (MCP) rewrote this project's Board Profiles |
+| `boardConfig:getShortcuts` | Get task detail dialog [shortcuts](#shortcuts) |
+| `boardConfig:setShortcuts` | Update task detail dialog shortcuts |
+| `boardConfig:shortcutsChanged` | Event: shortcuts file changed |
 | `boardConfig:setDefaultBaseBranch` | Update the default base branch in `kangentic.json` |
 
 ## Environment Variables

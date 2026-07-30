@@ -1,6 +1,6 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron';
 import { IPC } from '../shared/ipc-channels';
-import type { ElectronAPI, NotificationInput, Project, Session, SessionUsage, ActivityState, ActivityReason, SessionEvent, UpdateDownloadedInfo, UsageTimePeriod, UsageStatsScope, UsageDayDrill, UsageCustomWindow, TaskBulkDeleteProgress, ProjectMoveProgress, DictationModelProgress, MobilePairingSasPayload, MobilePairingEndedPayload } from '../shared/types';
+import type { ElectronAPI, NotificationInput, Project, Session, SessionUsage, ActivityState, ActivityReason, SessionEvent, UpdateDownloadedInfo, UsageTimePeriod, UsageStatsScope, UsageDayDrill, UsageCustomWindow, TaskBulkDeleteProgress, ProjectMoveProgress, DictationModelProgress, MobilePairingSasPayload, MobilePairingConfirmedPayload, MobilePairingEndedPayload } from '../shared/types';
 import type { LiveDeliveryStatus } from '../shared/live-delivery-status';
 import { POPOUT_ARG_PREFIX } from '../shared/pop-out';
 import type { PopOutDescriptor, PopOutKind, PopOutParamsByKind } from '../shared/pop-out';
@@ -43,7 +43,9 @@ const api: ElectronAPI = {
     delete: (id) => ipcRenderer.invoke(IPC.PROJECT_DELETE, id),
     open: (id) => ipcRenderer.invoke(IPC.PROJECT_OPEN, id),
     getCurrent: () => ipcRenderer.invoke(IPC.PROJECT_GET_CURRENT),
-    openByPath: (path: string) => ipcRenderer.invoke(IPC.PROJECT_OPEN_BY_PATH, path),
+    openByPath: (path: string, overrides) => ipcRenderer.invoke(IPC.PROJECT_OPEN_BY_PATH, path, overrides),
+    probePath: (path: string) => ipcRenderer.invoke(IPC.PROJECT_PROBE_PATH, path),
+    ensureGit: (path: string) => ipcRenderer.invoke(IPC.PROJECT_ENSURE_GIT, path),
     searchEntries: (input) => ipcRenderer.invoke(IPC.PROJECT_SEARCH_ENTRIES, input),
     rename: (id: string, name: string) => ipcRenderer.invoke(IPC.PROJECT_RENAME, id, name),
     setDefaultAgent: (id: string, agentName: string) => ipcRenderer.invoke(IPC.PROJECT_SET_DEFAULT_AGENT, id, agentName),
@@ -224,7 +226,7 @@ const api: ElectronAPI = {
     getActivityReasons: (projectId?: string) => ipcRenderer.invoke(IPC.SESSION_GET_ACTIVITY_REASONS, projectId),
     getActivityStats: (sessionId: string) => ipcRenderer.invoke(IPC.SESSION_GET_ACTIVITY_STATS, sessionId),
     onActivity: (callback) => {
-      const handler = (_event: Electron.IpcRendererEvent, sessionId: string, state: ActivityState, reason: ActivityReason, projectId?: string, taskId?: string, taskTitle?: string) => callback(sessionId, state, reason, projectId, taskId, taskTitle);
+      const handler = (_event: Electron.IpcRendererEvent, sessionId: string, state: ActivityState, reason: ActivityReason, projectId?: string, taskId?: string) => callback(sessionId, state, reason, projectId, taskId);
       ipcRenderer.on(IPC.SESSION_ACTIVITY, handler);
       return () => ipcRenderer.removeListener(IPC.SESSION_ACTIVITY, handler);
     },
@@ -306,13 +308,13 @@ const api: ElectronAPI = {
   },
 
   agent: {
-    detect: () => ipcRenderer.invoke(IPC.AGENT_DETECT),
     listCommands: (cwd?) => ipcRenderer.invoke(IPC.AGENT_LIST_COMMANDS, cwd),
     summarize: (input) => ipcRenderer.invoke(IPC.AGENT_SUMMARIZE, input),
   },
 
   agents: {
     list: (forceRefresh?: boolean) => ipcRenderer.invoke(IPC.AGENT_LIST, forceRefresh),
+    probeExecutionServer: (agentName: string) => ipcRenderer.invoke(IPC.AGENT_PROBE_EXECUTION_SERVER, agentName),
   },
 
   handoffs: {
@@ -328,8 +330,12 @@ const api: ElectronAPI = {
     exec: (command: string, cwd: string) => ipcRenderer.invoke(IPC.SHELL_EXEC, command, cwd),
   },
 
+  font: {
+    getAvailable: () => ipcRenderer.invoke(IPC.FONT_GET_AVAILABLE),
+  },
+
   git: {
-    detect: () => ipcRenderer.invoke(IPC.GIT_DETECT),
+    detect: (forceRefresh?: boolean) => ipcRenderer.invoke(IPC.GIT_DETECT, forceRefresh),
     listBranches: () => ipcRenderer.invoke(IPC.GIT_LIST_BRANCHES),
     diffFiles: (input) => ipcRenderer.invoke(IPC.GIT_DIFF_FILES, input),
     fileContent: (input) => ipcRenderer.invoke(IPC.GIT_FILE_CONTENT, input),
@@ -348,7 +354,7 @@ const api: ElectronAPI = {
   },
 
   dialog: {
-    selectFolder: () => ipcRenderer.invoke(IPC.DIALOG_SELECT_FOLDER),
+    selectFolder: (options) => ipcRenderer.invoke(IPC.DIALOG_SELECT_FOLDER, options),
   },
 
   notifications: {
@@ -450,15 +456,21 @@ const api: ElectronAPI = {
   mobile: {
     getStatus: () => ipcRenderer.invoke(IPC.MOBILE_GET_STATUS),
     startPairing: () => ipcRenderer.invoke(IPC.MOBILE_START_PAIRING),
-    confirmPairing: (displayName, capabilities) => ipcRenderer.invoke(IPC.MOBILE_CONFIRM_PAIRING, displayName, capabilities),
     cancelPairing: () => ipcRenderer.invoke(IPC.MOBILE_CANCEL_PAIRING),
     listDevices: () => ipcRenderer.invoke(IPC.MOBILE_LIST_DEVICES),
     revokeDevice: (deviceId) => ipcRenderer.invoke(IPC.MOBILE_REVOKE_DEVICE, deviceId),
+    renameDevice: (deviceId, displayName) => ipcRenderer.invoke(IPC.MOBILE_RENAME_DEVICE, deviceId, displayName),
     setDeviceCapabilities: (deviceId, capabilities) => ipcRenderer.invoke(IPC.MOBILE_SET_DEVICE_CAPABILITIES, deviceId, capabilities),
+    testRelay: (relayUrl) => ipcRenderer.invoke(IPC.MOBILE_TEST_RELAY, relayUrl),
     onPairingSas: (callback) => {
       const handler = (_event: Electron.IpcRendererEvent, payload: MobilePairingSasPayload) => callback(payload);
       ipcRenderer.on(IPC.MOBILE_PAIRING_SAS, handler);
       return () => ipcRenderer.removeListener(IPC.MOBILE_PAIRING_SAS, handler);
+    },
+    onPairingConfirmed: (callback) => {
+      const handler = (_event: Electron.IpcRendererEvent, payload: MobilePairingConfirmedPayload) => callback(payload);
+      ipcRenderer.on(IPC.MOBILE_PAIRING_CONFIRMED, handler);
+      return () => ipcRenderer.removeListener(IPC.MOBILE_PAIRING_CONFIRMED, handler);
     },
     onPairingEnded: (callback) => {
       const handler = (_event: Electron.IpcRendererEvent, payload: MobilePairingEndedPayload) => callback(payload);
@@ -485,6 +497,13 @@ const api: ElectronAPI = {
       const handler = (_event: Electron.IpcRendererEvent, projectId: string) => callback(projectId);
       ipcRenderer.on(IPC.BOARD_CONFIG_SHORTCUTS_CHANGED, handler);
       return () => ipcRenderer.removeListener(IPC.BOARD_CONFIG_SHORTCUTS_CHANGED, handler);
+    },
+    getBoardProfiles: () => ipcRenderer.invoke(IPC.BOARD_CONFIG_GET_BOARD_PROFILES),
+    setBoardProfiles: (profiles) => ipcRenderer.invoke(IPC.BOARD_CONFIG_SET_BOARD_PROFILES, profiles),
+    onBoardProfilesChanged: (callback) => {
+      const handler = (_event: Electron.IpcRendererEvent, projectId: string) => callback(projectId);
+      ipcRenderer.on(IPC.BOARD_CONFIG_BOARD_PROFILES_CHANGED, handler);
+      return () => ipcRenderer.removeListener(IPC.BOARD_CONFIG_BOARD_PROFILES_CHANGED, handler);
     },
     getShortcuts: () => ipcRenderer.invoke(IPC.BOARD_CONFIG_GET_SHORTCUTS),
     setShortcuts: (actions, target) => ipcRenderer.invoke(IPC.BOARD_CONFIG_SET_SHORTCUTS, actions, target),

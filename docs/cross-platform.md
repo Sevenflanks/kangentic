@@ -64,9 +64,10 @@ The PowerShell case fixes a Windows PowerShell 5.1 quirk: it treats `[` / `]` in
 | better-sqlite3 | Rebuilt against Electron headers via `scripts/rebuild-native.js` | Included via `files` in `electron-builder.yml`, C++ source excluded |
 | node-pty | Prebuilt NAPI binaries, no rebuild needed | Included via `files`, prebuilds unpacked from asar via `asarUnpack` |
 | sherpa-onnx-node | Prebuilt platform-specific binaries (no rebuild needed) | Included via `files` (`sherpa-onnx-node/**` plus the `sherpa-onnx-*/**` platform packages), unpacked from asar via `asarUnpack: node_modules/sherpa-onnx-*/**` (voice dictation engine) |
+| font-list | Shells out to `fc-list` (Linux) / a PowerShell script (Windows) / a bundled binary (macOS); no rebuild needed | Included via `files` (`font-list/**`), unpacked from asar via `asarUnpack` since the macOS binary is spawned via `child_process` (Terminal Font Family picker) |
 | simple-git | Pure JavaScript, bundled by esbuild | Not in node_modules (bundled into main process) |
 
-The `files` array in `electron-builder.yml` explicitly whitelists `.vite/build/**`, `better-sqlite3`, `node-pty`, `sherpa-onnx-node`, the `sherpa-onnx-*` platform packages, `bindings`, and `file-uri-to-path`. Everything else is excluded from the packaged app.
+The `files` array in `electron-builder.yml` explicitly whitelists `.vite/build/**`, `better-sqlite3`, `node-pty`, `sherpa-onnx-node`, the `sherpa-onnx-*` platform packages, `font-list`, `bindings`, and `file-uri-to-path`. Everything else is excluded from the packaged app.
 
 ### Bridge Script Unpacking
 
@@ -97,6 +98,14 @@ Windows resolves taskbar icons by matching the running window's AppUserModelID (
 ## macOS Title Bar
 
 `BrowserWindow` uses `titleBarStyle: 'hidden'` with `trafficLightPosition: { x: 12, y: 12 }` to position the native traffic lights within the custom TitleBar. The renderer detects macOS via `window.electronAPI.platform === 'darwin'` and applies `pl-20` (80px left padding) to prevent content from rendering under the traffic lights. On Windows/Linux, the custom TitleBar renders its own minimize/maximize/close buttons instead.
+
+## macOS Code Signing
+
+macOS builds use hardened runtime with `build/entitlements.plist` providing JIT, unsigned executable memory, and dyld environment variable entitlements (required by node-pty). Notarization uses `notarytool` via electron-builder, gated on the `APPLE_ID` and `APPLE_APP_SPECIFIC_PASSWORD` environment variables.
+
+## Linux System Dependencies
+
+The deb package declares `depends` on Electron's required system libraries (`libnss3`, `libatk-bridge2.0-0`, `libgtk-3-0`, `libgbm1`, `libasound2t64 | libasound2`, `libdrm2`, `libxshmfence1`); the alternation covers Ubuntu 24.04+'s rename of `libasound2` to `libasound2t64`. The rpm package declares `depends` as `.so` soname capabilities (`libnss3.so()(64bit)`, `libatk-1.0.so.0()(64bit)`, `libgtk-3.so.0()(64bit)`, `libgbm.so.1()(64bit)`, `libasound.so.2()(64bit)`, `libdrm.so.2()(64bit)`, `libxshmfence.so.1()(64bit)`) rather than package names, because RPM package names differ per distro (Fedora `libxshmfence` vs. openSUSE `libxshmfence1`) while every distro's rpmbuild auto-generates a `Provides:` for the soname itself. See ``. Without these, the app crashes on launch, or fails to install at all, on fresh Linux installations.
 
 ## Auto-Update Platform Guard
 

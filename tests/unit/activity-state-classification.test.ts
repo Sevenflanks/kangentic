@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 
-// Enforces .claude/rules/activity-state-classification.md. The idle-vs-active question
+// Enforces the idle-vs-active classification invariant. The idle-vs-active question
 // ("does this session require user interaction?") has a single source of truth in
 // src/shared/activity-state.ts (requiresUserInteraction / isActive, backed by a
 // `satisfies Record<ActivityState, ...>` table). Re-deriving that bucket inline by

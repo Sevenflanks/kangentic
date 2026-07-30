@@ -102,7 +102,6 @@ const mockEnsureTaskWorktree = vi.fn(async () => null);
 const mockEnsureTaskBranchCheckout = vi.fn(async () => {});
 const mockSpawnAgent = vi.fn(async () => ({ kind: 'not-applicable' } as const));
 const mockCreateTransitionEngine = vi.fn(() => ({}));
-const mockBuildAutoCommandVars = vi.fn(() => ({}));
 
 vi.mock('../../src/main/ipc/helpers/index', () => ({
   getProjectRepos: (...args: unknown[]) => mockGetProjectRepos(...args),
@@ -110,7 +109,6 @@ vi.mock('../../src/main/ipc/helpers/index', () => ({
   ensureTaskBranchCheckout: (...args: unknown[]) => mockEnsureTaskBranchCheckout(...args),
   spawnAgent: (...args: unknown[]) => mockSpawnAgent(...args),
   createTransitionEngine: (...args: unknown[]) => mockCreateTransitionEngine(...args),
-  buildAutoCommandVars: (...args: unknown[]) => mockBuildAutoCommandVars(...args),
   cleanupTaskResources: vi.fn(async () => {}),
   deleteTaskWorktree: vi.fn(async () => true),
   autoSpawnForTask: vi.fn(async () => {}),
@@ -186,7 +184,7 @@ function makeContext(taskRepo: unknown, swimlaneRepo: unknown) {
     mainWindow: { isDestroyed: vi.fn(() => false), webContents: { send: vi.fn() } },
     sessionManager,
     configManager: { getEffectiveConfig: vi.fn(() => ({ git: { defaultBaseBranch: 'main' } })) },
-    boardConfigManager: { getDefaultBaseBranch: vi.fn(() => null) },
+    boardConfigManager: { getDefaultBaseBranch: vi.fn(() => null), getBoardProfiles: vi.fn(() => []) },
     terminalSubmitScheduler: { cancel: vi.fn(), scheduleKeystrokes: vi.fn() },
     projectRepo: { getById: vi.fn(() => ({ id: 'proj-test', default_agent: 'claude' })) },
   };

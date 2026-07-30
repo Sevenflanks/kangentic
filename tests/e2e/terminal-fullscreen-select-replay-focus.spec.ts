@@ -112,6 +112,42 @@ async function scrollbackForTask(page: Page, taskId: string): Promise<string> {
   }, taskId);
 }
 
+/**
+ * One-time settle margin before the FIRST getScrollback() read of a freshly
+ * spawned session (see the call site below for why this test needs one).
+ *
+ * PtyBufferManager batches raw PTY output behind a fixed 16ms flush timer
+ * (session-manager.ts's onFlush -> firstOutputTracker.consume runs only
+ * inside that flush). getScrollback() drains the session's pending
+ * (not-yet-flushed) buffer as a side effect - `state.buffer = ''` in
+ * PtyBufferManager.getScrollback, pinned by the "getScrollback drains
+ * pending buffer" case in tests/unit/pty-buffer-manager.test.ts. The 16ms
+ * flush timer, once armed by the first PTY chunk, fires unconditionally
+ * later regardless of any getScrollback() call in between - but if that call
+ * drains the buffer before the timer fires, the timer finds nothing to
+ * deliver and skips its callback, so first-output detection never sees the
+ * bytes that would have latched it.
+ *
+ * mock-claude's fullscreen-select harness writes its ENTIRE frame (including
+ * the `\x1b[?25l` first-output trigger) in one stdout.write() and then parks
+ * waiting on stdin, so this is a one-shot, all-or-nothing race per spawn: a
+ * getScrollback() call that happens to land inside that single 16ms window
+ * (which this test's very first, zero-delay poll can do, since it fires
+ * immediately after moveTaskIpc() resolves and can coincide with the mock
+ * CLI's own spawn+write timing under CI load) permanently starves first
+ * output, and every later poll in the same test then finds the SAME
+ * stuck-empty state for its whole timeout with no way to recover - this was
+ * the CI flake this margin fixes.
+ *
+ * Waiting comfortably longer than the fixed 16ms interval before ever
+ * reading scrollback closes the window: whatever data has already arrived
+ * has had time to flush naturally, and data that has not arrived yet reads
+ * as an (harmless, nothing-to-drain) empty buffer. This mirrors the accepted
+ * PTY-resize-debounce fixed wait elsewhere in this suite - bridging a
+ * hardcoded internal batch timer, not "wait and hope."
+ */
+const FLUSH_SETTLE_MARGIN_MS = 500;
+
 async function openTaskWindow(page: Page, taskTitle: string): Promise<void> {
   const card = page.locator(`text=${taskTitle}`).first();
   await card.click();
@@ -173,10 +209,22 @@ test.describe('Fullscreen TUI select prompt - input/focus survives a scrollback 
     const taskId = await getTaskIdByTitle(page, taskTitle);
     await moveTaskIpc(page, taskId, executingId);
 
+    // See FLUSH_SETTLE_MARGIN_MS's doc comment: bridge the main process's
+    // fixed 16ms flush interval before the first getScrollback() read below,
+    // so this poll's own reads cannot race (and permanently starve) the
+    // one-time first-output latch the LaunchOverlay wait later in this test
+    // depends on.
+    await page.waitForTimeout(FLUSH_SETTLE_MARGIN_MS);
+
     // Wait for the mock's initial fullscreen frame: option 0 highlighted.
+    // 30000 (not the suite's default 20000 CI-slow budget): this depends on
+    // mock-claude's spawn landing and its first PTY chunk surviving the
+    // PtyBufferManager flush under CI's contended, sharded xvfb runners -
+    // the same "compound, multi-hop" class as the launch-overlay wait below,
+    // and matches session-resume.spec.ts's 30000 for that class of wait.
     await expect
       .poll(() => scrollbackForTask(page, taskId), {
-        timeout: 15000,
+        timeout: 30000,
         message: 'Expected the fullscreen select prompt to render with option 1 highlighted',
       })
       .toContain(HIGHLIGHT_FIRST);
@@ -197,7 +245,15 @@ test.describe('Fullscreen TUI select prompt - input/focus survives a scrollback 
     // poll above. Wait for it to clear so the click isn't racing it -
     // otherwise Playwright's own click-retry loop absorbs the wait and can
     // exceed its 30s action timeout under CI's slower, contended runners.
-    await dialog.locator('[data-testid="launch-overlay"]').waitFor({ state: 'hidden', timeout: 15000 });
+    // 30000 (not the suite's default 20000 CI-slow budget): terminalReady
+    // (TerminalTab.tsx) flips only after the PTY chunk survives the fixed
+    // 16ms PtyBufferManager flush AND propagates through the session store
+    // into a React re-render of a freshly (re)mounted dialog - a compound,
+    // multi-hop wait, the same class session-resume.spec.ts budgets at
+    // 30000 for post-restart session re-establishment. This is the wait that
+    // timed out at 15000 on CI (contended 8-worker Linux/xvfb shard; passed
+    // in 2.7s locally uncontended), the flake this comment documents fixing.
+    await dialog.locator('[data-testid="launch-overlay"]').waitFor({ state: 'hidden', timeout: 30000 });
     await dialog.locator('.xterm').first().click();
     await expect
       .poll(() => page.evaluate(() => document.activeElement?.className ?? null), {

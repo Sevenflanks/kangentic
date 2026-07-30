@@ -1,28 +1,26 @@
 import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
-import { Plus, X, Info } from 'lucide-react';
+import { Plus, X } from 'lucide-react';
 import { useBoardStore } from '../../stores/board-store';
 import { useConfigStore } from '../../stores/config-store';
 import { useProjectStore } from '../../stores/project-store';
 import { useSessionStore } from '../../stores/session-store';
-import { useAllExistingLabels } from '../../hooks/useAllExistingLabels';
 import { useToastStore } from '../../stores/toast-store';
 import { useKeybinding } from '../../hooks/useKeybinding';
 import { NameFromPromptButton } from '../NameFromPromptButton';
 import { BaseDialog } from './BaseDialog';
 import { ConfirmDialog } from './ConfirmDialog';
 import { maximizedDialogLayout, MaximizeToggleButton } from './dialog-maximize';
-import { BranchPicker } from './BranchPicker';
-import { WorktreeChip } from './WorktreeChip';
+import { TaskBranchRow } from './TaskBranchRow';
+import { PriorityLabelsRow } from './PriorityLabelsRow';
+import { DialogFooterActions } from './DialogFooterActions';
 import { AdvancedOverridesSection } from './AdvancedOverridesSection';
-import { Select } from '../settings/shared';
-import { LabelInput } from '../LabelInput';
 import { fetchGitBranches } from '../../utils/git-branches';
 import { isValidGitBranchName } from '../../../shared/git-utils';
 import { slugify, computeAutoBranchName } from '../../../shared/slugify';
-import { DEFAULT_PRIORITY_CONFIG } from '../../../shared/types';
-import type { PermissionMode } from '../../../shared/types';
+import type { PermissionMode, TaskRunMode } from '../../../shared/types';
 import { DescriptionEditor } from '../DescriptionEditor';
-import { MAX_ATTACHMENT_BYTES, MEDIA_TYPE_EXT, resolveMediaType, isImageMediaType, getFileTypeIcon, getExtension } from './attachment-utils';
+import { AttachmentChipStrip } from './AttachmentChipStrip';
+import { MAX_ATTACHMENT_BYTES, MEDIA_TYPE_EXT, resolveMediaType, isImageMediaType, pastedAttachmentPrefix, reserveNextPastedIndex } from './attachment-utils';
 import { compressClipboardImage } from './image-compress';
 
 interface PendingAttachment {
@@ -47,8 +45,6 @@ export function NewTaskDialog({ swimlaneId, onClose }: NewTaskDialogProps) {
   const defaultBaseBranch = useConfigStore((s) => s.config.git.defaultBaseBranch);
   const worktreesEnabled = useConfigStore((s) => s.config.git.worktreesEnabled);
   const currentProject = useProjectStore((s) => s.currentProject);
-  const labelColors = useConfigStore((s) => s.config.backlog?.labelColors) ?? {};
-  const priorities = useConfigStore((s) => s.config.backlog?.priorities) ?? DEFAULT_PRIORITY_CONFIG;
   const isMaximized = useSessionStore((s) => s.maximizedTasks.has(NEW_TASK_ENTITY_ID));
   const toggleMaximized = useSessionStore((s) => s.toggleMaximized);
   const handleToggleMaximized = useCallback(() => toggleMaximized(NEW_TASK_ENTITY_ID), [toggleMaximized]);
@@ -104,14 +100,15 @@ export function NewTaskDialog({ swimlaneId, onClose }: NewTaskDialogProps) {
     }
     return <>Agent will work directly on {pill(effectiveBaseBranch)}</>;
   }, [customBranchName, branchExists, effectiveWorktree, effectiveBaseBranch]);
-  const allExistingLabels = useAllExistingLabels();
 
   const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
   const [previewAttachment, setPreviewAttachment] = useState<PendingAttachment | null>(null);
   const [isDragOver, setIsDragOver] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
   const nextIdRef = useRef(0);
-  const pendingPasteCount = useRef(0);
+  // Highest pasted-filename index handed out so far, per prefix. Monotonic on
+  // purpose - see reserveNextPastedIndex.
+  const issuedPastedIndex = useRef<Record<string, number>>({});
 
   // Per-task agent/model/effort overrides. Empty string means "use column
   // default" for that field. The Advanced section locks all three for the
@@ -121,8 +118,16 @@ export function NewTaskDialog({ swimlaneId, onClose }: NewTaskDialogProps) {
   const [modelOverride, setModelOverride] = useState('');
   const [effortOverride, setEffortOverride] = useState('');
   const [permissionOverride, setPermissionOverride] = useState('');
+  const [profileId, setProfileId] = useState<string | null>(null);
+  // Which run-mode branch is selected. Persisted as `Task.run_mode`, so it is
+  // real form state here rather than local state inside AdvancedOverridesSection
+  // - which is also what lets `isDirty` below see it.
+  const [runMode, setRunMode] = useState<TaskRunMode>('column_settings');
 
-  const isDirty = title.trim() !== '' || description.trim() !== '' || customBranchName.trim() !== '' || attachments.length > 0 || labels.length > 0 || priority !== 0 || agentOverride !== '' || modelOverride !== '' || effortOverride !== '' || permissionOverride !== '';
+  // Every field the user can touch, including the two that pin nothing on their
+  // own: selecting Agent Override with all four inherited, or picking a Board
+  // Profile, is still work to lose, so Escape must prompt.
+  const isDirty = title.trim() !== '' || description.trim() !== '' || customBranchName.trim() !== '' || attachments.length > 0 || labels.length > 0 || priority !== 0 || agentOverride !== '' || modelOverride !== '' || effortOverride !== '' || permissionOverride !== '' || profileId !== null || runMode !== 'column_settings';
 
   // Guard close gestures (X, Escape, backdrop, Ctrl+Shift+W) so unsaved work is
   // not lost: when the form is dirty, ask before discarding. Returns true to let
@@ -152,7 +157,16 @@ export function NewTaskDialog({ swimlaneId, onClose }: NewTaskDialogProps) {
   // mirroring the task detail dialog and command terminal). panel.close and
   // Escape both route through the dirty-changes guard. No ad-hoc keydown listener.
   useKeybinding('panel.maximize', handleToggleMaximized, { capture: true });
-  useKeybinding('panel.close', closeWithAnimation, { capture: true });
+  // Suppressed while a surface the Advanced section can spawn is open over this
+  // dialog: the Board Manager (profile edit button) or the Settings panel (agent
+  // edit button). This binding is capture-phase while both of those dismiss on a
+  // bubble-phase listener, so without the gate a single Escape meant for the
+  // surface on top would reach here first and raise the discard-changes confirm
+  // over a draft the user never tried to abandon. Mirrors how BoardManagerDialog
+  // suppresses its own Escape under a nested modal.
+  const boardManagerOpen = useBoardStore((state) => state.boardManagerOpen);
+  const settingsOpen = useConfigStore((state) => state.settingsOpen);
+  useKeybinding('panel.close', closeWithAnimation, { capture: true, enabled: !boardManagerOpen && !settingsOpen });
 
   // Cleanup object URLs on unmount. Track the latest attachments in a ref so the
   // unmount-only cleanup revokes the CURRENT set: a [] dep captures the
@@ -235,24 +249,22 @@ export function NewTaskDialog({ swimlaneId, onClose }: NewTaskDialogProps) {
 
       event.preventDefault();
       const mediaType = resolveMediaType(file);
-      const isImage = isImageMediaType(mediaType);
-      const prefix = isImage ? 'pasted-image-' : 'pasted-file-';
+      const prefix = pastedAttachmentPrefix(mediaType);
       const extensionStart = file.name ? file.name.lastIndexOf('.') : -1;
       const fallbackExtension = MEDIA_TYPE_EXT[mediaType] || (extensionStart >= 0 ? file.name.slice(extensionStart) : '.bin');
-      const baseCount =
-        attachments.filter((attachment) => attachment.filename.startsWith(prefix)).length +
-        pendingPasteCount.current;
-      pendingPasteCount.current += 1;
+      // Reserved synchronously so two fast pastes cannot claim the same index,
+      // then recorded in a high-water mark that is never decremented.
+      const pastedIndex = reserveNextPastedIndex(
+        prefix,
+        attachments.map((attachment) => attachment.filename),
+        issuedPastedIndex.current[prefix] ?? 0,
+      );
+      issuedPastedIndex.current[prefix] = pastedIndex;
       void (async () => {
-        try {
-          const { file: outFile } = await compressClipboardImage(file);
-          const finalMediaType = resolveMediaType(outFile);
-          const finalExtension = MEDIA_TYPE_EXT[finalMediaType] ?? fallbackExtension;
-          const finalName = `${prefix}${baseCount + 1}${finalExtension}`;
-          await addFile(outFile, finalName);
-        } finally {
-          pendingPasteCount.current -= 1;
-        }
+        const { file: outFile } = await compressClipboardImage(file);
+        const finalMediaType = resolveMediaType(outFile);
+        const finalExtension = MEDIA_TYPE_EXT[finalMediaType] ?? fallbackExtension;
+        await addFile(outFile, `${prefix}${pastedIndex}${finalExtension}`);
       })();
     }
   }, [attachments, addFile]);
@@ -301,6 +313,11 @@ export function NewTaskDialog({ swimlaneId, onClose }: NewTaskDialogProps) {
         ...(modelOverride ? { model_override: modelOverride } : {}),
         ...(effortOverride ? { effort_override: effortOverride } : {}),
         ...(permissionOverride ? { permission_mode: permissionOverride as PermissionMode } : {}),
+        ...(profileId ? { profile_id: profileId } : {}),
+        // Always sent, never a conditional spread: 'column_settings' is a real
+        // choice, not an absent one, and it is the half of the pair that carries
+        // no pins to imply it.
+        run_mode: runMode,
         ...(attachments.length > 0 ? {
           pendingAttachments: attachments.map((attachment) => ({
             filename: attachment.filename,
@@ -332,6 +349,11 @@ export function NewTaskDialog({ swimlaneId, onClose }: NewTaskDialogProps) {
           closeRef={dialogCloseRef}
           onHeaderDoubleClick={handleToggleMaximized}
           onCloseRequest={handleCloseAttempt}
+          testId="new-task-dialog"
+          // The Advanced section's edit buttons open the Board Manager (profile)
+          // or Settings (agent) over this dialog; Escape then belongs to
+          // whichever of those is on top, alone.
+          suppressEscape={boardManagerOpen || settingsOpen}
           title="New Task"
           icon={<Plus size={14} className="text-fg-muted" />}
           headerRight={
@@ -344,22 +366,13 @@ export function NewTaskDialog({ swimlaneId, onClose }: NewTaskDialogProps) {
           bodyClassName="flex-1 flex flex-col"
           closeHotkeyActionId="panel.close"
           footer={
-            <div className="flex items-center justify-end gap-3">
-              <button
-                type="button"
-                onClick={closeWithAnimation}
-                className="px-4 py-1.5 text-xs text-fg-muted hover:text-fg-secondary border border-edge-input hover:border-fg-faint rounded transition-colors"
-              >
-                Cancel
-              </button>
-              <button
-                type="submit"
-                disabled={!!branchNameError || submitting}
-                className="px-4 py-1.5 text-xs bg-accent-emphasis hover:bg-accent text-accent-on rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-              >
-                {submitting ? 'Creating...' : 'Create'}
-              </button>
-            </div>
+            <DialogFooterActions
+              onCancel={closeWithAnimation}
+              submitLabel="Create"
+              busyLabel="Creating..."
+              busy={submitting}
+              disabled={!!branchNameError}
+            />
           }
         >
           <div
@@ -388,110 +401,39 @@ export function NewTaskDialog({ swimlaneId, onClose }: NewTaskDialogProps) {
               className="flex-1"
             />
 
-            {/* Thumbnail strip */}
-            {attachments.length > 0 && (
-              <div>
-                <div className="flex items-center justify-between mb-1.5">
-                  <span className="text-xs text-fg-faint">{attachments.length} attachment{attachments.length !== 1 ? 's' : ''}</span>
-                </div>
-                <div className="flex gap-2.5 overflow-x-auto pb-1" data-testid="attachment-thumbnails">
-                {attachments.map((attachment) => {
-                  const isImage = isImageMediaType(attachment.media_type);
-                  const FileTypeIcon = getFileTypeIcon(attachment.media_type);
-                  return (
-                    <div
-                      key={attachment.id}
-                      className="relative flex-shrink-0 w-24 h-24 rounded-md border border-edge-input overflow-hidden group cursor-pointer"
-                      onClick={() => isImage ? setPreviewAttachment(attachment) : undefined}
-                    >
-                      {isImage ? (
-                        <img
-                          src={attachment.previewUrl}
-                          alt={attachment.filename}
-                          className="w-full h-full object-cover"
-                        />
-                      ) : (
-                        <div className="w-full h-full bg-surface-secondary flex flex-col items-center justify-evenly px-1.5 py-2">
-                          <FileTypeIcon size={20} className="text-fg-muted shrink-0" />
-                          <span className="text-[10px] text-fg-muted text-center break-all line-clamp-2 w-full leading-tight">
-                            {attachment.filename}
-                          </span>
-                          <span className="bg-surface-raised border border-edge-input rounded px-1.5 py-0.5 text-[9px] font-medium text-fg-faint uppercase leading-none">
-                            {getExtension(attachment.filename).replace('.', '')}
-                          </span>
-                        </div>
-                      )}
-                      <button
-                        type="button"
-                        onClick={(buttonEvent) => { buttonEvent.stopPropagation(); removeAttachment(attachment.id); }}
-                        className="absolute top-0 right-0 p-1 bg-black/70 text-white rounded-bl opacity-0 group-hover:opacity-100 transition-opacity"
-                      >
-                        <X size={14} />
-                      </button>
-                      {isImage && (
-                        <div className="absolute bottom-0 left-0 right-0 bg-black/50 px-1 py-0.5 text-[9px] text-fg-tertiary truncate opacity-0 group-hover:opacity-100 transition-opacity">
-                          {attachment.filename}
-                        </div>
-                      )}
-                    </div>
-                  );
-                })}
-                </div>
-              </div>
-            )}
+            <AttachmentChipStrip
+              attachments={attachments}
+              onOpen={(attachment) => {
+                if (isImageMediaType(attachment.media_type)) setPreviewAttachment(attachment);
+              }}
+              onRemove={removeAttachment}
+            />
 
-            <div className="flex gap-3">
-              <div className="flex-1">
-                <label className="text-xs text-fg-muted mb-1 block">Priority</label>
-                <Select
-                  value={priority}
-                  onChange={(event) => setPriority(Number((event.target as HTMLSelectElement).value))}
-                  className="appearance-none bg-surface border border-edge-input rounded pl-3 pr-10 py-1.5 text-sm text-fg w-full focus:outline-none focus:border-accent"
-                  data-testid="task-priority"
-                >
-                  {priorities.map((priorityEntry, index) => (
-                    <option key={index} value={index}>{priorityEntry.label}</option>
-                  ))}
-                </Select>
-              </div>
-              <LabelInput
-                labels={labels}
-                setLabels={setLabels}
-                labelColors={labelColors}
-                allExistingLabels={allExistingLabels}
-                testId="task-labels"
-              />
-            </div>
+            <PriorityLabelsRow
+              priority={priority}
+              setPriority={setPriority}
+              labels={labels}
+              setLabels={setLabels}
+              testIdPrefix="task-"
+            />
 
-            <div>
-              <label className="text-[10px] text-fg-muted mb-1 block">Branch</label>
-              <div className="flex items-center gap-2">
-                <input
-                  data-testid="custom-branch-name-input"
-                  type="text"
-                  placeholder={branchPlaceholder}
-                  value={customBranchName}
-                  onChange={(event) => setCustomBranchName(event.target.value)}
-                  className={`flex-1 min-w-0 bg-surface border rounded px-3 py-1.5 text-xs text-fg placeholder-fg-faint focus:outline-none ${
-                    branchNameError
-                      ? 'border-red-500 focus:border-red-500'
-                      : 'border-edge-input focus:border-accent'
-                  }`}
-                />
-                <span className="text-xs text-fg-disabled shrink-0">from</span>
-                <BranchPicker value={baseBranch} defaultBranch={defaultBaseBranch || 'main'} onChange={setBaseBranch} />
-                <div className="w-px h-5 bg-edge-input shrink-0" />
-                <WorktreeChip enabled={effectiveWorktree} onToggle={() => setUseWorktree(effectiveWorktree ? false : true)} />
-              </div>
-              {branchNameError ? (
-                <p className="text-xs text-red-500 mt-0.5">{branchNameError}</p>
-              ) : (
-                <span className="text-xs text-fg-disabled mt-1 flex items-center gap-1"><Info size={12} className="shrink-0" />{branchHint}</span>
-              )}
-            </div>
+            <TaskBranchRow
+              customBranchName={customBranchName}
+              setCustomBranchName={setCustomBranchName}
+              branchPlaceholder={branchPlaceholder}
+              branchNameError={branchNameError}
+              branchHint={branchHint}
+              baseBranch={baseBranch}
+              setBaseBranch={setBaseBranch}
+              defaultBaseBranch={defaultBaseBranch}
+              effectiveWorktree={effectiveWorktree}
+              setUseWorktree={setUseWorktree}
+            />
 
             <AdvancedOverridesSection
               swimlaneId={swimlaneId}
+              runMode={runMode}
+              setRunMode={setRunMode}
               agentOverride={agentOverride}
               setAgentOverride={setAgentOverride}
               modelOverride={modelOverride}
@@ -500,6 +442,8 @@ export function NewTaskDialog({ swimlaneId, onClose }: NewTaskDialogProps) {
               setEffortOverride={setEffortOverride}
               permissionOverride={permissionOverride}
               setPermissionOverride={setPermissionOverride}
+              profileId={profileId}
+              setProfileId={setProfileId}
             />
 
             {/* Drag overlay */}
@@ -530,6 +474,7 @@ export function NewTaskDialog({ swimlaneId, onClose }: NewTaskDialogProps) {
         <div
           className="fixed inset-0 bg-black/80 flex flex-col items-center justify-center z-[60]"
           onClick={() => setPreviewAttachment(null)}
+          data-testid="attachment-preview-overlay"
         >
           <button
             className="absolute top-4 right-4 p-2 text-fg-muted hover:text-fg-secondary transition-colors"

@@ -8,9 +8,10 @@ import { readFileAsAttachment } from '../../db/repositories/attachment-utils';
 import { resolveColumn } from './column-resolver';
 import { resolveTask } from './task-resolver';
 import { handleCreateBacklogTask, BACKLOG_DESCRIPTION_MAX_LENGTH } from './backlog-commands';
+import { resolveProfileSelector } from './profile-commands';
 import { linkPRForTask } from '../../pr/pr-linking';
 import type { CommandContext, CommandHandler, CommandResponse } from './types';
-import type { TaskUpdateInput, PermissionMode } from '../../../shared/types';
+import type { TaskUpdateInput, PermissionMode, TaskRunMode } from '../../../shared/types';
 import type { AutoCommandImmediateOutcome } from '../../../shared/auto-command-outcome';
 
 export const TASK_DESCRIPTION_MAX_LENGTH = 50_000;
@@ -95,6 +96,23 @@ export function computeUpdatedDescription(
   return { success: true, text };
 }
 
+/**
+ * The PR number a PR URL names, or null when the URL carries none.
+ *
+ * `pr_url` and `pr_number` must always name the SAME PR: the linker writes the
+ * three PR columns atomically, and Tier 1 of the confidence ladder treats
+ * `pr_number` as authoritative. A caller naturally passes `prUrl` alone (the URL
+ * already encodes the number), which would otherwise leave the OLD number in the
+ * row - the next non-force resolve then resolves that stale number and silently
+ * overwrites the URL back to the previous PR. Deriving it here keeps the two in
+ * agreement, and mirrors `buildPrFields` in the task-detail edit form, which has
+ * always derived the number from the URL the same way.
+ */
+function prNumberFromUrl(prUrl: string): number | null {
+  const prNumberMatch = prUrl.match(/\/pull\/(\d+)/);
+  return prNumberMatch ? parseInt(prNumberMatch[1], 10) : null;
+}
+
 export const handleCreateTask: CommandHandler = async (
   params: Record<string, unknown>,
   context: CommandContext,
@@ -113,6 +131,12 @@ export const handleCreateTask: CommandHandler = async (
   const effortOverride = params.effortOverride as string | null;
   const permissionMode = params.permissionMode as PermissionMode | null;
   const autoCommand = params.autoCommand as string | null;
+  const profileSelector = params.profile as string | null;
+  const runMode = params.runMode as TaskRunMode | null;
+  // Normalized to null so an omitted key reads the same as the explicit `null`
+  // the MCP tool layer forwards - a direct handler call passes neither.
+  const prUrl = (params.prUrl as string | null | undefined) ?? null;
+  const prNumber = (params.prNumber as number | null | undefined) ?? null;
 
   // Observability for the "labels dropped on a large description" bug
   // (task #229). Logs what `labels` actually reached the handler. If it is
@@ -166,6 +190,15 @@ export const handleCreateTask: CommandHandler = async (
     return { success: false, error: 'Priority must be 0-4 (0=none, 1=low, 2=medium, 3=high, 4=urgent)' };
   }
 
+  // Resolved BEFORE the row is written: a typoed profile name must fail the
+  // create outright rather than leave a task silently running Default.
+  let profileId: string | null = null;
+  if (profileSelector) {
+    const resolvedProfile = resolveProfileSelector(context, profileSelector);
+    if (!resolvedProfile.ok) return { success: false, error: resolvedProfile.error };
+    profileId = resolvedProfile.profileId;
+  }
+
   const db = context.getProjectDb();
   const taskRepo = new TaskRepository(db);
 
@@ -189,7 +222,29 @@ export const handleCreateTask: CommandHandler = async (
     ...(effortOverride ? { effort_override: effortOverride } : {}),
     ...(permissionMode ? { permission_mode: permissionMode } : {}),
     ...(autoCommand ? { auto_command: autoCommand } : {}),
+    ...(profileId ? { profile_id: profileId } : {}),
+    ...(runMode ? { run_mode: runMode } : {}),
   });
+
+  // A review task names the PR it is about up front, so the linker's pr_number
+  // tier resolves it (a PR URL in the DESCRIPTION is deliberately not an anchor -
+  // see the ladder comment in pr-linking.ts). Applied as a follow-up update
+  // rather than through TaskCreateInput on purpose: `TaskRepository.create`
+  // always writes the three PR columns null, and keeping that invariant means
+  // the create path has exactly one shape. pr_state stays null and the next
+  // resolve fills it in.
+  let createdTask = task;
+  if (prUrl !== null || prNumber !== null) {
+    // An explicit prNumber wins; otherwise derive it from the URL, so a caller
+    // passing prUrl alone still lands on Tier 1 instead of producing a row that
+    // shows a PR badge but has no anchor to ever resolve it.
+    const linkedPrNumber = prNumber !== null ? Number(prNumber) : prNumberFromUrl(String(prUrl));
+    createdTask = taskRepo.update({
+      id: task.id,
+      ...(prUrl !== null ? { pr_url: String(prUrl) } : {}),
+      ...(linkedPrNumber !== null ? { pr_number: linkedPrNumber } : {}),
+    });
+  }
 
   // Persist label colors to config if any were provided
   if (Object.keys(labelColorMap).length > 0) {
@@ -210,18 +265,18 @@ export const handleCreateTask: CommandHandler = async (
     }
   }
 
-  context.onTaskCreated(task, targetSwimlane.name, targetSwimlane.id);
+  context.onTaskCreated(createdTask, targetSwimlane.name, targetSwimlane.id);
   const createdTaskData = {
-    id: task.id,
-    taskId: task.id,
-    title: task.title,
-    displayId: task.display_id,
+    id: createdTask.id,
+    taskId: createdTask.id,
+    title: createdTask.title,
+    displayId: createdTask.display_id,
     column: targetSwimlane.name,
   };
-  const createdTaskMessage = `Created task "${task.title}" in ${targetSwimlane.name} column (#${task.display_id}, id: ${task.id})`;
+  const createdTaskMessage = `Created task "${createdTask.title}" in ${targetSwimlane.name} column (#${createdTask.display_id}, id: ${createdTask.id})`;
 
   try {
-    const autoCommandOutcome = await context.onTaskAutoSpawn(task, targetSwimlane.id);
+    const autoCommandOutcome = await context.onTaskAutoSpawn(createdTask, targetSwimlane.id);
     return {
       success: true,
       data: withAutoCommandOutcome(createdTaskData, autoCommandOutcome),
@@ -257,6 +312,8 @@ export const handleUpdateTask: CommandHandler = (
   const newModel = params.model as string | null | undefined;
   const newEffort = params.effort as string | null | undefined;
   const newPermissionMode = params.permissionMode as PermissionMode | null | undefined;
+  const newProfileSelector = params.profile as string | null | undefined;
+  const newRunMode = params.runMode as TaskRunMode | undefined;
   const newAttachments = params.attachments as Array<{ filePath: string; filename?: string }> | null;
 
   // Observability for the "labels dropped on a large description" bug
@@ -308,7 +365,17 @@ export const handleUpdateTask: CommandHandler = (
   }
 
   if (newPrUrl !== null) updates.pr_url = String(newPrUrl);
+  // An explicit prNumber wins; otherwise derive it from the URL. Writing the URL
+  // alone would leave the OLD number behind, and the next resolve would take that
+  // stale number as authoritative and revert the URL to the previous PR.
   if (newPrNumber !== null) updates.pr_number = Number(newPrNumber);
+  else if (newPrUrl !== null) updates.pr_number = prNumberFromUrl(String(newPrUrl));
+  // Re-pointing the link invalidates any state carried over from the old PR. The
+  // three fields must always agree (the linker writes them atomically), and a
+  // stale terminal `merged`/`closed` would otherwise short-circuit every
+  // non-force resolve, freezing the task on a PR it no longer points at. The
+  // next resolve refills it.
+  if (newPrUrl !== null || newPrNumber !== null) updates.pr_state = null;
   if (newAgent !== null) updates.agent = newAgent;
   if (newPriority !== null) updates.priority = Number(newPriority);
   if (newLabels !== null) updates.labels = newLabels;
@@ -321,6 +388,22 @@ export const handleUpdateTask: CommandHandler = (
   if (newModel !== undefined) updates.model_override = newModel;
   if (newEffort !== undefined) updates.effort_override = newEffort;
   if (newPermissionMode !== undefined) updates.permission_mode = newPermissionMode;
+  // Same tri-state, plus a name-to-id resolution. An unknown name fails the
+  // whole update rather than clearing the task's profile, which is what `null`
+  // would otherwise mean here.
+  if (newProfileSelector !== undefined) {
+    if (newProfileSelector === null) {
+      updates.profile_id = null;
+    } else {
+      const resolvedProfile = resolveProfileSelector(context, newProfileSelector);
+      if (!resolvedProfile.ok) return { success: false, error: resolvedProfile.error };
+      updates.profile_id = resolvedProfile.profileId;
+    }
+  }
+  // No "clear" state: the mode is one of two values, so omitted simply means
+  // "leave it alone". A pin or profile in this same write still implies a mode
+  // via applyProfileExclusivity.
+  if (newRunMode !== undefined) updates.run_mode = newRunMode;
 
   const hasScalarChange = Object.keys(updates).length > 1;
   let updated = hasScalarChange ? taskRepo.update(updates as unknown as TaskUpdateInput) : task;
@@ -371,6 +454,8 @@ export const handleUpdateTask: CommandHandler = (
   if (newModel !== undefined) changedFields.push('model');
   if (newEffort !== undefined) changedFields.push('effort');
   if (newPermissionMode !== undefined) changedFields.push('permissionMode');
+  if (newProfileSelector !== undefined) changedFields.push('profile');
+  if (newRunMode !== undefined) changedFields.push('runMode');
   if (attachmentsAdded > 0) changedFields.push('attachments');
 
   return {
@@ -391,6 +476,11 @@ export const handleUpdateTask: CommandHandler = (
       modelOverride: updated.model_override,
       effortOverride: updated.effort_override,
       permissionMode: updated.permission_mode,
+      profileId: updated.profile_id,
+      // Reported like its exclusivity siblings above: a pin or a profile in
+      // this write can flip the mode without the caller naming it, so the
+      // resulting mode has to be visible in the response.
+      runMode: updated.run_mode,
       ...(newAttachments !== null ? { attachmentCount: updated.attachment_count, attachmentsAdded } : {}),
     },
   };

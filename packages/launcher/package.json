@@ -1,6 +1,6 @@
 {
   "name": "kangentic",
-  "version": "0.30.0",
+  "version": "0.31.0",
   "description": "Install and launch Kangentic -- visual agent orchestration for Claude Code",
   "private": true,
   "bin": {

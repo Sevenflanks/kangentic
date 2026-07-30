@@ -5,7 +5,7 @@ import { useBacklogStore } from '../../../stores/backlog-store';
 import { useSessionStore } from '../../../stores/session-store';
 import { useProjectStore } from '../../../stores/project-store';
 import { useToastStore } from '../../../stores/toast-store';
-import type { Task, Session, AgentCommand, Swimlane, PermissionMode } from '../../../../shared/types';
+import type { Task, Session, AgentCommand, Swimlane, PermissionMode, TaskRunMode } from '../../../../shared/types';
 import type { useBranchConfig } from './useBranchConfig';
 import type { useTaskProgress } from '../../../utils/task-progress';
 
@@ -42,6 +42,10 @@ export function useTaskActions(input: {
   modelOverride: string;
   effortOverride: string;
   permissionOverride: string;
+  /** Board Profile the task rides, or null for Default. */
+  profileId: string | null;
+  /** Which run-mode branch the edit form has selected (see `Task.run_mode`). */
+  runMode: TaskRunMode;
   setTitle: Dispatch<SetStateAction<string>>;
   setDescription: Dispatch<SetStateAction<string>>;
   setPrUrl: Dispatch<SetStateAction<string>>;
@@ -51,6 +55,8 @@ export function useTaskActions(input: {
   setModelOverride: Dispatch<SetStateAction<string>>;
   setEffortOverride: Dispatch<SetStateAction<string>>;
   setPermissionOverride: Dispatch<SetStateAction<string>>;
+  setProfileId: Dispatch<SetStateAction<string | null>>;
+  setRunMode: Dispatch<SetStateAction<TaskRunMode>>;
   setIsEditing: Dispatch<SetStateAction<boolean>>;
 
   // Branch config hook
@@ -227,19 +233,36 @@ export function useTaskActions(input: {
     input.setModelOverride(input.task.model_override ?? '');
     input.setEffortOverride(input.task.effort_override ?? '');
     input.setPermissionOverride(input.task.permission_mode ?? '');
+    // The run-mode branch and the profile pick live in the same host state as
+    // the four pins above and outlive the edit form's unmount, so cancel has to
+    // revert them too - otherwise re-entering edit shows the branch (or the
+    // profile) the user just abandoned.
+    input.setProfileId(input.task.profile_id ?? null);
+    input.setRunMode(input.task.run_mode);
     input.branchConfig.resetToTask();
     input.setIsEditing(false);
   };
 
-  /** Build pr_url/pr_number fields if the PR URL changed. */
-  const buildPrUrlFields = (): Pick<Parameters<typeof input.updateTask>[0], 'pr_url' | 'pr_number'> => {
+  /**
+   * Build the pr_url/pr_number/pr_state fields if the PR URL changed. All three
+   * move together, exactly as the linker writes them: leaving a stale `pr_state`
+   * behind produces the inconsistent row the linker forbids, and a terminal
+   * `merged`/`closed` value short-circuits every non-force resolve, freezing the
+   * task on a PR it no longer points at. The state is nulled on both branches
+   * (cleared and re-pointed) and refilled by the next resolve.
+   */
+  const buildPrFields = (): Pick<Parameters<typeof input.updateTask>[0], 'pr_url' | 'pr_number' | 'pr_state'> => {
     const trimmedPrUrl = input.prUrl.trim();
     if (trimmedPrUrl === (input.task.pr_url ?? '')) return {};
     if (trimmedPrUrl) {
       const prNumberMatch = trimmedPrUrl.match(/\/pull\/(\d+)/);
-      return { pr_url: trimmedPrUrl, pr_number: prNumberMatch ? parseInt(prNumberMatch[1], 10) : null };
+      return {
+        pr_url: trimmedPrUrl,
+        pr_number: prNumberMatch ? parseInt(prNumberMatch[1], 10) : null,
+        pr_state: null,
+      };
     }
-    return { pr_url: null, pr_number: null };
+    return { pr_url: null, pr_number: null, pr_state: null };
   };
 
   const executeSave = async (
@@ -256,7 +279,7 @@ export function useTaskActions(input: {
     setSaving(true);
     try {
       const needsSwitchBranch = (input.task.worktree_path && branchChanged) || enablingWorktree;
-      const prUrlFields = buildPrUrlFields();
+      const prFields = buildPrFields();
 
       // Per-task overrides: empty string in the form maps to null in the DB.
       // Always include them in the payload (even when unchanged) so a user
@@ -269,6 +292,15 @@ export function useTaskActions(input: {
           model_override: input.modelOverride || null,
           effort_override: input.effortOverride || null,
           permission_mode: (input.permissionOverride || null) as PermissionMode | null,
+          // Sent alongside the pins because they are mutually exclusive: the
+          // repository clears whichever side this write did not set, so both
+          // must travel together or one silently wins.
+          profile_id: input.profileId ?? null,
+          // Inside this object, not beside it: the whole block is skipped for an
+          // active session, which is the same condition that hides the run-mode
+          // control (TaskDetailEditForm). Sending it unconditionally would write
+          // a mode from a control the user was never shown.
+          run_mode: input.runMode,
         }
         : {};
 
@@ -281,20 +313,22 @@ export function useTaskActions(input: {
           }, useProjectStore.getState().currentProject?.id ?? null);
           if (input.title !== input.task.title
             || input.description !== input.task.description
-            || prUrlFields.pr_url !== undefined
+            || prFields.pr_url !== undefined
             || JSON.stringify(input.labels) !== JSON.stringify(input.task.labels ?? [])
             || input.priority !== (input.task.priority ?? 0)
             || (input.agentOverride || null) !== input.task.agent_override
             || (input.modelOverride || null) !== input.task.model_override
             || (input.effortOverride || null) !== input.task.effort_override
-            || (input.permissionOverride || null) !== input.task.permission_mode) {
+            || (input.permissionOverride || null) !== input.task.permission_mode
+            || (input.profileId ?? null) !== input.task.profile_id
+            || input.runMode !== input.task.run_mode) {
             await input.updateTask({
               id: input.task.id,
               title: input.title,
               description: input.description,
               labels: input.labels,
               priority: input.priority,
-              ...prUrlFields,
+              ...prFields,
               ...overrideFields,
             });
           }
@@ -314,7 +348,7 @@ export function useTaskActions(input: {
           description: input.description,
           labels: input.labels,
           priority: input.priority,
-          ...prUrlFields,
+          ...prFields,
           ...overrideFields,
         };
 

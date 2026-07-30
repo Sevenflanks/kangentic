@@ -162,8 +162,8 @@ test.describe('Task Activity Indicators', () => {
       // After activity sync, idle activity shows mail icon (no spinner)
       const title = page.locator('text=Test Initializing Task').first();
       const titleRow = title.locator('..');
-      await expect(titleRow.locator('.lucide-loader-circle')).not.toBeVisible({ timeout: 10000 });
-      await expect(titleRow.locator('.lucide-mail')).toBeVisible({ timeout: 10000 });
+      await expect(titleRow.locator('[data-mark="agent-working"]')).not.toBeVisible({ timeout: 10000 });
+      await expect(titleRow.locator('[data-mark="agent-idle"]')).toBeVisible({ timeout: 10000 });
     });
 
     test('running idle with events but no usage shows mail icon and usage bar', async () => {
@@ -177,8 +177,8 @@ test.describe('Task Activity Indicators', () => {
 
         const title = eventPage.locator('text=Test Initializing Task').first();
         const titleRow = title.locator('..');
-        await expect(titleRow.locator('.lucide-loader-circle')).not.toBeVisible({ timeout: 10000 });
-        await expect(titleRow.locator('.lucide-mail')).toBeVisible({ timeout: 10000 });
+        await expect(titleRow.locator('[data-mark="agent-working"]')).not.toBeVisible({ timeout: 10000 });
+        await expect(titleRow.locator('[data-mark="agent-idle"]')).toBeVisible({ timeout: 10000 });
       } finally {
         await eventBrowser.close();
       }
@@ -196,8 +196,8 @@ test.describe('Task Activity Indicators', () => {
         // Thinking activity: spinner icon in title row
         const title = thinkPage.locator('text=Test Initializing Task').first();
         const titleRow = title.locator('..');
-        await expect(titleRow.locator('.lucide-loader-circle')).toBeVisible();
-        await expect(titleRow.locator('.lucide-mail')).not.toBeVisible();
+        await expect(titleRow.locator('[data-mark="agent-working"]')).toBeVisible();
+        await expect(titleRow.locator('[data-mark="agent-idle"]')).not.toBeVisible();
       } finally {
         await thinkBrowser.close();
       }
@@ -225,8 +225,8 @@ test.describe('Task Activity Indicators', () => {
       await expect(card).toBeVisible();
 
       const titleRow = card.locator('..');
-      await expect(titleRow.locator('.lucide-mail')).toBeVisible();
-      await expect(titleRow.locator('.lucide-loader-circle')).not.toBeVisible();
+      await expect(titleRow.locator('[data-mark="agent-idle"]')).toBeVisible();
+      await expect(titleRow.locator('[data-mark="agent-working"]')).not.toBeVisible();
 
       const cardEl = page.locator(`[data-task-id="${TASK_ID}"]`);
       await expect(cardEl.locator('[data-testid="usage-bar"]')).toBeVisible();
@@ -260,8 +260,24 @@ test.describe('Task Activity Indicators', () => {
       // The old status-bar usage strip was replaced by the dashboard; the live
       // KPI layering reads the same in-memory sessionUsage. Self-cleaning for
       // the shared page: closes the dashboard before finishing.
+      //
+      // This is the only test in the file that opens the usage dashboard, so
+      // it is the first hit on the StatsDashboardBody lazy chunk in this
+      // browser (see LazyStatsDashboard.tsx / stats-lazy-retry.spec.ts). The
+      // idle warm (AppLayout's warmStatsDashboardOnIdle) races the click
+      // under CI worker/shard contention, so a genuinely cold chunk
+      // compile/fetch can leave the Suspense skeleton showing well past this
+      // test's default 15s budget - that is what produced the CI flake
+      // ("element(s) not found" on kpi-tokens, not a content mismatch: the
+      // real dashboard body, and kpi-tokens with it, simply hadn't mounted
+      // yet). Raise the test's own timeout and poll for the real body to
+      // mount (kpi-tiles only exists in the real body, never the skeleton)
+      // before asserting content, instead of assuming the chunk is warm.
+      test.setTimeout(60_000);
+
       await page.locator('[data-testid="usage-stats-button"]').click();
       await page.locator('[data-testid="stats-page"]').waitFor({ state: 'visible', timeout: 10000 });
+      await page.locator('[data-testid="kpi-tiles"]').waitFor({ state: 'visible', timeout: 40000 });
 
       const tokens = page.locator('[data-testid="kpi-tokens"]');
       const cost = page.locator('[data-testid="kpi-cost-value"]');
@@ -336,7 +352,7 @@ test.describe('Task Activity Indicators', () => {
       await expect(card).toBeVisible();
 
       const titleRow = card.locator('..');
-      await expect(titleRow.locator('.lucide-loader-circle')).not.toBeVisible();
+      await expect(titleRow.locator('[data-mark="agent-working"]')).not.toBeVisible();
       await expect(page.locator('[data-testid="status-bar"]')).not.toBeVisible();
     });
 
@@ -352,8 +368,8 @@ test.describe('Task Activity Indicators', () => {
         await expect(card).toBeVisible();
 
         const titleRow = card.locator('..');
-        await expect(titleRow.locator('.lucide-loader-circle')).not.toBeVisible();
-        await expect(titleRow.locator('.lucide-mail')).not.toBeVisible();
+        await expect(titleRow.locator('[data-mark="agent-working"]')).not.toBeVisible();
+        await expect(titleRow.locator('[data-mark="agent-idle"]')).not.toBeVisible();
         await expect(stalePage.locator('[data-testid="status-bar"]')).not.toBeVisible();
       } finally {
         await staleBrowser.close();
@@ -382,8 +398,8 @@ test.describe('Task Activity Indicators', () => {
       await expect(card).toBeVisible();
 
       const titleRow = card.locator('..');
-      await expect(titleRow.locator('.lucide-mail')).not.toBeVisible();
-      await expect(titleRow.locator('.lucide-loader-circle')).not.toBeVisible();
+      await expect(titleRow.locator('[data-mark="agent-idle"]')).not.toBeVisible();
+      await expect(titleRow.locator('[data-mark="agent-working"]')).not.toBeVisible();
     });
 
     test('suspended task shows "Paused" bottom bar with pause icon', async () => {
@@ -442,7 +458,7 @@ test.describe('Task Activity Indicators', () => {
       await expect(bottomBar.locator('.lucide-loader-circle')).toBeVisible();
 
       const titleRow = card.locator('text=Test Initializing Task').first().locator('..');
-      await expect(titleRow.locator('.lucide-mail')).not.toBeVisible();
+      await expect(titleRow.locator('[data-mark="agent-idle"]')).not.toBeVisible();
     });
   });
 
@@ -706,8 +722,11 @@ test.describe('Task Activity Indicators', () => {
         // Human-readable pill text
         await expect(usageBar).toContainText('Telemetry: TUI only');
 
-        // No spinner -- the indefinite Loader2 must be absent
-        await expect(usageBar.locator('.lucide-loader-2')).toHaveCount(0);
+        // No spinner - the indefinite Loader2 must be absent. Asserted on
+        // `.lucide-loader-circle`, the class lucide actually emits: `Loader2` is an alias for
+        // `LoaderCircle`, so the old `.lucide-loader-2` selector matched nothing and this
+        // assertion passed no matter what rendered.
+        await expect(usageBar.locator('.lucide-loader-circle')).toHaveCount(0);
 
         // No "Starting agent..." or "Resuming agent..." copy
         await expect(usageBar).not.toContainText('Starting agent...');
@@ -743,8 +762,8 @@ test.describe('Task Activity Indicators', () => {
         await expect(page.locator('[data-testid="usage-bar"]').first()).toBeVisible({ timeout: 10000 });
 
         const titleRow = page.locator('text=Test Initializing Task').first().locator('..');
-        await expect(titleRow.locator('.lucide-mail')).toBeVisible({ timeout: 10000 });
-        await expect(titleRow.locator('.lucide-loader-circle')).not.toBeVisible();
+        await expect(titleRow.locator('[data-mark="agent-idle"]')).toBeVisible({ timeout: 10000 });
+        await expect(titleRow.locator('[data-mark="agent-working"]')).not.toBeVisible();
       } finally {
         await browser.close();
       }
@@ -1248,10 +1267,10 @@ test.describe('Task Activity Indicators', () => {
         const titleRow = page.locator('text=Test Initializing Task').first().locator('..');
 
         // permission maps to isIdle=true: Mail icon appears (amber, "needs attention")
-        await expect(titleRow.locator('.lucide-mail')).toBeVisible({ timeout: 10000 });
+        await expect(titleRow.locator('[data-mark="agent-idle"]')).toBeVisible({ timeout: 10000 });
 
         // Spinner must NOT appear - permission is not a thinking state
-        await expect(titleRow.locator('.lucide-loader-circle')).not.toBeVisible();
+        await expect(titleRow.locator('[data-mark="agent-working"]')).not.toBeVisible();
       } finally {
         await browser.close();
       }
@@ -1299,7 +1318,7 @@ test.describe('Task Activity Indicators', () => {
         const titleRow = page.locator('text=Test Initializing Task').first().locator('..');
 
         // Confirm we start in permission (mail icon visible)
-        await expect(titleRow.locator('.lucide-mail')).toBeVisible({ timeout: 10000 });
+        await expect(titleRow.locator('[data-mark="agent-idle"]')).toBeVisible({ timeout: 10000 });
 
         // Push activity update: permission -> thinking (simulates engine re-arming turnActive)
         await page.evaluate((sessionId) => {
@@ -1310,10 +1329,10 @@ test.describe('Task Activity Indicators', () => {
         }, SESSION_ID);
 
         // Spinner must appear (thinking is now active)
-        await expect(titleRow.locator('.lucide-loader-circle')).toBeVisible({ timeout: 5000 });
+        await expect(titleRow.locator('[data-mark="agent-working"]')).toBeVisible({ timeout: 5000 });
 
         // Mail icon must be absent in the thinking state (no idle flash)
-        await expect(titleRow.locator('.lucide-mail')).not.toBeVisible();
+        await expect(titleRow.locator('[data-mark="agent-idle"]')).not.toBeVisible();
       } finally {
         await browser.close();
       }
@@ -1353,9 +1372,10 @@ test.describe('Task Activity Indicators', () => {
 
         const pauseButton = dialog.locator('button[title="Pause session"]');
         await expect(pauseButton).toBeVisible({ timeout: 10000 });
-        // Active: a spinning ring (animate-spin) + the centered pause.
-        await expect(pauseButton.locator('.lucide-circle.animate-spin')).toBeVisible();
-        await expect(pauseButton.locator('[data-testid="pause-bars"]')).toBeVisible();
+        // Active: the marching ring with the pause centered inside it. Ring and bars are one
+        // packaged mark now, so the mark's identity carries both facts.
+        await expect(pauseButton.locator('[data-mark="control-pause-working"]')).toBeVisible();
+        await expect(pauseButton.locator('[data-mark="control-pause-idle"]')).toHaveCount(0);
       } finally {
         await browser.close();
       }
@@ -1371,10 +1391,9 @@ test.describe('Task Activity Indicators', () => {
 
         const pauseButton = dialog.locator('button[title="Pause session"]');
         await expect(pauseButton).toBeVisible({ timeout: 10000 });
-        // Idle: a static amber ring + the centered pause; the ring does not spin.
-        await expect(pauseButton.locator('.lucide-circle')).toBeVisible();
-        await expect(pauseButton.locator('[data-testid="pause-bars"]')).toBeVisible();
-        await expect(pauseButton.locator('.lucide-circle.animate-spin')).toHaveCount(0);
+        // Idle: the static amber ring + the centered pause; the ring does not march.
+        await expect(pauseButton.locator('[data-mark="control-pause-idle"]')).toBeVisible();
+        await expect(pauseButton.locator('[data-mark="control-pause-working"]')).toHaveCount(0);
       } finally {
         await browser.close();
       }
@@ -1390,11 +1409,11 @@ test.describe('Task Activity Indicators', () => {
 
         const pauseButton = dialog.locator('button[title="Pause session"]');
         await expect(pauseButton).toBeVisible({ timeout: 10000 });
-        // Permission maps to idle: a static amber ring, never the spinner.
-        await expect(pauseButton.locator('.lucide-circle')).toBeVisible();
-        await expect(pauseButton.locator('.lucide-circle.animate-spin')).toHaveCount(0);
+        // Permission maps to idle: the static amber ring, never the marching one.
+        await expect(pauseButton.locator('[data-mark="control-pause-idle"]')).toBeVisible();
+        await expect(pauseButton.locator('[data-mark="control-pause-working"]')).toHaveCount(0);
 
-        // Drive permission -> thinking; the static ring becomes the spinning ring.
+        // Drive permission -> thinking; the static ring becomes the marching ring.
         await page.evaluate((sessionId) => {
           const stores = (window as unknown as {
             __zustandStores: { session: { getState: () => { updateActivity: (id: string, state: string) => void } } };
@@ -1402,9 +1421,9 @@ test.describe('Task Activity Indicators', () => {
           stores.session.getState().updateActivity(sessionId, 'thinking');
         }, SESSION_ID);
 
-        await expect(pauseButton.locator('.lucide-circle.animate-spin')).toBeVisible({ timeout: 5000 });
-        // The pause stays centered through the transition.
-        await expect(pauseButton.locator('[data-testid="pause-bars"]')).toBeVisible();
+        // The pause stays centered through the transition: it is part of the mark.
+        await expect(pauseButton.locator('[data-mark="control-pause-working"]')).toBeVisible({ timeout: 5000 });
+        await expect(pauseButton.locator('[data-mark="control-pause-idle"]')).toHaveCount(0);
       } finally {
         await browser.close();
       }
@@ -1454,12 +1473,12 @@ test.describe('Task Activity Indicators', () => {
         // Body: the muted launch overlay surfaces the spawn status.
         await expect(dialog.getByText('Creating worktree...').first()).toBeVisible({ timeout: 10000 });
 
-        // Header: a muted (grey) launch spinner - a Loader2, NOT the green active
-        // ring - with no pause bars yet (the agent has not started).
+        // Header: a muted (grey) launch spinner - still a lucide Loader2, since "waiting to
+        // start" is not agent activity and the branding set has no loading mark - with no
+        // activity ring at all yet (the agent has not started).
         const pauseButton = dialog.locator('button[title="Pause session"]');
         await expect(pauseButton.locator('.lucide-loader-circle')).toBeVisible();
-        await expect(pauseButton.locator('[data-testid="pause-bars"]')).toHaveCount(0);
-        await expect(pauseButton.locator('.lucide-circle')).toHaveCount(0);
+        await expect(pauseButton.locator('[data-mark^="control-pause-"]')).toHaveCount(0);
       } finally {
         await browser.close();
       }

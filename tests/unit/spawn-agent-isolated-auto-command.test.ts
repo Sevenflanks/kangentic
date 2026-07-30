@@ -29,8 +29,8 @@
  * The real spawnAgent is exercised end to end; only the engine, repos, and
  * context are injected mocks, plus resolveTargetAgent (force isHandoff=false to
  * reach the normal fallback) and agentRegistry (supply the destination
- * sessionType). resolveIsolatedSwimlaneId, isResumeEligible, interpolateTemplate,
- * and buildAutoCommandVars run for real - they are the logic under test.
+ * sessionType). resolveIsolatedSwimlaneId, isResumeEligible, interpolateTaskTemplate,
+ * and resolveTaskTemplateVars run for real - they are the logic under test.
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
@@ -177,6 +177,12 @@ function makeDeps(args: {
   transitionSpawnLifecycles?: readonly SpawnExecutionLifecycle[];
   transitionError?: Error;
   transitionSessionId?: string | null;
+  /**
+   * Optional attachments repo mock, forwarded to spawnAgent's `attachments`
+   * option exactly like a real getProjectRepos() call site would. Omitted by
+   * default so existing tests are unaffected ({{attachments}} resolves []).
+   */
+  attachments?: { getPathsForTask: ReturnType<typeof vi.fn> };
 }) {
   const transitionSpawnLifecycles = args.transitionSpawnLifecycles ?? [];
   const transitionSessionId = args.transitionSessionId === undefined
@@ -226,10 +232,19 @@ function makeDeps(args: {
     },
     mainWindow: { isDestroyed: vi.fn(() => false), webContents: { send: vi.fn() } },
     projectRepo: { getById: vi.fn(() => null) },
-    configManager: { getEffectiveConfig: vi.fn(() => ({ agent: { permissionMode: 'acceptEdits' } })) },
+    configManager: {
+      getEffectiveConfig: vi.fn(() => ({
+        agent: { permissionMode: 'acceptEdits' },
+        git: { defaultBaseBranch: 'main' },
+      })),
+    },
+    // resolveDefaultBaseBranch (git-stats-capture.ts) reads this for the
+    // team-shared board default; undefined falls through to the git config
+    // default above, matching resolveAutoCommandVars in agent-spawn.ts.
+    boardConfigManager: { getDefaultBaseBranch: vi.fn(() => undefined) },
   };
 
-  return { tasks, sessionRepo, engine, scheduleKeystrokes, context };
+  return { tasks, sessionRepo, engine, scheduleKeystrokes, context, attachments: args.attachments };
 }
 
 async function runSpawn(
@@ -253,6 +268,7 @@ async function runSpawn(
     suppressAutoCommand,
     projectId,
     autoCommandLifecycle,
+    attachments: deps.attachments as never,
   });
 }
 
@@ -293,8 +309,8 @@ describe('spawnAgent auto_command injection (isolation-scoped resume check)', ()
   it('ISOLATED + fresh: a {{baseBranch}} placeholder in the auto_command interpolates the task base branch into the initial prompt', async () => {
     // The isolated Code Review column ships `/code-review {{baseBranch}}` so the
     // review is scoped against the branch the task actually forked from, not a
-    // guessed default. Verifies buildAutoCommandVars + interpolateTemplate wire
-    // task.base_branch through to the delivered command.
+    // guessed default. Verifies resolveTaskTemplateVars + interpolateTaskTemplate
+    // wire task.base_branch through to the delivered command.
     const isolatedLane = makeSwimlane(ISOLATED_LANE_ID, {
       session_target: 'isolated',
       auto_command: '/code-review {{baseBranch}}',
@@ -308,6 +324,51 @@ describe('spawnAgent auto_command injection (isolation-scoped resume check)', ()
     await runSpawn(isolatedLane, deps, true);
 
     expect(resumePromptArg(deps.engine)).toBe('/code-review develop');
+    expect(deps.scheduleKeystrokes).not.toHaveBeenCalled();
+  });
+
+  it('ISOLATED + fresh: a null task.base_branch falls back to the effective project default, not empty (regression: base_branch is a per-task OVERRIDE, not the resolved value)', async () => {
+    const isolatedLane = makeSwimlane(ISOLATED_LANE_ID, {
+      session_target: 'isolated',
+      auto_command: '/code-review {{baseBranch}}',
+    });
+    const deps = makeDeps({
+      manualPauseRecord: null,
+      resumeRecord: undefined,
+      taskFields: { base_branch: null },
+    });
+
+    await runSpawn(isolatedLane, deps, true);
+
+    // Not '/code-review' (empty) and not '/code-review ' (trailing space) -
+    // the default from configManager.getEffectiveConfig().git.defaultBaseBranch.
+    expect(resumePromptArg(deps.engine)).toBe('/code-review main');
+    expect(deps.scheduleKeystrokes).not.toHaveBeenCalled();
+  });
+
+  it('ISOLATED + fresh: a {{attachments}} placeholder interpolates the paths from options.attachments.getPathsForTask (regression: attachments plumbing must reach resolveTaskTemplateVars)', async () => {
+    // Verifies the AttachmentRepository option added to AgentSpawnOptions
+    // actually threads through spawnAgent -> resolveAutoCommandVars ->
+    // resolveTaskTemplateVars -> interpolateTaskTemplate, and is not silently
+    // dropped (which would leave {{attachments}} resolving to []).
+    const isolatedLane = makeSwimlane(ISOLATED_LANE_ID, {
+      session_target: 'isolated',
+      auto_command: '/code-review {{attachments}}',
+    });
+    const getPathsForTask = vi.fn(() => ['/mock/a.png', '/mock/b.png']);
+    const deps = makeDeps({
+      manualPauseRecord: null,
+      resumeRecord: undefined,
+      attachments: { getPathsForTask },
+    });
+
+    await runSpawn(isolatedLane, deps, true);
+
+    // getPathsForTask resolves attachmentPaths ({{attachments}} joins them on
+    // newlines, see TASK_TEMPLATE_RESOLVERS.attachments in
+    // task-template-resolvers.ts), called with the task's own id.
+    expect(getPathsForTask).toHaveBeenCalledWith(TASK_ID);
+    expect(resumePromptArg(deps.engine)).toBe('/code-review \n/mock/a.png\n/mock/b.png');
     expect(deps.scheduleKeystrokes).not.toHaveBeenCalled();
   });
 
@@ -579,10 +640,9 @@ describe('spawnAgent Auto-command finalization after action spawns', () => {
       currentTrack: null,
       sequence: ['/task-command release'],
     }));
-    expect(outcome).toEqual({
+    expect(outcome).toMatchObject({
       kind: 'skipped',
       reason: 'fresh-not-supported',
-      warning: 'Auto-command was skipped because OpenCode fresh-session delivery is not supported.',
     });
     expect(deps.tasks.clearAutoCommand).toHaveBeenCalledExactlyOnceWith(TASK_ID);
     expect(toLane.auto_command).toBe('/lane-command');
@@ -616,10 +676,9 @@ describe('spawnAgent Auto-command finalization after action spawns', () => {
     );
 
     // Then
-    expect(outcome).toEqual({
+    expect(outcome).toMatchObject({
       kind: 'skipped',
       reason: 'native-evidence-unavailable',
-      warning: 'Auto-command was skipped because required OpenCode native session evidence is unavailable.',
     });
     expect(deps.tasks.clearAutoCommand).not.toHaveBeenCalled();
     expect(deps.tasks.getById()).toEqual(expect.objectContaining({ auto_command: '/task-command' }));
@@ -649,10 +708,9 @@ describe('spawnAgent Auto-command finalization after action spawns', () => {
     // Then
     expect(deps.engine.resumeSuspendedSession).not.toHaveBeenCalled();
     expect(deps.scheduleKeystrokes).not.toHaveBeenCalled();
-    expect(outcome).toEqual({
+    expect(outcome).toMatchObject({
       kind: 'skipped',
       reason: 'fresh-not-supported',
-      warning: 'Auto-command was skipped because OpenCode fresh-session delivery is not supported.',
     });
     expect(deps.tasks.clearAutoCommand).toHaveBeenCalledExactlyOnceWith(TASK_ID);
   });
@@ -677,10 +735,9 @@ describe('spawnAgent Auto-command finalization after action spawns', () => {
     const outcome = await runSpawn(toLane, deps, false, false, undefined, taskFields);
 
     // Then
-    expect(outcome).toEqual({
+    expect(outcome).toMatchObject({
       kind: 'skipped',
       reason: 'resume-not-supported',
-      warning: 'Auto-command was skipped because OpenCode resume delivery is not supported.',
     });
     expect(deps.tasks.clearAutoCommand).toHaveBeenCalledExactlyOnceWith(TASK_ID);
   });

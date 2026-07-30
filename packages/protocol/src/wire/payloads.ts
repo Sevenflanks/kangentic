@@ -17,6 +17,7 @@ import type { CapabilityVerb } from '../capabilities/verbs';
 import type { JsonValue } from './messages';
 import { isJsonValue, isRecord } from './json-value';
 import { base64UrlDecode } from './base64url';
+import { isPushCategory, type PushCategory } from '../crypto/push-envelope';
 import {
   isActivityReasonWire,
   isActivityStateWire,
@@ -25,6 +26,7 @@ import {
   parseBoardTaskWire,
   parseDiffFileContentWire,
   parseDiffFileListWire,
+  parseSessionSummaryWire,
   parseSessionUsageWire,
   parseTerminalDimensionsWire,
   parseTranscriptEntriesWire,
@@ -35,6 +37,7 @@ import {
   type BoardTaskWire,
   type DiffFileContentWire,
   type DiffFileListWire,
+  type SessionSummaryWire,
   type SessionUsageWire,
   type TerminalDimensionsWire,
   type TranscriptEntryWire,
@@ -57,6 +60,20 @@ export interface ReadStreamRequestPayload {
   beforeIndex?: number;
   /** transcript-window only: maximum entries wanted (the desktop may cap this and may return fewer). */
   limit?: number;
+  /**
+   * subscribe only: whether this subscription wants live PTY bytes.
+   *
+   * A phone watching its session list needs activity, permission and
+   * transcript pushes, but NOT the terminal - it discards those bytes on
+   * arrival. Measured on a live board, that discard cost roughly 13MB an hour
+   * of relay traffic and mobile data for a feed showing no terminal at all.
+   *
+   * Omitted means true, so an older phone keeps the previous behaviour and an
+   * older desktop that ignores the field simply keeps sending (wasteful, not
+   * broken). Set false for a list-only subscription and re-subscribe with it
+   * true when a terminal actually opens.
+   */
+  terminal?: boolean;
 }
 
 /**
@@ -75,6 +92,15 @@ export interface ReadStreamResponsePayload {
   usage: SessionUsageWire | null;
   /** The live outstanding permission-prompt id (see answer-permission-prompt), or null when none is pending. */
   awaitedPromptId: string | null;
+  /**
+   * The awaited prompt's numbered option labels, parsed by the desktop from
+   * the pending dialog's PTY frame, in keystroke order: options[0] is the
+   * row answered with "1\r", options[1] with "2\r", and so on. Absent from
+   * pre-0.6.0 desktops; absent or null means unknown (no numbered dialog
+   * could be parsed), and the phone falls back to its blind
+   * approve/deny keystrokes. Only meaningful while awaitedPromptId is set.
+   */
+  awaitedPromptOptions?: string[] | null;
   /**
    * The PTY grid the scrollback bytes are laid out for. Absent from
    * pre-0.4.0 desktops; the phone then falls back to inferring a width
@@ -106,6 +132,15 @@ export function parseReadStreamResponsePayload(payload: JsonValue): ReadStreamRe
     usage: payload.usage === null || payload.usage === undefined ? null : parseSessionUsageWire(payload.usage as JsonValue),
     awaitedPromptId: payload.awaitedPromptId ?? null,
   };
+  if (payload.awaitedPromptOptions !== undefined) {
+    if (payload.awaitedPromptOptions === null) {
+      response.awaitedPromptOptions = null;
+    } else if (Array.isArray(payload.awaitedPromptOptions) && payload.awaitedPromptOptions.every((option) => typeof option === 'string')) {
+      response.awaitedPromptOptions = payload.awaitedPromptOptions;
+    } else {
+      throw new Error('read-stream response has an invalid "awaitedPromptOptions"');
+    }
+  }
   if (payload.ptyDimensions !== undefined) {
     response.ptyDimensions = parseTerminalDimensionsWire(payload.ptyDimensions as JsonValue);
   }
@@ -170,20 +205,92 @@ function parseReadStreamRequestPayload(payload: JsonValue): ReadStreamRequestPay
     }
     request.limit = payload.limit;
   }
+  if (payload.terminal !== undefined) {
+    if (typeof payload.terminal !== 'boolean') throw new Error('read-stream payload has an invalid "terminal"');
+    request.terminal = payload.terminal;
+  }
   return request;
 }
 
 // === read-board ===
 
+/**
+ * Which projection of a board the phone wants.
+ *
+ * - 'sessions': columns, per-column task counts, and only the non-archived
+ *   tasks that carry a `session_id`. This is what an agent feed renders: it
+ *   watches every project at once but only ever draws the handful of tasks
+ *   with a live agent on them.
+ * - 'full': every non-archived task, for the one project whose board the user
+ *   actually has open.
+ *
+ * Neither carries the backlog. Sending the field at all is the signal that
+ * this phone tolerates a response without one; a phone that omits it gets the
+ * pre-0.9.0 payload unchanged.
+ */
+export type ReadBoardView = 'full' | 'sessions';
+
 export interface ReadBoardRequestPayload {
   projectId?: string;
-  /** Defaults to 'subscribe' when omitted. 'unsubscribe' only has an effect when projectId is set - the no-projectId project list is a one-shot read with no live feed to tear down. */
-  action?: 'subscribe' | 'unsubscribe';
+  /**
+   * Defaults to 'subscribe' when omitted. 'unsubscribe' only has an effect
+   * when projectId is set - the no-projectId project list is a one-shot read
+   * with no live feed to tear down.
+   *
+   * 'archived' (protocol 0.10.0) is a one-shot page of the project's COMPLETED
+   * tasks, which no other projection carries: both 'full' and 'sessions' are
+   * built from the desktop's non-archived task list. It is deliberately not a
+   * field on the snapshot, because a board subscription re-snapshots on every
+   * board change - archived tasks would then repeat down the wire forever,
+   * which is the exact bloat the 0.9.0 projections removed. Completed work
+   * changes rarely and is read on demand.
+   */
+  action?: 'subscribe' | 'unsubscribe' | 'archived';
+  /** 'archived' only: page size, newest-archived first. The desktop clamps it. */
+  limit?: number;
+  /** 'archived' only: how many newest to skip, for paging. Defaults to 0. */
+  offset?: number;
+  /**
+   * subscribe only: the projection wanted (protocol 0.9.0). Omitted means the
+   * legacy full board WITH the backlog.
+   *
+   * Measured on a 15-project desktop, the full boards were 63 kB compressed
+   * of a ~96 kB cold start, of which 23 kB was a backlog no phone has ever
+   * rendered and another 30 kB was tasks with no session on them. Worse, a
+   * board subscription re-snapshots on every board change, so that payload
+   * repeats for as long as the phone is connected. The 'sessions' projection
+   * is 12 kB for the same 15 projects.
+   *
+   * A pre-0.9.0 desktop ignores the field and returns a full board with no
+   * `view` echo, which is exactly how a 0.9.0 phone detects that it must not
+   * treat the snapshot as filtered.
+   */
+  view?: ReadBoardView;
+}
+
+/**
+ * A desktop project group ("KANGENTIC", "TROY WEB"), for a phone rendering
+ * its project list with the same structure the desktop sidebar shows
+ * (protocol 0.11.0).
+ */
+export interface ReadBoardProjectGroup {
+  id: string;
+  name: string;
+  /** Display order among groups. */
+  position: number;
 }
 
 export interface ReadBoardProjectSummary {
   id: string;
   name: string;
+  /**
+   * The group this project belongs to, or null/absent for an ungrouped one
+   * (protocol 0.11.0). Absent from an older desktop, which is indistinguishable
+   * from ungrouped and renders the same flat list as before.
+   */
+  groupId?: string | null;
+  /** Display order within the group, mirroring the desktop's own ordering (protocol 0.11.0). */
+  position?: number;
   /**
    * Accent color for this project ("#rrggbb"). Today the desktop derives
    * it deterministically from the project id; a user-set project color
@@ -196,19 +303,74 @@ export interface ReadBoardProjectSummary {
 /** Returned when the request omits projectId - the phone's project-bootstrap listing. */
 export interface ReadBoardProjectListResponsePayload {
   projects: ReadBoardProjectSummary[];
+  /**
+   * The desktop's project groups, in display order (protocol 0.11.0). Absent
+   * from an older desktop; a phone that gets none renders one flat list, which
+   * is exactly the pre-0.11.0 behaviour.
+   */
+  groups?: ReadBoardProjectGroup[];
 }
 
 /** Returned when the request carries a projectId - a snapshot of that project's board. */
 export interface ReadBoardSnapshotResponsePayload {
   projectId: string;
   columns: BoardColumnWire[];
+  /** Non-archived tasks; filtered to the ones carrying a `session_id` when `view` is 'sessions'. */
   tasks: BoardTaskWire[];
-  backlog: BacklogItemWire[];
+  /** Absent whenever the request carried a `view` (protocol 0.9.0) - no phone has ever rendered it. */
+  backlog?: BacklogItemWire[];
   /** The project's accent color ("#rrggbb"); same semantics as ReadBoardProjectSummary.color. Absent from pre-0.5.0 desktops. */
   projectColor?: string;
+  /**
+   * The desktop's Layout "Ticket Numbers" setting: whether task cards
+   * display their #N number. Absent from pre-0.6.0 desktops (treat as
+   * true, the desktop default).
+   */
+  showTicketNumbers?: boolean;
+  /**
+   * The projection actually applied, echoed back. Absent from a pre-0.9.0
+   * desktop, which always sends a full board - so treat an absent `view` as
+   * 'full', never as "filtered, unknown how".
+   */
+  view?: ReadBoardView;
+  /**
+   * Non-archived task count per column id, sent with a 'sessions' view because
+   * `tasks` is filtered and a count taken from it would be wrong. Appending a
+   * card to a column needs the real length.
+   */
+  taskCountsByColumnId?: Record<string, number>;
 }
 
-export type ReadBoardResponsePayload = ReadBoardProjectListResponsePayload | ReadBoardSnapshotResponsePayload;
+/**
+ * Returned for `action: 'archived'` - one page of a project's completed tasks
+ * (protocol 0.10.0).
+ *
+ * These never appear in a board snapshot: the desktop builds those from its
+ * non-archived task list, so a phone that only ever subscribed has no way to
+ * know a completed task exists at all.
+ */
+export interface ReadBoardArchivedResponsePayload {
+  projectId: string;
+  /** Newest-archived first. At most the requested `limit`. */
+  archivedTasks: BoardTaskWire[];
+  /**
+   * Total archived tasks in the project, NOT the length of the page above.
+   * Drives the column count and tells the phone whether another page exists.
+   */
+  archivedTotalCount: number;
+  /**
+   * Lifetime cost/duration/churn per task id, for the tasks on THIS page that
+   * have recorded metrics. Sparse on purpose: a task archived without ever
+   * running an agent has nothing to summarize and is simply absent, which is
+   * not an error.
+   */
+  summariesByTaskId: Record<string, SessionSummaryWire>;
+}
+
+export type ReadBoardResponsePayload =
+  | ReadBoardProjectListResponsePayload
+  | ReadBoardSnapshotResponsePayload
+  | ReadBoardArchivedResponsePayload;
 
 const ACCENT_COLOR_PATTERN = /^#[0-9a-fA-F]{6}$/;
 
@@ -219,9 +381,25 @@ function parseAccentColor(value: unknown, context: string): string {
   return value;
 }
 
-/** Phone-side narrowing of a read-board response (project list or board snapshot). Throws on a malformed required field. */
+/** Phone-side narrowing of a read-board response (project list, board snapshot, or archived page). Throws on a malformed required field. */
 export function parseReadBoardResponsePayload(payload: JsonValue): ReadBoardResponsePayload {
   if (!isRecord(payload)) throw new Error('read-board response must be an object');
+
+  // Discriminated before the snapshot branch: an archived page also carries a
+  // projectId, but no `columns`, so testing it later would fail the snapshot's
+  // required-field checks first and report a confusing "missing columns".
+  if (Array.isArray(payload.archivedTasks)) {
+    if (typeof payload.projectId !== 'string') throw new Error('read-board archived response is missing "projectId"');
+    if (typeof payload.archivedTotalCount !== 'number') {
+      throw new Error('read-board archived response is missing "archivedTotalCount"');
+    }
+    return {
+      projectId: payload.projectId,
+      archivedTasks: payload.archivedTasks.map((task) => parseBoardTaskWire(task as JsonValue)),
+      archivedTotalCount: payload.archivedTotalCount,
+      summariesByTaskId: parseSummariesByTaskId(payload.summariesByTaskId),
+    };
+  }
 
   if (Array.isArray(payload.projects)) {
     const projects = payload.projects.map((project, index): ReadBoardProjectSummary => {
@@ -232,22 +410,80 @@ export function parseReadBoardResponsePayload(payload: JsonValue): ReadBoardResp
         id: project.id,
         name: project.name,
         ...(project.color !== undefined ? { color: parseAccentColor(project.color, `read-board project ${index}`) } : {}),
+        ...(typeof project.groupId === 'string' ? { groupId: project.groupId } : {}),
+        ...(typeof project.position === 'number' ? { position: project.position } : {}),
       };
     });
-    return { projects };
+    // A malformed group is dropped rather than failing the whole listing: the
+    // projects are what the phone cannot work without, and grouping degrades
+    // to the flat list it rendered before 0.11.0.
+    const groups = Array.isArray(payload.groups)
+      ? payload.groups.flatMap((group): ReadBoardProjectGroup[] =>
+          isRecord(group) && typeof group.id === 'string' && typeof group.name === 'string' && typeof group.position === 'number'
+            ? [{ id: group.id, name: group.name, position: group.position }]
+            : [],
+        )
+      : undefined;
+    return { projects, ...(groups !== undefined ? { groups } : {}) };
   }
 
   if (typeof payload.projectId !== 'string') throw new Error('read-board response is missing "projectId"');
   if (!Array.isArray(payload.columns)) throw new Error('read-board response is missing "columns"');
   if (!Array.isArray(payload.tasks)) throw new Error('read-board response is missing "tasks"');
-  if (!Array.isArray(payload.backlog)) throw new Error('read-board response is missing "backlog"');
+  // 0.9.0+ responses omit the backlog entirely; only a present-but-wrong value is an error.
+  if (payload.backlog !== undefined && !Array.isArray(payload.backlog)) {
+    throw new Error('read-board response has a non-array "backlog"');
+  }
+  if (payload.showTicketNumbers !== undefined && typeof payload.showTicketNumbers !== 'boolean') {
+    throw new Error('read-board response has a non-boolean "showTicketNumbers"');
+  }
+  if (payload.view !== undefined && payload.view !== 'full' && payload.view !== 'sessions') {
+    throw new Error('read-board response has an invalid "view"');
+  }
   return {
     projectId: payload.projectId,
     columns: payload.columns.map((column) => parseBoardColumnWire(column as JsonValue)),
     tasks: payload.tasks.map((task) => parseBoardTaskWire(task as JsonValue)),
-    backlog: payload.backlog.map((item) => parseBacklogItemWire(item as JsonValue)),
+    ...(payload.backlog !== undefined
+      ? { backlog: payload.backlog.map((item) => parseBacklogItemWire(item as JsonValue)) }
+      : {}),
     ...(payload.projectColor !== undefined ? { projectColor: parseAccentColor(payload.projectColor, 'read-board snapshot') } : {}),
+    ...(payload.showTicketNumbers !== undefined ? { showTicketNumbers: payload.showTicketNumbers } : {}),
+    ...(payload.view !== undefined ? { view: payload.view } : {}),
+    ...(payload.taskCountsByColumnId !== undefined
+      ? { taskCountsByColumnId: parseTaskCountsByColumnId(payload.taskCountsByColumnId) }
+      : {}),
   };
+}
+
+/** Narrows the 'sessions' view's per-column task counts; a malformed entry is dropped rather than failing the whole snapshot. */
+function parseTaskCountsByColumnId(value: unknown): Record<string, number> {
+  if (!isRecord(value)) throw new Error('read-board response has a non-object "taskCountsByColumnId"');
+  const counts: Record<string, number> = {};
+  for (const [columnId, count] of Object.entries(value)) {
+    if (typeof count === 'number' && Number.isInteger(count) && count >= 0) counts[columnId] = count;
+  }
+  return counts;
+}
+
+/**
+ * Narrows the archived page's per-task summaries. A malformed entry is
+ * dropped, matching parseTaskCountsByColumnId: the map is already sparse by
+ * design (a task that never ran an agent has no summary), so one bad entry
+ * costs that task its stat strip rather than costing the whole page.
+ */
+function parseSummariesByTaskId(value: unknown): Record<string, SessionSummaryWire> {
+  if (value === undefined) return {};
+  if (!isRecord(value)) throw new Error('read-board archived response has a non-object "summariesByTaskId"');
+  const summaries: Record<string, SessionSummaryWire> = {};
+  for (const [taskId, summary] of Object.entries(value)) {
+    try {
+      summaries[taskId] = parseSessionSummaryWire(summary as JsonValue);
+    } catch {
+      // Dropped deliberately; see the doc comment above.
+    }
+  }
+  return summaries;
 }
 
 function parseReadBoardRequestPayload(payload: JsonValue): ReadBoardRequestPayload {
@@ -255,10 +491,33 @@ function parseReadBoardRequestPayload(payload: JsonValue): ReadBoardRequestPaylo
   if (payload.projectId !== undefined && typeof payload.projectId !== 'string') {
     throw new Error('read-board payload has a non-string "projectId"');
   }
-  if (payload.action !== undefined && payload.action !== 'subscribe' && payload.action !== 'unsubscribe') {
+  if (
+    payload.action !== undefined
+    && payload.action !== 'subscribe'
+    && payload.action !== 'unsubscribe'
+    && payload.action !== 'archived'
+  ) {
     throw new Error('read-board payload has an invalid "action"');
   }
-  return { projectId: payload.projectId, action: payload.action };
+  if (payload.view !== undefined && payload.view !== 'full' && payload.view !== 'sessions') {
+    throw new Error('read-board payload has an invalid "view"');
+  }
+  // Rejected rather than clamped: a negative or fractional page bound is a
+  // caller bug, and silently repairing it here would hide it behind results
+  // that look plausible. The desktop still caps `limit` from above.
+  if (payload.limit !== undefined && (typeof payload.limit !== 'number' || !Number.isInteger(payload.limit) || payload.limit < 1)) {
+    throw new Error('read-board payload has an invalid "limit"');
+  }
+  if (payload.offset !== undefined && (typeof payload.offset !== 'number' || !Number.isInteger(payload.offset) || payload.offset < 0)) {
+    throw new Error('read-board payload has an invalid "offset"');
+  }
+  return {
+    projectId: payload.projectId,
+    action: payload.action,
+    view: payload.view,
+    limit: payload.limit,
+    offset: payload.offset,
+  };
 }
 
 // === read-diff ===
@@ -454,12 +713,20 @@ const PUSH_KEY_LENGTH = 32;
  * notification envelope with (see crypto/push-envelope.ts); 'unregister'
  * carries neither. The desktop keys the registration by the requesting
  * device's roster identity, never by anything in this payload.
+ *
+ * `categories`, when present, is the device's push preferences: the desktop
+ * filters outgoing notifications to this set before sending, so preference
+ * enforcement never depends on the receiving device (a future iOS
+ * Notification Service Extension stays preference-free). Absent means every
+ * category (the default, and what an older device that predates this field
+ * implicitly requests); an explicit empty array means none.
  */
 export interface RegisterPushRequestPayload {
   action: 'register' | 'unregister';
   expoPushToken?: string;
   pushKeyBase64?: string;
   platform?: 'android' | 'ios';
+  categories?: PushCategory[];
 }
 
 export interface RegisterPushResponsePayload {
@@ -494,6 +761,15 @@ export function parseRegisterPushRequestPayload(payload: JsonValue): RegisterPus
       throw new Error('register-push payload has an invalid "platform"');
     }
     request.platform = payload.platform;
+  }
+  if (payload.categories !== undefined) {
+    if (!Array.isArray(payload.categories) || !payload.categories.every((entry) => typeof entry === 'string')) {
+      throw new Error('register-push payload has a malformed "categories"');
+    }
+    // An unrecognized category (e.g. from a newer device) is dropped, not
+    // rejected: registration must not fail outright over a category this
+    // desktop does not yet know.
+    request.categories = payload.categories.filter(isPushCategory);
   }
   if (request.action === 'register') {
     if (request.expoPushToken === undefined) throw new Error('register-push register payload missing "expoPushToken"');

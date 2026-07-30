@@ -30,6 +30,21 @@ async function moveToDestination(): Promise<TaskMoveResult> {
 
 describe('handleTaskMove live lane submission', () => {
   beforeAll(async () => {
+    const { getProjectRepos } = await import('../../src/main/ipc/helpers');
+    const projectRepos = getProjectRepos(context as never);
+    projectRepos.attachments.getPathsForTask = vi.fn(() => []);
+    vi.mocked(getProjectRepos).mockReturnValue(projectRepos);
+    vi.doMock('../../src/main/agent/shared', async () => {
+      const { interpolateTaskTemplate } = await import('../../src/main/agent/shared/template-utils');
+      const { resolveTaskTemplateVars } = await import('../../src/main/agent/shared/task-template-resolvers');
+      return {
+        interpolateTemplate: vi.fn((template: string) => template),
+        resolveBridgeScript: vi.fn(() => '/bridge.js'),
+        execVersion: vi.fn(async () => '1'),
+        interpolateTaskTemplate,
+        resolveTaskTemplateVars,
+      };
+    });
     ({ handleTaskMove } = await import('../../src/main/ipc/handlers/task-move'));
   });
 

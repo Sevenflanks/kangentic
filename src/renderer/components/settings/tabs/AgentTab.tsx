@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
 import { Check, CircleAlert, Copy, RefreshCw } from 'lucide-react';
 import { useConfigStore } from '../../../stores/config-store';
 import { useProjectStore } from '../../../stores/project-store';
@@ -9,19 +9,16 @@ import { useAgentCapabilityResolution } from '../../../hooks/useAgentCapabilityR
 import { useModelContextWindows, useModelDisplayNames } from '../../../hooks/useKnownModels';
 import { ModelCombobox } from '../../dialogs/ModelCombobox';
 import { Combobox } from '../../dialogs/Combobox';
-import { SettingRow, INPUT_CLASS, useScopedUpdate } from '../shared';
+import { SectionHeader, SettingRow, INPUT_CLASS, useScopedUpdate } from '../shared';
 import { settingProps } from '../settings-registry';
+import { AgentExecutionFields } from './agent-execution-fields';
+import { AgentLaunchOptionFields } from './agent-launch-option-fields';
 
-export function AgentTab({ config, globalConfig, agentInfo, agentList }: {
+export function AgentTab({ config, globalConfig, agentList }: {
   config: AppConfig;
   globalConfig: AppConfig;
-  agentInfo: { found: boolean; path: string | null; version: string | null } | null;
   agentList: AgentDetectionInfo[];
 }) {
-  // agentInfo is kept in the signature for future use (e.g. surfacing the currently-detected
-  // Claude CLI details even when another agent is the project default).
-  void agentInfo;
-
   const updateGlobal = useScopedUpdate('global');
   const updateProject = useScopedUpdate('project');
   const currentProject = useProjectStore((state) => state.currentProject);
@@ -97,6 +94,10 @@ export function AgentTab({ config, globalConfig, agentInfo, agentList }: {
 
   return (
     <>
+      <SectionHeader
+        label="Project Defaults"
+        searchIds={['project.defaultAgent', 'project.defaultModel', 'project.defaultEffort', 'agent.permissionMode']}
+      />
       <SettingRow {...settingProps('project.defaultAgent')}>
         <Combobox
           value={effectiveAgent}
@@ -147,73 +148,70 @@ export function AgentTab({ config, globalConfig, agentInfo, agentList }: {
           testId="agent-permission-mode"
         />
       </SettingRow>
+      <SectionHeader
+        label="Agent CLI"
+        searchIds={['agent.cliPaths', 'agent.executionMode', 'agent.executionServerUrl', 'agent.executionServerAuth', 'agent.executionWorkingDirectory', 'agent.launchOptions']}
+      />
       {agentList.filter((agent) => agent.name === effectiveAgent).map((agent) => {
         const loginCommand = agentLoginCommand(agent.name);
         const unauthenticated = agent.found && agent.authenticated === false;
         return (
-        <SettingRow
-          key={agent.name}
-          {...settingProps('agent.cliPaths')}
-          label={`${agent.displayName} Path`}
-          trailing={
-            unauthenticated ? (
-              <span className="text-xs flex items-center gap-1 text-amber-400">
-                <CircleAlert size={13} />Not signed in
-              </span>
-            ) : (
-              <span className={`text-xs flex items-center gap-1 ${agent.found ? 'text-fg-faint' : 'text-red-400/70'}`}>
-                {agent.found
-                  ? <><Check size={13} className="text-green-400" />{agent.version ? `v${agent.version.replace(/^v/, '')}` : 'Detected'}</>
-                  : <><CircleAlert size={13} />Not found</>}
-              </span>
-            )
-          }
-        >
-          <div className="relative">
-            <input
-              type="text"
-              value={globalConfig.agent.cliPaths[agent.name] || ''}
-              onChange={(event) => updateGlobal({ agent: { cliPaths: { ...globalConfig.agent.cliPaths, [agent.name]: event.target.value || null } } })}
-              placeholder={agent.found ? (agent.path ?? undefined) : 'Enter path manually'}
-              className={`${INPUT_CLASS} pr-8 placeholder-fg-muted`}
-            />
-            <button
-              type="button"
-              onClick={handleRefreshAgents}
-              disabled={refreshing}
-              className="absolute right-2.5 top-1/2 -translate-y-1/2 transition-colors disabled:opacity-50"
-              title={agent.found ? 'Re-detect agent' : `${agent.displayName} not found - click to re-detect`}
-            >
-              <RefreshCw size={16} className={`text-fg-faint hover:text-fg-muted ${refreshing ? 'animate-spin' : ''}`} />
-            </button>
-          </div>
-          {unauthenticated && loginCommand && (
-            <div className="mt-1 text-xs text-amber-400/80 flex items-center gap-2">
-              <span>Run <code className="font-mono">{loginCommand}</code> in your terminal to authenticate.</span>
+        <Fragment key={agent.name}>
+          <SettingRow
+            {...settingProps('agent.cliPaths')}
+            label={`${agent.displayName} Path`}
+            trailing={
+              unauthenticated ? (
+                <span className="text-xs flex items-center gap-1 text-amber-400">
+                  <CircleAlert size={13} />Not signed in
+                </span>
+              ) : (
+                <span className={`text-xs flex items-center gap-1 ${agent.found ? 'text-fg-faint' : 'text-red-400/70'}`}>
+                  {agent.found
+                    ? <><Check size={13} className="text-green-400" />{agent.version ? `v${agent.version.replace(/^v/, '')}` : 'Detected'}</>
+                    : <><CircleAlert size={13} />Not found</>}
+                </span>
+              )
+            }
+          >
+            <div className="relative">
+              <input
+                type="text"
+                value={globalConfig.agent.cliPaths[agent.name] || ''}
+                onChange={(event) => updateGlobal({ agent: { cliPaths: { ...globalConfig.agent.cliPaths, [agent.name]: event.target.value || null } } })}
+                placeholder={agent.found ? (agent.path ?? undefined) : 'Enter path manually'}
+                className={`${INPUT_CLASS} pr-8 placeholder-fg-muted`}
+              />
               <button
                 type="button"
-                onClick={() => handleCopyLoginCommand(agent.name, loginCommand)}
-                className="inline-flex items-center gap-1 text-accent hover:underline cursor-pointer"
-                title={`Copy "${loginCommand}" to clipboard`}
-                data-testid={`agent-tab-copy-login-${agent.name}`}
+                onClick={handleRefreshAgents}
+                disabled={refreshing}
+                className="absolute right-2.5 top-1/2 -translate-y-1/2 transition-colors disabled:opacity-50"
+                title={agent.found ? 'Re-detect agent' : `${agent.displayName} not found - click to re-detect`}
               >
-                <Copy size={11} />{copiedAgent === agent.name ? 'Copied!' : 'Copy'}
+                <RefreshCw size={16} className={`text-fg-faint hover:text-fg-muted ${refreshing ? 'animate-spin' : ''}`} />
               </button>
             </div>
-          )}
-        </SettingRow>
+            {unauthenticated && loginCommand && (
+              <div className="mt-1 text-xs text-amber-400/80 flex items-center gap-2">
+                <span>Run <code className="font-mono">{loginCommand}</code> in your terminal to authenticate.</span>
+                <button
+                  type="button"
+                  onClick={() => handleCopyLoginCommand(agent.name, loginCommand)}
+                  className="inline-flex items-center gap-1 text-accent hover:underline cursor-pointer"
+                  title={`Copy "${loginCommand}" to clipboard`}
+                  data-testid={`agent-tab-copy-login-${agent.name}`}
+                >
+                  <Copy size={11} />{copiedAgent === agent.name ? 'Copied!' : 'Copy'}
+                </button>
+              </div>
+            )}
+          </SettingRow>
+          <AgentExecutionFields agent={agent} config={config} globalConfig={globalConfig} />
+          <AgentLaunchOptionFields agent={agent} globalConfig={globalConfig} />
+        </Fragment>
         );
       })}
-      <SettingRow {...settingProps('agent.idleTimeoutMinutes')}>
-        <input
-          type="number"
-          value={globalConfig.agent.idleTimeoutMinutes}
-          onChange={(event) => updateGlobal({ agent: { idleTimeoutMinutes: Number(event.target.value) } })}
-          min={0}
-          max={120}
-          className={INPUT_CLASS}
-        />
-      </SettingRow>
     </>
   );
 }

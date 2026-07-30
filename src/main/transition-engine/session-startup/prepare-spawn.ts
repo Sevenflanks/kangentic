@@ -4,11 +4,15 @@ import { randomUUID } from 'node:crypto';
 import { agentRegistry } from '../../agent/agent-registry';
 import type { AgentAdapter } from '../../agent/agent-adapter';
 import type { McpHttpServerHandle } from '../../agent/mcp-http-server';
-import type { AppConfig, Swimlane, Task } from '../../../shared/types';
+import { appendCallerSession } from '../../agent/mcp-http/caller-url';
+import type { AppConfig, BoardProfile, Swimlane, Task } from '../../../shared/types';
 import type { TaskRepository } from '../../db/repositories/task-repository';
 import { removeAdapterHooks } from '../../pty/lifecycle/adapter-lifecycle';
 import { runSpawnPreamble, resolveEffectivePermissionMode } from '../spawn-preamble';
+import { applyProfileToLane, findTaskProfile } from '../column-strategy';
 import { sessionOutputPaths } from '../session-paths';
+import { resolveExecutionTarget } from '../../agent/shared/execution-target';
+import { resolveLaunchOptions } from '../../agent/shared/launch-options';
 
 /**
  * Fully-prepared agent spawn: the adapter has been resolved, the CLI
@@ -96,8 +100,25 @@ export async function prepareAgentSpawn(input: {
    */
   hasSessionRecord: boolean;
   tasks: Pick<TaskRepository, 'update'>;
+  /**
+   * The board's Board Profiles, so a task riding one resumes under that
+   * profile's rung for its current column rather than the column's base
+   * settings. Omitted (or empty) means every task runs the columns' own
+   * settings, which is the pre-profile behavior.
+   */
+  boardProfiles?: ReadonlyArray<BoardProfile>;
 }): Promise<PrepareResult> {
-  const { task, swimlane, cwd, projectId, projectPath, effectiveConfig: config } = input;
+  const { task, cwd, projectId, projectPath, effectiveConfig: config } = input;
+
+  // Fold the task's profile over its column once, then shadow `swimlane` so
+  // every read below (the preamble, permission mode, model/effort) sees the
+  // profile-resolved strategy. Startup recovery must agree with the board path
+  // here: a task that spawned under a profile and is then resumed after a crash
+  // has to come back on the same rung.
+  const swimlane = applyProfileToLane(
+    input.swimlane,
+    findTaskProfile({ profiles: input.boardProfiles, profileId: task.profile_id, taskId: task.id }),
+  );
 
   // The task sits in the lane it is spawning into on the startup paths, so
   // the settings lane and the destination lane are the same lane here: the
@@ -159,7 +180,9 @@ export async function prepareAgentSpawn(input: {
     eventsOutputPath,
     shell: input.resolvedShell,
     mcpServerEnabled: config.mcpServer?.enabled ?? true,
-    mcpServerUrl: input.mcpServerHandle?.urlForProject(projectId),
+    // Carries this session's own id so the MCP server can identify the caller
+    // (see appendCallerSession). Stamped, never looked up, so it cannot drift.
+    mcpServerUrl: appendCallerSession(input.mcpServerHandle?.urlForProject(projectId), sessionRecordId),
     mcpServerToken: input.mcpServerHandle?.token,
     // Task-level override (set by the ContextBar popover) wins over the
     // swimlane override, which wins over the project-level default - once a
@@ -167,6 +190,8 @@ export async function prepareAgentSpawn(input: {
     // column moves until they clear it.
     model: task.model_override ?? swimlane?.model_override ?? input.projectDefaultModel ?? undefined,
     effort: task.effort_override ?? swimlane?.effort_override ?? input.projectDefaultEffort ?? undefined,
+    executionTarget: resolveExecutionTarget(agent, config.agent.executionServers, config.agent.execution) ?? undefined,
+    launchOptions: resolveLaunchOptions(adapter, config.agent.launchOptions),
   };
 
   const command = adapter.buildCommand(commandOptions);

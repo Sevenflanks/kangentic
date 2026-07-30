@@ -73,6 +73,7 @@ export function DevToolsSections({ globalConfig }: { globalConfig: AppConfig }) 
           and hard-to-reach UI paths; leave off otherwise.
         </Description>
       </section>
+
     </div>
   );
 }

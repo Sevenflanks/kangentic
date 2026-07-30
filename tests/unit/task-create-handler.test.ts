@@ -151,11 +151,17 @@ vi.mock('../../src/main/ipc/helpers', () => ({
   spawnAgent: (...args: unknown[]) => mockSpawnAgent(...args),
 }));
 
-vi.mock('../../src/main/agent/shared', () => ({
-  interpolateTemplate: vi.fn((template: string) => template),
-  resolveBridgeScript: vi.fn(() => '/mock/bridge.js'),
-  execVersion: vi.fn(async () => '1.0.0'),
-}));
+vi.mock('../../src/main/agent/shared', async () => {
+  const { interpolateTaskTemplate } = await import('../../src/main/agent/shared/template-utils');
+
+  return {
+    interpolateTemplate: vi.fn((template: string) => template),
+    interpolateTaskTemplate,
+    resolveTaskTemplateVars: vi.fn(() => ({})),
+    resolveBridgeScript: vi.fn(() => '/mock/bridge.js'),
+    execVersion: vi.fn(async () => '1.0.0'),
+  };
+});
 
 vi.mock('../../src/main/ipc/handlers/task-move', () => ({
   guardActiveNonWorktreeSessions: vi.fn(),
@@ -273,6 +279,7 @@ interface MockContext {
   };
   boardConfigManager: {
     getDefaultBaseBranch: ReturnType<typeof vi.fn>;
+    getBoardProfiles: ReturnType<typeof vi.fn>;
   };
   terminalSubmitScheduler: {
     scheduleKeystrokes: ReturnType<typeof vi.fn>;
@@ -364,6 +371,7 @@ function createMockContext(overrides: Partial<MockContext> = {}): MockContext {
     },
     boardConfigManager: {
       getDefaultBaseBranch: vi.fn(() => null),
+      getBoardProfiles: vi.fn(() => []),
     },
     terminalSubmitScheduler: {
       scheduleKeystrokes: vi.fn(),
@@ -581,7 +589,9 @@ describe('TASK_CREATE handler', () => {
     mockDirectGetProjectRepos.mockReturnValue({
       tasks: taskRepo,
       actions: {},
-      attachments: {},
+      attachments: {
+        getPathsForTask: vi.fn(() => []),
+      },
     });
     mockSwimlaneRepoGetById.mockReturnValue(targetLane);
     mockAgentRegistryGet.mockReturnValue({
@@ -628,7 +638,9 @@ describe('TASK_CREATE handler', () => {
     mockDirectGetProjectRepos.mockReturnValue({
       tasks: taskRepo,
       actions: {},
-      attachments: {},
+      attachments: {
+        getPathsForTask: vi.fn(() => []),
+      },
     });
     mockSwimlaneRepoGetById.mockReturnValue(targetLane);
     mockAgentRegistryGet.mockReturnValue(undefined);

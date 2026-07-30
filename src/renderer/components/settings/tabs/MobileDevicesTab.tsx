@@ -1,52 +1,84 @@
-import { useEffect, useState } from 'react';
-import { Check, Copy, QrCode, Smartphone, Trash2 } from 'lucide-react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { Check, CircleAlert, Copy, Loader2, Pencil, QrCode, Server, Smartphone, Trash2, WifiOff, X } from 'lucide-react';
 import QRCode from 'qrcode';
-import { MOBILE_CAPABILITY_VERBS, type AppConfig, type MobileCapabilityVerb, type MobilePairedDevice } from '../../../../shared/types';
-import { CompactToggleList, INPUT_CLASS, SectionHeader, SettingRow, SettingToggleRow, useScopedUpdate } from '../shared';
+import { formatKeyFingerprint } from '@kangentic/protocol/roster/fingerprint';
+import type { AppConfig, MobileDeviceConnectionState, MobilePairedDevice, RemoteServerStatus } from '../../../../shared/types';
+import { inferRelayMode, resolveRelayUrl, validateRelayUrl } from '../../../../shared/relay';
+import { formatDate } from '../../../lib/datetime';
+import { INPUT_CLASS, SectionHeader, Select, SettingRow, SettingToggleRow, useScopedUpdate } from '../shared';
+import { Pill } from '../../Pill';
 import { settingProps } from '../settings-registry';
 import { ConfirmDialog } from '../../dialogs/ConfirmDialog';
 import { useMobileStore } from '../../../stores/mobile-store';
 
-/** Short label + blurb per verb, for the per-device capability toggle list. Keyed off MOBILE_CAPABILITY_VERBS so a new verb is a compile error here until classified. */
-const CAPABILITY_LABELS: Record<MobileCapabilityVerb, { label: string; description: string }> = {
-  'read-stream': { label: 'Live output', description: 'Terminal output and activity for running sessions' },
-  'read-board': { label: 'Board', description: 'View tasks, columns, and backlog' },
-  'read-diff': { label: 'Diffs', description: 'View code changes' },
-  'send-user-message': { label: 'Send messages', description: 'Send a message to a running agent' },
-  'move-task': { label: 'Move tasks', description: 'Move tasks between columns' },
-  'answer-permission-prompt': { label: 'Answer prompts', description: 'Approve or deny an agent permission request' },
-  'interactive-terminal': { label: 'Interactive terminal', description: 'Full keystroke control of the running terminal' },
-  'board-tool-read': { label: 'Task details', description: 'Search tasks and read stats, transcripts, and handoff notes' },
-  'board-tool-write': { label: 'Task actions', description: 'Create, edit, and delete tasks or backlog items, link PRs' },
-  'register-push': { label: 'Push notifications', description: 'Register this device for end-to-end encrypted push notifications' },
-};
+/**
+ * 'idle' means this device has no session open yet (nothing to report), so it
+ * renders nothing rather than a confusing "Disconnected".
+ *
+ * 'offline' and 'reconnecting' are deliberately distinct: 'reconnecting' means
+ * the relay link itself dropped and is backing off (fix the network), while
+ * 'offline' means the relay is healthy and the phone is simply not attached
+ * (open the phone). Offline is also the one steady state here, so it gets a
+ * static muted treatment rather than a spinner promising imminent resolution.
+ */
+function connectionStateDisplay(state: MobileDeviceConnectionState): { label: string; className: string; icon: ReactNode } | null {
+  switch (state) {
+    case 'connected':
+      return { label: 'Connected', className: 'text-green-400', icon: <Check size={12} /> };
+    case 'connecting':
+      return { label: 'Connecting…', className: 'text-amber-400', icon: <Loader2 size={12} className="animate-spin" /> };
+    case 'reconnecting':
+      return { label: 'Reconnecting…', className: 'text-amber-400', icon: <Loader2 size={12} className="animate-spin" /> };
+    case 'offline':
+      return { label: 'Offline', className: 'text-fg-faint', icon: <WifiOff size={12} /> };
+    case 'closed':
+      return { label: 'Disconnected', className: 'text-danger', icon: <CircleAlert size={12} /> };
+    case 'idle':
+      return null;
+  }
+}
 
 export function MobileDevicesTab({ globalConfig }: { globalConfig: AppConfig }) {
   const updateGlobal = useScopedUpdate('global');
   const enabled = globalConfig.mobileBridge?.enabled ?? false;
-  const relayUrl = globalConfig.mobileBridge?.relayUrl ?? '';
+  const relayMode = inferRelayMode(globalConfig.mobileBridge);
+  const resolvedRelayUrl = resolveRelayUrl(globalConfig.mobileBridge);
+
+  // Local draft with a commit boundary (blur/Enter), not a per-keystroke write:
+  // each committed relayUrl change disposes and redials every bridge session
+  // (mobile-bridge-service.ts's reconcile()), so typing a URL character by
+  // character used to do that on every keystroke.
+  const [relayDraft, setRelayDraft] = useState(globalConfig.mobileBridge?.relayUrl ?? '');
+  const [relayDraftError, setRelayDraftError] = useState<string | null>(null);
+  const [testingRelay, setTestingRelay] = useState(false);
+  const [relayTestResult, setRelayTestResult] = useState<RemoteServerStatus | null>(null);
+  /** Identifies the in-flight "Test connection" probe so a reply for a relay the user has since navigated away from is discarded rather than shown. Bumped on every retarget. */
+  const relayTestRequestRef = useRef(0);
 
   const status = useMobileStore((state) => state.status);
   const devices = useMobileStore((state) => state.devices);
   const loading = useMobileStore((state) => state.loading);
   const pairingSas = useMobileStore((state) => state.pairingSas);
+  const pairingConfirmed = useMobileStore((state) => state.pairingConfirmed);
   const pairingEndedReason = useMobileStore((state) => state.pairingEndedReason);
   const loadStatus = useMobileStore((state) => state.loadStatus);
   const loadDevices = useMobileStore((state) => state.loadDevices);
   const startPairing = useMobileStore((state) => state.startPairing);
-  const confirmPairing = useMobileStore((state) => state.confirmPairing);
   const cancelPairing = useMobileStore((state) => state.cancelPairing);
   const revokeDevice = useMobileStore((state) => state.revokeDevice);
-  const setDeviceCapabilities = useMobileStore((state) => state.setDeviceCapabilities);
+  const renameDevice = useMobileStore((state) => state.renameDevice);
   const setPairingSas = useMobileStore((state) => state.setPairingSas);
+  const setPairingConfirmed = useMobileStore((state) => state.setPairingConfirmed);
+  const clearPairingConfirmed = useMobileStore((state) => state.clearPairingConfirmed);
   const setPairingEnded = useMobileStore((state) => state.setPairingEnded);
   const clearPairingEnded = useMobileStore((state) => state.clearPairingEnded);
 
   const [qrUri, setQrUri] = useState<string | null>(null);
   const [qrDataUrl, setQrDataUrl] = useState<string | null>(null);
   const [linkCopied, setLinkCopied] = useState(false);
-  const [deviceNameDraft, setDeviceNameDraft] = useState('');
   const [revokeTarget, setRevokeTarget] = useState<{ deviceId: string; displayName: string } | null>(null);
+  const [renamingDeviceId, setRenamingDeviceId] = useState<string | null>(null);
+  const [renameDraft, setRenameDraft] = useState('');
 
   useEffect(() => {
     void loadStatus();
@@ -57,8 +89,17 @@ export function MobileDevicesTab({ globalConfig }: { globalConfig: AppConfig }) 
     const unsubscribeSas = window.electronAPI.mobile.onPairingSas((payload) => {
       setPairingSas(payload);
     });
+    const unsubscribeConfirmed = window.electronAPI.mobile.onPairingConfirmed((payload) => {
+      setPairingConfirmed(payload);
+      setQrUri(null);
+      setQrDataUrl(null);
+    });
     const unsubscribeEnded = window.electronAPI.mobile.onPairingEnded((payload) => {
-      setPairingEnded(payload.reason);
+      // A plain cancel (Cancel button, or the panel closing mid-ceremony) is
+      // a deliberate action already obvious from the UI returning to idle -
+      // only a genuine failure (mismatch, timeout, handshake error) is worth
+      // surfacing as a message.
+      if (payload.kind === 'failed') setPairingEnded(payload.reason);
       setQrUri(null);
       setQrDataUrl(null);
     });
@@ -68,10 +109,41 @@ export function MobileDevicesTab({ globalConfig }: { globalConfig: AppConfig }) 
     });
     return () => {
       unsubscribeSas();
+      unsubscribeConfirmed();
       unsubscribeEnded();
       unsubscribeState();
     };
-  }, [loadStatus, loadDevices, setPairingSas, setPairingEnded]);
+  }, [loadStatus, loadDevices, setPairingSas, setPairingConfirmed, setPairingEnded]);
+
+  // Genuine unmount only, so this lives in its own effect with empty deps
+  // rather than riding along on the subscription effect above: that one's
+  // cleanup re-runs whenever its dependencies change, and this teardown
+  // mutates main-process state, so it must never fire on a mere re-subscribe.
+  //
+  // The desktop displaying the SAS digits IS the pairing ceremony: if this
+  // tab unmounts (Settings closed, tab switched away) mid-ceremony, the human
+  // can no longer complete the comparison, so the ceremony must not be left
+  // auto-enrolling in the background. Clearing the two transient banners
+  // matters for the same reason - they live in the module-global store, so a
+  // "Paired: <name>" whose 3s timer was cut short by the unmount, or a
+  // failure reason (only ever cleared by starting a NEW pairing), would
+  // otherwise reappear as stale text the next time this tab mounts.
+  // Actions are read via getState() so no store reference enters the deps.
+  useEffect(() => {
+    return () => {
+      void window.electronAPI.mobile.cancelPairing();
+      useMobileStore.getState().clearPairingConfirmed();
+      useMobileStore.getState().clearPairingEnded();
+    };
+  }, []);
+
+  // The "Paired: <name>" confirmation is a brief acknowledgement, not a
+  // resting state - it self-dismisses back to the idle/device-list view.
+  useEffect(() => {
+    if (!pairingConfirmed) return;
+    const timer = setTimeout(() => clearPairingConfirmed(), 3000);
+    return () => clearTimeout(timer);
+  }, [pairingConfirmed, clearPairingConfirmed]);
 
   useEffect(() => {
     if (!qrUri) {
@@ -95,9 +167,14 @@ export function MobileDevicesTab({ globalConfig }: { globalConfig: AppConfig }) 
 
   const handleStartPairing = async () => {
     clearPairingEnded();
+    clearPairingConfirmed();
     setLinkCopied(false);
-    const result = await startPairing();
-    setQrUri(result.qrUri);
+    try {
+      const result = await startPairing();
+      setQrUri(result.qrUri);
+    } catch (error) {
+      setPairingEnded(error instanceof Error ? error.message : 'Could not start pairing.');
+    }
   };
 
   const handleCopyLink = async () => {
@@ -112,14 +189,59 @@ export function MobileDevicesTab({ globalConfig }: { globalConfig: AppConfig }) 
     setQrDataUrl(null);
   };
 
-  const handleConfirmMatch = async () => {
-    // Omit capabilities so the main-process default (DEFAULT_PAIRING_CAPABILITIES,
-    // read-only) applies. Passing [] here would defeat that default and leave the
-    // device with zero granted verbs (permanently inert until a capability UI ships).
-    await confirmPairing(deviceNameDraft.trim() || 'Paired Device');
-    setQrUri(null);
-    setQrDataUrl(null);
-    setDeviceNameDraft('');
+  const startRename = (device: MobilePairedDevice) => {
+    setRenamingDeviceId(device.deviceId);
+    setRenameDraft(device.displayName);
+  };
+
+  const commitRename = async (deviceId: string) => {
+    const trimmed = renameDraft.trim();
+    setRenamingDeviceId(null);
+    if (!trimmed) return;
+    await renameDevice(deviceId, trimmed);
+  };
+
+  const commitRelayDraft = () => {
+    const trimmed = relayDraft.trim();
+    if (trimmed.length === 0) {
+      // Empty draft: resolveRelayUrl falls back to the built-in default, so
+      // this is a valid "no custom URL yet" state, not an error.
+      setRelayDraftError(null);
+      updateGlobal({ mobileBridge: { relayMode: 'custom', relayUrl: '' } });
+      return;
+    }
+    const validation = validateRelayUrl(trimmed);
+    if (!validation.ok) {
+      setRelayDraftError(validation.reason);
+      return;
+    }
+    setRelayDraftError(null);
+    setRelayDraft(validation.normalized);
+    updateGlobal({ mobileBridge: { relayMode: 'custom', relayUrl: validation.normalized } });
+  };
+
+  const handleTestRelay = async () => {
+    const urlToTest = relayMode === 'custom' ? relayDraft.trim() : resolvedRelayUrl;
+    const requestId = ++relayTestRequestRef.current;
+    setTestingRelay(true);
+    try {
+      const result = await window.electronAPI.mobile.testRelay(urlToTest);
+      // Neither the mode Select nor the URL input is disabled during a probe,
+      // and the probe has a 5s timeout budget, so the user can retarget while
+      // one is in flight. Their onChange already cleared the result slot and
+      // invalidated this request; without the guard the late reply would
+      // repopulate that slot with a verdict for a URL they navigated away from.
+      if (relayTestRequestRef.current !== requestId) return;
+      setRelayTestResult(result);
+    } finally {
+      // Unconditional on purpose. The button is disabled while testingRelay is
+      // true, so there is only ever one probe in flight and it always owns the
+      // spinner. Guarding this on requestId (as the result assignment above
+      // correctly is) would strand testingRelay=true forever whenever the user
+      // retargets mid-probe, leaving the button disabled and spinning until
+      // the tab remounts.
+      setTestingRelay(false);
+    }
   };
 
   return (
@@ -132,16 +254,96 @@ export function MobileDevicesTab({ globalConfig }: { globalConfig: AppConfig }) 
       />
 
       <div className={enabled ? 'space-y-4' : 'space-y-4 opacity-40 pointer-events-none'}>
-        <SettingRow {...settingProps('mobileBridge.relayUrl')}>
-          <input
-            type="text"
-            className={INPUT_CLASS}
-            value={relayUrl}
-            placeholder="wss://relay.example.com"
-            disabled={!enabled}
-            onChange={(event) => updateGlobal({ mobileBridge: { relayUrl: event.target.value } })}
-          />
+        <SettingRow {...settingProps('mobileBridge.relayMode')}>
+          <div className="flex gap-2 items-start">
+            <div className="flex-1 flex flex-col gap-2">
+              <Select
+                value={relayMode}
+                onChange={(event) => {
+                  // A stale reachability result from the previous mode must not
+                  // linger next to a mode/URL it was never actually run against.
+                  // Bumping the ref also discards a probe still in flight for
+                  // the old mode, which would otherwise land after this clear.
+                  relayTestRequestRef.current++;
+                  setRelayTestResult(null);
+                  updateGlobal({ mobileBridge: { relayMode: event.target.value as 'hosted' | 'local' | 'custom' } });
+                }}
+                disabled={!enabled}
+                data-testid="mobile-relay-mode"
+              >
+                {__KANGENTIC_DEV__ && <option value="local">Local</option>}
+                <option value="hosted">Kangentic Cloud</option>
+                <option value="custom">Custom Relay</option>
+              </Select>
+              {relayMode !== 'custom' && (
+                <Pill size="sm" className="self-start bg-surface-hover/60 text-fg-faint font-mono" data-testid="mobile-relay-resolved-url">
+                  {resolvedRelayUrl}
+                </Pill>
+              )}
+            </div>
+            <div className="shrink-0 flex flex-col items-start gap-1">
+              <button
+                type="button"
+                onClick={() => void handleTestRelay()}
+                disabled={testingRelay || !enabled || (relayMode === 'custom' && relayDraft.trim().length === 0)}
+                className="flex items-center gap-1.5 px-3 py-1.5 text-sm rounded border border-edge-input bg-surface-hover text-fg-secondary hover:text-fg disabled:opacity-50 disabled:cursor-not-allowed"
+                data-testid="mobile-relay-test-connection"
+              >
+                {testingRelay ? <Loader2 size={13} className="animate-spin" /> : <Server size={13} />}
+                Test connection
+              </button>
+              {/* Fixed-height slot, always present: the result pill must not
+                  reflow the resolved-URL row next to it when a test result
+                  appears/disappears or flips between the two pill widths. */}
+              <div className="h-6 flex items-center">
+                {relayTestResult && (
+                  relayTestResult.reachable ? (
+                    <Pill size="sm" className="bg-green-500/15 text-green-400">
+                      <Check size={11} />
+                      {relayTestResult.version ? `v${relayTestResult.version}` : 'Reachable'}
+                    </Pill>
+                  ) : (
+                    <Pill size="sm" className="bg-amber-500/15 text-amber-400" title={relayTestResult.reason}>
+                      <CircleAlert size={11} />
+                      No response
+                    </Pill>
+                  )
+                )}
+              </div>
+            </div>
+          </div>
         </SettingRow>
+
+        {relayMode === 'custom' && (
+          <SettingRow {...settingProps('mobileBridge.relayUrl')}>
+            <div className="ml-1 space-y-2 border-l border-edge pl-3" data-testid="mobile-relay-custom-fields">
+              <input
+                type="text"
+                className={INPUT_CLASS}
+                value={relayDraft}
+                placeholder="wss://relay.example.com"
+                disabled={!enabled}
+                data-testid="mobile-relay-url-input"
+                onChange={(event) => {
+                  setRelayDraft(event.target.value);
+                  setRelayDraftError(null);
+                  // Same in-flight invalidation as the mode Select above.
+                  relayTestRequestRef.current++;
+                  setRelayTestResult(null);
+                }}
+                onBlur={commitRelayDraft}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') event.currentTarget.blur();
+                }}
+              />
+              {relayDraftError && (
+                <p className="text-xs text-danger" data-testid="mobile-relay-url-error">
+                  {relayDraftError}
+                </p>
+              )}
+            </div>
+          </SettingRow>
+        )}
 
         {status && !status.secureStorageAvailable && (
           <p className="text-xs text-danger">
@@ -150,57 +352,43 @@ export function MobileDevicesTab({ globalConfig }: { globalConfig: AppConfig }) 
         )}
 
         <SectionHeader label="Pair a Device" searchIds={['mobileBridge.pairing']} />
-        {!qrUri ? (
+        {!qrUri && !pairingConfirmed ? (
           <div className="space-y-2">
             <button
               type="button"
               className="inline-flex items-center gap-1.5 rounded-md border border-edge bg-surface-hover px-3 py-1.5 text-sm text-fg hover:bg-surface-hover/70 transition-colors disabled:opacity-50"
               onClick={() => void handleStartPairing()}
               disabled={loading || !status?.secureStorageAvailable}
+              data-testid="mobile-pair-start"
             >
               <QrCode size={16} />
               Pair a device
             </button>
             {pairingEndedReason && <p className="text-xs text-danger">{pairingEndedReason}</p>}
           </div>
+        ) : pairingConfirmed ? (
+          <div className="rounded-md border border-edge bg-surface-hover/40 p-4 flex items-center gap-2 text-sm text-fg">
+            <Check size={16} className="text-green-400" />
+            Paired: {pairingConfirmed.displayName}
+          </div>
         ) : pairingSas ? (
-          <div className="space-y-3 rounded-md border border-edge bg-surface-hover/40 p-4">
-            <p className="text-sm text-fg-secondary">Confirm this code matches what your phone shows.</p>
-            <div className="flex items-center gap-3">
-              <span className="text-lg font-mono tracking-widest text-fg">{pairingSas.digits}</span>
-              <span className="text-lg">{pairingSas.emoji.join(' ')}</span>
-            </div>
-            <input
-              type="text"
-              className={INPUT_CLASS}
-              placeholder="Device name (e.g. My iPhone)"
-              value={deviceNameDraft}
-              onChange={(event) => setDeviceNameDraft(event.target.value)}
-            />
-            <div className="flex gap-2">
-              <button
-                type="button"
-                className="rounded-md bg-accent-emphasis px-3 py-1.5 text-sm text-accent-on hover:bg-accent transition-colors"
-                onClick={() => void handleConfirmMatch()}
-              >
-                Codes match
-              </button>
-              <button
-                type="button"
-                className="rounded-md border border-edge px-3 py-1.5 text-sm text-fg-secondary hover:bg-surface-hover transition-colors"
-                onClick={() => void handleCancelPairing()}
-              >
-                Codes don&apos;t match
-              </button>
-            </div>
+          <div className="space-y-3 rounded-md border border-edge bg-surface-hover/40 p-4" data-testid="mobile-pair-waiting">
+            <p className="text-sm text-fg-secondary">Waiting for your phone…</p>
+            <span className="text-lg font-mono tracking-widest text-fg" data-testid="mobile-pair-sas-digits">
+              {pairingSas.digits}
+            </span>
+            <p className="text-xs text-fg-faint">Your phone shows this code too. Confirm there to finish pairing.</p>
+            <button
+              type="button"
+              className="rounded-md border border-edge px-3 py-1.5 text-sm text-fg-secondary hover:bg-surface-hover transition-colors"
+              onClick={() => void handleCancelPairing()}
+            >
+              Cancel
+            </button>
           </div>
         ) : (
-          <div className="space-y-3 rounded-md border border-edge bg-surface-hover/40 p-4">
-            <p className="text-sm text-fg-secondary">
-              Scan this code with the Kangentic mobile app, or copy the pairing link and paste it
-              into the app&apos;s &quot;paste pairing link&quot; field (for devices without a
-              camera on this screen, like an emulator).
-            </p>
+          <div className="space-y-3 rounded-md border border-edge bg-surface-hover/40 p-4" data-testid="mobile-pair-qr">
+            <p className="text-sm text-fg-secondary">Scan this code with the Kangentic app on your phone.</p>
             {qrDataUrl && (
               <img src={qrDataUrl} alt="Pairing QR code" className="rounded-md border border-edge" width={220} height={220} />
             )}
@@ -221,6 +409,7 @@ export function MobileDevicesTab({ globalConfig }: { globalConfig: AppConfig }) 
                 Cancel
               </button>
             </div>
+            <p className="text-xs text-fg-faint">No camera? Copy the link and paste it into the app.</p>
           </div>
         )}
 
@@ -229,25 +418,103 @@ export function MobileDevicesTab({ globalConfig }: { globalConfig: AppConfig }) 
           <p className="text-sm text-fg-faint">No devices paired yet.</p>
         ) : (
           <ul className="space-y-2">
-            {devices.map((device) => (
-              <li
-                key={device.deviceId}
-                className="rounded-md border border-edge bg-surface-hover/30 px-3 py-2 space-y-2"
-              >
-                <div className="flex items-center justify-between gap-3">
-                  <div className="min-w-0 text-sm text-fg-secondary truncate">{device.displayName}</div>
-                  <button
-                    type="button"
-                    className="shrink-0 rounded p-1.5 text-fg-faint hover:text-danger hover:bg-danger/10 transition-colors"
-                    title="Revoke"
-                    onClick={() => setRevokeTarget({ deviceId: device.deviceId, displayName: device.displayName })}
-                  >
-                    <Trash2 size={14} />
-                  </button>
-                </div>
-                <DeviceCapabilityToggles device={device} onChange={setDeviceCapabilities} />
-              </li>
-            ))}
+            {devices.map((device) => {
+              const connection = connectionStateDisplay(device.connectionState);
+              const fingerprint = formatKeyFingerprint(device.deviceId);
+              return (
+                <li
+                  key={device.deviceId}
+                  className="rounded-md border border-edge bg-surface-hover/30 px-3 py-2 space-y-1.5"
+                  data-testid="mobile-device-row"
+                >
+                  <div className="flex items-center justify-between gap-3">
+                    {renamingDeviceId === device.deviceId ? (
+                      <div className="flex-1 flex items-center gap-1">
+                        <input
+                          type="text"
+                          autoFocus
+                          // Matches the main process's own clamp on the way
+                          // into the signed roster, so the field cannot accept
+                          // a name that would be silently truncated on save.
+                          maxLength={64}
+                          className={`${INPUT_CLASS} flex-1`}
+                          value={renameDraft}
+                          onChange={(event) => setRenameDraft(event.target.value)}
+                          onKeyDown={(event) => {
+                            // Settings' dismiss listener is a bubble-phase
+                            // document keydown (shared.tsx), so without this
+                            // the Escape that cancels the rename ALSO closes
+                            // the whole panel - the same reason the other two
+                            // inline-edit fields stop propagation first thing
+                            // (ProjectListItem.tsx, KeyCaptureInput.tsx).
+                            event.stopPropagation();
+                            if (event.key === 'Enter') void commitRename(device.deviceId);
+                            if (event.key === 'Escape') setRenamingDeviceId(null);
+                          }}
+                        />
+                        <button
+                          type="button"
+                          className="shrink-0 rounded p-1.5 text-fg-faint hover:text-fg hover:bg-surface-hover transition-colors"
+                          title="Save name"
+                          onClick={() => void commitRename(device.deviceId)}
+                        >
+                          <Check size={14} />
+                        </button>
+                        <button
+                          type="button"
+                          className="shrink-0 rounded p-1.5 text-fg-faint hover:text-fg hover:bg-surface-hover transition-colors"
+                          title="Cancel"
+                          onClick={() => setRenamingDeviceId(null)}
+                        >
+                          <X size={14} />
+                        </button>
+                      </div>
+                    ) : (
+                      <>
+                        <div className="min-w-0 flex items-center gap-2">
+                          <span className="text-sm text-fg-secondary truncate">{device.displayName}</span>
+                          <Pill size="sm" className="shrink-0 bg-surface-hover/60 text-fg-faint font-mono" data-testid="mobile-device-fingerprint">
+                            {fingerprint}
+                          </Pill>
+                        </div>
+                        <div className="shrink-0 flex items-center gap-1">
+                          <button
+                            type="button"
+                            className="rounded p-1.5 text-fg-faint hover:text-fg hover:bg-surface-hover transition-colors"
+                            title="Rename"
+                            data-testid="mobile-device-rename"
+                            onClick={() => startRename(device)}
+                          >
+                            <Pencil size={14} />
+                          </button>
+                          <button
+                            type="button"
+                            className="rounded p-1.5 text-fg-faint hover:text-danger hover:bg-danger/10 transition-colors"
+                            title="Revoke"
+                            data-testid="mobile-device-revoke"
+                            onClick={() => setRevokeTarget({ deviceId: device.deviceId, displayName: device.displayName })}
+                          >
+                            <Trash2 size={14} />
+                          </button>
+                        </div>
+                      </>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-2 text-xs text-fg-faint">
+                    {connection && (
+                      <>
+                        <span className={`flex items-center gap-1 ${connection.className}`} data-testid="mobile-device-connection">
+                          {connection.icon}
+                          {connection.label}
+                        </span>
+                        <span aria-hidden="true">|</span>
+                      </>
+                    )}
+                    <span>Paired {formatDate(device.pairedAt)}</span>
+                  </div>
+                </li>
+              );
+            })}
           </ul>
         )}
       </div>
@@ -255,7 +522,7 @@ export function MobileDevicesTab({ globalConfig }: { globalConfig: AppConfig }) 
       {revokeTarget && (
         <ConfirmDialog
           title="Revoke device"
-          message={`Revoke "${revokeTarget.displayName}"? It loses access immediately and must be paired again to reconnect.`}
+          message={`Revoke "${revokeTarget.displayName}" (${formatKeyFingerprint(revokeTarget.deviceId)})? It loses access immediately and must be paired again to reconnect.`}
           confirmLabel="Revoke"
           variant="danger"
           onConfirm={() => {
@@ -267,39 +534,5 @@ export function MobileDevicesTab({ globalConfig }: { globalConfig: AppConfig }) 
         />
       )}
     </div>
-  );
-}
-
-/**
- * Minimal per-device capability grant UI: one toggle per verb in
- * MOBILE_CAPABILITY_VERBS, so a new verb auto-surfaces here without a
- * component change. Fuller device-management UX (grouping, presets) is
- * Bridge Phase 3 scope - this exists so the Phase 2 write/control verbs
- * (interactive-terminal, move-task, answer-permission-prompt,
- * send-user-message, board-tool-write) are actually grantable, since
- * pairing itself only grants the read-only default set.
- */
-function DeviceCapabilityToggles({
-  device,
-  onChange,
-}: {
-  device: MobilePairedDevice;
-  onChange: (deviceId: string, capabilities: MobileCapabilityVerb[]) => void;
-}) {
-  const granted = new Set(device.capabilities);
-  return (
-    <CompactToggleList
-      items={MOBILE_CAPABILITY_VERBS.map((verb) => ({
-        label: CAPABILITY_LABELS[verb].label,
-        description: CAPABILITY_LABELS[verb].description,
-        checked: granted.has(verb),
-        onChange: (value) => {
-          const next = value
-            ? [...device.capabilities, verb]
-            : device.capabilities.filter((existing) => existing !== verb);
-          onChange(device.deviceId, next);
-        },
-      }))}
-    />
   );
 }

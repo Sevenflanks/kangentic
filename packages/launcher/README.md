@@ -33,6 +33,15 @@ npx kangentic /path/to/your/project
    - **macOS：** 將 ZIP 解壓縮到 `~/Applications/Kangentic.app`。
    - **Linux：** 在 RPM 系統且未偵測到 `apt` 時使用 `sudo rpm -i` 安裝 `.rpm` package，其他情況使用 `sudo dpkg -i` 安裝 `.deb` package。
 4. 啟動已安裝的 upstream app。
+1. Detects your platform (Windows, macOS, Linux) and architecture (x64, arm64)
+2. Downloads the matching installer from [GitHub Releases](https://github.com/Kangentic/kangentic/releases)
+3. Installs per platform:
+   - **Windows:** Runs NSIS installer silently to `%LOCALAPPDATA%\Programs\Kangentic\`
+   - **macOS:** Extracts .zip to `~/Applications/Kangentic.app`
+   - **Linux:** Installs .rpm on RPM-family systems (`sudo dnf install` on Fedora/RHEL,
+     `sudo zypper install` on openSUSE, falling back to `sudo rpm -i`) or .deb elsewhere
+     (`sudo apt install`, falling back to `sudo dpkg -i`); prompts for password
+4. Launches the app
 
 ## Upstream 更新
 

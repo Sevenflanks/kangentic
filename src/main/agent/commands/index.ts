@@ -4,6 +4,12 @@ export { resolveColumn, listActiveSwimlanes } from './column-resolver';
 import { handleCreateTask, handleUpdateTask, handleDeleteTask, handleMoveTask, handleLinkPr, handleRemoveAttachment } from './task-commands';
 import { handleUpdateColumn } from './column-commands';
 import { handleListColumns, handleListTasks } from './inventory-commands';
+import {
+  handleListBoardProfiles,
+  handleCreateBoardProfile,
+  handleUpdateBoardProfile,
+  handleDeleteBoardProfile,
+} from './profile-commands';
 import { handleSearchTasks, handleFindTask, handleGetCurrentTask } from './search-commands';
 import { handleGetTaskStats, handleBoardSummary, handleListSessions, handleGetSessionHistory, handleGetColumnDetail } from './analytics-commands';
 import { handleGetUsageStats } from './usage-commands';
@@ -11,6 +17,7 @@ import { handleListBacklog, handleCreateBacklogTask, handlePromoteBacklog, handl
 import { handleGetHandoffContext } from './handoff-commands';
 import { handleGetTranscript, handleQueryDb } from './inspect-commands';
 import { handleGetSessionFiles, handleGetSessionEvents } from './session-files-commands';
+import { handleGetActivityIntervals } from './activity-interval-commands';
 import type { CommandHandler } from './types';
 
 /**
@@ -27,6 +34,10 @@ export const commandHandlers: Record<string, CommandHandler> = {
   remove_attachment: handleRemoveAttachment,
   update_column: handleUpdateColumn,
   list_columns: handleListColumns,
+  list_board_profiles: handleListBoardProfiles,
+  create_board_profile: handleCreateBoardProfile,
+  update_board_profile: handleUpdateBoardProfile,
+  delete_board_profile: handleDeleteBoardProfile,
   list_tasks: handleListTasks,
   search_tasks: handleSearchTasks,
   find_task: handleFindTask,
@@ -47,4 +58,5 @@ export const commandHandlers: Record<string, CommandHandler> = {
   query_db: handleQueryDb,
   get_session_files: handleGetSessionFiles,
   get_session_events: handleGetSessionEvents,
+  get_activity_intervals: handleGetActivityIntervals,
 };

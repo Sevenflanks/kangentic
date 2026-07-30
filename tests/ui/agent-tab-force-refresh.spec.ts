@@ -14,7 +14,7 @@
 
 import { test, expect, chromium, type Browser, type Page } from '@playwright/test';
 import path from 'node:path';
-import { waitForViteReady } from './helpers';
+import { waitForViteReady, dismissOnboardingChecklist } from './helpers';
 
 const MOCK_SCRIPT = path.join(__dirname, 'mock-electron-api.js');
 const VITE_URL = `http://localhost:${process.env.PLAYWRIGHT_VITE_PORT || '5173'}`;
@@ -44,6 +44,7 @@ async function createProjectAndWaitForBoard(page: Page, projectSlug: string): Pr
   } else {
     await sidebarButton.click();
   }
+  await dismissOnboardingChecklist(page);
 
   await page.locator('[data-swimlane-name="To Do"]').waitFor({ state: 'visible', timeout: 15000 });
 }
@@ -173,15 +174,14 @@ test.describe('AgentTab - re-detect button wires forceRefresh=true', () => {
     await waitForBootstrapComplete(page);
 
     // Clear the agentList so Settings open DOES trigger a loadAgentList() call
-    // (giving us a call to observe the argument on). agentInfo is also cleared
-    // so detectAgent() runs too, but we only track agents.list() (loadAgentList).
+    // (giving us a call to observe the argument on).
     await page.evaluate(() => {
       const configStore = (window as unknown as {
         __zustandStores?: {
-          config?: { setState: (partial: { agentList: unknown[]; agentInfo: null }) => void };
+          config?: { setState: (partial: { agentList: unknown[] }) => void };
         };
       }).__zustandStores?.config;
-      configStore?.setState({ agentList: [], agentInfo: null });
+      configStore?.setState({ agentList: [] });
     });
 
     // Install the call interceptor AFTER clearing the store.
@@ -205,5 +205,41 @@ test.describe('AgentTab - re-detect button wires forceRefresh=true', () => {
     expect(finalCalls.wasCalledWithTrue).toBe(false);
 
     await closeSettings(page);
+  });
+
+  test('updateConfig with a cliPaths change refreshes the agent inventory', async () => {
+    // config-store's updateConfig() calls get().loadAgentList() (a plain,
+    // non-forced reload) whenever partial.agent is present, so a CLI-path
+    // save picks up the new binary immediately instead of requiring a
+    // restart. Drive updateConfig directly against the store (no Settings UI
+    // involved) so this test pins the store-level wiring in isolation from
+    // the AgentTab input form.
+    ({ browser, page } = await launchFreshPage());
+    await createProjectAndWaitForBoard(page, 'agent-tab-cli-path-refresh');
+
+    await waitForBootstrapComplete(page);
+
+    // Install the call interceptor AFTER bootstrap so bootstrap's own
+    // agents.list() call does not contaminate the recorded state.
+    await instrumentAgentListCalls(page);
+
+    await page.evaluate(async () => {
+      const configStore = (window as unknown as {
+        __zustandStores?: {
+          config?: { getState: () => { updateConfig: (partial: unknown) => Promise<void> } };
+        };
+      }).__zustandStores?.config;
+      await configStore?.getState().updateConfig({ agent: { cliPaths: { claude: '/mock/bin/claude' } } });
+    });
+
+    // A cliPaths change must trigger at least one agents.list() call so the
+    // UI reflects the new path without a restart.
+    await expect.poll(
+      async () => {
+        const calls = await readAgentListCalls(page);
+        return calls.callCount;
+      },
+      { timeout: 3000, intervals: [200, 200, 300, 300] },
+    ).toBeGreaterThanOrEqual(1);
   });
 });

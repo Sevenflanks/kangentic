@@ -55,7 +55,14 @@ export type ActivityEventPayload =
   | { type: 'activity'; state: ActivityStateWire; reason: ActivityReasonWire }
   | { type: 'usage'; usage: SessionUsageWire }
   | { type: 'event'; event: SessionEventWire }
-  | { type: 'permission'; promptId: string; pending: boolean }
+  /**
+   * `options`, when present on a pending push, carries the prompt dialog's
+   * numbered option labels in keystroke order (options[0] is answered with
+   * "1\r"). Absent from pre-0.6.0 desktops and whenever no numbered dialog
+   * could be parsed from the PTY frame; the phone then falls back to its
+   * blind approve/deny keystrokes.
+   */
+  | { type: 'permission'; promptId: string; pending: boolean; options?: string[] }
   /**
    * The streamed session's PTY exited. Pushed once by the desktop's
    * read-stream subscription right before it tears itself down, so the
@@ -63,7 +70,22 @@ export type ActivityEventPayload =
    * inferring it from silence. `intentional` distinguishes a deliberate
    * stop (desktop Stop button, suspend, shutdown) from a crash.
    */
-  | { type: 'session-ended'; intentional: boolean };
+  | { type: 'session-ended'; intentional: boolean }
+  /**
+   * The agent's most recent assistant message, already collapsed to a short
+   * plain-text preview, pushed whenever it changes.
+   *
+   * A phone's session list renders exactly one line per session. Deriving it
+   * client-side cost a transcript-window request per session (measured 2.3 to
+   * 34.6 KB each, to keep a string under 200 characters) plus 0.7 to 3.8
+   * seconds of desktop work per request. The desktop already resolves the
+   * transcript to compute its delta pushes, so it can carry the line for
+   * free on a feed the phone is receiving anyway.
+   *
+   * Absent from pre-0.8.0 desktops; a phone that sees none should fall back
+   * to whatever it can derive locally rather than showing nothing.
+   */
+  | { type: 'message-preview'; text: string };
 
 export interface ActivityEvent {
   kind: 'activity';
@@ -128,11 +150,21 @@ export function parseActivityEventPayload(payload: JsonValue): ActivityEventPayl
     case 'permission': {
       if (typeof payload.promptId !== 'string') throw new Error('permission payload is missing "promptId"');
       if (typeof payload.pending !== 'boolean') throw new Error('permission payload is missing "pending"');
-      return { type: 'permission', promptId: payload.promptId, pending: payload.pending };
+      if (payload.options === undefined) {
+        return { type: 'permission', promptId: payload.promptId, pending: payload.pending };
+      }
+      if (!Array.isArray(payload.options) || !payload.options.every((option) => typeof option === 'string')) {
+        throw new Error('permission payload has an invalid "options"');
+      }
+      return { type: 'permission', promptId: payload.promptId, pending: payload.pending, options: payload.options };
     }
     case 'session-ended': {
       if (typeof payload.intentional !== 'boolean') throw new Error('session-ended payload is missing "intentional"');
       return { type: 'session-ended', intentional: payload.intentional };
+    }
+    case 'message-preview': {
+      if (typeof payload.text !== 'string') throw new Error('message-preview payload is missing "text"');
+      return { type: 'message-preview', text: payload.text };
     }
     default:
       throw new Error('activity payload has an unknown "type"');

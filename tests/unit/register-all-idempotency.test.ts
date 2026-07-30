@@ -7,6 +7,7 @@
  * re-registering ipcMain.handle handlers (which throws on duplicates).
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { KANGENTIC_HOSTED_RELAY_URL } from '../../src/shared/relay';
 
 // ── Hoisted mocks ─────────────────────────────────────────────────────────
 
@@ -229,7 +230,7 @@ describe('registerAllIpc idempotency', () => {
   // re-import alone can exceed 5s). The explicit 30s timeout on each test keeps
   // them green under load; they still complete in ~1s when run scoped.
   it('first call initializes context and registers handlers', async () => {
-    const { registerAllIpc, getSessionManager } = await import('../../src/main/ipc/register-all');
+    const { registerAllIpc, getSessionManager, getOptionalIpcContext } = await import('../../src/main/ipc/register-all');
     const { registerProjectHandlers } = await import('../../src/main/ipc/handlers/projects');
     const { registerTaskCrudHandlers } = await import('../../src/main/ipc/handlers/task-crud');
     const { registerTaskArchiveHandlers } = await import('../../src/main/ipc/handlers/task-archive');
@@ -257,12 +258,19 @@ describe('registerAllIpc idempotency', () => {
     expect(retrievalService.attach).toHaveBeenCalledTimes(1);
 
     // MobileBridgeService.reconcile() is called once at startup with the
-    // real effective config's mobileBridge fields (defaulted, since the
-    // mocked ConfigManager.getEffectiveConfig() here returns no mobileBridge
-    // key) - not left at the { enabled: false, relayUrl: '' } placeholder
-    // the constructor takes before configManager is available.
+    // real effective config's mobileBridge fields resolved through
+    // resolveRelayUrl() (defaulted, since the mocked
+    // ConfigManager.getEffectiveConfig() here returns no mobileBridge key) -
+    // not left at the { enabled: false, relayUrl: '' } placeholder the
+    // constructor takes before configManager is available, and not the raw
+    // '' relayUrl either: resolveRelayUrl() never returns '', it infers
+    // 'hosted' mode from the missing mobileBridge key and falls back to the
+    // hosted relay (src/shared/relay.ts).
     expect(mobileBridgeReconcileSpy).toHaveBeenCalledTimes(1);
-    expect(mobileBridgeReconcileSpy).toHaveBeenCalledWith({ enabled: false, relayUrl: '' });
+    expect(mobileBridgeReconcileSpy).toHaveBeenCalledWith({
+      enabled: false,
+      relayUrl: KANGENTIC_HOSTED_RELAY_URL,
+    });
 
     // attachContext() wires the capability-verb handlers and must run once,
     // before reconcile() (which drives syncSessions()) so the first sync has
@@ -271,10 +279,26 @@ describe('registerAllIpc idempotency', () => {
 
     // Context is initialized (wrappers don't throw)
     expect(() => getSessionManager()).not.toThrow();
+
+    // The desktop notifier is constructed, wired into IpcContext, and
+    // start()-ed exactly once, attaching one 'activity' and one 'exit'
+    // listener to the real (unmocked) SessionManager EventEmitter. The
+    // ActivityIntervalRecorder (also real and unmocked here - it is
+    // constructed and .start()-ed the same way as desktopNotifier, just
+    // below it in register-all.ts) attaches its own 'activity'/'exit' pair
+    // to write the session_activity_intervals ledger. Nothing else in this
+    // test's dependency graph listens on those events (every other
+    // registerXHandlers call and retrievalService.attach are mocked above),
+    // so a count of 2 here is exactly desktopNotifier (1) +
+    // activityIntervalRecorder (1). If this ever needs to change, re-attribute
+    // the count explicitly rather than just bumping the number.
+    expect(getOptionalIpcContext()?.desktopNotifier).toBeDefined();
+    expect(getSessionManager().listenerCount('activity')).toBe(2);
+    expect(getSessionManager().listenerCount('exit')).toBe(2);
   }, 30000);
 
   it('second call updates mainWindow without re-registering handlers', async () => {
-    const { registerAllIpc } = await import('../../src/main/ipc/register-all');
+    const { registerAllIpc, getSessionManager } = await import('../../src/main/ipc/register-all');
     const { registerProjectHandlers } = await import('../../src/main/ipc/handlers/projects');
     const { registerTaskCrudHandlers } = await import('../../src/main/ipc/handlers/task-crud');
     const { registerTaskArchiveHandlers } = await import('../../src/main/ipc/handlers/task-archive');
@@ -333,6 +357,18 @@ describe('registerAllIpc idempotency', () => {
     // router a second time would be a correctness bug even if the mock
     // doesn't throw the way a real double-registration might.
     expect(mobileBridgeAttachContextSpy).toHaveBeenCalledTimes(1);
+
+    // Same guarantee for the desktop notifier AND the ActivityIntervalRecorder:
+    // a re-activate on macOS must not attach a second pair of SessionManager
+    // listeners for either (which would double-fire every idle/crash
+    // notification, and double-write every committed disposition transition
+    // to session_activity_intervals). Both are constructed inside the
+    // `if (context) return` idempotency guard at the top of registerAllIpc,
+    // so this assertion genuinely exercises that guard rather than passing
+    // by accident - it goes red the moment either listener stops being
+    // reused across a second registerAllIpc call.
+    expect(getSessionManager().listenerCount('activity')).toBe(2);
+    expect(getSessionManager().listenerCount('exit')).toBe(2);
   }, 30000);
 
   it('second call preserves existing services', async () => {

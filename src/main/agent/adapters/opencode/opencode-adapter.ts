@@ -4,7 +4,7 @@ import path from 'node:path';
 import { OpenCodeDetector } from './detector';
 import { OpenCodeCommandBuilder, mapPermissionModeToAgent } from './command-builder';
 import { OpenCodeSessionHistoryParser } from './session-history-parser';
-import { parseOpenCodeTranscript, openCodeTranscriptSourcePath } from './transcript-parser';
+import { parseOpenCodeTranscript, openCodeTranscriptSourcePath, mapOpenCodeRemoteEntries } from './transcript-parser';
 import { migrateOpenCodeProjectData } from './project-relocation';
 import { removeHooks as removeOpenCodeHooks } from './hook-manager';
 import { discoverOpenCodeCapabilities } from './capability-discovery';
@@ -19,7 +19,17 @@ import type {
   SettingsChangeSpec,
   ParsedTranscript,
 } from '../../agent-adapter';
-import type { AgentPermissionEntry, PermissionMode, AdapterRuntimeStrategy, SessionEvent, SubmissionContextType, SubmissionVerifier, AgentCapabilities } from '../../../../shared/types';
+import { probeOpenCodeServer, fetchOpenCodeSessionMessages } from './remote-client';
+import type {
+  AgentPermissionEntry,
+  PermissionMode,
+  AdapterRuntimeStrategy,
+  SessionEvent,
+  SubmissionContextType,
+  SubmissionVerifier,
+  AgentCapabilities,
+  ResolvedExecutionTarget,
+} from '../../../../shared/types';
 import { ActivityDetection } from '../../../../shared/types';
 import { EventTypeActivity } from '../../../../shared/types';
 import { parseOpenCodeNativeBoundary } from './native-boundary';
@@ -150,6 +160,12 @@ function parsePublicSessionEvent(line: string): SessionEvent | null {
  *    must enable auto-approval via `opencode.json` config. The
  *    `permissions` list below is therefore informational - all modes
  *    produce the same CLI invocation today.
+ *  - Remote execution: declares `remoteExecution` so a project can attach
+ *    to a user-run `opencode serve` instead of spawning locally
+ *    (`opencode attach <url> --dir <serverPath>`). See command-builder.ts
+ *    (`buildOpenCodeAttachCommand`) and remote-client.ts for the HTTP side.
+ *    Local behavior above is completely unchanged when no project has
+ *    opted an OpenCode session into remote mode.
  */
 export class OpenCodeAdapter implements AgentAdapter {
   readonly name = 'opencode';
@@ -203,6 +219,29 @@ export class OpenCodeAdapter implements AgentAdapter {
   // CodexAdapter.hookHolders.
   private readonly hookHolders = new Map<string, Set<string>>();
 
+  // Keyed by spawn cwd, populated in buildCommand whenever a spawn resolves
+  // to remote mode. Lets parseTranscript / locateSessionHistoryFile /
+  // sessionId.fromFilesystem branch to the remote server without any
+  // AgentAdapter interface change - adapters have no other way to reach
+  // Kangentic's AppConfig (see agent-adapters-boundary.md). Known limitation:
+  // empty after an app restart, so a remote session's transcript falls back
+  // to the (empty) local SQLite lookup until the task is resumed again.
+  private readonly remoteTargetsByCwd = new Map<string, ResolvedExecutionTarget>();
+
+  /** Declares OpenCode's own dialect of the generic remote-execution capability. */
+  readonly remoteExecution = {
+    info: {
+      urlPlaceholder: 'http://10.0.0.5:4096',
+      authKind: 'basic' as const,
+      workingDirectoryScope: 'per-invocation' as const,
+      remoteModeCaveat:
+        'The server is the authority for providers, models, and MCP tools in remote mode. '
+        + 'The Kangentic MCP server and the activity-tracking plugin are not available for remote '
+        + 'OpenCode sessions - attach has no way to push local config into an already-running server.',
+    },
+    probeServer: probeOpenCodeServer,
+  };
+
   async detect(overridePath?: string | null): Promise<AgentInfo> {
     return this.detector.detect(overridePath);
   }
@@ -253,10 +292,28 @@ export class OpenCodeAdapter implements AgentAdapter {
       effort,
       ...rest,
     });
+
+    if (options.executionTarget) {
+      // Remember the resolved server for this cwd so parseTranscript /
+      // locateSessionHistoryFile / sessionId.fromFilesystem can branch to it
+      // later without needing config access of their own.
+      this.remoteTargetsByCwd.set(options.cwd, options.executionTarget);
+      return command;
+    }
+
+    // Local spawn: clear any remote target a previous remote spawn recorded
+    // for this cwd. Without this the entry outlives the mode flip, and
+    // `sessionId.fromFilesystem` / `locateSessionHistoryFile` / `parseTranscript`
+    // keep branching to a server that no longer backs this session - which
+    // disables local session-id capture and can leave `agent_session_id` null,
+    // silently breaking resume. The same key also collides when worktrees are
+    // disabled (remote and local both use projectPath as cwd).
+    this.remoteTargetsByCwd.delete(options.cwd);
+
     // buildOpenCodeCommand copies the activity plugin into
-    // `<cwd>/.opencode/plugins/` whenever eventsOutputPath is set.
-    // Retain a reference keyed by that exact cwd so concurrent sessions
-    // coordinate cleanup in `removeHooks`.
+    // `<cwd>/.opencode/plugins/` whenever eventsOutputPath is set. Retain a
+    // reference keyed by that exact cwd so concurrent local sessions coordinate
+    // cleanup; remote mode returned above and never installs this plugin.
     if (options.eventsOutputPath) {
       this.retainHooks(options.cwd, options.hookOwnerId ?? options.taskId);
     }
@@ -278,6 +335,12 @@ export class OpenCodeAdapter implements AgentAdapter {
   }
 
   prepareInitialPrompt(input: InitialPromptInput): InitialPromptPreparation {
+    // `opencode attach` talks to an already-running server, which cannot read
+    // the attach process's payload file or accept a prompt flag. Reuse the
+    // scheduler's writable-TUI path; local OpenCode keeps the plugin payload.
+    if (input.executionTarget) {
+      return { delivery: 'terminal-submit' };
+    }
     const sourcePath = path.join(input.sessionDirectory, INITIAL_PROMPT_PAYLOAD_FILENAME);
     const mappedAgent = mapPermissionModeToAgent(input.permissionMode);
     const payload: OpenCodeInitialPromptPayload = input.resume
@@ -385,11 +448,17 @@ export class OpenCodeAdapter implements AgentAdapter {
 
         return null;
       },
-      fromFilesystem: (options: { spawnedAt: Date; cwd: string }) =>
-        OpenCodeSessionHistoryParser.captureSessionIdFromFilesystem({
+      fromFilesystem: (options: { spawnedAt: Date; cwd: string }) => {
+        // The local SQLite DB lives on the Kangentic host; a remote spawn's
+        // session row lives on the server instead, so this poll would only
+        // ever time out. Skip it - fromOutput (the PTY scan above) is the
+        // sole capture path for remote sessions.
+        if (this.remoteTargetsByCwd.has(options.cwd)) return Promise.resolve(null);
+        return OpenCodeSessionHistoryParser.captureSessionIdFromFilesystem({
           ...options,
           getAgentVersion: () => this.detector.getCachedVersion(),
-        }),
+        });
+      },
     },
   };
 
@@ -442,10 +511,22 @@ export class OpenCodeAdapter implements AgentAdapter {
   }
 
   async locateSessionHistoryFile(agentSessionId: string, cwd: string): Promise<string | null> {
+    // Cross-agent handoff degrades for a remote session: there is no local
+    // history file to hand off. The PTY-scrollback cleanup path
+    // (handoff/transcript-cleanup.ts) is the fallback for these sessions.
+    if (this.remoteTargetsByCwd.has(cwd)) return null;
     return OpenCodeSessionHistoryParser.locate({ agentSessionId, cwd });
   }
 
-  async parseTranscript(agentSessionId: string, _cwd: string): Promise<ParsedTranscript> {
+  async parseTranscript(agentSessionId: string, cwd: string): Promise<ParsedTranscript> {
+    const target = this.remoteTargetsByCwd.get(cwd);
+    if (target) {
+      const messages = await fetchOpenCodeSessionMessages(target, agentSessionId);
+      return {
+        entries: mapOpenCodeRemoteEntries(messages),
+        sourcePath: `${target.url}/session/${agentSessionId}/message`,
+      };
+    }
     const entries = await parseOpenCodeTranscript(agentSessionId);
     // The shared DB path is always known, so report it even when no entries
     // were found (empty session vs missing DB) - consistent with the

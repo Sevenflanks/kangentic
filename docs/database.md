@@ -128,12 +128,45 @@ Per-column session model (two orthogonal axes; see `src/shared/types.ts` and `do
 | agent_override | TEXT | | NULL |
 | permission_mode | TEXT | | NULL |
 | auto_command | TEXT | | NULL |
+| profile_id | TEXT | | NULL |
+| run_mode | TEXT | NOT NULL | 'column_settings' |
 | detail_view_state | TEXT | | NULL |
 | archived_at | TEXT | | NULL |
 | created_at | TEXT | NOT NULL | |
 | updated_at | TEXT | NOT NULL | |
 
 Indexes: `idx_tasks_swimlane_position` on (swimlane_id, position), `idx_tasks_display_id` on (display_id) UNIQUE, `idx_tasks_session_id` on (session_id), `idx_tasks_external` on (external_source, external_id).
+
+`profile_id` names a Board Profile - a team-shared, named alternate set of per-column strategy
+settings the task rides as it moves (see [Configuration > Board Profiles](configuration.md#board-profiles)).
+There is deliberately **no foreign key**: profile *definitions* live in `kangentic.json`, not this
+database, so the profile is team-shared while the assignment stays per-machine runtime state. NULL
+means "Default" - every column uses its own settings - and Default is synthetic: there is no stored
+Default profile, so a board that has never used the feature needs no migration or backfill. An id
+pointing at a profile a teammate deleted degrades to Default and logs once, rather than wedging the
+task.
+
+`run_mode` records which of the New Task / Edit dialog's two branches the user chose:
+`'column_settings'` (follow each column as the task moves; `profile_id` selects which set of column
+settings applies) or `'agent_override'` (pin agent/model/effort/permission for the task's whole
+life). It is stored rather than derived from "does the task carry a pin", because Agent Override with
+all four fields left on inherit writes exactly the same nulls as Column Settings while meaning the
+opposite - the first locks all four at first spawn, the second never locks. Deriving it silently
+dropped that choice on every save. The migration backfills `'agent_override'` for any row that
+already carries one of the four pins **and** has a NULL `profile_id`, reproducing the old derivation
+exactly, so upgraded boards behave identically. The `profile_id IS NULL` clause is belt-and-braces -
+a profile task cannot carry a pin, so it changes no row today - but it makes the backfill correct by
+construction rather than by trusting an invariant enforced in another file.
+
+`profile_id`, `run_mode`, and the four Advanced pins (`agent_override`, `model_override`,
+`effort_override`, `permission_mode`) are **mutually exclusive**, enforced at write time in
+`TaskRepository` (`applyProfileExclusivity`): setting the profile nulls all four pins and forces
+`run_mode = 'column_settings'`; setting any of the four (or asking for `'agent_override'` directly)
+nulls the profile and sets `run_mode = 'agent_override'`. That exclusivity is what keeps
+`lockAdvancedOverridesOnFirstSpawn` correct - a profile task is never in override mode, so the
+first-spawn lock never fires for it. `auto_command` is deliberately **not** in the exclusivity set:
+it is an MCP-only escape hatch, so a task may carry both a profile and its own auto-command, and it
+never implies override mode.
 
 ### actions table
 
@@ -335,6 +368,32 @@ Index: `idx_handoffs_task_id` on (task_id).
 
 TypeScript type: `HandoffRecord` in `src/shared/types.ts`. Repository: `HandoffRepository` in `src/main/db/repositories/handoff-repository.ts`.
 
+### session_messages_sent table
+
+Provenance for messages sent into a session via `kangentic_send_session_message` (see [mcp-server.md](mcp-server.md)) - by another agent, or by a human steering that session directly. The delivered message carries no in-band marker, so these rows are the only record that a turn arrived through the tool rather than being typed at the keyboard.
+
+| Column | Type | Constraints | Default |
+|--------|------|-------------|---------|
+| id | TEXT | PRIMARY KEY | |
+| session_id | TEXT | NOT NULL, FK->sessions ON DELETE CASCADE | |
+| caller_session_id | TEXT | | NULL |
+| caller_task_id | TEXT | | NULL |
+| caller_project_id | TEXT | | NULL |
+| message | TEXT | NOT NULL | |
+| status | TEXT | NOT NULL | |
+| error | TEXT | | NULL |
+| created_at | TEXT | NOT NULL | |
+
+Index: `idx_session_messages_sent_session_id` on (session_id).
+
+`session_id` is the session that RECEIVED the message. `status` is one of `delivered`, `queued` (both produced a turn), `refused` (a guard rejected it), or `failed` (delivery threw; whether a turn landed is unknown) - so a row exists for every attempt, not just the successes. `error` carries the refusal or failure detail and is NULL on success.
+
+The three `caller_*` columns are deliberately NOT foreign keys: a cross-project steer originates in a different project's database, so those ids are unresolvable locally. They are NULL for a human-driven caller with no Kangentic session.
+
+`message` is stored as the caller supplied it, which is how a consumer correlates it to the transcript turn it produced. The delivered text is byte-identical for ordinary prose; the paste path additionally collapses CR/CRLF to LF and strips C0 control characters, so a message carrying those differs from the stored row by exactly that normalization. Reconstructing "which turns arrived this way" means filtering to `delivered` / `queued`.
+
+TypeScript type: `SentSessionMessage` in `src/shared/types.ts`. Repository: `SentSessionMessageRepository` in `src/main/db/repositories/sent-session-message-repository.ts`.
+
 ### memory_chunks table
 
 Conversation-memory index: a per-project retrieval store over the STRUCTURED transcript (TranscriptEntry-derived chunks), not the raw `session_transcripts` scrollback blob. Corpus-generic (a `corpus` column) so the same store can later index repo files/docs; `session_id`/`task_id` are nullable for that reuse and always set for the conversation corpus.
@@ -418,6 +477,31 @@ Keyed by `turn_uuid` because a `--resume` replays its parent's turns verbatim un
 
 Module: `src/main/retrieval/` (store `RetrievalStore`, usage ledger `ConversationUsageStore`, indexer `ConversationIndexer`, service `retrievalService`, query `searchConversationMemory`).
 
+### session_activity_intervals table
+
+Durable activity-disposition ledger. One row per continuous span a session spent in one `ActivityDisposition` bucket - `'idle'` (needing the user, covering both the `idle` and `permission` activity states) or `'active'` (the agent working on its own, the `thinking` state); see `dispositionOf` in `src/shared/activity-state.ts`. Written the moment the activity engine commits a disposition-changing transition, so it survives the engine's own in-memory state (wiped on `deleteSession`/dispose) and is faithful where `events.jsonl` is not (that file logs raw hook events, not committed transitions, and is not reliably retained). Symmetric by design: both dispositions are recorded directly, so "active time" and "idle time" are each a straight SUM rather than an inverse requiring session-boundary reconciliation.
+
+| Column | Type | Constraints | Default |
+|--------|------|-------------|---------|
+| id | INTEGER | PRIMARY KEY AUTOINCREMENT | |
+| session_id | TEXT | NOT NULL | |
+| task_id | TEXT | | NULL |
+| disposition | TEXT | NOT NULL | |
+| state | TEXT | NOT NULL | |
+| previous_state | TEXT | NOT NULL | |
+| enter_trigger | TEXT | NOT NULL | |
+| started_ms | INTEGER | NOT NULL | |
+| started_at | TEXT | NOT NULL | |
+| ended_ms | INTEGER | | NULL |
+| ended_at | TEXT | | NULL |
+| duration_ms | INTEGER | | NULL |
+| exit_trigger | TEXT | | NULL |
+| recorded_at | TEXT | NOT NULL | |
+
+One row per INTERVAL, not per transition: a `permission` to `idle` crossing stays inside the same `'idle'`-disposition interval, so nothing closes and reopens. `enter_trigger` / `exit_trigger` carry the engine's own `TransitionTrigger` labels, so a consumer can tell a hook-authoritative park (`event:idle`) from a watchdog guess (`timer:stale-thinking`), and a genuine human reply (`event:prompt`) from the agent resuming itself (`event:prompt:pty-activity`). `started_at` / `ended_at` are TEXT UTC ISO 8601 mirrors of `started_ms` / `ended_ms`, written by the store from the same value so the two representations cannot drift; `ended_at` is NULL exactly when `ended_ms` is (the interval is still open). Indices: `idx_activity_intervals_task` (task_id), `idx_activity_intervals_session` (session_id), `idx_activity_intervals_started` (started_ms), `idx_activity_intervals_open` (session_id, ended_ms - resolves the one open interval per session without holding row ids across a restart). Deliberately has NO `sessions` DELETE cascade, for the same reason as `conversation_turn_usage`: it is a durable ledger, so an interval outlives the session row that produced it. A session that dies mid-interval leaves it permanently open; consumers filter `ended_ms IS NOT NULL`.
+
+Module: `src/main/activity-engine/` (store `ActivityIntervalStore`, recorder `ActivityIntervalRecorder`). Read via the `kangentic_get_activity_intervals` MCP tool (see [mcp-server.md](mcp-server.md)) or `kangentic_query_db`; there is no desktop-facing IPC endpoint yet.
+
 ## Migration Strategy
 
 Migrations run automatically on database open via `runGlobalMigrations()` (from `src/main/db/migrations/global-schema.ts`) and `runProjectMigrations()` (from `src/main/db/migrations/project-schema.ts`). Default swimlane and action seeding lives in `src/main/db/migrations/default-data.ts`. The strategy uses three approaches depending on the change:
@@ -484,6 +568,10 @@ Grouped by feature. The numbering is for cross-reference only and does not refle
 47. **`permission_mode` column on tasks** - adds `permission_mode TEXT DEFAULT NULL`, a per-task permission override mirroring `agent_override`/`model_override`/`effort_override`: settable via the New Task dialog's Advanced section and the task-detail edit form (pre-spawn or suspended only, same lock as `agent_override`). Takes precedence over the swimlane's `permission_mode` and the project's default permission mode; NULL means inherit. Idempotent guarded `ALTER TABLE`.
 48. **`auto_command` column on tasks** - adds `auto_command TEXT DEFAULT NULL`, an MCP-only per-task initial command set via `kangentic_create_task`'s `autoCommand` param so a skill can mint a task that runs a command (e.g. `/code-review`) once the agent spawns. Not surfaced in the New Task dialog or project settings. Takes precedence over the swimlane's `auto_command` for this task only; NULL means inherit from the swimlane. Idempotent guarded `ALTER TABLE`.
 49. **`agent` and `effort` columns on `usage_history`** - adds `agent TEXT` and `effort TEXT` (both in the `CREATE TABLE` block plus guarded `ALTER TABLE` for existing DBs) so the usage dashboard can break usage down by agent and by reasoning effort. `agent` is stamped at capture time from the session manager's recorded agent name; `effort` from `sessions.applied_effort` (the last-applied `--effort` value, NULL = agent default). Each has a one-shot backfill: `agent` from surviving `sessions` -> `tasks.agent` joins, `effort` from surviving `sessions.applied_effort`. Rows whose source was deleted stay NULL (rendered "(unknown)" / "(default)"). The one-shot `usage_history` seed backfill (migration 36) also carries both columns. Idempotent guarded `ALTER TABLE`.
+50. **Durable activity-disposition-interval ledger (`session_activity_intervals`)** - creates the table plus its `idx_activity_intervals_task` / `idx_activity_intervals_session` / `idx_activity_intervals_started` / `idx_activity_intervals_open` indices. One row per continuous span a session spent in the `'active'` or `'idle'` `ActivityDisposition` bucket, written by `ActivityIntervalRecorder` the moment the activity engine commits a disposition-changing transition - symmetric by design (both dispositions recorded directly, not one derived as the inverse of the other). `started_at`/`ended_at` mirror `started_ms`/`ended_ms` as UTC ISO 8601, derived from the same value at write time. Deliberately has NO `sessions` DELETE cascade (same rationale as `conversation_turn_usage`): a durable ledger, so an interval outlives the session row that produced it. See the `session_activity_intervals table` section above. Idempotent `CREATE ... IF NOT EXISTS`.
+51. **Sent-message provenance (`session_messages_sent`)** - creates the table plus `idx_session_messages_sent_session_id`, recording every `kangentic_send_session_message` ATTEMPT (`delivered` / `queued` / `refused` / `failed`) against the session that received it. `session_id` cascades on `sessions` DELETE; the three `caller_*` columns are deliberately plain ids, not foreign keys, because a cross-project steer originates in another project's database. Followed by a guarded `ALTER TABLE ... ADD COLUMN error TEXT` so a database created by the intermediate (pre-`error`) shape picks the column up. Because the delivered message carries no in-band marker, these rows are the only record that a turn arrived through the tool rather than being typed. See the `session_messages_sent table` section above. Idempotent `CREATE ... IF NOT EXISTS` + `pragma table_info` guard.
+52. **`profile_id` column on tasks** - adds `profile_id TEXT DEFAULT NULL`, naming the Board Profile a task rides: a team-shared, named alternate set of per-column strategy settings applied as the task moves (see the `tasks table` section above and [Configuration > Board Profiles](configuration.md#board-profiles)). No foreign key and no backfill: profile *definitions* live in `kangentic.json` while this assignment is per-machine, and NULL already means the synthetic "Default" (every column uses its own settings), so an existing board needs no data migration and behaves byte-identically until a profile is created. Mutually exclusive with `agent_override` / `model_override` / `effort_override` / `permission_mode`, enforced in `TaskRepository`. Idempotent guarded `ALTER TABLE`.
+53. **`run_mode` column on tasks** - adds `run_mode TEXT NOT NULL DEFAULT 'column_settings'`, recording which of the New Task / Edit dialog's two branches the user chose (`'column_settings'` | `'agent_override'`, the `TaskRunMode` union). Previously the branch was derived on mount from "does the task carry any of the four Advanced pins", which cannot represent Agent Override with all four fields left on inherit: that saves the same five nulls as Column Settings, so the choice was dropped on every save and `lockAdvancedOverridesOnFirstSpawn` never fired. Backfills `'agent_override'` for any row where `agent_override`, `model_override`, `effort_override`, or `permission_mode` is non-NULL **and** `profile_id IS NULL` - exactly the old derivation, so upgraded boards behave identically; `auto_command` is excluded (not an Advanced pin) and profile tasks carry no pins, so both stay on `'column_settings'`. The `profile_id IS NULL` clause changes no row today (the repository has enforced profile-vs-pin exclusivity since `profile_id` shipped) but makes the backfill correct by construction rather than by trusting that invariant. Joins the profile-vs-pin exclusivity set in `applyProfileExclusivity` (see the `tasks table` section above). Idempotent guarded `ALTER TABLE` + backfill `UPDATE`, both inside a single `db.transaction()`: the guard tests only for the column's existence, so a crash between the two statements would leave the column present, the guard satisfied, and the backfill never run again.
 
 ### Key Migrations (Global DB)
 

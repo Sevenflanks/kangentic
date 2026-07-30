@@ -1,5 +1,6 @@
 import { type BrowserWindow, ipcMain } from 'electron';
 import { IPC } from '../../shared/ipc-channels';
+import type { ProjectOpenByPathOverrides } from '../../shared/types';
 import { trackEvent, sanitizeErrorMessage } from '../analytics/analytics';
 import { ProjectRepository } from '../db/repositories/project-repository';
 import { ProjectGroupRepository } from '../db/repositories/project-group-repository';
@@ -9,6 +10,7 @@ import { BoardConfigManager } from '../config/board-config-manager';
 import { DiffWatcher } from '../git/diff-watcher';
 import { GitDetector } from '../git/git-detector';
 import { ShellResolver } from '../pty/spawn/shell-resolver';
+import { FontResolver } from '../font-resolver';
 import { TerminalSubmitScheduler } from '../transition-engine/terminal-submit-scheduler';
 import { createPasteEngine } from '../pty/paste-engine';
 import { TerminalSubmit } from '../pty/terminal-submit';
@@ -32,7 +34,7 @@ import { registerTransientSessionHandlers } from './handlers/transient-sessions'
 import { registerTranscriptionHandlers } from './handlers/transcription';
 import { TranscriptionService } from '../transcription/transcription-service';
 import { registerBoardHandlers } from './handlers/board';
-import { registerSystemHandlers } from './handlers/system';
+import { registerSystemHandlers, showDesktopNotification } from './handlers/system';
 import { registerBacklogHandlers } from './handlers/backlog';
 import { registerGitDiffHandlers } from './handlers/git-diff';
 import { registerBrowserHandlers } from './handlers/browser';
@@ -44,6 +46,12 @@ import { registerPopOutHandlers } from './handlers/pop-out';
 import { retrievalService } from '../retrieval/retrieval-service';
 import { MobileBridgeService } from '../mobile-bridge/mobile-bridge-service';
 import { BoardEventBus } from '../mobile-bridge/board-event-bus';
+import { DesktopNotifier } from '../notifications/desktop-notifier';
+import { ActivityIntervalRecorder } from '../activity-engine/activity-interval-recorder';
+import { ActivityIntervalStore } from '../activity-engine/activity-interval-store';
+import { getProjectDb } from '../db/database';
+import { getProjectRepos } from './helpers';
+import { KANGENTIC_HOSTED_RELAY_URL, resolveRelayUrl } from '../../shared/relay';
 import type { IpcContext } from './ipc-context';
 import type { McpHttpServerHandle } from '../agent/mcp-http-server';
 
@@ -100,8 +108,36 @@ export function registerAllIpc(mainWindow: BrowserWindow, mcpServerHandle: McpHt
   // after `context` (and its configManager getter) is constructed below,
   // since MobileBridgeService's constructor needs a config synchronously
   // but configManager itself is only available once `context` exists.
-  const mobileBridgeService = new MobileBridgeService({ enabled: false, relayUrl: '' });
+  const mobileBridgeService = new MobileBridgeService({ enabled: false, relayUrl: KANGENTIC_HOSTED_RELAY_URL });
   const boardEvents = new BoardEventBus();
+  // Owns the desktop idle/crash notification decision (cooldown, focus gate,
+  // active-project gate, title assembly). Every option closure goes through
+  // requireContext() rather than capturing `context` directly: this notifier
+  // is constructed before `context` is assigned below, and its callbacks only
+  // ever run later (in response to a SessionManager event), by which point
+  // `context` is set.
+  const desktopNotifier = new DesktopNotifier({
+    sessionManager,
+    getNotificationConfig: () => requireContext().configManager.load().notifications,
+    getActiveProjectId: () => requireContext().currentProjectId ?? undefined,
+    isWindowFocused: () => {
+      const mainWindow = requireContext().mainWindow;
+      return !mainWindow.isDestroyed() && mainWindow.isFocused();
+    },
+    flashFrame: () => {
+      const mainWindow = requireContext().mainWindow;
+      if (!mainWindow.isDestroyed()) mainWindow.flashFrame(true);
+    },
+    resolveTaskTitle: (projectId, taskId) => {
+      try {
+        return getProjectRepos(requireContext(), projectId).tasks.getById(taskId)?.title;
+      } catch {
+        return undefined;
+      }
+    },
+    resolveProjectName: (projectId) => requireContext().projectRepo.getById(projectId)?.name,
+    showNotification: (input) => showDesktopNotification(requireContext(), input),
+  });
 
   // Lazy-initialize heavy objects on first access
   let projectRepo: ProjectRepository | null = null;
@@ -109,6 +145,7 @@ export function registerAllIpc(mainWindow: BrowserWindow, mcpServerHandle: McpHt
   let configManager: ConfigManager | null = null;
   let gitDetector: GitDetector | null = null;
   let shellResolver: ShellResolver | null = null;
+  let fontResolver: FontResolver | null = null;
 
   context = {
     mainWindow,
@@ -135,6 +172,10 @@ export function registerAllIpc(mainWindow: BrowserWindow, mcpServerHandle: McpHt
       if (!shellResolver) shellResolver = new ShellResolver();
       return shellResolver;
     },
+    get fontResolver() {
+      if (!fontResolver) fontResolver = new FontResolver();
+      return fontResolver;
+    },
     terminalSubmitScheduler,
     terminalSubmit,
     transcriptionService,
@@ -144,6 +185,7 @@ export function registerAllIpc(mainWindow: BrowserWindow, mcpServerHandle: McpHt
     mcpServerHandle,
     mobileBridgeService,
     boardEvents,
+    desktopNotifier,
   };
 
   // The bridge needs IpcContext (SessionManager, repos, DiffService,
@@ -152,6 +194,20 @@ export function registerAllIpc(mainWindow: BrowserWindow, mcpServerHandle: McpHt
   // yet at that point. attachContext() must run before reconcile() so the
   // first reconcile's syncSessions() has handlers to route into.
   mobileBridgeService.attachContext(context);
+  desktopNotifier.start();
+
+  // Durable activity-disposition-interval ledger (see
+  // activity-interval-recorder.ts and the session_activity_intervals
+  // migration comment for why this exists: the engine's own state is
+  // in-memory only, and events.jsonl is neither a faithful nor a
+  // reliably-retained record of committed transitions). getProjectDb caches
+  // connections per project, so resolving a fresh store on every event is
+  // cheap - it never opens a new connection.
+  const activityIntervalRecorder = new ActivityIntervalRecorder({
+    sessionManager,
+    getStore: (projectId) => new ActivityIntervalStore(getProjectDb(projectId)),
+  });
+  activityIntervalRecorder.start();
 
   const effectiveConfig = context.configManager.getEffectiveConfig(context.currentProjectPath ?? undefined);
   mobileBridgeService.reconcile({
@@ -159,7 +215,7 @@ export function registerAllIpc(mainWindow: BrowserWindow, mcpServerHandle: McpHt
     // enables the bridge regardless of persisted config (paired gates:
     // system.ts's config:set reconcile and the renderer's settings tab).
     enabled: __KANGENTIC_DEV__ && (effectiveConfig.mobileBridge?.enabled ?? false),
-    relayUrl: effectiveConfig.mobileBridge?.relayUrl ?? '',
+    relayUrl: resolveRelayUrl(effectiveConfig.mobileBridge),
   });
 
   registerProjectHandlers(context);
@@ -235,8 +291,8 @@ export async function pruneStaleWorktreeProjects(): Promise<void> {
   return pruneStaleWorktreeProjectsImpl(requireContext());
 }
 
-export async function openProjectByPath(projectPath: string) {
-  return openProjectByPathImpl(requireContext(), projectPath);
+export async function openProjectByPath(projectPath: string, overrides?: ProjectOpenByPathOverrides) {
+  return openProjectByPathImpl(requireContext(), projectPath, overrides);
 }
 
 export async function activateAllProjects(): Promise<void> {
