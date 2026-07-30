@@ -13,10 +13,9 @@
 // hook-manager.ts uses it to identify files it authored before
 // deletion, so it never removes user-authored plugins.
 //
-// The pure event-extraction helpers (extractSessionEvent /
-// extractToolStartEvent / extractToolEndEvent) are exported so they
-// can be unit-tested against captured OpenCode event fixtures
-// (tests/fixtures/opencode-plugin-events.json).
+// The pure event-extraction helpers stay private; their behavior is
+// exercised through KangenticActivity's returned hooks against captured
+// OpenCode event fixtures (tests/fixtures/opencode-plugin-events.json).
 import fs from 'node:fs';
 
 // allow: SIZE_OK - 單一安裝 asset 保留 bootstrap closure，避免 OpenCode plugin discovery 失配。
@@ -45,7 +44,7 @@ let rootSessionId = null;
  *  - `session.idle`:    emit `idle` (the agent has stopped working).
  *  - `session.error`:   emit `idle` with `detail: 'error'`.
  */
-export function extractSessionEvent(event, now = Date.now()) {
+function extractSessionEvent(event, now = Date.now()) {
   if (!event || typeof event !== 'object') return null;
   const eventType = event.type;
   if (eventType === 'session.created' || eventType === 'session.start') {
@@ -98,7 +97,7 @@ function truncate(value) {
  * Tries common arg field names in priority order; falls back to undefined
  * for unknown tools (the consumer is fine with no detail).
  */
-export function extractToolDetail(args) {
+function extractToolDetail(args) {
   if (!args || typeof args !== 'object') return undefined;
   return truncate(args.command ?? args.filePath ?? args.path ?? args.pattern ?? null);
 }
@@ -107,7 +106,7 @@ export function extractToolDetail(args) {
  * Extract a `tool_start` event from OpenCode's `tool.execute.before`
  * (input, output) handler arguments.
  */
-export function extractToolStartEvent(input, output, now = Date.now()) {
+function extractToolStartEvent(input, output, now = Date.now()) {
   const detail = extractToolDetail(output?.args);
   const nativeSessionId = nativeSessionIdFrom(input);
   const isRootTurn = rootSessionId !== null && nativeSessionId === rootSessionId;
@@ -125,7 +124,7 @@ export function extractToolStartEvent(input, output, now = Date.now()) {
 /**
  * Extract a `tool_end` event from OpenCode's `tool.execute.after` input.
  */
-export function extractToolEndEvent(input, now = Date.now()) {
+function extractToolEndEvent(input, now = Date.now()) {
   return {
     ts: now,
     type: 'tool_end',
@@ -200,6 +199,7 @@ function appendSanitizedError(eventsPath, nativeSessionId = null) {
   });
 }
 
+// 已發布的 OpenCode legacy loader 會把每個 named function export 當作 factory 呼叫，所以 helper 必須維持 private。
 export const KangenticActivity = ({ client, directory } = {}) => {
   const eventsPath = process.env.KANGENTIC_EVENTS_PATH;
   const initialPromptSourcePath = process.env[INITIAL_PROMPT_PATH_ENV];

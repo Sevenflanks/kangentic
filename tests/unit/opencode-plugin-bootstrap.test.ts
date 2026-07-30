@@ -301,8 +301,7 @@ describe('opencode-plugin', () => {
     });
 
     it('claims a fresh payload and submits its exact prompt through the root session API', async () => {
-      const pluginModule = await loadPlugin();
-      const plugin = pluginModule.KangenticActivity;
+      const { KangenticActivity: plugin } = await loadPlugin();
       const directory = makeTemporaryDirectory();
       const eventsPath = path.join(directory, 'events.jsonl');
       const sourcePath = writePayload(directory, {
@@ -321,19 +320,6 @@ describe('opencode-plugin', () => {
         expect(fs.readdirSync(directory).some((entry) => entry.includes('.claim-'))).toBe(false);
         return { data: { id: 'ses_fresh_123' } };
       });
-      root.promptAsync.mockImplementation(async () => {
-        root.promptCalled.resolve(undefined);
-        const turnStart = pluginModule.extractToolStartEvent(
-          { tool: 'bash', sessionID: 'ses_fresh_123' },
-          { args: { command: 'pwd' } },
-          1717000000001,
-        );
-        expect(turnStart.privateNativeBoundary).toEqual({
-          kind: 'turn-start',
-          nativeSessionId: 'ses_fresh_123',
-          occurredAt: 1717000000001,
-        });
-      });
       process.env[INITIAL_PROMPT_PATH_ENV] = sourcePath;
       process.env[EVENTS_PATH_ENV] = eventsPath;
 
@@ -341,6 +327,10 @@ describe('opencode-plugin', () => {
       expect(hooks).not.toBeInstanceOf(Promise);
       vi.runOnlyPendingTimers();
       await root.promptCalled.promise;
+      hooks['tool.execute.before'](
+        { tool: 'bash', sessionID: 'ses_fresh_123' },
+        { args: { command: 'pwd' } },
+      );
 
       expect(renameSpy).toHaveBeenCalledWith(sourcePath, expect.stringContaining('.claim-'));
       expect(root.create).toHaveBeenCalledWith({
@@ -367,16 +357,29 @@ describe('opencode-plugin', () => {
         throwOnError: true,
       });
       expect(root.command).not.toHaveBeenCalled();
-      expect(readEvents(eventsPath)).toEqual([{
-        ts: expect.any(Number),
-        type: 'session_start',
-        hookContext: JSON.stringify({ sessionID: 'ses_fresh_123' }),
-        privateNativeBoundary: {
-          kind: 'created',
-          nativeSessionId: 'ses_fresh_123',
-          occurredAt: expect.any(Number),
+      expect(readEvents(eventsPath)).toEqual([
+        {
+          ts: expect.any(Number),
+          type: 'session_start',
+          hookContext: JSON.stringify({ sessionID: 'ses_fresh_123' }),
+          privateNativeBoundary: {
+            kind: 'created',
+            nativeSessionId: 'ses_fresh_123',
+            occurredAt: expect.any(Number),
+          },
         },
-      }]);
+        {
+          ts: expect.any(Number),
+          type: 'tool_start',
+          tool: 'bash',
+          detail: 'pwd',
+          privateNativeBoundary: {
+            kind: 'turn-start',
+            nativeSessionId: 'ses_fresh_123',
+            occurredAt: expect.any(Number),
+          },
+        },
+      ]);
       const sessionStartAppendIndex = appendSpy.mock.calls.findIndex(([, payload]) => (
         String(payload).includes('"type":"session_start"')
       ));
