@@ -449,9 +449,9 @@ describe('SessionManager.write - regression-locking concurrent write case', () =
     // would start separate setTimeout(1) loops that interleaved, fragmenting
     // bracketed-paste sequences.
     //
-    // After the queue: both enqueue() calls append to the SAME buffer. The
-    // single drain loop emits them in FIFO order. The combined output must be
-    // exactly 'A'*50000 + 'B'*50000 with no interleaving.
+    // After the queue: each enqueue() call creates its own FIFO entry. The
+    // single drain loop completes one entry before the next, so combined output
+    // must be exactly 'A'*50000 + 'B'*50000 with no interleaving.
     vi.useFakeTimers();
     try {
       const { session, mockPty } = await spawnSessionWithMock(
@@ -478,24 +478,23 @@ describe('SessionManager.write - regression-locking concurrent write case', () =
       expect(writtenText).toBe(firstPayload + secondPayload);
 
       // No interleaving: the first 'B' must appear at exactly index 50000
-      // in the joined output. This is the definitive proof that both writes
-      // were serialised through the same queue buffer - any interleaving
-      // would scatter 'B' bytes among the first 50000 characters.
+      // in the joined output. This proves the per-session FIFO completed the
+      // first entry before starting the second - any interleaving would scatter
+      // 'B' bytes among the first 50000 characters.
       const firstBIndex = writtenText.indexOf('B');
       expect(firstBIndex).toBe(50000);
 
-      // At most ONE chunk may straddle the A/B boundary (the chunk that
-      // happens to span index 50000). Every other chunk must be pure A's
-      // or pure B's. Mixed chunks beyond the first transition indicate
-      // interleaved writes, not a single boundary crossing.
+      // Per-entry chunking produces zero mixed chunks because no chunk crosses
+      // an enqueue boundary. This legacy upper-bound assertion still guards
+      // the user-visible no-interleaving contract without exposing internals.
       const writtenChunks: string[] = (mockPty.write.mock.calls as [string][]).map(
         (callArgs) => callArgs[0],
       );
       const mixedChunkCount = writtenChunks.filter(
         (chunk) => chunk.includes('A') && chunk.includes('B'),
       ).length;
-      // Exactly 0 or 1 chunk may contain both A and B: the boundary chunk.
-      // More than 1 mixed chunk proves interleaving, which is the regression.
+      // Zero is expected for per-entry FIFO; more than 1 still proves the
+      // interleaving regression this integration test was created to catch.
       expect(mixedChunkCount).toBeLessThanOrEqual(1);
     } finally {
       vi.useRealTimers();

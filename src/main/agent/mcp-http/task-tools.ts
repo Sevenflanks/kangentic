@@ -1,11 +1,12 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod/v4';
-import { callHandler, runHandler, withProject, detectCrossProjectMention, sanitizeProjectName, PROJECT_SELECTOR_DESCRIPTION, type TaskCounter } from './handler-helpers';
+import { callHandler, runHandler, withProject, detectCrossProjectMention, sanitizeProjectName, PROJECT_SELECTOR_DESCRIPTION, type McpToolResult, type TaskCounter } from './handler-helpers';
 import { READ_ONLY_ANNOTATIONS, MUTATING_ANNOTATIONS } from './annotations';
 import type { RequestResolver } from './project-resolver';
 import type { BoardHit, BacklogHit, SearchScope } from '../commands/search-commands';
 import { TASK_DESCRIPTION_MAX_LENGTH, handleMoveTaskToProject } from '../commands/task-commands';
 import { resolveModelSelector, resolveEffortSelector } from '../../../shared/model-id';
+import type { CommandResponse } from '../commands/types';
 
 const PERMISSION_MODE_SCHEMA = z.enum(['default', 'plan', 'acceptEdits', 'dontAsk', 'bypassPermissions', 'auto']);
 
@@ -23,6 +24,29 @@ function buildRoutingCheckMessage(activeName: string, mentioned: string[]): stri
     return `Routing check: this task was about to be created in the active project "${safeActive}", but its text mentions the registered project ${safeMentioned[0]}. No task was created. Re-run kangentic_create_task with project: ${safeMentioned[0]} to file it there, or with project: "${safeActive}" to confirm the active project.`;
   }
   return `Routing check: this task was about to be created in the active project "${safeActive}", but its text mentions these other registered projects: ${safeMentioned.join(', ')}. No task was created. Re-run kangentic_create_task with project set to the intended one (e.g. project: ${safeMentioned[0]}), or with project: "${safeActive}" to confirm the active project.`;
+}
+
+function isStructuredContent(data: unknown): data is Record<string, unknown> {
+  return data !== null && typeof data === 'object' && !Array.isArray(data);
+}
+
+function toTaskMutationResult(response: CommandResponse, fallbackText: string): McpToolResult {
+  if (!response.success) {
+    return {
+      content: [{ type: 'text', text: response.error ?? fallbackText }],
+      isError: true,
+    };
+  }
+
+  const text = response.message ?? JSON.stringify(response.data ?? {});
+  const data = response.data;
+  if (isStructuredContent(data)) {
+    return {
+      content: [{ type: 'text', text }],
+      structuredContent: data,
+    };
+  }
+  return { content: [{ type: 'text', text }] };
 }
 
 /**
@@ -78,7 +102,7 @@ export function registerTaskTools(
       }),
       annotations: MUTATING_ANNOTATIONS,
     },
-    async ({ title, description, column, priority, labels, branchName, baseBranch, useWorktree, attachments, agentOverride, modelOverride, effortOverride, permissionMode, autoCommand, project }) => withProject(resolver, project, (ctx, resolved) => {
+    async ({ title, description, column, priority, labels, branchName, baseBranch, useWorktree, attachments, agentOverride, modelOverride, effortOverride, permissionMode, autoCommand, project }) => withProject(resolver, project, async (ctx, resolved) => {
       // Routing guardrail: when the caller defaulted to the active
       // project (no explicit selector) but the task text names a
       // DIFFERENT registered project, refuse instead of silently filing
@@ -110,7 +134,7 @@ export function registerTaskTools(
           isError: true,
         });
       }
-      return callHandler('create_task', {
+      const response = await runHandler('create_task', {
         title,
         description: description ?? '',
         column: column ?? null,
@@ -125,7 +149,8 @@ export function registerTaskTools(
         effortOverride: effortOverride ? resolveEffortSelector(effortOverride) : null,
         permissionMode: permissionMode ?? null,
         autoCommand: autoCommand ?? null,
-      }, ctx, 'Failed to create task');
+      }, ctx);
+      return toTaskMutationResult(response, 'Failed to create task');
     }, { alwaysAnnotate: true }),
   );
 
@@ -457,7 +482,10 @@ export function registerTaskTools(
       }),
       annotations: MUTATING_ANNOTATIONS,
     },
-    async ({ taskId, column, project }) => withProject(resolver, project, (ctx) => callHandler('move_task', { taskId, column }, ctx, 'Failed to move task')),
+    async ({ taskId, column, project }) => withProject(resolver, project, async (ctx) => {
+      const response = await runHandler('move_task', { taskId, column }, ctx);
+      return toTaskMutationResult(response, 'Failed to move task');
+    }),
   );
 
   // --- kangentic_move_task_to_project ---

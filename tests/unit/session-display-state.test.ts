@@ -4,7 +4,7 @@
  * activity, and spawn progress data. Covers all state kinds plus edge cases.
  */
 import { describe, it, expect } from 'vitest';
-import { getTaskProgress } from '../../src/renderer/utils/task-progress';
+import { deriveTerminalOverlayLabel, getTaskProgress } from '../../src/renderer/utils/task-progress';
 import type { Session, SessionUsage, ActivityState } from '../../src/shared/types';
 
 /** Minimal session factory - only fields that matter for the function. */
@@ -123,5 +123,15 @@ describe('getTaskProgress', () => {
     const session = makeSession({ status: 'running' });
     const result = getTaskProgress({ session, usage: MOCK_USAGE, activity: 'idle' as ActivityState });
     expect(result).toEqual({ kind: 'running', activity: 'idle', usage: MOCK_USAGE });
+  });
+});
+
+describe('deriveTerminalOverlayLabel', () => {
+  it('ignores a lane command when no explicit pending label exists', () => {
+    const laneCommandCanary = 'private-command-canary';
+
+    const label = Reflect.apply(deriveTerminalOverlayLabel, null, [null, false, laneCommandCanary]);
+
+    expect(label).toBe('Starting agent...');
   });
 });

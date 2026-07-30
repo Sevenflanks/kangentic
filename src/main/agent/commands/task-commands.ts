@@ -11,6 +11,7 @@ import { handleCreateBacklogTask, BACKLOG_DESCRIPTION_MAX_LENGTH } from './backl
 import { linkPRForTask } from '../../pr/pr-linking';
 import type { CommandContext, CommandHandler, CommandResponse } from './types';
 import type { TaskUpdateInput, PermissionMode } from '../../../shared/types';
+import type { AutoCommandImmediateOutcome } from '../../../shared/auto-command-outcome';
 
 export const TASK_DESCRIPTION_MAX_LENGTH = 50_000;
 
@@ -22,6 +23,23 @@ export interface DescriptionEdit {
 export type DescriptionEditResult =
   | { success: true; text: string }
   | { success: false; error: string };
+
+function withAutoCommandOutcome(
+  data: { id: string; displayId: number; column: string; taskId?: string; title?: string },
+  autoCommand: AutoCommandImmediateOutcome,
+): { id: string; displayId: number; column: string; taskId?: string; title?: string; autoCommand: AutoCommandImmediateOutcome; warning?: string } {
+  switch (autoCommand.kind) {
+    case 'scheduled':
+    case 'not-applicable':
+      return { ...data, autoCommand };
+    case 'skipped':
+      return { ...data, autoCommand, warning: autoCommand.warning };
+    default: {
+      const exhaustiveOutcome: never = autoCommand;
+      return exhaustiveOutcome;
+    }
+  }
+}
 
 /**
  * Render a `find` value for an error message without echoing a huge string
@@ -77,7 +95,7 @@ export function computeUpdatedDescription(
   return { success: true, text };
 }
 
-export const handleCreateTask: CommandHandler = (
+export const handleCreateTask: CommandHandler = async (
   params: Record<string, unknown>,
   context: CommandContext,
 ) => {
@@ -193,12 +211,31 @@ export const handleCreateTask: CommandHandler = (
   }
 
   context.onTaskCreated(task, targetSwimlane.name, targetSwimlane.id);
-
-  return {
-    success: true,
-    data: { taskId: task.id, displayId: task.display_id, title: task.title, column: targetSwimlane.name },
-    message: `Created task "${task.title}" in ${targetSwimlane.name} column (#${task.display_id}, id: ${task.id})`,
+  const createdTaskData = {
+    id: task.id,
+    taskId: task.id,
+    title: task.title,
+    displayId: task.display_id,
+    column: targetSwimlane.name,
   };
+  const createdTaskMessage = `Created task "${task.title}" in ${targetSwimlane.name} column (#${task.display_id}, id: ${task.id})`;
+
+  try {
+    const autoCommandOutcome = await context.onTaskAutoSpawn(task, targetSwimlane.id);
+    return {
+      success: true,
+      data: withAutoCommandOutcome(createdTaskData, autoCommandOutcome),
+      message: createdTaskMessage,
+    };
+  } catch {
+    // Task 已持久化且已通知 board；這裡只轉換 startup rejection，不能擴大到前面的失敗邊界。
+    const warning = 'Task was created, but the agent could not be started. The task remains on the board.';
+    return {
+      success: true,
+      data: { ...createdTaskData, warning },
+      message: `${createdTaskMessage} ${warning}`,
+    };
+  }
 };
 
 export const handleUpdateTask: CommandHandler = (
@@ -429,10 +466,10 @@ export const handleLinkPr: CommandHandler = async (
   }
 };
 
-export const handleMoveTask: CommandHandler = (
+export const handleMoveTask: CommandHandler = async (
   params: Record<string, unknown>,
   context: CommandContext,
-): CommandResponse => {
+): Promise<CommandResponse> => {
   const taskIdParam = params.taskId as string | null;
   const columnName = params.column as string | null;
 
@@ -460,7 +497,11 @@ export const handleMoveTask: CommandHandler = (
     return {
       success: true,
       message: `Task "${task.title}" is already in ${targetSwimlane.name}.`,
-      data: { id: task.id, displayId: task.display_id, column: targetSwimlane.name },
+      data: withAutoCommandOutcome({
+        id: task.id,
+        displayId: task.display_id,
+        column: targetSwimlane.name,
+      }, { kind: 'not-applicable' }),
     };
   }
 
@@ -468,20 +509,20 @@ export const handleMoveTask: CommandHandler = (
   const targetTasks = taskRepo.list(targetSwimlane.id);
   const targetPosition = targetTasks.length;
 
-  // Fire-and-forget the async move (transition engine, agent spawn/suspend, worktree management).
-  // The MCP response confirms intent; the LLM should re-query to verify state if needed.
-  void context.onTaskMove({
+  const result = await context.onTaskMove({
     taskId: task.id,
     targetSwimlaneId: targetSwimlane.id,
     targetPosition,
-  }).catch((error) => {
-    console.error(`[move_task] Failed for task ${task.id.slice(0, 8)}:`, error);
   });
 
   return {
     success: true,
     message: `Moving "${task.title}" (#${task.display_id}) to ${targetSwimlane.name}.`,
-    data: { id: task.id, displayId: task.display_id, column: targetSwimlane.name },
+    data: withAutoCommandOutcome({
+      id: task.id,
+      displayId: task.display_id,
+      column: targetSwimlane.name,
+    }, result.autoCommand),
   };
 };
 

@@ -114,7 +114,15 @@ export function registerBoardHandlers(context: IpcContext): void {
       before.model_override !== result.model_override
       || before.effort_override !== result.effort_override
     );
-    if (overridesChanged) {
+    const liveSubmissionConfigurationChanged = !!before && (
+      before.auto_spawn !== result.auto_spawn
+      || before.auto_command !== result.auto_command
+      || before.agent_override !== result.agent_override
+      || before.session_target !== result.session_target
+      || before.session_spawn_strategy !== result.session_spawn_strategy
+      || overridesChanged
+    );
+    if (liveSubmissionConfigurationChanged) {
       const projectId = context.currentProjectId;
       const projectPath = context.currentProjectPath;
       const sessionRepo = projectId
@@ -125,6 +133,9 @@ export function registerBoardHandlers(context: IpcContext): void {
         if (!task.session_id) continue;
         const session = context.sessionManager.getSession(task.session_id);
         if (!session || session.status !== 'running') continue;
+        // 行為設定改變只讓既有 waiter 失效，不可因儲存 lane 而重跑 auto_command。
+        context.terminalSubmitScheduler.cancel(task.id);
+        if (!overridesChanged) continue;
         const adapter = task.agent ? agentRegistry.get(task.agent) : undefined;
         // No auto_command propagation on column edits - the column-edit
         // intent is "change settings", not "re-run any auto trigger".
@@ -148,7 +159,7 @@ export function registerBoardHandlers(context: IpcContext): void {
               if (!restart.ok) {
                 console.warn(
                   `[SWIMLANE_UPDATE] Could not restart session for task ${taskId.slice(0, 8)}`
-                  + ` after model change in column "${result.name}": ${restart.reason}`,
+                  + ` after model change.`,
                 );
                 return;
               }
@@ -164,12 +175,13 @@ export function registerBoardHandlers(context: IpcContext): void {
           } else {
             console.warn(
               `[SWIMLANE_UPDATE] Skipping model-change restart for task ${task.id.slice(0, 8)}`
-              + ` in column "${result.name}": no resolved project context.`,
+              + `: no resolved project context.`,
             );
           }
           continue;
         }
 
+        if (!context.sessionManager.isWritable(task.session_id)) continue;
         context.terminalSubmitScheduler.scheduleKeystrokes(task.id, task.session_id, plan.sequence, {
           verifier: plan.verifier,
           verifiedPrefixLength: plan.verifiedPrefixLength,
@@ -180,7 +192,7 @@ export function registerBoardHandlers(context: IpcContext): void {
         }
         console.log(
           `[SWIMLANE_UPDATE] Propagating ${plan.sequence.length} setting(s) to active session for task ${task.id.slice(0, 8)}`
-          + ` in column "${result.name}"${plan.verifier ? ' (with command verification)' : ''}: ${plan.sequence.join(' | ')}`,
+          + `${plan.verifier ? ' (with command verification)' : ''}.`,
         );
       }
     }

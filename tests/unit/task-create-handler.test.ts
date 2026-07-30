@@ -31,6 +31,28 @@
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
+const {
+  mockAgentRegistryGet,
+  mockDirectGetProjectRepos,
+  mockDirectEnsureTaskWorktree,
+  mockDirectResumeSuspendedSession,
+  mockDirectRunSpawnPreamble,
+  mockGetProjectDb,
+  mockSessionRepoGetLatestForTask,
+  mockSessionRepoGetLatestForTaskByTypeAndIsolation,
+  mockSwimlaneRepoGetById,
+} = vi.hoisted(() => ({
+  mockAgentRegistryGet: vi.fn(),
+  mockDirectGetProjectRepos: vi.fn(),
+  mockDirectEnsureTaskWorktree: vi.fn(async () => undefined),
+  mockDirectResumeSuspendedSession: vi.fn(async () => undefined),
+  mockDirectRunSpawnPreamble: vi.fn(() => ({ agent: 'mock-agent', isHandoff: false })),
+  mockGetProjectDb: vi.fn(() => ({})),
+  mockSessionRepoGetLatestForTask: vi.fn(() => undefined),
+  mockSessionRepoGetLatestForTaskByTypeAndIsolation: vi.fn(() => undefined),
+  mockSwimlaneRepoGetById: vi.fn(),
+}));
+
 // ---------------------------------------------------------------------------
 // Hoisted mocks
 // ---------------------------------------------------------------------------
@@ -61,15 +83,20 @@ vi.mock('simple-git', () => ({
   default: vi.fn(() => ({})),
 }));
 
-vi.mock('../../src/main/db/database', () => ({ getProjectDb: vi.fn(() => ({})) }));
+vi.mock('../../src/main/db/database', () => ({ getProjectDb: mockGetProjectDb }));
 vi.mock('../../src/main/db/repositories/task-repository', () => ({
   TaskRepository: class {},
 }));
 vi.mock('../../src/main/db/repositories/session-repository', () => ({
-  SessionRepository: class {},
+  SessionRepository: class {
+    getLatestForTask = mockSessionRepoGetLatestForTask;
+    getLatestForTaskByTypeAndIsolation = mockSessionRepoGetLatestForTaskByTypeAndIsolation;
+  },
 }));
 vi.mock('../../src/main/db/repositories/swimlane-repository', () => ({
-  SwimlaneRepository: class {},
+  SwimlaneRepository: class {
+    getById = mockSwimlaneRepoGetById;
+  },
 }));
 vi.mock('../../src/main/db/repositories/action-repository', () => ({
   ActionRepository: class {},
@@ -135,6 +162,38 @@ vi.mock('../../src/main/ipc/handlers/task-move', () => ({
   handleTaskMove: vi.fn(async () => {}),
 }));
 
+vi.mock('../../src/main/agent/agent-registry', () => ({
+  agentRegistry: { get: mockAgentRegistryGet },
+}));
+
+vi.mock('../../src/main/ipc/helpers/project-repos', () => ({
+  getProjectRepos: mockDirectGetProjectRepos,
+  resolveProjectContext: (context: { currentProjectId: string | null; currentProjectPath: string | null }, projectId?: string | null) => ({
+    projectId: projectId ?? context.currentProjectId,
+    projectPath: context.currentProjectPath,
+  }),
+}));
+
+vi.mock('../../src/main/ipc/helpers/task-git', () => ({
+  ensureTaskWorktree: mockDirectEnsureTaskWorktree,
+  ensureTaskBranchCheckout: vi.fn(async () => undefined),
+}));
+
+vi.mock('../../src/main/transition-engine/spawn-preamble', () => ({
+  runSpawnPreamble: mockDirectRunSpawnPreamble,
+}));
+
+vi.mock('../../src/main/transition-engine/transition-engine', () => ({
+  TransitionEngine: class {
+    executeTransition = vi.fn(async () => undefined);
+    resumeSuspendedSession = mockDirectResumeSuspendedSession;
+  },
+}));
+
+vi.mock('../../src/main/diagnostics/project-log-context', () => ({
+  runWithProjectLogContext: <T>(_projectName: string, run: () => Promise<T>): Promise<T> => run(),
+}));
+
 // ---------------------------------------------------------------------------
 // Capture handlers registered by ipcMain.handle
 // ---------------------------------------------------------------------------
@@ -146,6 +205,8 @@ const capturedHandlers = new Map<string, (...args: unknown[]) => unknown>();
 // ---------------------------------------------------------------------------
 
 import { registerTaskCrudHandlers } from '../../src/main/ipc/handlers/task-crud';
+import { autoSpawnForTask } from '../../src/main/ipc/helpers/agent-spawn';
+import { _taskLockCountForTesting } from '../../src/main/ipc/task-lifecycle-lock';
 import { IPC } from '../../src/shared/ipc-channels';
 
 // ---------------------------------------------------------------------------
@@ -174,6 +235,7 @@ interface MockSwimlane {
 }
 
 interface MockTaskRepo {
+  clearAutoCommand: ReturnType<typeof vi.fn>;
   create: ReturnType<typeof vi.fn>;
   getById: ReturnType<typeof vi.fn>;
   list: ReturnType<typeof vi.fn>;
@@ -249,6 +311,11 @@ function createMockTaskRepo(task: MockTask): MockTaskRepo {
   // Stored task reflects updates (e.g. session_id set by the engine)
   let storedTask = { ...task };
   return {
+    clearAutoCommand: vi.fn((taskId: string) => {
+      if (taskId === storedTask.id) {
+        storedTask = { ...storedTask, auto_command: null };
+      }
+    }),
     create: vi.fn((_input: unknown) => storedTask),
     getById: vi.fn((_id: string) => storedTask),
     list: vi.fn(() => [storedTask]),
@@ -491,6 +558,86 @@ describe('TASK_CREATE handler', () => {
     // The engine and repos the handler constructed are handed through.
     expect(spawnArg.engine).toBe(engine);
     expect(spawnArg.tasks).toBe(taskRepo);
+  });
+
+  it('consumes a skipped MCP task auto-command exactly once while the caller-held lock is active', async () => {
+    task = createMockTask('task-mcp-auto-command', {
+      auto_command: '/review',
+      swimlane_id: 'lane-doing',
+    });
+    taskRepo = createMockTaskRepo(task);
+    targetLane = createMockSwimlane('lane-doing', {
+      auto_command: '/lane-command',
+      auto_spawn: true,
+    });
+    context.projectRepo.getById.mockReturnValue({
+      id: 'proj-123',
+      name: 'Example project',
+      path: '/mock/project',
+      default_agent: 'mock-agent',
+      default_model: null,
+      default_effort: null,
+    });
+    mockDirectGetProjectRepos.mockReturnValue({
+      tasks: taskRepo,
+      actions: {},
+      attachments: {},
+    });
+    mockSwimlaneRepoGetById.mockReturnValue(targetLane);
+    mockAgentRegistryGet.mockReturnValue({
+      sessionType: 'mock-session',
+      getAutoCommandDisposition: () => ({
+        kind: 'skip',
+        reason: 'fresh-not-supported',
+        warning: 'Fresh sessions do not support this Auto-command.',
+      }),
+    });
+    const lockCounts: number[] = [];
+    taskRepo.clearAutoCommand.mockImplementation(() => {
+      lockCounts.push(_taskLockCountForTesting());
+    });
+
+    const outcome = await autoSpawnForTask(context as never, 'proj-123', task, targetLane.id);
+
+    expect(outcome).toEqual({
+      kind: 'skipped',
+      reason: 'fresh-not-supported',
+      warning: 'Fresh sessions do not support this Auto-command.',
+    });
+    expect(taskRepo.clearAutoCommand).toHaveBeenCalledOnce();
+    expect(taskRepo.clearAutoCommand).toHaveBeenCalledWith(task.id);
+    expect(lockCounts).toEqual([1]);
+    expect(targetLane.auto_command).toBe('/lane-command');
+  });
+
+  it('propagates a fallback spawn lifecycle failure without consuming the task override', async () => {
+    task = createMockTask('task-mcp-failure', {
+      auto_command: '/review',
+      swimlane_id: 'lane-doing',
+    });
+    taskRepo = createMockTaskRepo(task);
+    targetLane = createMockSwimlane('lane-doing', { auto_spawn: true });
+    context.projectRepo.getById.mockReturnValue({
+      id: 'proj-123',
+      name: 'Example project',
+      path: '/mock/project',
+      default_agent: 'mock-agent',
+      default_model: null,
+      default_effort: null,
+    });
+    mockDirectGetProjectRepos.mockReturnValue({
+      tasks: taskRepo,
+      actions: {},
+      attachments: {},
+    });
+    mockSwimlaneRepoGetById.mockReturnValue(targetLane);
+    mockAgentRegistryGet.mockReturnValue(undefined);
+    mockDirectResumeSuspendedSession.mockRejectedValueOnce(new Error('session launch failed'));
+
+    await expect(
+      autoSpawnForTask(context as never, 'proj-123', task, targetLane.id),
+    ).rejects.toThrow('session launch failed');
+    expect(taskRepo.clearAutoCommand).not.toHaveBeenCalled();
   });
 
   it('returns the created task even when spawnAgent rejects', async () => {

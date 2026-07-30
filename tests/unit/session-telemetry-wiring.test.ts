@@ -14,12 +14,70 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+
+vi.mock('../../src/main/analytics/analytics', () => ({
+  trackEvent: vi.fn(),
+  sanitizeErrorMessage: (message: string) => message,
+}));
+
 import { SessionTelemetry } from '../../src/main/activity-engine/session-telemetry';
+import { SessionManager } from '../../src/main/pty/session-manager';
+import { OpenCodeAdapter } from '../../src/main/agent/adapters/opencode/opencode-adapter';
 import type { SessionTelemetryOptions } from '../../src/main/activity-engine/session-telemetry';
 import type { ProcessInfo, ProcessTreeProbe } from '../../src/main/activity-engine/background-shell/process-tree';
 import { looksLikeShellId } from '../../src/main/activity-engine/background-shell/looks-like-shell-id';
 import { EventType } from '../../src/shared/types';
 import type { ActivityState, ActivityReason, SessionUsage, SessionEvent } from '../../src/shared/types';
+
+describe('SessionManager: adapter-private raw event routing', () => {
+  it('routes raw boundaries through the optional adapter hook without an agent-name branch', () => {
+    const manager = new SessionManager();
+    const adapter = new OpenCodeAdapter();
+    manager['registry'].set('pty-a', {
+      id: 'pty-a',
+      taskId: 'task-a',
+      projectId: 'project-a',
+      pty: null,
+      status: 'running',
+      shell: 'pwsh',
+      cwd: 'C:\\repo',
+      startedAt: new Date(0).toISOString(),
+      exitCode: null,
+      resuming: false,
+      transient: false,
+      exitSequence: ['\x03'],
+      agentParser: adapter,
+      agentName: 'adapter-name-does-not-control-routing',
+    });
+    manager['nativeIdleEvidence'].initializeSession('pty-a', 1);
+    const createdLine = JSON.stringify({
+      ts: 10,
+      type: 'session_start',
+      privateNativeBoundary: {
+        kind: 'created',
+        nativeSessionId: 'root-a',
+        occurredAt: 10,
+      },
+    });
+    const idleLine = JSON.stringify({
+      ts: 20,
+      type: 'idle',
+      privateNativeBoundary: {
+        kind: 'idle',
+        nativeSessionId: 'root-a',
+        occurredAt: 20,
+      },
+    });
+
+    manager['statusFileReader']['callbacks'].onEventsParsed('pty-a', [createdLine, idleLine], []);
+
+    expect(manager['nativeIdleEvidence'].snapshot('pty-a')?.cleanIdle).toEqual({
+      nativeSessionId: 'root-a',
+      occurredAt: 20,
+    });
+    manager.dispose();
+  });
+});
 
 // ==== Minimal mock process-tree probe ====
 

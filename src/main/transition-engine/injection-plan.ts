@@ -1,5 +1,5 @@
 import type { Project, SessionRecord, Swimlane, Task } from '../../shared/types';
-import type { AgentAdapter } from '../agent/agent-adapter';
+import { DEFAULT_LIVE_SUBMISSION_POLICY, type AgentAdapter, type LiveSubmissionPolicy } from '../agent/agent-adapter';
 import type { SessionRepository } from '../db/repositories/session-repository';
 import type { CommandVerifier } from './terminal-submit-scheduler';
 
@@ -53,6 +53,8 @@ export interface InjectionPlanInput {
   project?: Pick<Project, 'default_model' | 'default_effort'> | null;
   /** Already-interpolated auto_command from the destination column, or empty. */
   autoCommand?: string;
+  /** Explicit live PTY record. `undefined` retains the legacy latest-record lookup. */
+  sessionRecord?: SessionRecord | null;
 }
 
 export interface InjectionPlan {
@@ -85,10 +87,11 @@ export interface InjectionPlan {
    * and the respawn records `applied_model` itself via its `--model` flag.
    */
   appliedSettings?: { effort?: string };
+  liveSubmissionPolicy?: LiveSubmissionPolicy;
 }
 
 export function prepareInjectionPlan(input: InjectionPlanInput): InjectionPlan | null {
-  const { adapter, sessionRepo, task, toLane, autoCommand, project } = input;
+  const { adapter, sessionRepo, task, toLane, autoCommand, project, sessionRecord } = input;
 
   // SOURCE is the model/effort the live session is ACTUALLY running at, read
   // from the session record (`applied_model` / `applied_effort`), NOT the
@@ -105,7 +108,9 @@ export function prepareInjectionPlan(input: InjectionPlanInput): InjectionPlan |
   // would read source = the applied project default (recorded at the last
   // spawn) vs target = null, and spuriously restart/re-inject even though
   // nothing actually changed.
-  const record = sessionRepo?.getLatestForTask(task.id) ?? null;
+  const record = sessionRecord !== undefined
+    ? sessionRecord
+    : sessionRepo?.getLatestForTask(task.id) ?? null;
   const sourceModel = task.model_override ?? record?.applied_model ?? null;
   const targetModel = task.model_override ?? toLane?.model_override ?? project?.default_model ?? null;
   const sourceEffort = task.effort_override ?? record?.applied_effort ?? null;
@@ -168,6 +173,9 @@ export function prepareInjectionPlan(input: InjectionPlanInput): InjectionPlan |
     verifiedPrefixLength: settingsSequence.length,
     needsRestartForModel,
     ...(hasApplied ? { appliedSettings } : {}),
+    ...(trimmedAutoCommand
+      ? { liveSubmissionPolicy: adapter?.liveSubmissionPolicy ?? DEFAULT_LIVE_SUBMISSION_POLICY }
+      : {}),
   };
 }
 

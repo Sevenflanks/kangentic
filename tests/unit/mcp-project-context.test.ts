@@ -1,5 +1,11 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
+const { mockGetProjectDb, mockAutoSpawnForTask, mockHandleTaskMove } = vi.hoisted(() => ({
+  mockGetProjectDb: vi.fn(() => ({})),
+  mockAutoSpawnForTask: vi.fn(async () => ({ kind: 'not-applicable' })),
+  mockHandleTaskMove: vi.fn(async () => ({ ok: true, autoCommand: { kind: 'not-applicable' } })),
+}));
+
 // The module under test (`mcp-project-context.ts`) pulls in several
 // Electron/Node-native dependencies through its own imports:
 //   - getProjectDb   -> better-sqlite3 native module
@@ -13,15 +19,15 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 // the module-level imports to resolve without crashing.
 
 vi.mock('../../src/main/db/database', () => ({
-  getProjectDb: vi.fn(() => ({})),
+  getProjectDb: mockGetProjectDb,
 }));
 
 vi.mock('../../src/main/ipc/helpers', () => ({
-  autoSpawnForTask: vi.fn(() => Promise.resolve()),
+  autoSpawnForTask: mockAutoSpawnForTask,
 }));
 
 vi.mock('../../src/main/ipc/handlers/task-move', () => ({
-  handleTaskMove: vi.fn(() => Promise.resolve()),
+  handleTaskMove: mockHandleTaskMove,
 }));
 
 vi.mock('../../src/main/git/worktree-manager', () => ({
@@ -184,6 +190,7 @@ describe('buildCommandContextForProject', () => {
     expect(typeof context!.onTaskUpdated).toBe('function');
     expect(typeof context!.onTaskDeleted).toBe('function');
     expect(typeof context!.onTaskMove).toBe('function');
+    expect(typeof context!.onTaskAutoSpawn).toBe('function');
     expect(typeof context!.onSwimlaneUpdated).toBe('function');
     expect(typeof context!.onBacklogChanged).toBe('function');
     expect(typeof context!.onLabelColorsChanged).toBe('function');
@@ -294,6 +301,81 @@ describe('buildCommandContextForProject - consolidated board-changed bus fan-out
     context.onTaskCreated({ id: 'task-0', title: 'Task Zero' } as never, 'To Do', 'lane-0');
 
     expect(emitBoardChanged).toHaveBeenCalledWith({ projectId: DEFAULT_ID, change: 'task-created', ids: ['task-0'] });
+  });
+
+  it('keeps onTaskCreated notification-only without starting an Auto-command lifecycle', () => {
+    const { ipcContext, send, emitBoardChanged } = makeFanOutContext();
+    const context = buildCommandContextForProject(ipcContext, DEFAULT_ID);
+    if (context === null) throw new Error('Command context was not built');
+
+    context.onTaskCreated({ id: 'task-notification', title: 'Notification only' } as never, 'To Do', 'lane-0');
+
+    expect(mockAutoSpawnForTask).not.toHaveBeenCalled();
+    expect(send).toHaveBeenCalledWith(
+      'TASK_CREATED_BY_AGENT', 'task-notification', 'Notification only', 'To Do', DEFAULT_ID,
+    );
+    expect(emitBoardChanged).toHaveBeenCalledWith({
+      projectId: DEFAULT_ID,
+      change: 'task-created',
+      ids: ['task-notification'],
+    });
+  });
+
+  it('awaits and returns the distinct Auto-command lifecycle outcome', async () => {
+    const { ipcContext } = makeFanOutContext();
+    const context = buildCommandContextForProject(ipcContext, DEFAULT_ID);
+    if (context === null) throw new Error('Command context was not built');
+    const outcome = { kind: 'scheduled', transport: 'native-idle', generation: 4 } as const;
+    mockAutoSpawnForTask.mockResolvedValueOnce(outcome);
+    const task = { id: 'task-autospawn', title: 'Await lifecycle' } as never;
+
+    const result = await context.onTaskAutoSpawn(task, 'lane-review');
+
+    expect(result).toBe(outcome);
+    expect(mockAutoSpawnForTask).toHaveBeenCalledWith(ipcContext, DEFAULT_ID, task, 'lane-review');
+  });
+
+  it('propagates an Auto-command lifecycle failure instead of fabricating an outcome', async () => {
+    const { ipcContext } = makeFanOutContext();
+    const context = buildCommandContextForProject(ipcContext, DEFAULT_ID);
+    if (context === null) throw new Error('Command context was not built');
+    mockAutoSpawnForTask.mockRejectedValueOnce(new Error('worktree setup failed'));
+
+    await expect(
+      context.onTaskAutoSpawn({ id: 'task-failed', title: 'Failure' } as never, 'lane-review'),
+    ).rejects.toThrow('worktree setup failed');
+  });
+
+  it('returns the exact immediate move result after notifying the renderer', async () => {
+    const { ipcContext, send, emitBoardChanged } = makeFanOutContext();
+    const movedTask = { id: 'task-moved', title: 'Moved task' };
+    mockGetProjectDb.mockReturnValueOnce({
+      prepare: vi.fn(() => ({ get: vi.fn(() => movedTask) })),
+    });
+    const moveResult = {
+      ok: true,
+      autoCommand: { kind: 'scheduled', transport: 'legacy' },
+    } as const;
+    mockHandleTaskMove.mockResolvedValueOnce(moveResult);
+    const context = buildCommandContextForProject(ipcContext, DEFAULT_ID);
+    if (context === null) throw new Error('Command context was not built');
+    const input = { taskId: movedTask.id, targetSwimlaneId: 'lane-done', targetPosition: 2 };
+
+    const result = await context.onTaskMove(input);
+
+    expect(result).toBe(moveResult);
+    expect(mockHandleTaskMove).toHaveBeenCalledWith(
+      ipcContext,
+      input,
+      DEFAULT_ID,
+      '/projects/example',
+    );
+    expect(send).toHaveBeenCalledWith('TASK_UPDATED_BY_AGENT', movedTask.id, movedTask.title, DEFAULT_ID);
+    expect(emitBoardChanged).toHaveBeenCalledWith({
+      projectId: DEFAULT_ID,
+      change: 'task-updated',
+      ids: [movedTask.id],
+    });
   });
 
   it('onTaskUpdated fires both the IPC push and a task-updated board event', () => {

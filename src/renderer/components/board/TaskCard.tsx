@@ -2,7 +2,7 @@ import React, { useCallback, useMemo, useState } from 'react';
 import { useShallow } from 'zustand/react/shallow';
 import { useSortable } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
-import { Loader2, CirclePause, Mail, Paperclip, Trash2 } from 'lucide-react';
+import { Loader2, CircleAlert, CirclePause, Check, Mail, Paperclip, Trash2, X } from 'lucide-react';
 import { formatRelativeTime } from '../../lib/datetime';
 import { TaskChangesDialog } from '../dialogs/TaskChangesDialog';
 import { ConfirmDialog } from '../dialogs/ConfirmDialog';
@@ -13,7 +13,7 @@ import { useProjectStore } from '../../stores/project-store';
 import { useBacklogStore } from '../../stores/backlog-store';
 import { useConfigStore } from '../../stores/config-store';
 import { useToastStore } from '../../stores/toast-store';
-import { useTaskProgress } from '../../utils/task-progress';
+import { getLiveDeliveryLabel, useAutoCommandWarning, useLiveDeliveryStatus, useTaskProgress } from '../../utils/task-progress';
 import { isContextWindowTrusted } from '../../utils/format-tokens';
 import { requiresUserInteraction, isActive } from '../../../shared/activity-state';
 import { getProgressColor } from '../../utils/color-lerp';
@@ -54,6 +54,10 @@ const TaskCardInner = function TaskCard({ task, isDragOverlay, compact, onDelete
   );
   const setDetailTaskId = useSessionStore((s) => s.setDetailTaskId);
   const displayState = useTaskProgress(task.id, sessionId);
+  const liveDeliveryStatus = useLiveDeliveryStatus(task.id);
+  const liveDeliveryLabel = liveDeliveryStatus ? getLiveDeliveryLabel(liveDeliveryStatus) : null;
+  const autoCommandWarning = useAutoCommandWarning(task.id);
+  const clearAutoCommandWarningForTask = useSessionStore((s) => s.clearAutoCommandWarningForTask);
 
   const {
     attributes,
@@ -176,6 +180,11 @@ const TaskCardInner = function TaskCard({ task, isDragOverlay, compact, onDelete
     }
     await useBoardStore.getState().deleteTask(task.id);
     setConfirmDelete(false);
+  };
+
+  const handleDismissAutoCommandWarning = (event: React.MouseEvent<HTMLButtonElement>) => {
+    event.stopPropagation();
+    clearAutoCommandWarningForTask(task.id);
   };
 
   if (compact) {
@@ -323,8 +332,45 @@ const TaskCardInner = function TaskCard({ task, isDragOverlay, compact, onDelete
           </div>
         )}
 
+        {!isCompactDensity && autoCommandWarning && (
+          <div
+            className="mt-2 pt-2 border-t border-edge flex items-start gap-1 text-xs text-attention"
+            data-testid="auto-command-warning"
+            role="alert"
+          >
+            <CircleAlert size={12} className="shrink-0 mt-0.5" />
+            <span className="min-w-0 flex-1 whitespace-normal">{autoCommandWarning.message}</span>
+            <button
+              type="button"
+              aria-label="Dismiss auto-command warning"
+              className="shrink-0 w-6 h-6 flex items-center justify-center rounded text-attention hover:text-fg hover:bg-surface-hover transition-colors"
+              onClick={handleDismissAutoCommandWarning}
+              onPointerDown={(event) => event.stopPropagation()}
+            >
+              <X size={12} />
+            </button>
+          </div>
+        )}
+
         {/* Bottom bar -- exhaustive switch on display state */}
         {!isCompactDensity && (() => {
+          if (liveDeliveryStatus && liveDeliveryLabel) {
+            const isWarning = liveDeliveryStatus.state === 'cancelled';
+            const isDelivered = liveDeliveryStatus.state === 'delivered';
+            return (
+              <div
+                className="mt-2 pt-2 border-t border-edge"
+                data-testid="live-delivery-status"
+                role="status"
+                aria-live="polite"
+              >
+                <span className={`text-xs flex gap-1 min-w-0 ${isWarning ? 'items-start text-attention' : 'items-center text-fg-faint'}`}>
+                  {isWarning ? <CircleAlert size={12} className="shrink-0" /> : isDelivered ? <Check size={12} className="shrink-0" /> : <Loader2 size={12} className="animate-spin shrink-0" />}
+                  <span className={isWarning ? 'min-w-0 whitespace-normal' : 'truncate'}>{liveDeliveryLabel}</span>
+                </span>
+              </div>
+            );
+          }
           switch (displayState.kind) {
             case 'running': {
               // Footer model label is the human name (e.g. "Opus 4.8"). We

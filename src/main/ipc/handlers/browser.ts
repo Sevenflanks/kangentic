@@ -48,6 +48,12 @@ export function registerBrowserHandlers(context: IpcContext): void {
     if (!input.sessionId) throw new Error('captureAndSend requires a sessionId');
     if (!input.pngBase64) throw new Error('captureAndSend requires pngBase64');
     if (!input.cwd) throw new Error('captureAndSend requires cwd');
+    if (!input.projectId) throw new Error('captureAndSend requires projectId');
+
+    const project = context.projectRepo.getById(input.projectId);
+    if (!project) throw new Error('captureAndSend project not found');
+
+    const projectRoot = project.path;
 
     // Defensive: sessionId is interpolated into a filesystem path. Reject
     // anything that isn't a UUID so a malformed IPC payload can't escape
@@ -56,10 +62,8 @@ export function registerBrowserHandlers(context: IpcContext): void {
       throw new Error('captureAndSend received malformed sessionId');
     }
 
-    // Always anchor at the project root so this directory lines up with
-    // the session dir that resource-cleanup / cleanupTaskSession already
-    // manage. Falls back to cwd when no project is open (transient case).
-    const projectRoot = context.currentProjectPath ?? input.cwd;
+    // Capture storage follows the project selected when Send was pressed;
+    // cwd remains only the agent-visible base for the relative @-mention.
     const captureDir = path.join(projectRoot, '.kangentic', 'sessions', input.sessionId, 'captures');
     await fs.promises.mkdir(captureDir, { recursive: true });
 
@@ -92,16 +96,22 @@ export function registerBrowserHandlers(context: IpcContext): void {
     const agentName = context.sessionManager.getSessionAgentName(input.sessionId);
     const adapter = agentName ? agentRegistry.get(agentName) : undefined;
     const verifier = adapter?.getSubmissionVerifier?.('paste') ?? undefined;
+    const lease = context.sessionManager.acquireUserSubmission(input.sessionId);
+    if (!lease) throw new Error('Session is not accepting input');
 
     // TerminalSubmit.submitContent handles bracketed-paste wrap, drain,
-    // paste-to-Enter gap, and atomic submit. Translate engine errors to
-    // renderer-facing toasts.
+    // paste-to-Enter gap, and atomic submit. Capture preparation is complete
+    // before ownership starts; only terminal delivery belongs inside the lease.
     try {
-      await context.terminalSubmit.submitContent(input.sessionId, payload, {
-        bracketed: true,
-        source: 'browser-capture',
-        verifier,
-      });
+      await lease.run(() => context.terminalSubmit.submitContent(
+        input.sessionId,
+        payload,
+        {
+          bracketed: true,
+          source: 'browser-capture',
+          verifier,
+        },
+      ));
     } catch (caught) {
       if (caught instanceof PasteSubmitError) {
         const userMessage = caught.code === 'timeout'
@@ -116,6 +126,8 @@ export function registerBrowserHandlers(context: IpcContext): void {
         throw error;
       }
       throw caught;
+    } finally {
+      lease.release();
     }
 
     return { filePath: absolutePngPath };

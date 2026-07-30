@@ -7,6 +7,10 @@ const REPO_ROOT = path.resolve(__dirname, '../..');
 const GOVERNANCE_DOCUMENT_PATH = path.join(REPO_ROOT, 'docs', 'fork-governance.md');
 const OVERVIEW_DOCUMENT_PATH = path.join(REPO_ROOT, 'docs', 'overview.md');
 const WORKTREE_STRATEGY_DOCUMENT_PATH = path.join(REPO_ROOT, 'docs', 'worktree-strategy.md');
+const ARCHITECTURE_DOCUMENT_PATH = path.join(REPO_ROOT, 'docs', 'architecture.md');
+const TRANSITION_ENGINE_DOCUMENT_PATH = path.join(REPO_ROOT, 'docs', 'transition-engine.md');
+const COMMAND_INJECTION_DOCUMENT_PATH = path.join(REPO_ROOT, 'docs', 'command-injection.md');
+const SESSION_LIFECYCLE_DOCUMENT_PATH = path.join(REPO_ROOT, 'docs', 'session-lifecycle.md');
 const BOARD_CONFIG_PATH = path.join(REPO_ROOT, 'kangentic.json');
 const PACKAGE_MANIFEST_PATH = path.join(REPO_ROOT, 'package.json');
 const LICENSE_PATH = path.join(REPO_ROOT, 'LICENSE');
@@ -95,6 +99,64 @@ function readGovernanceContract(): z.infer<typeof governanceContractSchema> {
   return governanceContractSchema.parse(readGovernanceContractJson());
 }
 
+type ForbiddenOpenCodeDeliveryRelation = {
+  readonly lifecycle: RegExp;
+};
+
+const forbiddenOpenCodeDeliveryRelations = [
+  { lifecycle: /\b(?:new|fresh|freshly created) session\b/ },
+  { lifecycle: /\bresume(?:s|d|ing)?\b/ },
+  { lifecycle: /\b(?:after|post) spawn\b/ },
+  { lifecycle: /\b(?:agent )?(?:handoff|switch(?:es|ed|ing)?)\b/ },
+  { lifecycle: /\bpublic (?:activity|thinking)\b/ },
+  { lifecycle: /\b(?:generic )?(?:timer|30 seconds?|30 second)\b/ },
+] as const satisfies readonly ForbiddenOpenCodeDeliveryRelation[];
+
+const commandAlias = '(?:auto command|configured (?:column )?command|column command|automation command)';
+const deliveryAlias = '(?:send(?:s|ing)?|deliver(?:s|ed|ing)?|inject(?:s|ed|ing)?|schedul(?:e|es|ed|ing)|admit(?:s|ted|ting)|run(?:s|ning)?)';
+const openCodeCommandPattern = new RegExp(`\\b${commandAlias}\\b`);
+const deliveryOccurrencePattern = new RegExp(`\\b${deliveryAlias}\\b`, 'g');
+const directlyNegatedDeliveryPattern = new RegExp(
+  `\\b(?:(?:does|do|did|will) not|never)\\s+${deliveryAlias}\\b|\\b(?:is|was|are|were)\\s+not\\s+${deliveryAlias}\\b|\\bwill not be\\s+${deliveryAlias}\\b`,
+  'g',
+);
+
+function normalizeGovernanceSentence(sentence: string): string {
+  return sentence
+    .toLowerCase()
+    .replace(/[_-]+/g, ' ')
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function hasUnnegatedPositiveDelivery(sentence: string): boolean {
+  const directlyNegatedDeliverySpans = [...sentence.matchAll(directlyNegatedDeliveryPattern)]
+    .flatMap((match) => match.index === undefined
+      ? []
+      : [{ start: match.index, end: match.index + match[0].length }]);
+
+  return [...sentence.matchAll(deliveryOccurrencePattern)].some((match) => {
+    if (match.index === undefined) return false;
+
+    const start = match.index;
+    const end = start + match[0].length;
+    return !directlyNegatedDeliverySpans.some((span) => span.start <= start && end <= span.end);
+  });
+}
+
+function hasForbiddenOpenCodeFallbackClaim(document: string): boolean {
+  return document
+    .split(/[.!?。]/)
+    .map(normalizeGovernanceSentence)
+    .some((sentence) => (
+      sentence.includes('opencode')
+      && openCodeCommandPattern.test(sentence)
+      && hasUnnegatedPositiveDelivery(sentence)
+      && forbiddenOpenCodeDeliveryRelations.some(({ lifecycle }) => lifecycle.test(sentence))
+    ));
+}
+
 describe('fork governance contract', () => {
   it('locks main as the upstream mirror and uses sevenflanks-main as the personal integration trunk', () => {
     const branches = readGovernanceContract().branches;
@@ -171,10 +233,12 @@ describe('fork governance contract', () => {
     expect(release.linuxPackaging).toBe('retained-upstream-development-only-unapproved');
   });
 
-  it('keeps distribution and recovered session-routing documentation within the fork contract', () => {
+  it('keeps distribution and OpenCode active-session-only documentation within the fork contract', () => {
     const readme = readRequiredFile(path.join(REPO_ROOT, 'README.md'));
-    const architecture = readRequiredFile(path.join(REPO_ROOT, 'docs', 'architecture.md'));
-    const transitionEngine = readRequiredFile(path.join(REPO_ROOT, 'docs', 'transition-engine.md'));
+    const architecture = readRequiredFile(ARCHITECTURE_DOCUMENT_PATH);
+    const transitionEngine = readRequiredFile(TRANSITION_ENGINE_DOCUMENT_PATH);
+    const commandInjection = readRequiredFile(COMMAND_INJECTION_DOCUMENT_PATH);
+    const sessionLifecycle = readRequiredFile(SESSION_LIFECYCLE_DOCUMENT_PATH);
     const overview = readRequiredFile(OVERVIEW_DOCUMENT_PATH);
     const worktreeStrategy = readRequiredFile(WORKTREE_STRATEGY_DOCUMENT_PATH);
     const falseLiveSettingsClaims = [
@@ -194,15 +258,9 @@ describe('fork governance contract', () => {
     }
 
     expect(readme).not.toContain('Model changes suspend and resume with new launch flags;');
-    expect(transitionEngine).toContain('When a `spawn_agent` transition action creates the session itself (a custom action wired onto the entry transition), that action\'s own prompt template runs and the fallback `auto_command` / continuation injection is skipped for that spawn.');
     expect(transitionEngine).not.toContain('Transition action chains (priority 4) only fire when a task has no active session.');
-    expect(architecture).not.toContain('Transitions only fire for case 5.');
     expect(readme).toContain('Only a changed, concrete effective model target restarts a live session; a null or unchanged target keeps it, while clearing an override can expose a changed project default.');
     expect(transitionEngine).toContain('The effective model target resolves task override, then lane override, then project default; only a changed, concrete result restarts a live session.');
-    expect(transitionEngine).toContain('On the normal `spawnAgent` fallback path, fresh spawns with `skipPromptTemplate` pass `auto_command` as the initial prompt.');
-    expect(transitionEngine).toContain('On the normal `spawnAgent` fallback path, a templated fresh spawn schedules `auto_command` through `TerminalSubmitScheduler.scheduleKeystrokes` with `sendCtrlC: false`.');
-    expect(transitionEngine).toContain('Native-history handoff bypasses the transition action chain and schedules `auto_command` after the target spawn.');
-    expect(architecture).toContain('Transition action chains run for Priority 3 fallthrough and Priority 4 only on the normal `spawnAgent` path; native-history handoff bypasses the chain.');
     expect(overview).not.toContain('Native installers for Windows (NSIS), macOS (DMG), and Linux (deb/rpm).');
     expect(overview).toContain('Only approved fork distribution: local unsigned Windows `npm run make:win`.');
     expect(overview).toContain('Kangentic runs across Windows, macOS, and Linux');
@@ -211,6 +269,57 @@ describe('fork governance contract', () => {
     expect(worktreeStrategy).toMatch(
       /same-track, same-agent, same-model live session stays live and injects\s+supported auto_command and effort changes; an unsupported concrete effort target can\s+respawn, while permission-only changes or no setting delta stay live/,
     );
+
+    const openCodeDocuments = [architecture, transitionEngine, commandInjection, sessionLifecycle];
+    for (const document of openCodeDocuments) {
+      expect(document).toMatch(/OpenCode[\s\S]{0,500}active[ -]writable[\s\S]{0,500}compatible[\s\S]{0,500}Main Session/i);
+      expect(document).toMatch(/fresh[\s\S]{0,240}resume[\s\S]{0,240}handoff[\s\S]{0,240}restart[\s\S]{0,240}isolated[\s\S]{0,240}(?:skip|skipped)/i);
+      expect(document).toMatch(/ordinary Task prompt[\s\S]{0,240}(?:separate|independent|intact)/i);
+      expect(document).toMatch(/non-OpenCode[\s\S]{0,240}(?:legacy|existing)[\s\S]{0,240}(?:unchanged|intact)/i);
+      expect(document).toMatch(/action-backed spawn[\s\S]{0,240}own prompt[\s\S]{0,240}central Auto-command disposition/i);
+    }
+
+    for (const document of openCodeDocuments) {
+      expect(hasForbiddenOpenCodeFallbackClaim(document)).toBe(false);
+    }
+
+    expect(sessionLifecycle).toMatch(/non-OpenCode legacy[\s\S]{0,240}isolated reviewer/i);
+    expect(sessionLifecycle).toMatch(/continuation prompt[\s\S]{0,240}intact/i);
+  });
+
+  it('rejects synonymous OpenCode lifecycle-to-delivery fallback claims', () => {
+    const forbiddenFixtures = [
+      'OpenCode sends the configured column command when it starts a fresh session.',
+      'OpenCode delivers Auto-command when it resumes a session.',
+      'OpenCode injects the configured column command after spawn.',
+      'OpenCode schedules Auto-command during an agent handoff.',
+      'OpenCode delivers the column command after public activity reports thinking.',
+      'OpenCode admits Auto-command after a generic 30-second timer.',
+      'OpenCode sends Auto-command after a fresh session, not through native idle.',
+      'OpenCode schedules the configured column command after spawn while an unrelated safeguard is skipped.',
+      'OpenCode runs the automation command after a freshly created session.',
+      'OpenCode delivers Auto-command during agent switching.',
+      'OpenCode Auto-command is delivered after a fresh session.',
+      'OpenCode skips Auto-command for a fresh session but delivers it after a fresh session.',
+      'OpenCode does not deliver Auto-command after a fresh session but schedules it after a fresh session.',
+    ] as const;
+
+    for (const fixture of forbiddenFixtures) {
+      expect(hasForbiddenOpenCodeFallbackClaim(fixture)).toBe(true);
+    }
+
+    const compliantFixtures = [
+      'OpenCode skips Auto-command for a fresh session.',
+      'OpenCode does not deliver the configured column command after a handoff.',
+      'OpenCode never injects the configured column command after public activity.',
+      'OpenCode does not admit Auto-command after a generic 30-second timer.',
+      'OpenCode never schedules the automation command after a freshly created session.',
+      'OpenCode Auto-command is not delivered after a fresh session.',
+    ] as const;
+
+    for (const fixture of compliantFixtures) {
+      expect(hasForbiddenOpenCodeFallbackClaim(fixture)).toBe(false);
+    }
   });
 
   it('keeps repository-local .claude absent while supporting content in external user projects', () => {

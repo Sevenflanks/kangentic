@@ -76,8 +76,10 @@ const context: CommandContext = {
   getProjectPath: () => '/projects/example',
   onTaskCreated: vi.fn(),
   onTaskUpdated: vi.fn(),
-  onTaskDeleted: vi.fn(),
-  onBacklogChanged: vi.fn(),
+    onTaskDeleted: vi.fn(),
+    onTaskMove: vi.fn(async () => ({ ok: true, autoCommand: { kind: 'not-applicable' } })),
+    onTaskAutoSpawn: vi.fn(async () => ({ kind: 'not-applicable' })),
+    onBacklogChanged: vi.fn(),
   onLabelColorsChanged: vi.fn(),
 };
 

@@ -5,6 +5,7 @@ import os from 'node:os';
 import { createHash } from 'node:crypto';
 import { execSync, spawn } from 'node:child_process';
 import type { Session, Swimlane, Task } from '../../src/shared/types';
+import type { TaskMoveResult } from '../../src/shared/auto-command-outcome';
 
 export type AgentName = 'claude' | 'codex' | 'gemini' | 'cursor' | 'warp' | 'opencode' | 'kimi' | 'qwen' | 'droid';
 
@@ -539,9 +540,9 @@ export async function getSwimlaneIds(page: Page): Promise<{ planning: string; do
 }
 
 /** Move a task to a target swimlane via IPC (no UI drag). */
-export async function moveTaskIpc(page: Page, taskId: string, targetSwimlaneId: string): Promise<void> {
-  await page.evaluate(async ({ taskId: id, targetSwimlaneId: swimlaneId }) => {
-    await window.electronAPI.tasks.move({
+export async function moveTaskIpc(page: Page, taskId: string, targetSwimlaneId: string): Promise<TaskMoveResult> {
+  return page.evaluate(async ({ taskId: id, targetSwimlaneId: swimlaneId }) => {
+    return window.electronAPI.tasks.move({
       taskId: id,
       targetSwimlaneId: swimlaneId,
       targetPosition: 0,

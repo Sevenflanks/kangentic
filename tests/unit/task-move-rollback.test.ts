@@ -350,6 +350,7 @@ describe('handleTaskMove outer-catch rollback', () => {
       id: 'task-aaa00001',
       swimlane_id: SOURCE_LANE_ID,
       session_id: null,
+      auto_command: '/task-level-command',
     });
 
     taskRepo = makeTaskRepo(task);
@@ -421,10 +422,10 @@ describe('handleTaskMove outer-catch rollback', () => {
 
     const context = makeContext(taskRepo, swimlaneRepo);
 
-    // Abort errors are swallowed - the handler returns undefined.
+    // Abort errors are swallowed - the handler reports no applicable Auto-command outcome.
     await expect(
       handleTaskMove(context as never, MOVE_INPUT),
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual({ ok: true, autoCommand: { kind: 'not-applicable' } });
 
     // PTY map cleanup must still run on abort.
     expect(context.sessionManager.removeByTaskId).toHaveBeenCalledWith(task.id);
@@ -492,6 +493,7 @@ describe('handleTaskMove outer-catch rollback', () => {
     expect(context.sessionManager.removeByTaskId).toHaveBeenCalledWith(task.id);
     // DB row session_id cleared.
     expect(taskRepo.update).toHaveBeenCalledWith({ id: task.id, session_id: null });
+    expect(taskRepo.update).not.toHaveBeenCalledWith(expect.objectContaining({ auto_command: null }));
     // Column revert: Phase 1 forward + rollback reverse = 2 calls.
     expect(taskRepo.move).toHaveBeenCalledTimes(2);
     const rollbackMoveArg = taskRepo.move.mock.calls[1][0];

@@ -147,7 +147,13 @@ beforeEach(() => {
   vi.resetAllMocks();
   tasksApi.onBulkDeleteProgress.mockImplementation(() => () => {});
   useToastStore.getState.mockReturnValue({ addToast: vi.fn() });
-  useSessionStore.getState.mockReturnValue({ setSpawnProgress: vi.fn() });
+  useSessionStore.getState.mockReturnValue({
+    clearAutoCommandWarningsForTasks: vi.fn(),
+    clearAutoCommandWarningForTask: vi.fn(),
+    clearLiveDeliveryStatusesForTasks: vi.fn(),
+    clearLiveDeliveryStatusForTask: vi.fn(),
+    setSpawnProgress: vi.fn(),
+  });
   useSessionStore.setState.mockImplementation(() => {});
   useProjectStore.getState.mockReturnValue({ currentProject: null });
 });

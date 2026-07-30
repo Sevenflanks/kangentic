@@ -69,7 +69,7 @@ Drag a task from To Do to any active column (Planning, Executing, etc.). Kangent
   - "Initializing..." or "Resuming..." during session startup
   - "Queued..." when waiting for a concurrency slot
   - "Paused" when manually suspended
-- **Shimmer overlay** - when a session is starting or resuming (e.g., after a column move that triggers an auto_command), a shimmer loading overlay appears over the terminal. It shows a context-aware label such as the auto_command name, "Resuming agent...", or "Starting agent...". Terminal output is suppressed behind the overlay until the session is ready.
+- **Shimmer overlay** - when a column move is awaiting session lifecycle resolution, a shimmer loading overlay appears over the terminal. It uses the fixed "Starting agent..." label until the lifecycle is resolved and never displays auto-command content. Terminal output is suppressed behind the overlay until the session is ready.
 
 ### Move Between Active Columns
 

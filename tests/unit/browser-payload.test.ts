@@ -46,6 +46,7 @@ function makeElement(overrides: Partial<BrowserPickedElement> = {}): BrowserPick
 
 function makeInput(overrides: Partial<BrowserCaptureInput> = {}): BrowserCaptureInput {
   return {
+    projectId: 'project-1',
     sessionId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
     taskId: 'task-1',
     cwd: '/projects/myapp',

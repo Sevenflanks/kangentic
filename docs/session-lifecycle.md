@@ -168,10 +168,11 @@ When a suspended task moves to an active column:
   session running.
 - A plan-exit auto-move (Planning -> Executing), triggered when the user
   approves the plan (the `ExitPlanMode` tool completes, not when the agent
-  merely invokes it), passes a continuation prompt
-  ("Proceed with implementing the approved plan.") delivered as the resumed
-  session's first message when the destination column has no `auto_command`;
-  the `auto_command` wins when present.
+  merely invokes it), preserves its continuation prompt
+  ("Proceed with implementing the approved plan.") as the resumed session's
+  first message when the existing continuation flow qualifies. For OpenCode,
+  a skipped Auto-command never replaces or erases that continuation prompt;
+  non-OpenCode existing legacy behavior remains intact.
 - The **first move OUT of Done** (the recovery / restore move, whatever the
   destination column) resumes the session WITHOUT injecting the destination
   column's `auto_command`. Restoring a Done task is usually to inspect the
@@ -184,6 +185,12 @@ When a suspended task moves to an active column:
   it from `handleTaskMove` when `fromLane.role === 'done'`. Model / effort /
   permission-mode settings still apply on the recovery move. The next move
   injects per column config as usual.
+
+### OpenCode Auto-command
+
+OpenCode Auto-command is separate from the ordinary Task prompt and is delivered only to an active writable compatible Main Session through the native-idle live path with `sendCtrlC: false` and user-input cancellation. Fresh, resume, handoff, restart, isolated, and no-active lifecycle cases finalizes a skip while their normal lifecycle continues. Ordinary Task prompt, continuation prompt, and action prompt remain intact; non-OpenCode existing legacy behavior remains intact.
+
+An action-backed spawn runs its own prompt and still finalizes the central Auto-command disposition.
 
 ## Crash Recovery (Session Recovery)
 
@@ -218,7 +225,7 @@ The four combinations:
 
 Both fields are enums so future tracks/strategies need no schema migration.
 
-**An isolated session is context-isolated.** It does NOT inherit the main session's conversation. This is the point of the feature: pairing `session_target: isolated` (with the default `always_spawn_new`) and `auto_command: /code-review` yields an independent reviewer that judges the current diff without the generator's reasoning trail. (This is distinct from Claude Code's own `/fork` / `--fork-session`, which *inherit* the conversation; we deliberately do not.) "Restart the conversation" within a session is otherwise left to the agent's native `/clear` / `/compact`.
+**An isolated session is context-isolated.** It does NOT inherit the main session's conversation. For non-OpenCode legacy adapters, pairing `session_target: isolated` (with the default `always_spawn_new`) and `auto_command: /code-review` yields an independent isolated reviewer that judges the current diff without the generator's reasoning trail. OpenCode isolated entry finalizes an Auto-command skip while the ordinary Task prompt and continuation prompt remain intact. (This is distinct from Claude Code's own `/fork` / `--fork-session`, which *inherit* the conversation; we deliberately do not.) "Restart the conversation" within a session is otherwise left to the agent's native `/clear` / `/compact`.
 
 **One active PTY per task** is preserved. The worktree is shared across a task's sessions (same `task.worktree_path`), so an isolated session's edits are real and persist; the main session sees the changed tree but not the isolated conversation.
 
@@ -226,7 +233,7 @@ Both fields are enums so future tracks/strategies need no schema migration.
 
 Lifecycle on task move (`task-move.ts`, the session switch branch inside Priority 3):
 
-- **Enter an isolated column from a live main session**: suspend the main session (preserve `agent_session_id`), then Phase 3 spawns/resumes the isolated session and runs its `auto_command`. With `always_spawn_new` (the isolated default) it spawns fresh each entry, retiring the prior pass.
+- **Enter an isolated column from a live main session**: suspend the main session (preserve `agent_session_id`), then Phase 3 spawns/resumes the isolated session. Non-OpenCode legacy adapters keep their existing configured delivery; OpenCode finalizes an Auto-command skip. With `always_spawn_new` (the isolated default) it spawns fresh each entry, retiring the prior pass.
 - **Leave an isolated column for a normal column**: suspend the isolated session (resumable), then Phase 3 resumes the **main** session.
 - **Reset-main / recycle**: an `always_spawn_new` column forces a fresh spawn on its target track even when the live session is already on that track, so the switch fires on `resolveForceFresh(toLane)`, not only on a target change.
 - The target + spawn policy are derived from the destination column in `resolveSpawnOverrides`, threaded through `SpawnOverrides.isolatedSwimlaneId` / `SpawnOverrides.forceFresh` into `resolveSpawnIntent` (which retires the prior record on a forced-fresh entry) and `sessionRepo.insert`. The terminal tab badges an isolated session as "Isolated" vs "Main".

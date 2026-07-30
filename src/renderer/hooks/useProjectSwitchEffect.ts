@@ -60,6 +60,9 @@ export function useProjectSwitchEffect(currentProject: Project | null): void {
       return;
     }
 
+    useSessionStore.getState().clearLiveDeliveryStatuses();
+    useSessionStore.getState().clearAutoCommandWarnings();
+
     // Capture the outgoing project's slice state before we mutate the
     // stores. Skip self-switches (same id) and the initial cold mount
     // (no previous project to snapshot).

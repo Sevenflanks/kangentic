@@ -117,6 +117,7 @@ export const createArchivedTasksSlice: StateCreator<BoardStore, [], [], Archived
   },
 
   archiveTask: (id) => {
+    useSessionStore.getState().clearAutoCommandWarningForTask(id);
     // Optimistic: move from tasks to archivedTasks
     set((s) => {
       const task = s.tasks.find((t) => t.id === id);
@@ -233,6 +234,8 @@ export const createArchivedTasksSlice: StateCreator<BoardStore, [], [], Archived
     try {
       await window.electronAPI.tasks.delete(id, useProjectStore.getState().currentProject?.id ?? null);
       // Also clean up sessions in session store
+      useSessionStore.getState().clearLiveDeliveryStatusForTask(id);
+      useSessionStore.getState().clearAutoCommandWarningForTask(id);
       useSessionStore.setState((s) => ({
         sessions: s.sessions.filter((session) => session.taskId !== id),
       }));
@@ -273,6 +276,8 @@ export const createArchivedTasksSlice: StateCreator<BoardStore, [], [], Archived
       // Always clear sessions for fully-deleted tasks. Partial-failure tasks
       // still had their DB row deleted (cleanup just left worktree files
       // behind), so dropping the session is correct either way.
+      useSessionStore.getState().clearLiveDeliveryStatusesForTasks(ids);
+      useSessionStore.getState().clearAutoCommandWarningsForTasks(ids);
       useSessionStore.setState((state) => ({
         sessions: state.sessions.filter((session) => !idSet.has(session.taskId)),
       }));

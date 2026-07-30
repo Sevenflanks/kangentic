@@ -882,6 +882,14 @@
           archivedTasks.push(archived);
           tasks.splice(idx, 1);
         }
+
+        if (typeof window !== 'undefined' && window.__mockTaskMoveResult) {
+          var moveResult = window.__mockTaskMoveResult;
+          window.__mockTaskMoveResult = null;
+          return moveResult;
+        }
+
+        return { ok: true, autoCommand: { kind: 'not-applicable' } };
       },
       cancelSpawn: async function (taskId) {
         // Record cancellations so UI tests can assert the stall toast's Cancel
@@ -1372,6 +1380,11 @@
       write: async function (sessionId, payload) {
         window.electronAPI.sessions.__writeCalls.push({ sessionId: sessionId, payload: payload });
       },
+      // Call log for focus-report assertions. Each entry is { sessionId, report, projectId }.
+      __focusReportCalls: [],
+      writeFocusReport: async function (sessionId, report, projectId) {
+        window.electronAPI.sessions.__focusReportCalls.push({ sessionId: sessionId, report: report, projectId: projectId });
+      },
       resize: async function () { return { colsChanged: false }; },
       list: async function () {
         return sessions;
@@ -1450,6 +1463,24 @@
         }
         return function () {
           var listeners = window.__mockStatusListeners || [];
+          var idx = listeners.indexOf(callback);
+          if (idx >= 0) listeners.splice(idx, 1);
+        };
+      },
+      onLiveDeliveryStatus: function (callback) {
+        if (!window.__mockLiveDeliveryStatusListeners) window.__mockLiveDeliveryStatusListeners = [];
+        window.__mockLiveDeliveryStatusListeners.push(callback);
+        window.__mockGetLiveDeliveryStatusListenerCount = function () {
+          return (window.__mockLiveDeliveryStatusListeners || []).length;
+        };
+        if (!window.__mockFireLiveDeliveryStatus) {
+          window.__mockFireLiveDeliveryStatus = function (status) {
+            var listeners = (window.__mockLiveDeliveryStatusListeners || []).slice();
+            for (var i = 0; i < listeners.length; i++) { listeners[i](status); }
+          };
+        }
+        return function () {
+          var listeners = window.__mockLiveDeliveryStatusListeners || [];
           var idx = listeners.indexOf(callback);
           if (idx >= 0) listeners.splice(idx, 1);
         };

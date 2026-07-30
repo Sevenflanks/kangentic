@@ -831,6 +831,46 @@ describe('Pre-registration spawn cleanup', () => {
     expect(manager.getSession(registeredSession.id)).toMatchObject({ id: registeredSession.id, status: 'running' });
     expect(pty.spawn).toHaveBeenCalledOnce();
   });
+
+  it('disposes successor cleanup without releasing predecessor hooks when same-ID replacement teardown throws', async () => {
+    const manager = new SessionManager();
+    const predecessorDisposeError = new Error('predecessor attachment disposal failed');
+    const predecessorDispose = vi.fn(() => { throw predecessorDisposeError; });
+    const adapter = Object.assign(new OpenCodeAdapter(), {
+      attachSession: () => ({ dispose: predecessorDispose }),
+    });
+    const removeHooks = vi.spyOn(adapter, 'removeHooks').mockImplementation(() => {});
+    const firstPty = createMockPty();
+    firstPty.mockPty.kill.mockImplementation(() => {});
+    vi.mocked(pty.spawn).mockReturnValue(firstPty.mockPty as unknown as pty.IPty);
+    const sessionId = 'same-id-throwing-predecessor';
+    const taskId = 'task-same-id-throwing-predecessor';
+    await manager.spawn({
+      id: sessionId,
+      taskId,
+      projectId: 'project-same-id-throwing-predecessor',
+      command: '',
+      cwd: tmpDir,
+      agentParser: adapter,
+    });
+    const registeredOwner = manager['registry'].get(sessionId);
+    removeHooks.mockClear();
+    const successorCleanup = { dispose: vi.fn() };
+
+    await expect(manager.spawn({
+      id: sessionId,
+      taskId,
+      projectId: 'project-same-id-throwing-predecessor',
+      command: '',
+      cwd: tmpDir,
+      agentParser: adapter,
+      spawnCleanup: successorCleanup,
+    })).rejects.toBe(predecessorDisposeError);
+
+    expect(successorCleanup.dispose).toHaveBeenCalledOnce();
+    expect(manager['registry'].get(sessionId)).toBe(registeredOwner);
+    expect(removeHooks).not.toHaveBeenCalled();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -2795,5 +2835,335 @@ describe('findLiveSessionByTaskId delegate', () => {
     // Empty registry - delegate must pass through undefined without throwing.
     const result = manager.findLiveSessionByTaskId('task-delegate-missing');
     expect(result).toBeUndefined();
+  });
+});
+
+function createCoordinationPty(): {
+  readonly pty: pty.IPty;
+  readonly writes: string[];
+  readonly triggerExit: (exitCode?: number) => void;
+} {
+  const writes: string[] = [];
+  let exitHandler: ((event: { exitCode: number; signal?: number }) => void) | null = null;
+  const ptyProcess: pty.IPty = {
+    pid: 54321,
+    cols: 120,
+    rows: 30,
+    process: 'mock-shell',
+    handleFlowControl: false,
+    onData: vi.fn((_listener: (data: string) => void) => ({ dispose: vi.fn() })),
+    onExit: vi.fn((listener: (event: { exitCode: number; signal?: number }) => void) => {
+      exitHandler = listener;
+      return { dispose: vi.fn() };
+    }),
+    resize: vi.fn(),
+    clear: vi.fn(),
+    write: vi.fn((data: string | Buffer) => {
+      writes.push(typeof data === 'string' ? data : data.toString());
+    }),
+    kill: vi.fn(() => exitHandler?.({ exitCode: 0 })),
+    pause: vi.fn(),
+    resume: vi.fn(),
+  };
+  return {
+    pty: ptyProcess,
+    writes,
+    triggerExit: (exitCode = 0) => exitHandler?.({ exitCode }),
+  };
+}
+
+describe('Input coordination', () => {
+  let manager: SessionManager;
+
+  beforeEach(() => {
+    manager = new SessionManager();
+  });
+
+  afterEach(() => {
+    manager.killAll();
+    vi.restoreAllMocks();
+  });
+
+  async function spawnCoordinatedSession(taskId: string) {
+    const mock = createCoordinationPty();
+    vi.mocked(pty.spawn).mockReturnValue(mock.pty);
+    const session = await manager.spawn({ taskId, command: '', cwd: tmpDir });
+    return { session, ...mock };
+  }
+
+  function expectInputCoordinationRemoved(sessionId: string): void {
+    expect(manager.getSessionGeneration(sessionId)).toBeNull();
+    expect(manager.getInputGeneration(sessionId)).toBeNull();
+    expect(manager['nativeIdleEvidence'].snapshot(sessionId)).toBeNull();
+  }
+
+  it('exposes a readonly native idle snapshot and returns null for an unknown session', async () => {
+    const { session } = await spawnCoordinatedSession('task-native-idle-snapshot');
+
+    expect(manager.snapshotNativeIdle('missing-session')).toBeNull();
+    expect(manager.snapshotNativeIdle(session.id)).toMatchObject({
+      sessionGeneration: 1,
+      inputGeneration: 0,
+      cleanIdle: null,
+      errorLatched: false,
+    });
+  });
+
+  it('forwards native idle notifications until the returned unsubscribe is called', async () => {
+    const { session } = await spawnCoordinatedSession('task-native-idle-subscribe');
+    const listener = vi.fn();
+    const unsubscribe = manager.subscribeNativeIdle(session.id, listener);
+
+    manager.writeUserInput(session.id, 'first', 20);
+    expect(listener).toHaveBeenCalledTimes(1);
+
+    unsubscribe();
+    manager.writeUserInput(session.id, 'second', 21);
+    expect(listener).toHaveBeenCalledTimes(1);
+  });
+
+  it('uses Date.now for the two-argument writeUserInput shape', async () => {
+    // Given
+    const { session, writes } = await spawnCoordinatedSession('task-coordination-default-time');
+    vi.spyOn(Date, 'now').mockReturnValue(123_456);
+    const evidenceWrite = vi.spyOn(manager['nativeIdleEvidence'], 'recordUserInput');
+
+    // When
+    manager.writeUserInput(session.id, 'user');
+
+    // Then
+    expect(evidenceWrite).toHaveBeenCalledWith(session.id, 1, 123_456);
+    expect(writes).toEqual(['user']);
+  });
+
+  it('updates native idle evidence before user bytes reach the PTY', async () => {
+    // Given
+    const { session, pty: ptyProcess, writes } = await spawnCoordinatedSession('task-coordination-evidence-order');
+    const order: string[] = [];
+    const evidence = manager['nativeIdleEvidence'];
+    const recordEvidence = evidence.recordUserInput.bind(evidence);
+    vi.spyOn(evidence, 'recordUserInput').mockImplementation((sessionId, generation, occurredAt) => {
+      order.push('evidence');
+      recordEvidence(sessionId, generation, occurredAt);
+    });
+    vi.mocked(ptyProcess.write).mockImplementation((data: string | Buffer) => {
+      order.push('pty-write');
+      writes.push(typeof data === 'string' ? data : data.toString());
+    });
+
+    // When
+    manager.writeUserInput(session.id, 'user', 20);
+
+    // Then
+    expect(order).toEqual(['evidence', 'pty-write']);
+    expect(writes).toEqual(['user']);
+  });
+
+  it('advances user-submission generation and evidence before acquisition returns', async () => {
+    // Given
+    const { session } = await spawnCoordinatedSession('task-coordination-user-marker');
+    vi.spyOn(Date, 'now').mockReturnValue(654_321);
+    const evidenceWrite = vi.spyOn(manager['nativeIdleEvidence'], 'recordUserInput');
+
+    // When
+    const lease = manager.acquireUserSubmission(session.id);
+
+    // Then
+    expect(lease).not.toBeNull();
+    expect(manager.getInputGeneration(session.id)).toBe(1);
+    expect(evidenceWrite).toHaveBeenCalledWith(session.id, 1, 654_321);
+    expect(manager['nativeIdleEvidence'].snapshot(session.id)).toMatchObject({
+      inputGeneration: 1,
+    });
+    lease?.release();
+  });
+
+  it('exposes generations after spawn and advances input generation through writeUserInput', async () => {
+    // Given
+    const { session, writes } = await spawnCoordinatedSession('task-coordination-write');
+    const sessionGeneration = manager.getSessionGeneration(session.id);
+
+    // When
+    manager.write(session.id, 'legacy');
+    manager.writeUserInput(session.id, 'user', 20);
+
+    // Then
+    expect(sessionGeneration).toBe(1);
+    expect(manager.getInputGeneration(session.id)).toBe(1);
+    expect(writes).toEqual(['legacy', 'user']);
+    expect(manager['nativeIdleEvidence'].snapshot(session.id)).toMatchObject({
+      sessionGeneration,
+      inputGeneration: 1,
+    });
+  });
+
+  it('buffers manager user input behind committed automation until release', async () => {
+    // Given
+    const { session, writes } = await spawnCoordinatedSession('task-coordination-automation');
+    const sessionGeneration = manager.getSessionGeneration(session.id);
+    const inputGeneration = manager.getInputGeneration(session.id);
+    const lease = sessionGeneration === null || inputGeneration === null
+      ? null
+      : manager.acquireAutomation(
+          session.id,
+          { sessionGeneration, inputGeneration },
+          vi.fn(),
+        );
+    await lease?.write('automation');
+
+    // When
+    manager.writeUserInput(session.id, 'user', 20);
+
+    // Then
+    expect(writes).toEqual(['automation']);
+    lease?.release();
+    expect(writes).toEqual(['automation', 'user']);
+  });
+
+  it('keeps focus reports in mixed deferred FIFO order without recording user input evidence', async () => {
+    // Given
+    const { session, writes } = await spawnCoordinatedSession('task-coordination-focus-report');
+    const sessionGeneration = manager.getSessionGeneration(session.id);
+    const inputGeneration = manager.getInputGeneration(session.id);
+    const automation = sessionGeneration === null || inputGeneration === null
+      ? null
+      : manager.acquireAutomation(
+          session.id,
+          { sessionGeneration, inputGeneration },
+          vi.fn(),
+        );
+    await automation?.write('automation');
+
+    // When
+    manager.writeUserInput(session.id, 'human-1', 20);
+    manager.writeFocusReport(session.id, '\x1b[I');
+    manager.writeUserInput(session.id, 'human-2', 21);
+    manager.writeFocusReport(session.id, '\x1b[O');
+    automation?.release();
+
+    // Then
+    expect(writes).toEqual(['automation', 'human-1', '\x1b[I', 'human-2', '\x1b[O']);
+    expect(manager.getInputGeneration(session.id)).toBe(2);
+  });
+
+  it('blocks automation while a user submission lease is active', async () => {
+    // Given
+    const { session } = await spawnCoordinatedSession('task-coordination-user-submission');
+    const sessionGeneration = manager.getSessionGeneration(session.id);
+    const inputGeneration = manager.getInputGeneration(session.id);
+    const expectation = sessionGeneration === null || inputGeneration === null
+      ? null
+      : { sessionGeneration, inputGeneration };
+
+    // When
+    const userSubmission = manager.acquireUserSubmission(session.id);
+    const blockedAutomation = expectation
+      ? manager.acquireAutomation(session.id, expectation, vi.fn())
+      : null;
+    await userSubmission?.run(async () => Promise.resolve());
+    const releasedAutomation = expectation
+      ? manager.acquireAutomation(
+          session.id,
+          { ...expectation, inputGeneration: expectation.inputGeneration + 1 },
+          vi.fn(),
+        )
+      : null;
+
+    // Then
+    expect(blockedAutomation).toBeNull();
+    expect(releasedAutomation).not.toBeNull();
+  });
+
+  it('uses one shared queue for legacy, multi-chunk automation, and deferred user writes', async () => {
+    vi.useFakeTimers();
+    try {
+      // Given
+      const { session, writes } = await spawnCoordinatedSession('task-coordination-shared-queue');
+      const legacy = 'L'.repeat(5_000);
+      const automation = 'A'.repeat(5_000);
+      manager.write(session.id, legacy);
+      await vi.runAllTimersAsync();
+      await manager.drain(session.id);
+      const sessionGeneration = manager.getSessionGeneration(session.id);
+      const inputGeneration = manager.getInputGeneration(session.id);
+      const lease = sessionGeneration === null || inputGeneration === null
+        ? null
+        : manager.acquireAutomation(
+            session.id,
+            { sessionGeneration, inputGeneration },
+            vi.fn(),
+          );
+
+      // When
+      const automationWrite = lease?.write(automation);
+      await vi.runAllTimersAsync();
+      await automationWrite;
+      manager.writeUserInput(session.id, 'user-1', 20);
+      manager.writeUserInput(session.id, 'user-2', 21);
+      lease?.release();
+      await vi.runAllTimersAsync();
+      await manager.drain(session.id);
+
+      // Then
+      expect(manager['writeQueues'].size).toBe(1);
+      expect(writes.join('')).toBe(`${legacy}${automation}user-1user-2`);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('clears generations immediately on suspend and on explicit kill', async () => {
+    // Given
+    const first = await spawnCoordinatedSession('task-coordination-suspend');
+
+    // When
+    const suspension = manager.suspend(first.session.id);
+
+    // Then
+    expectInputCoordinationRemoved(first.session.id);
+    first.triggerExit(0);
+    await suspension;
+
+    const second = await spawnCoordinatedSession('task-coordination-kill');
+    manager.kill(second.session.id);
+    expectInputCoordinationRemoved(second.session.id);
+  });
+
+  it('clears generations on natural exit and synchronous killAll', async () => {
+    // Given
+    const natural = await spawnCoordinatedSession('task-coordination-exit');
+
+    // When
+    natural.triggerExit(0);
+
+    // Then
+    expectInputCoordinationRemoved(natural.session.id);
+
+    const shutdown = await spawnCoordinatedSession('task-coordination-kill-all');
+    manager.killAll();
+    expectInputCoordinationRemoved(shutdown.session.id);
+  });
+
+  it('clears coordinator and evidence together on remove', async () => {
+    // Given
+    const { session } = await spawnCoordinatedSession('task-coordination-remove');
+
+    // When
+    manager.remove(session.id);
+
+    // Then
+    expectInputCoordinationRemoved(session.id);
+  });
+
+  it('clears coordinator and evidence synchronously when suspendAll starts', async () => {
+    // Given
+    const { session } = await spawnCoordinatedSession('task-coordination-suspend-all');
+
+    // When
+    const suspension = manager.suspendAll(0);
+
+    // Then
+    expectInputCoordinationRemoved(session.id);
+    await suspension;
   });
 });

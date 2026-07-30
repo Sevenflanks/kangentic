@@ -62,6 +62,11 @@ vi.mock('../../src/main/pty/spawn/spawn-failure-handler', () => ({
 vi.mock('../../src/main/pty/lifecycle/adapter-lifecycle', () => ({
   attachAdapter: vi.fn(),
   disposeAdapterAttachment: vi.fn(),
+  disposeSpawnCleanup: vi.fn((owner: { spawnCleanup?: { dispose(): void } }) => {
+    const cleanup = owner.spawnCleanup;
+    owner.spawnCleanup = undefined;
+    cleanup?.dispose();
+  }),
   removeAdapterHooks: vi.fn(),
 }));
 
@@ -177,6 +182,15 @@ function makeContext(): SpawnFlowContext {
     firstOutputTracker: {
       removeSession: vi.fn(),
     },
+    writeCoordinator: {
+      initialize: vi.fn(() => 41),
+      getSessionGeneration: vi.fn(() => 41),
+      disposeSession: vi.fn(),
+    },
+    nativeIdleEvidence: {
+      initializeSession: vi.fn(),
+      removeSession: vi.fn(),
+    },
     getTranscriptWriter: vi.fn(() => null),
     getShell: vi.fn().mockResolvedValue('/bin/bash'),
     takePendingResize: vi.fn(() => undefined),
@@ -221,6 +235,112 @@ describe('performSpawn - same-task replacement cleanup', () => {
     // Then
     expect(context.firstOutputTracker.removeSession).toHaveBeenCalledOnce();
     expect(context.firstOutputTracker.removeSession).toHaveBeenCalledWith(existing.id);
+  });
+
+  it('disposes coordinator and native evidence for the replaced session before initializing the new one', async () => {
+    // Given
+    const context = makeContext();
+    const existing = context.registry.registerSuspendedPlaceholder({
+      taskId: 'task-001',
+      projectId: 'project-001',
+      cwd: '/home/dev/project',
+    });
+
+    // When
+    await performSpawn(makeInput(), context);
+
+    // Then
+    expect(context.writeCoordinator.disposeSession).toHaveBeenCalledWith(existing.id);
+    expect(context.nativeIdleEvidence.removeSession).toHaveBeenCalledWith(existing.id);
+    expect(context.writeCoordinator.disposeSession).toHaveBeenCalledBefore(
+      context.writeCoordinator.initialize,
+    );
+    expect(context.nativeIdleEvidence.removeSession).toHaveBeenCalledBefore(
+      context.writeCoordinator.initialize,
+    );
+  });
+});
+
+describe('performSpawn - input coordination lifecycle', () => {
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('initializes coordinator and evidence immediately after registry insertion and before readers', async () => {
+    // Given
+    const context = makeContext();
+    context.writeCoordinator.initialize.mockImplementation((sessionId: string) => {
+      expect(context.registry.has(sessionId)).toBe(true);
+      return 41;
+    });
+
+    // When
+    await performSpawn(makeInput(), context);
+
+    // Then
+    expect(context.writeCoordinator.initialize).toHaveBeenCalledWith('input-session-id-0000-000000000000');
+    expect(context.nativeIdleEvidence.initializeSession).toHaveBeenCalledWith(
+      'input-session-id-0000-000000000000',
+      41,
+    );
+    expect(context.writeCoordinator.initialize).toHaveBeenCalledBefore(context.nativeIdleEvidence.initializeSession);
+    expect(context.nativeIdleEvidence.initializeSession).toHaveBeenCalledBefore(context.bufferManager.initSession);
+    expect(context.nativeIdleEvidence.initializeSession).toHaveBeenCalledBefore(context.sessionFiles.register);
+    expect(context.nativeIdleEvidence.initializeSession).toHaveBeenCalledBefore(context.telemetry.initSession);
+  });
+
+  it('disposes coordinator and evidence together on natural PTY exit', async () => {
+    // Given
+    const context = makeContext();
+    await performSpawn(makeInput(), context);
+    const spawnedPty = vi.mocked(ptyModule.spawn).mock.results[0]?.value;
+    const exitListener = spawnedPty
+      ? vi.mocked(spawnedPty.onExit).mock.calls[0]?.[0]
+      : undefined;
+
+    // When
+    exitListener?.({ exitCode: 0 });
+
+    // Then
+    expect(context.writeCoordinator.disposeSession).toHaveBeenCalledWith('input-session-id-0000-000000000000');
+    expect(context.nativeIdleEvidence.removeSession).toHaveBeenCalledWith('input-session-id-0000-000000000000');
+  });
+
+  it('does not let an old PTY exit dispose a newer generation that reused the session ID', async () => {
+    // Given
+    const context = makeContext();
+    context.writeCoordinator.initialize
+      .mockReturnValueOnce(41)
+      .mockReturnValueOnce(42);
+    context.writeCoordinator.getSessionGeneration.mockReturnValue(42);
+    const input = makeInput();
+    await performSpawn(input, context);
+    const firstPty = vi.mocked(ptyModule.spawn).mock.results[0]?.value;
+    const firstExitListener = firstPty
+      ? vi.mocked(firstPty.onExit).mock.calls[0]?.[0]
+      : undefined;
+    await performSpawn(input, context);
+    context.writeCoordinator.disposeSession.mockClear();
+    context.nativeIdleEvidence.removeSession.mockClear();
+    context.statusFileReader.flushPendingEvents.mockClear();
+    context.sessionFiles.detachOnPtyExit.mockClear();
+    context.emit.mockClear();
+
+    // When
+    firstExitListener?.({ exitCode: 0 });
+
+    // Then
+    expect(context.writeCoordinator.disposeSession).not.toHaveBeenCalled();
+    expect(context.nativeIdleEvidence.removeSession).not.toHaveBeenCalled();
+    expect(context.statusFileReader.flushPendingEvents).not.toHaveBeenCalled();
+    expect(context.sessionFiles.detachOnPtyExit).not.toHaveBeenCalled();
+    expect(context.emit).not.toHaveBeenCalled();
+  });
+});
+
+describe('performSpawn - generic spawn cleanup transfer', () => {
+  afterEach(() => {
+    vi.clearAllMocks();
   });
 
   it('transfers generic spawn cleanup to the running managed session', async () => {

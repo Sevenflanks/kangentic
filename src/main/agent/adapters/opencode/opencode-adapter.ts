@@ -8,6 +8,7 @@ import { parseOpenCodeTranscript, openCodeTranscriptSourcePath } from './transcr
 import { migrateOpenCodeProjectData } from './project-relocation';
 import { removeHooks as removeOpenCodeHooks } from './hook-manager';
 import { discoverOpenCodeCapabilities } from './capability-discovery';
+import { getOpenCodeAutoCommandDisposition } from './auto-command-policy';
 import { runCliPrintSummarize, buildSummarizePrompt } from '../../shared/auto-name';
 import type {
   AgentAdapter,
@@ -20,6 +21,14 @@ import type {
 } from '../../agent-adapter';
 import type { AgentPermissionEntry, PermissionMode, AdapterRuntimeStrategy, SessionEvent, SubmissionContextType, SubmissionVerifier, AgentCapabilities } from '../../../../shared/types';
 import { ActivityDetection } from '../../../../shared/types';
+import { EventTypeActivity } from '../../../../shared/types';
+import { parseOpenCodeNativeBoundary } from './native-boundary';
+import type { EventType as SessionEventType } from '../../../../shared/types';
+import type { PrivateEventLinesInput } from '../../agent-adapter';
+import type {
+  AutoCommandDisposition,
+  AutoCommandDispositionInput,
+} from '../../auto-command-disposition';
 
 const INITIAL_PROMPT_PAYLOAD_FILENAME = 'opencode-initial-prompt.json';
 const INITIAL_PROMPT_PAYLOAD_PATH_ENV = 'KANGENTIC_OPENCODE_INITIAL_PROMPT_PATH';
@@ -77,6 +86,39 @@ const LABELED_SESSION_ID_REGEX = new RegExp(
 );
 const ANSI_ESCAPE_REGEX = /\x1b\[[0-9;?]*[a-zA-Z]/g;
 
+type JsonRecord = { readonly [key: string]: unknown };
+
+function isJsonRecord(value: unknown): value is JsonRecord {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isEventType(value: unknown): value is SessionEventType {
+  return typeof value === 'string'
+    && Object.prototype.hasOwnProperty.call(EventTypeActivity, value);
+}
+
+function parsePublicSessionEvent(line: string): SessionEvent | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(line);
+  } catch (error) {
+    if (error instanceof SyntaxError) return null;
+    throw error;
+  }
+  if (!isJsonRecord(parsed)
+    || typeof parsed.ts !== 'number'
+    || !Number.isFinite(parsed.ts)
+    || !isEventType(parsed.type)) return null;
+
+  return {
+    ts: parsed.ts,
+    type: parsed.type,
+    ...(typeof parsed.detail === 'string' ? { detail: parsed.detail } : {}),
+    ...(typeof parsed.tool === 'string' ? { tool: parsed.tool } : {}),
+    ...(typeof parsed.toolId === 'string' ? { toolId: parsed.toolId } : {}),
+  };
+}
+
 /**
  * OpenCode CLI adapter (https://github.com/sst/opencode). OpenCode is a
  * TUI-based AI coding agent installed via `npm i -g opencode-ai`, the
@@ -114,6 +156,23 @@ export class OpenCodeAdapter implements AgentAdapter {
   readonly displayName = 'OpenCode';
   readonly sessionType = 'opencode_agent';
   readonly supportsCallerSessionId = false;
+  readonly liveSubmissionPolicy = {
+    mode: 'wait-for-native-idle',
+    timeoutMs: 120_000,
+    cancelOnUserInput: true,
+    sendCtrlC: false,
+  } as const;
+
+  getAutoCommandDisposition(input: AutoCommandDispositionInput): AutoCommandDisposition {
+    return getOpenCodeAutoCommandDisposition(input);
+  }
+
+  ingestPrivateEventLines(input: PrivateEventLinesInput): void {
+    for (const line of input.rawLines) {
+      const boundary = parseOpenCodeNativeBoundary(line);
+      if (boundary) input.nativeIdleEvidence.recordBoundary(input.ptySessionId, boundary);
+    }
+  }
   // OpenCode's autonomy is expressed through "agents" (Build, Plan,
   // and any custom agents the user defines in opencode.json), cycled
   // at runtime via Tab. We expose those native concepts directly
@@ -299,13 +358,7 @@ export class OpenCodeAdapter implements AgentAdapter {
     activity: ActivityDetection.hooksAndPty(),
     statusFile: {
       parseStatus: () => null,
-      parseEvent: (line: string): SessionEvent | null => {
-        try {
-          return JSON.parse(line) as SessionEvent;
-        } catch {
-          return null;
-        }
-      },
+      parseEvent: parsePublicSessionEvent,
       isFullRewrite: false,
     },
     sessionId: {

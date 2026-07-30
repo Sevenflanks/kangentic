@@ -478,7 +478,7 @@ When a task moves between swimlanes, the IPC handler checks priorities in order:
 2. **Target is Done** → Suspend session (resumable), archive task
 3. **Target has auto_spawn=false** → Suspend session
 4. **Task has active session** → A permission-only lane change keeps the live session running. The effective model target resolves task override, then lane override, then project default; only a changed, concrete result restarts the session. An effort change is live-swapped when the adapter supports it, otherwise a concrete effort change restarts the session. Agent, session-track, and force-fresh changes also follow the spawn path. See [Transition Engine](transition-engine.md) Priority 3 for the full sub-case order.
-5. **Task has no session** → The normal `spawnAgent` path creates a worktree (if enabled), runs the transition action chain, then applies fallback prompt delivery. For resumed sessions, `auto_command` is preloaded as the resume prompt. A fresh spawn with `skipPromptTemplate` receives `auto_command` as its initial prompt; a templated fresh spawn receives it through `TerminalSubmitScheduler.scheduleKeystrokes` with `sendCtrlC: false`.
+5. **Task has no session** → The normal `spawnAgent` path creates a worktree (if enabled) and runs the transition action chain. Non-OpenCode adapters retain their existing legacy fallback delivery. OpenCode finalizes Auto-command as a skip when there is no active writable compatible Main Session; fresh, resume, handoff, restart, isolated, and no-active paths all skip while their normal lifecycle continues.
 
 Transition action chains run for Priority 3 fallthrough and Priority 4 only on the normal `spawnAgent` path; native-history handoff bypasses the chain. The normal action chain runs in `execution_order`: typically `create_worktree` → `spawn_agent`.
 
@@ -525,11 +525,19 @@ Template variables available: `{{title}}`, `{{description}}`, `{{task_xml}}`, `{
 
 ### OpenCode Prompt Delivery
 
-OpenCode uses **TUI-ready terminal submission**, not `--prompt` or shell argument parsing. Kangentic launches a fresh OpenCode TUI, or resumes with `--session <id>`, then waits for the OpenCode adapter's observed `ESC[?1049h` alternate-screen takeover before `TerminalSubmit.submitContent()` sends bracketed paste. Shell or OpenCode cursor-hide and generic bracketed-paste mode are insufficient readiness signals, and this `1049h` rule applies only to OpenCode.
+OpenCode 的初始 prompt 由 adapter 私有 payload 與 project-local `.opencode/plugins/kangentic-activity.js` 交付。OpenCode 1.18.4 的本機 discovery 掃描 `.ts` 與 `.js`，因此安裝檔使用 `.js`；來源與 packaged build asset 維持 `kangentic-activity.mjs`。loader await factory 後，plugin 同步回傳 hooks，再以一個零延遲 macrotask 延後 bootstrap。timer 只處理 event ordering，不是 readiness evidence，也不是 upstream 的未來保證。
 
-A fresh OpenCode session receives the full Task XML. A resumed session receives only the current `resumePrompt`; a promptless resume restores the native session without content submission or Task XML replay. The session queue wait sits outside the 120-second readiness limit, which starts only after the session reaches `running`. There is no pre-readiness content-delivery fallback.
+plugin 會 claim 並刪除 payload、建立或驗證 native session，並呼叫 `promptAsync`，不會退回 PTY bracketed-paste。fresh session 取得 `session.create().data.id`，把 early 或 late matching `session.created` reconcile 成一個成功 bootstrap 的 `session_start`，重播 unrelated starts，透過 `client.tui.publish` 發布 `tui.session.select`，然後 prompt。resume session 用 `session.get` 驗證 known ID，reconcile 一個 `session_start`，不 publish selection，然後 prompt。每個 SDK request 帶物件內 `throwOnError: true`。每條 failure path 至多 best-effort 附加一筆 sanitized error 與 private native boundary；publish 或 prompt failure 前可能已有 `session_start`，start append failure 可由後續 matching native event 補寫。錯誤 telemetry 不含 raw data，SDK call 沒有 retry 或 fallback。successful bootstrap `session_start` reconciliation 的 exactly once 僅指 telemetry，不代表 prompt 或 live command exactly once。Fresh session 帶完整 Task XML；resume session 只帶目前的 `resumePrompt`；沒有 prompt 的 resume 不會重送 Task XML。
 
-After the initial free-form content job completes, the scheduler sends only the latest queued fresh-spawn auto-command directly as a keystroke burst with `sendCtrlC: false`. Paste acceptance evidence is collected after Enter and is separate from readiness. Session records retain the intended prompt for lifecycle and audit display, while error logs contain metadata only and never prompt content.
+同一 session track、同一 agent 的後續 live `auto_command` 與初始 prompt 是兩條獨立路徑。只有稍後出現的預期 root-native clean idle，且 session 與 input generations 相符，才可授權交付。公開 activity 的 generic idle 或 timer 完成都不能授權。Child idle、使用者輸入、native error、session exit、supersession、timeout 與 shutdown 都不能授權交付。使用者輸入與既有 cancellation 行為不變。
+
+交付使用既有本機 PTY writer，依序送出 `text`、`Esc`、`Enter`。acknowledgement 只表示最後一個 chunk 已通過本機 `pty.write` 呼叫。公開的 `LiveDeliveryStatus` 使用 `state` discriminant，`delivered` 表示 command bytes 已到達本機 terminal write path，不表示 OpenCode 已執行命令或產生 transcript receipt。
+
+這些 status 是暫時性的 project-scoped IPC state，不是 DB schema。lane auto-command 沒有 retry、persistence、recovery、reconnect、respawn 或 exactly-once guarantee。native identity、generations、clean-idle evidence 與 error latch 保留在 main process，不會出現在公開 event DTO。
+
+OpenCode Auto-command 與 ordinary Task prompt 是分離的契約。只有 active writable compatible Main Session 的 later live command 可由 native-idle evidence 授權，並保持 `sendCtrlC: false` 與 user-input cancellation。fresh、resume、handoff、restart、isolated、no-active 狀態都 finalizes a skip；它們仍保留 ordinary Task prompt、continuation prompt、action prompt 與既有 lifecycle。Non-OpenCode existing legacy delivery remains intact.
+
+An action-backed spawn runs its own prompt and still finalizes the central Auto-command disposition.
 
 ### Output Streaming
 

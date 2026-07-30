@@ -4,6 +4,7 @@ import { FitAddon } from '../addons/fit-addon';
 import { attachWebglRenderer } from '../utils/terminal-webgl';
 import { copySelectionToClipboard, enableTerminalClipboard, stripOsc52Sequences } from '../utils/terminal-clipboard';
 import { createWriteBatcher, type WriteBatcher } from '../utils/write-batcher';
+import { routeTerminalData } from '../utils/terminal-data-router';
 import { createIncomingWriteQueue, writeChunkedToTerminal } from '../utils/incoming-write-queue';
 import { isBoardDragActive, onBoardDragEnd } from '../lib/session-update-coalescer';
 import { isTerminalParked, onTerminalReveal } from '../utils/parked-terminals';
@@ -81,6 +82,7 @@ const TERMINAL_THEME = {
 
 interface UseTerminalOptions {
   sessionId: string | null;
+  projectId: string | null;
   fontFamily?: string;
   fontSize?: number;
   scrollbackLines?: number;
@@ -240,13 +242,18 @@ export function useTerminal(options: UseTerminalOptions) {
     xtermRef.current = terminal;
     fitAddonRef.current = fitAddon;
 
-    // Send user input to PTY (via the microtask-batched queue above).
+    // Send xterm data to PTY. Parser-generated focus responses use their own
+    // non-user route; all ordinary keyboard and clipboard paths retain batching.
     if (options.sessionId) {
-      terminal.onData(batcher.schedule);
+      const sid = options.sessionId;
+      terminal.onData((data) => routeTerminalData(
+        data,
+        batcher,
+        (report) => window.electronAPI.sessions.writeFocusReport(sid, report, options.projectId),
+      ));
 
       // Debounced PTY resize -- coalesces rapid dimension changes so the
       // TUI only redraws once after resizing settles.
-      const sid = options.sessionId;
       terminal.onResize(({ cols, rows }) => {
         if (resizeTimerRef.current) clearTimeout(resizeTimerRef.current);
         resizeTimerRef.current = setTimeout(() => {
@@ -351,7 +358,7 @@ export function useTerminal(options: UseTerminalOptions) {
       // No session -- just fit immediately
       fitAddon.fit();
     }
-  }, [options.sessionId, options.fontFamily, options.fontSize, options.scrollbackLines, options.cursorStyle, options.shellName, options.releaseEscapeWhenPointerOutside, settleScrollback]);
+  }, [options.sessionId, options.projectId, options.fontFamily, options.fontSize, options.scrollbackLines, options.cursorStyle, options.shellName, options.releaseEscapeWhenPointerOutside, settleScrollback]);
 
   // Set up data listener. Inbound PTY data flows through a bounded queue that
   // writes capped slices paced by xterm.write's completion callback, yielding

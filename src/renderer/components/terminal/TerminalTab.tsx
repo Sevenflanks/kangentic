@@ -53,6 +53,13 @@ export function TerminalTab({ sessionId, taskId, active, releaseEscapeWhenPointe
       [sessionId],
     ),
   );
+  const sessionProjectId = useSessionStore(
+    useCallback(
+      (s: ReturnType<typeof useSessionStore.getState>) =>
+        s.sessions.find((session) => session.id === sessionId)?.projectId ?? null,
+      [sessionId],
+    ),
+  );
 
   // Resolve via the session's own taskId (not the taskId prop / task's forward
   // session_id), mirroring ContextBar: a model/effort restart respawns the
@@ -93,6 +100,7 @@ export function TerminalTab({ sessionId, taskId, active, releaseEscapeWhenPointe
 
   const { terminalRef, initTerminal, fit, flushResize, focus, reloadScrollback, scrollbackPending, suppressDataRef } = useTerminal({
     sessionId,
+    projectId: sessionProjectId,
     fontFamily: config.terminal.fontFamily,
     fontSize: config.terminal.fontSize,
     scrollbackLines: config.terminal.scrollbackLines,

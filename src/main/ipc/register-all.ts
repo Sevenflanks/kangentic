@@ -82,7 +82,15 @@ export function registerAllIpc(mainWindow: BrowserWindow, mcpServerHandle: McpHt
   const sessionManager = new SessionManager();
   const pasteEngine = createPasteEngine(sessionManager);
   const terminalSubmit = new TerminalSubmit(sessionManager, pasteEngine);
-  const terminalSubmitScheduler = new TerminalSubmitScheduler(sessionManager, terminalSubmit);
+  const terminalSubmitScheduler = new TerminalSubmitScheduler(
+    sessionManager,
+    terminalSubmit,
+    (status) => {
+      const mainWindow = context?.mainWindow;
+      if (!mainWindow || mainWindow.isDestroyed()) return;
+      mainWindow.webContents.send(IPC.SESSION_LIVE_DELIVERY_STATUS, status);
+    },
+  );
   const transcriptionService = new TranscriptionService();
   const boardConfigManager = new BoardConfigManager({
     ephemeral: process.argv.includes('--ephemeral'),

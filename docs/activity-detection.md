@@ -193,6 +193,12 @@ Each adapter declares one strategy via its `runtime.activity` field (constructed
 
 Both `pty` and `hooks_and_pty` may pass an optional `detectIdle(data: string) => boolean` for instant idle detection from the input-prompt regex. Without it, idle is inferred from a silence timer.
 
+### OpenCode live `auto_command` admission
+
+OpenCode 的 `hooks_and_pty` activity state 仍用於一般 UI 顯示，但 generic public idle 不能授權後續 live `auto_command`。同一 session track、同一 agent 的 lane command 只有在稍後收到私有 root native session 的 matching clean idle，並通過 session 與 input generations 比對時，才能交付。timer 完成也不能授權。Child idle、使用者輸入、native error、session exit、supersession、timeout 與 shutdown 都會阻止交付。使用者輸入與既有 cancellation 維持原行為。
+
+這份私有 evidence 由 project-local `.opencode/plugins/kangentic-activity.js` 在 main process 的事件管線中建立。OpenCode 1.18.4 的 project-local discovery 掃描 `.ts` 與 `.js`，但來源與 packaged build asset 維持 `kangentic-activity.mjs`。公開 IPC 只送出暫時性的 `LiveDeliveryStatus`，以 `state` 表示 waiting、sending、delivered 或 cancelled。`delivered` 只表示 bytes 已通過本機 PTY 寫入，不表示 OpenCode 已執行命令。系統不提供 retry、persistence、recovery、reconnect、respawn 或 live-command exactly-once guarantee。successful bootstrap `session_start` reconciliation 的 exactly once 僅限 telemetry event。
+
 ## Predicate
 
 The engine exposes ONE predicate:

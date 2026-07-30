@@ -24,6 +24,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import type { TaskMoveResult } from '../../src/shared/auto-command-outcome';
 import type { Task, Swimlane } from '../../src/shared/types';
 
 const hoisted = vi.hoisted(() => ({
@@ -43,6 +44,7 @@ vi.mock('../../src/main/db/database', () => ({ getProjectDb: vi.fn(() => ({})) }
 vi.mock('../../src/main/db/repositories/task-repository', () => ({ TaskRepository: class {} }));
 vi.mock('../../src/main/db/repositories/session-repository', () => ({
   SessionRepository: class {
+    findById = vi.fn((sessionId: string) => hoisted.activeRecord?.id === sessionId ? hoisted.activeRecord : undefined);
     getLatestForTask = vi.fn(() => hoisted.activeRecord);
     getLatestForTaskByTypeAndIsolation = vi.fn(() => hoisted.activeRecord);
     updateGitStats = vi.fn();
@@ -98,7 +100,7 @@ vi.mock('../../src/main/agent/shared', () => ({
 const mockGetProjectRepos = vi.fn();
 const mockEnsureTaskWorktree = vi.fn(async () => null);
 const mockEnsureTaskBranchCheckout = vi.fn(async () => {});
-const mockSpawnAgent = vi.fn(async () => {});
+const mockSpawnAgent = vi.fn(async () => ({ kind: 'not-applicable' } as const));
 const mockCreateTransitionEngine = vi.fn(() => ({}));
 const mockBuildAutoCommandVars = vi.fn(() => ({}));
 
@@ -206,12 +208,16 @@ describe('handleTaskMove session switch', () => {
     hoisted.activeRecord = null;
     mockEnsureTaskWorktree.mockResolvedValue(null);
     mockEnsureTaskBranchCheckout.mockResolvedValue(undefined);
-    mockSpawnAgent.mockResolvedValue(undefined);
+    mockSpawnAgent.mockResolvedValue({ kind: 'not-applicable' } as const);
   });
 
-  it('ENTER isolated: suspends the live main session and spawns the isolated column', async () => {
+  it('ENTER isolated force-fresh: suspends the live main session without a restart lifecycle override', async () => {
     const execLane = makeSwimlane(EXEC_LANE_ID, { session_target: 'main' });
-    const isolatedLane = makeSwimlane(REVIEW_ISOLATED_LANE_ID, { session_target: 'isolated', auto_command: '/code-review' });
+    const isolatedLane = makeSwimlane(REVIEW_ISOLATED_LANE_ID, {
+      session_target: 'isolated',
+      session_spawn_strategy: 'always_spawn_new',
+      auto_command: '/code-review',
+    });
     const swimlaneRepo = {
       getById: vi.fn((id: string) => (id === EXEC_LANE_ID ? execLane : id === REVIEW_ISOLATED_LANE_ID ? isolatedLane : null)),
       list: vi.fn(() => [execLane, isolatedLane]),
@@ -219,7 +225,7 @@ describe('handleTaskMove session switch', () => {
 
     // Live main session on the exec lane.
     hoisted.activeRecord = {
-      id: 'rec-main', task_id: 'task-aaa00001', isolated_swimlane_id: null,
+      id: 'active-session-1', task_id: 'task-aaa00001', isolated_swimlane_id: null,
       agent_session_id: 'agent-A', status: 'running',
       started_at: '2026-01-01T00:00:00Z', session_type: 'claude_agent',
     };
@@ -236,12 +242,12 @@ describe('handleTaskMove session switch', () => {
 
     const context = makeContext(taskRepo, swimlaneRepo);
 
-    await handleTaskMove(context as never, {
+    const result = await handleTaskMove(context as never, {
       taskId: 'task-aaa00001', targetSwimlaneId: REVIEW_ISOLATED_LANE_ID, targetPosition: 0,
     });
 
     // Suspended the live (main) line.
-    expect(markRecordSuspended).toHaveBeenCalledWith(expect.anything(), 'rec-main', 'system');
+    expect(markRecordSuspended).toHaveBeenCalledWith(expect.anything(), 'active-session-1', 'system');
     expect(context.sessionManager.suspend).toHaveBeenCalledWith('active-session-1');
     expect(taskRepo.update).toHaveBeenCalledWith({ id: 'task-aaa00001', session_id: null });
 
@@ -250,6 +256,11 @@ describe('handleTaskMove session switch', () => {
     const spawnArg = mockSpawnAgent.mock.calls[0][0] as { toLane: Swimlane };
     expect(spawnArg.toLane.id).toBe(REVIEW_ISOLATED_LANE_ID);
     expect(spawnArg.toLane.session_target).toBe('isolated');
+    expect(spawnArg.toLane.session_spawn_strategy).toBe('always_spawn_new');
+    expect(mockSpawnAgent).toHaveBeenCalledWith(expect.objectContaining({
+      autoCommandLifecycle: undefined,
+    }));
+    expect(result).toEqual({ ok: true, autoCommand: { kind: 'not-applicable' } } satisfies TaskMoveResult);
   });
 
   it('LEAVE isolated: suspends the isolated line and spawns the normal column (no keep-alive strand)', async () => {
@@ -262,7 +273,7 @@ describe('handleTaskMove session switch', () => {
 
     // Live ISOLATED session (line = the review lane id).
     hoisted.activeRecord = {
-      id: 'rec-isolated', task_id: 'task-aaa00001', isolated_swimlane_id: REVIEW_ISOLATED_LANE_ID,
+      id: 'active-session-1', task_id: 'task-aaa00001', isolated_swimlane_id: REVIEW_ISOLATED_LANE_ID,
       agent_session_id: 'agent-B', status: 'running',
       started_at: '2026-01-02T00:00:00Z', session_type: 'claude_agent',
     };
@@ -284,7 +295,7 @@ describe('handleTaskMove session switch', () => {
     });
 
     // Suspended the live isolated line (not kept alive).
-    expect(markRecordSuspended).toHaveBeenCalledWith(expect.anything(), 'rec-isolated', 'system');
+    expect(markRecordSuspended).toHaveBeenCalledWith(expect.anything(), 'active-session-1', 'system');
     expect(context.sessionManager.suspend).toHaveBeenCalledWith('active-session-1');
 
     // Phase 3 spawned with the NORMAL column (which resumes main).
@@ -292,6 +303,9 @@ describe('handleTaskMove session switch', () => {
     const spawnArg = mockSpawnAgent.mock.calls[0][0] as { toLane: Swimlane };
     expect(spawnArg.toLane.id).toBe(EXEC_LANE_ID);
     expect(spawnArg.toLane.session_target).toBe('main');
+    expect(mockSpawnAgent).toHaveBeenCalledWith(expect.objectContaining({
+      autoCommandLifecycle: undefined,
+    }));
   });
 
   it('regression: normal -> normal move of a main session does NOT line-switch', async () => {
@@ -304,7 +318,7 @@ describe('handleTaskMove session switch', () => {
 
     // Live main session; target is another normal column, no auto_command.
     hoisted.activeRecord = {
-      id: 'rec-main', task_id: 'task-aaa00001', isolated_swimlane_id: null,
+      id: 'active-session-1', task_id: 'task-aaa00001', isolated_swimlane_id: null,
       agent_session_id: 'agent-A', status: 'running',
       started_at: '2026-01-01T00:00:00Z', session_type: 'claude_agent',
     };
@@ -345,7 +359,7 @@ describe('handleTaskMove session switch', () => {
 
     // Live MAIN session (isolation null on both the active record and the target).
     hoisted.activeRecord = {
-      id: 'rec-main', task_id: 'task-aaa00001', isolated_swimlane_id: null,
+      id: 'active-session-1', task_id: 'task-aaa00001', isolated_swimlane_id: null,
       agent_session_id: 'agent-A', status: 'running',
       started_at: '2026-01-01T00:00:00Z', session_type: 'claude_agent',
     };
@@ -367,11 +381,14 @@ describe('handleTaskMove session switch', () => {
     });
 
     // Suspended the live main session and routed to Phase 3 to spawn fresh.
-    expect(markRecordSuspended).toHaveBeenCalledWith(expect.anything(), 'rec-main', 'system');
+    expect(markRecordSuspended).toHaveBeenCalledWith(expect.anything(), 'active-session-1', 'system');
     expect(context.sessionManager.suspend).toHaveBeenCalledWith('active-session-1');
     expect(mockSpawnAgent).toHaveBeenCalledTimes(1);
     const spawnArg = mockSpawnAgent.mock.calls[0][0] as { toLane: Swimlane };
     expect(spawnArg.toLane.id).toBe('lane-reset');
     expect(spawnArg.toLane.session_spawn_strategy).toBe('always_spawn_new');
+    expect(mockSpawnAgent).toHaveBeenCalledWith(expect.objectContaining({
+      autoCommandLifecycle: { kind: 'restart' },
+    }));
   });
 });

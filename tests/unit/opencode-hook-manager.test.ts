@@ -8,7 +8,7 @@ import { buildHooks, removeHooks } from '../../src/main/agent/adapters/opencode'
 let projectDir: string;
 
 function pluginPath(directory = projectDir): string {
-  return path.join(directory, '.opencode', 'plugins', 'kangentic-activity.mjs');
+  return path.join(directory, '.opencode', 'plugins', 'kangentic-activity.js');
 }
 
 function sourcePluginPath(): string {
@@ -34,10 +34,11 @@ afterEach(() => {
 
 describe('opencode-hook-manager', () => {
   describe('buildHooks', () => {
-    it('copies the kangentic activity plugin into .opencode/plugins/', () => {
+    it('installs only the discoverable .js entry into .opencode/plugins/', () => {
       buildHooks(projectDir);
 
       expect(fs.existsSync(pluginPath())).toBe(true);
+      expect(fs.existsSync(path.join(projectDir, '.opencode', 'plugins', 'kangentic-activity.mjs'))).toBe(false);
     });
 
     it('plugin file starts with the kangentic-activity sentinel', () => {
@@ -270,7 +271,7 @@ describe('opencode-hook-manager', () => {
   });
 
   describe('buildHooks gitignore behavior', () => {
-    const PLUGIN_GITIGNORE_ENTRY = '.opencode/plugins/kangentic-activity.mjs';
+    const PLUGIN_GITIGNORE_ENTRY = '.opencode/plugins/kangentic-activity.js';
 
     function gitignorePath(): string {
       return path.join(projectDir, '.gitignore');
@@ -318,7 +319,7 @@ describe('opencode-hook-manager', () => {
       buildHooks(projectDir);
 
       // The plugin must still install...
-      expect(fs.existsSync(path.join(projectDir, '.opencode', 'plugins', 'kangentic-activity.mjs'))).toBe(true);
+      expect(fs.existsSync(path.join(projectDir, '.opencode', 'plugins', 'kangentic-activity.js'))).toBe(true);
       // ...but no .gitignore must be created.
       expect(fs.existsSync(gitignorePath())).toBe(false);
     });

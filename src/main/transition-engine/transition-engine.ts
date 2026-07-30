@@ -20,6 +20,14 @@ import type { TaskRepository } from '../db/repositories/task-repository';
 import type { SessionRepository } from '../db/repositories/session-repository';
 import type { AttachmentRepository } from '../db/repositories/attachment-repository';
 import type { InitialPromptInput, InitialPromptPreparation } from '../agent/agent-adapter';
+import type { AutoCommandLifecycle } from '../agent/auto-command-disposition';
+
+type SpawnExecutionLifecycle = Extract<
+  AutoCommandLifecycle,
+  { readonly kind: 'fresh' | 'resume' }
+>;
+
+type SpawnLifecycleObserver = (lifecycle: SpawnExecutionLifecycle) => void;
 
 interface TransitionEngineConfig {
   permissionMode: string;
@@ -99,7 +107,7 @@ export class TransitionEngine {
     }, permissionOverride, resumePrompt, signal, agentOverride, handoffPromptPrefix, spawnOverrides);
   }
 
-  async executeTransition(task: Task, fromSwimlaneId: string, toSwimlaneId: string, permissionOverride?: PermissionMode | null, skipPromptTemplate?: boolean, signal?: AbortSignal, agentOverride?: string, spawnOverrides?: SpawnOverrides, onProgress?: (phase: string) => void): Promise<void> {
+  async executeTransition(task: Task, fromSwimlaneId: string, toSwimlaneId: string, permissionOverride?: PermissionMode | null, skipPromptTemplate?: boolean, signal?: AbortSignal, agentOverride?: string, spawnOverrides?: SpawnOverrides, onProgress?: (phase: string) => void, onSpawnLifecycle?: SpawnLifecycleObserver, continuationPrompt?: string): Promise<void> {
     const transitions = this.actionRepo.getTransitionsFor(fromSwimlaneId, toSwimlaneId);
     if (transitions.length === 0) return;
 
@@ -108,11 +116,11 @@ export class TransitionEngine {
       const action = this.actionRepo.getById(transition.action_id);
       if (!action) continue;
 
-      await this.executeAction(action, task, permissionOverride, skipPromptTemplate, signal, agentOverride, spawnOverrides, onProgress);
+      await this.executeAction(action, task, permissionOverride, skipPromptTemplate, signal, agentOverride, spawnOverrides, onProgress, onSpawnLifecycle, continuationPrompt);
     }
   }
 
-  private async executeAction(action: Action, task: Task, permissionOverride?: PermissionMode | null, skipPromptTemplate?: boolean, signal?: AbortSignal, agentOverride?: string, spawnOverrides?: SpawnOverrides, onProgress?: (phase: string) => void): Promise<void> {
+  private async executeAction(action: Action, task: Task, permissionOverride?: PermissionMode | null, skipPromptTemplate?: boolean, signal?: AbortSignal, agentOverride?: string, spawnOverrides?: SpawnOverrides, onProgress?: (phase: string) => void, onSpawnLifecycle?: SpawnLifecycleObserver, continuationPrompt?: string): Promise<void> {
     let config: ActionConfig;
     try {
       config = JSON.parse(action.config_json);
@@ -141,12 +149,15 @@ export class TransitionEngine {
     };
 
     switch (action.type) {
-      case 'spawn_agent':
+      case 'spawn_agent': {
         if (skipPromptTemplate) {
           config.promptTemplate = undefined;
         }
-        await this.executeSpawnAgent(config, task, templateVars, permissionOverride, undefined, signal, agentOverride, undefined, spawnOverrides);
+        const lifecycle = await this.executeSpawnAgent(config, task, templateVars, permissionOverride, undefined, signal, agentOverride, undefined, spawnOverrides, continuationPrompt);
+        // 只在 spawn 完成後通知，且必須在下一個 action 前更新；後續 action 失敗時呼叫端仍可使用最後成功的 lifecycle。
+        onSpawnLifecycle?.(lifecycle);
         break;
+      }
 
       case 'send_command':
         // Fire-and-forget: executeSendCommand internally spawns a fire-and-
@@ -179,7 +190,7 @@ export class TransitionEngine {
     }
   }
 
-  private async executeSpawnAgent(config: ActionConfig, task: Task, vars: Record<string, string>, permissionOverride?: PermissionMode | null, resumePrompt?: string, signal?: AbortSignal, agentOverride?: string, handoffPromptPrefix?: string, spawnOverrides?: SpawnOverrides): Promise<void> {
+  private async executeSpawnAgent(config: ActionConfig, task: Task, vars: Record<string, string>, permissionOverride?: PermissionMode | null, resumePrompt?: string, signal?: AbortSignal, agentOverride?: string, handoffPromptPrefix?: string, spawnOverrides?: SpawnOverrides, continuationPrompt?: string): Promise<SpawnExecutionLifecycle> {
     const appConfig = this.getConfig();
 
     // Resolve which agent adapter to use.
@@ -241,7 +252,10 @@ export class TransitionEngine {
       ? intent.agentSessionId
       : (adapter.supportsCallerSessionId ? randomUUID() : null);
 
-    let prompt = intent.prompt;
+    // Continuation is resume-only; generic resumePrompt still governs promptless fresh delivery.
+    let prompt = intent.mode === 'resume' && continuationPrompt !== undefined
+      ? continuationPrompt
+      : intent.prompt;
 
     // Generate PTY session ID upfront (used for directory naming, DB primary key).
     // This is Kangentic's internal ID, separate from the agent CLI's session ID.
@@ -438,6 +452,8 @@ export class TransitionEngine {
         verifier: adapter.getSubmissionVerifier?.('paste') ?? null,
       });
     }
+
+    return canResume ? { kind: 'resume' } : { kind: 'fresh' };
   }
 
   private async executeSendCommand(config: ActionConfig, task: Task, vars: Record<string, string>): Promise<void> {

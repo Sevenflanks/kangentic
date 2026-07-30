@@ -770,6 +770,23 @@ test.describe('Task Activity Indicators', () => {
     });
   });
 
+  test('live delivery feedback temporarily takes precedence over the running usage footer', async () => {
+    const { browser, page } = await launchWithState(
+      makePreConfig({ sessionStatus: 'running', activity: 'thinking', withUsage: true }),
+    );
+    try {
+      await page.locator('[data-swimlane-name="To Do"]').waitFor({ state: 'visible', timeout: 15000 });
+      const card = page.locator(`[data-task-id="${TASK_ID}"]`);
+      await page.waitForFunction('typeof window.__mockFireLiveDeliveryStatus === "function"');
+      await page.evaluate(`window.__mockFireLiveDeliveryStatus({ projectId: '${PROJECT_ID}', taskId: '${TASK_ID}', sessionId: '${SESSION_ID}', generation: 1, at: '2026-07-22T00:00:00.000Z', state: 'waiting' })`);
+
+      await expect(card.locator('[data-testid="live-delivery-status"]')).toContainText('Waiting for agent input...');
+      await expect(card.locator('[data-testid="usage-bar"]')).not.toBeVisible();
+    } finally {
+      await browser.close();
+    }
+  });
+
   // Group: rate-limits pill (Claude-only field, ContextBar component)
   test.describe('rate limits pill', () => {
     test('renders 5h and 7d bars in task detail ContextBar when usage.rateLimits is present', async () => {

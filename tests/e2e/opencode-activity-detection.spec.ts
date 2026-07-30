@@ -1,8 +1,8 @@
 /**
  * E2E test for OpenCode activity detection.
  *
- * OpenCode's runtime strategy is `ActivityDetection.pty()` - the CLI has no
- * hook system, so activity is derived purely from PTY silence (same as Codex).
+ * OpenCode activity uses its installed plugin's native session/tool events,
+ * with PTY silence retained as a fallback between explicit events.
  * This spec verifies that:
  *  - A spawned OpenCode session shows up in the activity IPC map
  *  - The session settles to 'idle' once the mock stops emitting output
@@ -84,9 +84,8 @@ test.describe('OpenCode Agent - Activity Detection', () => {
     await moveTaskIpc(page, taskId, swimlaneIds.planning);
     await waitForScrollback(page, 'MOCK_OPENCODE_SESSION:');
 
-    // PTY-only strategy: with no further mock output after the startup
-    // banner, the silence-based detector should land on 'idle' within
-    // a few seconds (10s silence budget is the adapter default).
+    // The default mock emits no native idle after startup, so the PTY-silence
+    // fallback should land on 'idle' within the adapter's 10s silence budget.
     await expect.poll(async () => {
       const activity = await page.evaluate(() => window.electronAPI.sessions.getActivity());
       return Object.values(activity as Record<string, ActivityState>);

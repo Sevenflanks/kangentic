@@ -12,7 +12,13 @@ import type {
   TranscriptEntry,
   TranscriptUsage,
   TranscriptToolCounts,
+  AgentParser,
 } from '../../shared/types';
+import type { NativeIdleEvidence } from '../activity-engine/native-idle-evidence';
+import type {
+  AutoCommandDisposition,
+  AutoCommandDispositionInput,
+} from './auto-command-disposition';
 
 /**
  * Result of `AgentAdapter.parseTranscript`. `entries` is the parsed
@@ -83,6 +89,33 @@ export type SpawnCommandOptions = Omit<CommandOptions, 'cliPath'> & {
 };
 
 export type InitialPromptDelivery = 'command-argument' | 'terminal-submit';
+
+export type LiveSubmissionPolicy =
+  | { readonly mode: 'interrupt-immediately'; readonly sendCtrlC: true }
+  | { readonly mode: 'wait-for-native-idle'; readonly timeoutMs: 120_000; readonly cancelOnUserInput: true; readonly sendCtrlC: false };
+
+export const DEFAULT_LIVE_SUBMISSION_POLICY: LiveSubmissionPolicy = {
+  mode: 'interrupt-immediately',
+  sendCtrlC: true,
+};
+
+export interface PrivateEventLinesInput {
+  readonly ptySessionId: string;
+  readonly rawLines: readonly string[];
+  readonly nativeIdleEvidence: NativeIdleEvidence;
+}
+
+interface PrivateEventLinesAdapter {
+  ingestPrivateEventLines(input: PrivateEventLinesInput): void;
+}
+
+export function hasPrivateEventLinesHook(
+  adapter: AgentParser | undefined,
+): adapter is AgentParser & PrivateEventLinesAdapter {
+  return adapter !== undefined
+    && 'ingestPrivateEventLines' in adapter
+    && typeof adapter.ingestPrivateEventLines === 'function';
+}
 
 export type InitialPromptInput = {
   readonly prompt: string;
@@ -167,6 +200,12 @@ export interface AgentAdapter {
   buildCommand(options: SpawnCommandOptions): string;
 
   readonly initialPromptDelivery?: InitialPromptDelivery;
+
+  readonly liveSubmissionPolicy?: LiveSubmissionPolicy;
+
+  getAutoCommandDisposition?(input: AutoCommandDispositionInput): AutoCommandDisposition;
+
+  ingestPrivateEventLines?(input: PrivateEventLinesInput): void;
 
   /**
    * Prepare an adapter-owned initial prompt transport after its private session

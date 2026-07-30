@@ -1,8 +1,10 @@
 # Command Injection
 
-Kangentic injects per-column `auto_command` values and supported effort changes into a live agent session when a task moves between columns. Model changes set `needsRestartForModel` and are handled by the caller before any live writes. `TerminalSubmitScheduler` (`src/main/transition-engine/terminal-submit-scheduler.ts`) schedules each task's burst and decides whether the burst is prefixed with a `Ctrl+C` (live-injection) or not (fresh-spawn). `TerminalSubmit.submitKeystrokes` (`src/main/pty/terminal-submit.ts`) executes the byte-level keystroke sequence (`Ctrl+C? → text → Esc → Enter` per command). This document covers how the **command-injection** verification context confirms each chained command lands cleanly on the agent's TUI.
+Kangentic injects per-column `auto_command` values and supported effort changes into a live agent session when a task moves between columns. Model changes set `needsRestartForModel` and are handled by the caller before any live writes. For ordinary `TerminalSubmitScheduler` (`src/main/transition-engine/terminal-submit-scheduler.ts`) bursts, regular live injection is prefixed with `Ctrl+C` while fresh-spawn bursts are not. OpenCode trailing live lane commands use the separate `wait-for-native-idle` path: same-process native-idle admission, user-input cancellation, and `TerminalSubmit.submitKeystrokes` (`src/main/pty/terminal-submit.ts`) with `sendCtrlC: false`. This document covers how the **command-injection** verification context confirms each chained command lands cleanly on the agent's TUI.
 
-OpenCode's initial content follows a separate **TUI-ready terminal submission** path. A fresh session receives the full Task XML through `TerminalSubmit.submitContent()` bracketed paste after the adapter observes `ESC[?1049h` alternate-screen takeover. A resumed session receives only its current `resumePrompt`, and a promptless resume restores the native session without content submission or Task XML replay. Cursor-hide and generic bracketed-paste mode are not enough to treat OpenCode as ready.
+OpenCode 的初始內容走獨立的私有 plugin 路徑，已依 OpenCode 1.18.4 本機原始碼窄幅確認。OpenCode 專案本機 discovery 會掃描 `.ts` 與 `.js`，因此安裝檔是 `.opencode/plugins/kangentic-activity.js`；來源與 packaged build asset 仍是 `kangentic-activity.mjs`。loader 會 await factory，但 Kangentic 同步回傳 hooks，並以一個零延遲 macrotask 延後 bootstrap，避免 factory 在 OpenCode instance bootstrap 內等待自身 Session API 而卡住。bootstrap 不由第一個 event 啟動。這個 timer 只處理執行順序，不是 readiness 證據，也不構成未來 upstream 保證。
+
+`prepareInitialPrompt` 寫入 adapter 準備的私有 payload，由同一 OpenCode process 的 plugin claim 後刪除。fresh payload 會建立 session、取得 `session.create().data.id`，把早到或晚到的相符 `session.created` 與合成事件整合為一個成功 bootstrap 的 `session_start`，重播不相關的 starts，再以 `client.tui.publish` 發布 `tui.session.select`，最後呼叫 `promptAsync`。resume payload 以 `session.get` 驗證已知 ID，整合一個 `session_start`，不發布 selection，接著呼叫 `promptAsync`。每次 create、get、publish 與 prompt request 都帶物件內的 `throwOnError: true`。每條 bootstrap failure path 至多 best-effort 附加一筆 sanitized public `idle` error 與同時間戳的 private native error boundary；publish 或 prompt failure 前可能已寫入 `session_start`，而 start append failure 可由後續 matching native event 補寫。這些路徑不含原始資料，也不 retry SDK call 或切換 fallback。成功 bootstrap `session_start` reconciliation 的 exactly once 只指 telemetry event，並不宣稱 prompt 執行或 live command exactly once。完整 Task 5 QA 尚未成功，現有證據限於 automated 與 runtime boundary。
 
 ## What gets injected (the settings delta)
 
@@ -71,7 +73,7 @@ The scan is bounded by a 50ms tolerance window around the send time (`Date.now()
 
 `TerminalSubmitScheduler.scheduleKeystrokes` hands a chain of commands to `TerminalSubmit.submitKeystrokes`, which delivers them with the following timing:
 
-0. **Optional leading `Ctrl+C`** (`sendCtrlC` opt-in, default true). The scheduler passes `sendCtrlC: false` when `opts.freshlySpawned` is true so fresh-spawn auto_command bursts skip the interrupt entirely. Live-injection paths (supported effort changes and board column edits on a running session) keep `sendCtrlC: true` so they can interrupt mid-thinking before delivering the new write.
+0. **Optional leading `Ctrl+C`** (`sendCtrlC` opt-in, default true). The scheduler passes `sendCtrlC: false` when `opts.freshlySpawned` is true so fresh-spawn auto_command bursts skip the interrupt entirely. Regular live-injection paths (supported effort changes and board column edits on a running session) keep `sendCtrlC: true` so they can interrupt mid-thinking before delivering the new write. OpenCode trailing live lane commands are a separate `wait-for-native-idle` path: they use `sendCtrlC: false` and are cancelled if user input arrives before admission.
 1. Initial write of command text + Escape + Enter (text → `\x1b` → `\r`).
 2. **If the command falls within `verifiedPrefixLength`**: poll the verifier every 25ms for up to 400ms. If unconfirmed, re-fire `\r` and try again. After 4 retries, log a warning, send Ctrl+C to clear the prompt buffer, and continue with the next command.
 3. **Otherwise** (no verifier, or command falls outside the verified prefix): wait a fixed 500ms settle window before the next command.
@@ -80,7 +82,9 @@ The scan is bounded by a 50ms tolerance window around the send time (`Date.now()
 
 The `Ctrl+C` opt-out exists to prevent a distinct concatenation failure mode from the chained-command one above. Fresh-spawn auto_command paths just consumed the CLI prompt arg (e.g. `claude -- "<task>...</task>"`) and the CLI is mid-render of that first user turn. On Windows ConPTY + Ink, sending `Ctrl+C` during that render lands in a state where the just-submitted prompt and the follow-up keystrokes get rendered as one user message: `</task>/test` glued together. Suppressing the leading `Ctrl+C` lets the keystrokes queue cleanly behind the in-flight turn and submit as a distinct second user message.
 
-For OpenCode, the queued fresh-spawn burst waits until the initial free-form content job completes, then sends only the latest burst directly with `sendCtrlC: false`. It does not replace the initial TUI-ready terminal submission.
+對 OpenCode 而言，Auto-command 只允許 already-running active writable compatible Main Session 的 later live path。它必須等待稍後相符的 root-native clean idle evidence，採 `sendCtrlC: false`，並在 user-input cancellation 時停止；generic public idle、child idle 或 timer 完成都不能授權。fresh、resume、handoff、restart、isolated、no-active lifecycle cases 都 finalizes a skip。ordinary Task prompt 與 continuation prompt 保持 separate，OpenCode plugin 的初始 payload transport 不會承接 Auto-command。Non-OpenCode existing legacy command-injection behavior remains intact.
+
+An action-backed spawn runs its own prompt and still finalizes the central Auto-command disposition.
 
 The `verifiedPrefixLength` distinction is critical: the deterministic adapter-emitted `/effort Y` write from `getInjectionSequence` is safe to verify because we know exactly what JSONL entry to expect. A trailing user-supplied `auto_command` is **not** verified: it may not produce a matching JSONL entry the verifier recognizes, and retry exhaustion would drop the user's intended action. So we let auto-commands sail through with a time-based settle.
 
@@ -93,7 +97,7 @@ The `verifiedPrefixLength` distinction is critical: the deterministic adapter-em
 
 The two contexts solve different problems: `'paste'` confirms one-shot paste submissions of arbitrary user prompts, while `'command-injection'` confirms each link in a multi-command chain landed cleanly. They share an interface (`getSubmissionVerifier`) so adapters declare what they support per context, and the renderer/IPC layer never has to branch on agent name.
 
-Paste acceptance evidence is evaluated after Enter. It is distinct from readiness: OpenCode has no pre-readiness content-delivery fallback, so acceptance evidence cannot authorize delivery before the adapter has observed its TUI-ready terminal submission signal.
+Paste acceptance evidence is evaluated after Enter. It is distinct from initial-prompt delivery: OpenCode's plugin claims the private payload and uses the generated SDK, rather than authorizing a PTY paste from a TUI readiness signal.
 
 **OR-combine vs poll-and-retry.** The two contexts also differ in how the engine consumes the verifier:
 

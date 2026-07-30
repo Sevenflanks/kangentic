@@ -171,6 +171,50 @@ async function waitForToast(
   ).toBeVisible({ timeout: timeoutMs });
 }
 
+async function setAutoCommandWarning(page: Page, taskId: string, projectId: string): Promise<void> {
+  await page.evaluate(({ id, project }) => {
+    const stores = (window as unknown as {
+      __zustandStores?: {
+        session: {
+          getState: () => {
+            setAutoCommandWarning: (warning: {
+              projectId: string;
+              taskId: string;
+              reason: 'no-active-main-session';
+              message: string;
+              at: string;
+            }) => void;
+          };
+        };
+      };
+    }).__zustandStores;
+    if (!stores?.session) throw new Error('session store not exposed on __zustandStores');
+    stores.session.getState().setAutoCommandWarning({
+      projectId: project,
+      taskId: id,
+      reason: 'no-active-main-session',
+      message: 'Preserve this warning on rollback.',
+      at: '2026-07-27T00:00:00.000Z',
+    });
+  }, { id: taskId, project: projectId });
+}
+
+function readAutoCommandWarningTaskId(page: Page, taskId: string): Promise<string | null> {
+  return page.evaluate((id) => {
+    const stores = (window as unknown as {
+      __zustandStores?: {
+        session: {
+          getState: () => {
+            autoCommandWarningsByTaskId: Record<string, { taskId: string }>;
+          };
+        };
+      };
+    }).__zustandStores;
+    if (!stores?.session) throw new Error('session store not exposed on __zustandStores');
+    return stores.session.getState().autoCommandWarningsByTaskId[id]?.taskId ?? null;
+  }, taskId);
+}
+
 async function resolveLaneId(page: Page, laneName: string): Promise<string> {
   const id = await page.evaluate(async (name) => {
     const lanes = await window.electronAPI.swimlanes.list();
@@ -216,6 +260,7 @@ test.describe('deleteTask - optimistic removal', () => {
 
     try {
       await page.locator('[data-swimlane-name="To Do"]').waitFor({ state: 'visible', timeout: 15000 });
+      await setAutoCommandWarning(page, TASK_ID, PROJECT_ID);
 
       const initialState = await readTaskLists(page, TASK_ID);
       expect(initialState.inTasks).toBe(true);
@@ -247,11 +292,13 @@ test.describe('deleteTask - optimistic removal', () => {
 
       const result = await deletePromise;
       expect(result.ok).toBe(true);
+      expect(await readAutoCommandWarningTaskId(page, TASK_ID)).toBeNull();
 
       // After settle, task is still gone (success path, no rollback)
       const finalState = await readTaskLists(page, TASK_ID);
       expect(finalState.inTasks).toBe(false);
       expect(finalState.inArchivedTasks).toBe(false);
+      await expect(page.locator(`[data-task-id="${TASK_ID}"] [data-testid="auto-command-warning"]`)).toHaveCount(0);
     } finally {
       await browser.close();
     }
@@ -274,6 +321,8 @@ test.describe('deleteTask - failure path rollback', () => {
       expect(beforeState.inTasks).toBe(true);
       expect(beforeState.taskSwimlaneId).toBe(todoLaneId);
       expect(beforeState.taskPosition).toBe(0);
+      await setAutoCommandWarning(page, TASK_ID, PROJECT_ID);
+      await expect(page.locator(`[data-task-id="${TASK_ID}"] [data-testid="auto-command-warning"]`)).toContainText('Preserve this warning on rollback.');
 
       // Arm the error hook
       await page.evaluate(() => {
@@ -298,6 +347,8 @@ test.describe('deleteTask - failure path rollback', () => {
       expect(afterState.inArchivedTasks).toBe(false);
       expect(afterState.taskSwimlaneId).toBe(todoLaneId);
       expect(afterState.taskPosition).toBe(0);
+      expect(await readAutoCommandWarningTaskId(page, TASK_ID)).toBe(TASK_ID);
+      await expect(page.locator(`[data-task-id="${TASK_ID}"] [data-testid="auto-command-warning"]`)).toContainText('Preserve this warning on rollback.');
 
       // Error toast must surface with the thrown message
       await waitForToast(page, 'Failed to delete task:');
@@ -345,7 +396,9 @@ test.describe('deleteTask - failure path rollback', () => {
 // -----------------------------------------------------------------------
 
 const CALLER_TASK_ID = 'task-caller-delete';
+const ARCHIVED_PROJECT_ID = 'proj-archived-delete';
 const ARCHIVED_TASK_ID = 'task-archived-delete';
+const BULK_ARCHIVED_TASK_ID = 'task-archived-bulk-delete';
 
 /**
  * Launch with an active task seeded in the To Do lane (same as
@@ -496,6 +549,27 @@ async function launchWithArchivedTask(): Promise<{ browser: Browser; page: Page 
         description: 'Was previously in Done lane',
         swimlane_id: laneIds['Done'],
         position: 0,
+        agent: 'claude',
+        session_id: null,
+        worktree_path: null,
+        branch_name: null,
+        pr_number: null,
+        pr_url: null,
+        base_branch: 'main',
+        use_worktree: 0,
+        labels: [],
+        priority: 0,
+        attachment_count: 0,
+        archived_at: ts,
+        created_at: ts,
+        updated_at: ts,
+      });
+      state.archivedTasks.push({
+        id: '${BULK_ARCHIVED_TASK_ID}',
+        title: 'Archived Task For Bulk Delete Test',
+        description: 'Will be deleted through bulkDeleteArchivedTasks',
+        swimlane_id: laneIds['Done'],
+        position: 1,
         agent: 'claude',
         session_id: null,
         worktree_path: null,
@@ -793,6 +867,79 @@ test.describe('deleteTask - archivedTasks primary hit', () => {
         .filter({ hasText: 'Failed to delete task:' })
         .count();
       expect(errorToastCount).toBe(0);
+    } finally {
+      await browser.close();
+    }
+  });
+});
+
+test.describe('auto-command warning lifecycle entry points', () => {
+  test('archiveTask clears the stored warning', async () => {
+    const { browser, page } = await launchWithActiveTask();
+
+    try {
+      await page.locator('[data-swimlane-name="To Do"]').waitFor({ state: 'visible', timeout: 15000 });
+      await setAutoCommandWarning(page, TASK_ID, PROJECT_ID);
+
+      await page.evaluate((taskId) => {
+        const stores = (window as unknown as {
+          __zustandStores?: {
+            board: { getState: () => { archiveTask: (id: string) => void } };
+          };
+        }).__zustandStores;
+        if (!stores?.board) throw new Error('board store not exposed on __zustandStores');
+        stores.board.getState().archiveTask(taskId);
+      }, TASK_ID);
+
+      expect(await readAutoCommandWarningTaskId(page, TASK_ID)).toBeNull();
+    } finally {
+      await browser.close();
+    }
+  });
+
+  test('deleteArchivedTask clears the stored warning after success', async () => {
+    const { browser, page } = await launchWithArchivedTask();
+
+    try {
+      await page.locator('[data-swimlane-name="To Do"]').waitFor({ state: 'visible', timeout: 15000 });
+      await setAutoCommandWarning(page, ARCHIVED_TASK_ID, ARCHIVED_PROJECT_ID);
+
+      await page.evaluate(async (taskId) => {
+        const stores = (window as unknown as {
+          __zustandStores?: {
+            board: { getState: () => { deleteArchivedTask: (id: string) => Promise<void> } };
+          };
+        }).__zustandStores;
+        if (!stores?.board) throw new Error('board store not exposed on __zustandStores');
+        await stores.board.getState().deleteArchivedTask(taskId);
+      }, ARCHIVED_TASK_ID);
+
+      expect(await readAutoCommandWarningTaskId(page, ARCHIVED_TASK_ID)).toBeNull();
+    } finally {
+      await browser.close();
+    }
+  });
+
+  test('bulkDeleteArchivedTasks clears every stored warning after success', async () => {
+    const { browser, page } = await launchWithArchivedTask();
+
+    try {
+      await page.locator('[data-swimlane-name="To Do"]').waitFor({ state: 'visible', timeout: 15000 });
+      await setAutoCommandWarning(page, ARCHIVED_TASK_ID, ARCHIVED_PROJECT_ID);
+      await setAutoCommandWarning(page, BULK_ARCHIVED_TASK_ID, ARCHIVED_PROJECT_ID);
+
+      await page.evaluate(async (taskIds) => {
+        const stores = (window as unknown as {
+          __zustandStores?: {
+            board: { getState: () => { bulkDeleteArchivedTasks: (ids: string[]) => Promise<void> } };
+          };
+        }).__zustandStores;
+        if (!stores?.board) throw new Error('board store not exposed on __zustandStores');
+        await stores.board.getState().bulkDeleteArchivedTasks(taskIds);
+      }, [ARCHIVED_TASK_ID, BULK_ARCHIVED_TASK_ID]);
+
+      expect(await readAutoCommandWarningTaskId(page, ARCHIVED_TASK_ID)).toBeNull();
+      expect(await readAutoCommandWarningTaskId(page, BULK_ARCHIVED_TASK_ID)).toBeNull();
     } finally {
       await browser.close();
     }

@@ -184,7 +184,7 @@ Each adapter implements `detectFirstOutput(data)` to signal when the agent's TUI
 | Oz CLI (Warp) | `data.length > 0` | `oz agent run` streams output, no alternate screen |
 | Kimi Code | `\x1b[?25l` (cursor hide) | TUI hides cursor when its alternate-screen buffer takes over (verified empirically with kimi v1.37.0) |
 | Droid | `\x1b[?25l` (cursor hide) | Ink-based TUI, same pattern as Claude (verified empirically) |
-| OpenCode | `\x1b[?1049h` (alternate-screen takeover) | The observed OpenCode TUI takeover required before TUI-ready terminal submission; cursor hide and bracketed-paste mode can occur earlier and do not establish readiness |
+| OpenCode | `\x1b[?1049h` (alternate-screen takeover) | Observed visual TUI readiness only; initial prompts use the plugin/generated-SDK path |
 | Ollama | `data.length > 0` | Ollama streams output immediately (no alternate screen buffer) |
 
 For the cursor-hide adapters, the `\x1b[?25l` (ANSI cursor hide) sequence fires after shell prompt noise but before the TUI draws its startup banner. This keeps the shell command hidden behind the shimmer overlay. OpenCode instead requires its own alternate-screen signal above.
@@ -570,33 +570,34 @@ Caller-owned via `--session-id <uuid>`, mirroring Claude. `supportsCallerSession
 opencode [--session <id>]
 ```
 
-Important shape constraints (verified against /anomalyco/opencode docs):
+重要形狀限制已依 OpenCode 1.18.4 本機原始碼窄幅確認。完整 Task 5 QA 尚未成功，現有證據限於 automated 與 runtime boundary：
 
 - The TUI's positional argument is a **project directory**, not a prompt. The PTY layer already sets the shell cwd, so Kangentic never emits a positional or `--dir` value.
-- OpenCode initial prompt delivery uses **TUI-ready terminal submission**, not `--prompt` or shell argument parsing. Kangentic launches a fresh TUI, or resumes with `--session <id>` (alias `-s`), then waits for adapter-defined first output before `TerminalSubmit.submitContent()` sends bracketed paste.
-- A fresh OpenCode session sends the full Task XML. A resumed session sends only the current `resumePrompt`; a promptless resume restores the native session without content submission or replaying Task XML. No prompt content is part of the shell command.
-- OpenCode readiness is specifically the observed alternate-screen takeover `ESC[?1049h`. Cursor-hide from the shell or OpenCode, and generic bracketed-paste mode, are not sufficient readiness signals. This observation is OpenCode-specific, not a universal adapter rule.
+- OpenCode initial prompt delivery 不是 terminal paste 或 shell argument parsing。專案本機 plugin discovery 掃描 `.ts` 與 `.js`，因此安裝檔為 `.opencode/plugins/kangentic-activity.js`；來源與 packaged build asset 仍為 `kangentic-activity.mjs`。loader await factory，Kangentic 同步回傳 hooks，然後以一個零延遲 macrotask 延後 bootstrap。這個 timer 只處理 ordering，不是 readiness evidence，也不是 upstream 的未來保證。
+- `prepareInitialPrompt` 寫入私有 payload，由同一 OpenCode process 的 activity plugin claim 並刪除，之後使用 generated SDK。fresh payload 會建立 session、取得 `session.create().data.id`，把早到或晚到的 matching `session.created` reconcile 為一個成功 bootstrap 的 `session_start`，重播不相關 starts，以 `client.tui.publish` 發布 `tui.session.select`，最後呼叫 `promptAsync`。resume payload 會用 `session.get` 驗證 known ID，reconcile 一個 `session_start`，不發布 selection，然後呼叫 `promptAsync`。每個 generated SDK request 都帶物件內的 `throwOnError: true`。
+- Shell command 不含 prompt content。每條 bootstrap failure path 至多 best-effort 附加一筆 sanitized public `idle` error 與相同 timestamp 的 private native error boundary；publish 或 prompt failure 前可能已有 `session_start`，start append failure 也可由後續 matching native event 補寫。錯誤 telemetry 不含 raw data，SDK call 沒有 retry 或 fallback。successful bootstrap `session_start` reconciliation exactly once 只適用 telemetry event，不代表 prompt execution 或 live-command delivery exactly once。
 - The session record still retains the intended prompt for existing lifecycle and audit display, while errors log metadata only and never prompt content.
 
 ### Permission Modes
 
-The `permissions` list exposes two entries in OpenCode's own vocabulary: `plan` (label "Plan", OpenCode's built-in read-only agent) and `acceptEdits` (label "Build", full tool access). The stored `PermissionMode` enum values are reused for compatibility, so a swimlane set to `acceptEdits` under Claude continues to mean "Build" under OpenCode. Both entries are **informational** today - they produce the same CLI invocation. There is no `--dangerously-skip-permissions` flag in TUI mode (it exists only on the non-interactive `opencode run` subcommand), and no per-mode flag set. Historical values outside this list (`default`, `bypassPermissions`, `dontAsk`, `auto`) are still accepted by `mapPermissionModeToAgent` for backward compatibility with mixed-agent projects. Users who want auto-approval must enable it in `opencode.json`. The default mode is `acceptEdits`.
+The `permissions` list exposes two entries in OpenCode's own vocabulary: `plan` (label "Plan", OpenCode's built-in read-only agent) and `acceptEdits` (label "Build", full tool access). On fresh spawns, `plan` maps to `--agent plan` and `acceptEdits` maps to `--agent build`; historical `bypassPermissions` also maps to `--agent build`, while `default`, `dontAsk`, and `auto` omit `--agent`. Resume also omits `--agent` to preserve the user's runtime Tab selection. There is no `--dangerously-skip-permissions` flag in TUI mode (it exists only on the non-interactive `opencode run` subcommand), and agent-level tool permissions remain OpenCode-native. Users who want auto-approval must enable it in `opencode.json`. The default mode is `acceptEdits`.
 
 ### Settings Merge
 
-None. OpenCode reads MCP and provider configuration from `opencode.json` (project) or `~/.config/opencode/opencode.json` (global). Wiring the Kangentic MCP server into that config is a follow-up - `removeHooks` is a no-op and `clearSettingsCache` has nothing to clear.
+OpenCode 從 `opencode.json` sources 讀取 MCP 與 provider configuration，並 deep-merge `OPENCODE_CONFIG_CONTENT`。Kangentic 透過該 environment variable 注入 MCP entry，保留使用者定義的 `mcp.*` entries，且不變更其 configuration file。必要 activity plugin 的 source 與 packaged build asset 是 `kangentic-activity.mjs`，但 project-local installed file 是 `.opencode/plugins/kangentic-activity.js`。spawn owners 會 reference-count 此 shared same-cwd file，`removeHooks` 在最後一個 holder 釋放後只移除 Kangentic-authored `.js` file。`clearSettingsCache` 不需清除任何內容。
 
 ### Session ID Capture
 
-Not caller-owned (`supportsCallerSessionId = false`). Two capture pathways run concurrently and the first to succeed wins:
+Not caller-owned (`supportsCallerSessionId = false`). Three capture pathways run concurrently and the first to succeed wins:
 
-- **`sessionId.fromOutput`:** `SessionIdScanner` strips ANSI escapes from each PTY chunk and matches against `(?:session(?:[ _-]?id)?|sid)` and `--session` flag forms. Accepts both OpenCode's native `ses_<16-64 alphanumeric>` shape (verified empirically on v1.14.25, e.g. `ses_2349b5c91ffeKd6qajuUTR4clq`) and canonical UUID format.
+- **Plugin JSONL:** activity plugin 會為 `session.created` 與 `session.start` 寫入帶 OpenCode session ID 的 `session_start`，也會寫入 `session.idle`、`session.error` 與 `tool.execute.before` / `tool.execute.after` telemetry。fresh bootstrap 成功時，matching `session.created` 的 reconciliation 僅產生一個 `session_start` telemetry event，早到與晚到 event 都依相同規則處理。不相關 starts 會重播。Public parsing 只暴露 sanitized `SessionEvent` fields。Private `privateNativeBoundary` 提供 native-idle path 的 native identity evidence，不對 renderer 可見。
+- **`sessionId.fromOutput`:** `SessionIdScanner` strips ANSI escapes from each PTY chunk and matches an announced session label with a `:` or `=` separator. It accepts OpenCode's native `ses_<16-64 alphanumeric>` shape and canonical UUID format, while excluding bare `--session` command echoes.
 - **`sessionId.fromFilesystem`:** Polls the OpenCode SQLite database at `~/.local/share/opencode/opencode.db` (read-only, WAL-friendly handle) for a `session` row whose `directory` equals the spawn cwd and whose `time_created` falls within `[spawnedAt - 5s, spawnedAt + 30s]`. Polls every 500 ms for up to ~10 s. Direct DB read avoids ~200-500 ms `opencode` CLI spin-up per poll, and avoids the Windows `child_process.execFile` rejection of `.cmd` shims.
 
 ### Limitations
 
 - **Concurrent same-cwd spawns cannot be disambiguated:** Two OpenCode tasks spawned within ~30 s against the same `cwd` cannot be reliably distinguished by `captureSessionIdFromFilesystem`. Both rows match the directory + time-window predicate, so the parser returns the most recently created row - which can attribute task A's session ID to task B, or vice versa. Kangentic's per-task worktrees (`git.worktreesEnabled`, default `true`) sidestep this by giving every task its own `cwd`. If you have disabled worktrees and need to run multiple OpenCode tasks against the same project root, either re-enable worktrees in Settings -> Git or stagger the spawns by more than 30 seconds. The Codex CLI parser carries the same caveat.
-- **No status / events telemetry:** OpenCode has no documented hook system, so activity detection is PTY-silence-only (`PTY_SILENCE_THRESHOLD_MS`, same `PtyActivityTracker` shape as Codex) and there is no `status.json` / `events.jsonl` pipeline.
+- **Plugin telemetry:** OpenCode uses plugin JSONL telemetry with PTY activity as a fallback. It does not use the `status.json` pipeline.
 - **No trust dialog:** `ensureTrust` is a no-op. OpenCode does not prompt for directory trust on first run.
 
 ## Aider

@@ -148,6 +148,11 @@ export class TaskRepository {
     return updated;
   }
 
+  clearAutoCommand(taskId: string): void {
+    this.db.prepare('UPDATE tasks SET auto_command = NULL, updated_at = ? WHERE id = ?')
+      .run(new Date().toISOString(), taskId);
+  }
+
   /**
    * Update only the model/effort override fields on a task. Any field omitted
    * from `patch` is left untouched; passing `null` clears that override.

@@ -79,23 +79,22 @@ export function registerTranscriptionHandlers(context: IpcContext): void {
     transcriptionService.ingest(chunk.dictationSessionId, new Int16Array(chunk.pcm));
   });
 
-  // Live experience: write raw bytes (text and/or \x7f backspaces) straight into
-  // the focused terminal as the user speaks. Same ordered FIFO write path as
-  // SESSION_WRITE, so it never fragments concurrent user typing.
+  // Live experience: classify raw bytes (text and/or \x7f backspaces) at the
+  // same user-input boundary as SESSION_WRITE before they join the ordered FIFO.
   ipcMain.on(IPC.TRANSCRIBE_LIVE_WRITE, (_event, sessionId: string, payload: string) => {
-    if (sessionId && payload) context.sessionManager.write(sessionId, payload);
+    if (sessionId && payload) context.sessionManager.writeUserInput(sessionId, payload);
   });
 
   // Inject finalized text into the focused terminal WITHOUT submitting. The
   // renderer resolves the single target session and passes it explicitly.
   // Newlines collapse to spaces so nothing accidentally submits; the user
   // presses Enter themselves. Writes go through the per-session ordered FIFO
-  // queue (sessionManager.write), preserving byte order against concurrent
-  // user typing - never `writeRaw`, never the paste engine (which submits).
+  // queue (sessionManager.writeUserInput), preserving byte order against
+  // concurrent user typing - never `writeRaw`, never the paste engine (which submits).
   ipcMain.handle(IPC.TRANSCRIBE_COMMIT, (_event, sessionId: string, text: string): boolean => {
     const sanitized = text.replace(/[\r\n]+/g, ' ').trim();
     if (!sessionId || sanitized.length === 0) return false;
-    context.sessionManager.write(sessionId, sanitized);
+    context.sessionManager.writeUserInput(sessionId, sanitized);
     return true;
   });
 
@@ -114,12 +113,20 @@ export function registerTranscriptionHandlers(context: IpcContext): void {
     async (_event, sessionId: string, text: string, eraseCount: number): Promise<boolean> => {
       const sanitized = text.replace(/[\r\n]+/g, ' ').trim();
       if (!sessionId || sanitized.length === 0) return false;
-      if (eraseCount > 0) context.sessionManager.write(sessionId, '\x7f'.repeat(eraseCount));
+      const lease = context.sessionManager.acquireUserSubmission(sessionId);
+      if (!lease) throw new Error('Session is not accepting input');
       try {
-        await context.terminalSubmit.submitContent(sessionId, sanitized, { source: 'dictation' });
+        if (eraseCount > 0) context.sessionManager.writeUserInput(sessionId, '\x7f'.repeat(eraseCount));
+        await lease.run(() => context.terminalSubmit.submitContent(
+          sessionId,
+          sanitized,
+          { source: 'dictation' },
+        ));
         return true;
       } catch {
         return false;
+      } finally {
+        lease.release();
       }
     },
   );

@@ -1,6 +1,7 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron';
 import { IPC } from '../shared/ipc-channels';
 import type { ElectronAPI, NotificationInput, Project, Session, SessionUsage, ActivityState, ActivityReason, SessionEvent, UpdateDownloadedInfo, UsageTimePeriod, UsageStatsScope, UsageDayDrill, UsageCustomWindow, TaskBulkDeleteProgress, ProjectMoveProgress, DictationModelProgress, MobilePairingSasPayload, MobilePairingEndedPayload } from '../shared/types';
+import type { LiveDeliveryStatus } from '../shared/live-delivery-status';
 import { POPOUT_ARG_PREFIX } from '../shared/pop-out';
 import type { PopOutDescriptor, PopOutKind, PopOutParamsByKind } from '../shared/pop-out';
 import { installConsoleCapture } from './diagnostics/console-capture';
@@ -181,6 +182,7 @@ const api: ElectronAPI = {
     reconcile: (taskId, projectId) => ipcRenderer.invoke(IPC.SESSION_RECONCILE, taskId, projectId),
     reset: (taskId, projectId) => ipcRenderer.invoke(IPC.SESSION_RESET, taskId, projectId),
     write: (id, data) => ipcRenderer.invoke(IPC.SESSION_WRITE, id, data),
+    writeFocusReport: (id, report, projectId) => ipcRenderer.invoke(IPC.SESSION_WRITE_FOCUS_REPORT, id, report, projectId),
     resize: (id, cols, rows) => ipcRenderer.invoke(IPC.SESSION_RESIZE, id, cols, rows),
     list: () => ipcRenderer.invoke(IPC.SESSION_LIST),
     getScrollback: (id) => ipcRenderer.invoke(IPC.SESSION_GET_SCROLLBACK, id),
@@ -206,6 +208,11 @@ const api: ElectronAPI = {
       const handler = (_event: Electron.IpcRendererEvent, sessionId: string, session: Session, projectId?: string) => callback(sessionId, session, projectId);
       ipcRenderer.on(IPC.SESSION_STATUS, handler);
       return () => ipcRenderer.removeListener(IPC.SESSION_STATUS, handler);
+    },
+    onLiveDeliveryStatus: (callback) => {
+      const handler = (_event: Electron.IpcRendererEvent, status: LiveDeliveryStatus) => callback(status);
+      ipcRenderer.on(IPC.SESSION_LIVE_DELIVERY_STATUS, handler);
+      return () => ipcRenderer.removeListener(IPC.SESSION_LIVE_DELIVERY_STATUS, handler);
     },
     onUsage: (callback) => {
       const handler = (_event: Electron.IpcRendererEvent, sessionId: string, data: SessionUsage, projectId?: string) => callback(sessionId, data, projectId);

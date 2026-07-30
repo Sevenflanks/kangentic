@@ -200,6 +200,13 @@ describe('spawn entry-point parity: chokepoints actually run the shared preamble
         + `instead of an inline ternary. See ${ROOT_GUIDANCE_FILE}.`,
     ).toBe(true);
   });
+
+  it.each([
+    'src/main/ipc/helpers/agent-spawn.ts',
+    'src/main/ipc/handlers/task-move.ts',
+  ])('%s finalizes Auto-command disposition through the main-private gate', (relativePath) => {
+    expect(fileHasNonCommentCall(relativePath, 'finalizeAutoCommandGate')).toBe(true);
+  });
 });
 
 describe('spawn entry-point parity: single lock call site', () => {

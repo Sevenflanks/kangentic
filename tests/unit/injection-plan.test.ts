@@ -76,6 +76,31 @@ function sessionRepoWith(record: Partial<SessionRecord> | null): SessionReposito
 }
 
 describe('prepareInjectionPlan', () => {
+  it('uses an explicit captured record instead of the repository latest record', async () => {
+    const verifierInputs: Array<{ readonly agentSessionId: string; readonly cwd: string }> = [];
+    const adapter = fakeAdapter({
+      getInjectionSequence: (spec) => spec.effortChanged && spec.effort ? [`/effort ${spec.effort}`] : [],
+      getSubmissionVerifier: () => async (input) => {
+        verifierInputs.push({ agentSessionId: input.agentSessionId, cwd: input.cwd });
+        return true;
+      },
+    });
+    const latest = { applied_model: 'latest-model', applied_effort: 'low', agent_session_id: 'latest-agent', cwd: '/latest' };
+    const captured = { applied_model: 'captured-model', applied_effort: 'high', agent_session_id: 'captured-agent', cwd: '/captured' };
+    const plan = prepareInjectionPlan({
+      adapter,
+      sessionRepo: sessionRepoWith(latest),
+      task: { id: 't1', agent: 'fake' },
+      toLane: lane({ effort_override: 'high' }),
+      sessionRecord: captured as SessionRecord,
+      autoCommand: '/go',
+    });
+
+    expect(plan?.sequence).toEqual(['/go']);
+    expect(plan?.verifier).not.toBeNull();
+    await plan?.verifier?.('/effort high', 1);
+    expect(verifierInputs).toEqual([{ agentSessionId: 'captured-agent', cwd: '/captured' }]);
+  });
   it('returns null when the session already runs at the target (no delta, no auto_command)', () => {
     const adapter = fakeAdapter({
       getInjectionSequence: () => [],
@@ -277,7 +302,60 @@ describe('prepareInjectionPlan', () => {
     // verifiedPrefixLength = 0 because settings sequence is empty.
     // The auto_command sits at index 0 and is fire-and-forget.
     // appliedSettings is absent: no settings field changed to a concrete value.
-    expect(plan).toEqual({ sequence: ['do thing'], verifier: null, verifiedPrefixLength: 0, needsRestartForModel: false });
+    expect(plan).toEqual({
+      sequence: ['do thing'],
+      verifier: null,
+      verifiedPrefixLength: 0,
+      needsRestartForModel: false,
+      liveSubmissionPolicy: {
+        mode: 'interrupt-immediately',
+        sendCtrlC: true,
+      },
+    });
+  });
+
+  it('uses the adapter policy only when a non-empty auto_command is appended', () => {
+    const liveSubmissionPolicy = {
+      mode: 'wait-for-native-idle' as const,
+      timeoutMs: 120_000,
+      cancelOnUserInput: true,
+      sendCtrlC: false as const,
+    };
+    const adapter = fakeAdapter({
+      liveSubmissionPolicy,
+      getInjectionSequence: () => [],
+    });
+
+    const plan = prepareInjectionPlan({
+      adapter,
+      sessionRepo: null,
+      task: { id: 't1', agent: 'fake' },
+      toLane: lane(),
+      autoCommand: '  do thing  ',
+    });
+
+    expect(plan?.liveSubmissionPolicy).toEqual(liveSubmissionPolicy);
+  });
+
+  it('keeps settings-only plans without a live submission policy', () => {
+    const adapter = fakeAdapter({
+      liveSubmissionPolicy: {
+        mode: 'wait-for-native-idle',
+        timeoutMs: 120_000,
+        cancelOnUserInput: true,
+        sendCtrlC: false,
+      },
+      getInjectionSequence: () => ['/settings-only'],
+    });
+
+    const plan = prepareInjectionPlan({
+      adapter,
+      sessionRepo: null,
+      task: { id: 't1', agent: 'fake' },
+      toLane: lane(),
+    });
+
+    expect(plan?.liveSubmissionPolicy).toBeUndefined();
   });
 
   it('verifiedPrefixLength excludes the trailing auto_command so it stays fire-and-forget', () => {
@@ -355,7 +433,16 @@ describe('prepareInjectionPlan', () => {
       toLane: lane(),
       autoCommand: 'fallback',
     });
-    expect(plan).toEqual({ sequence: ['fallback'], verifier: null, verifiedPrefixLength: 0, needsRestartForModel: false });
+    expect(plan).toEqual({
+      sequence: ['fallback'],
+      verifier: null,
+      verifiedPrefixLength: 0,
+      needsRestartForModel: false,
+      liveSubmissionPolicy: {
+        mode: 'interrupt-immediately',
+        sendCtrlC: true,
+      },
+    });
   });
 
   it('verifier is null when sessionRepo is null even if adapter has getSubmissionVerifier', () => {

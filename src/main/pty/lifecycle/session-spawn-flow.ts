@@ -15,6 +15,8 @@ import type { SessionHistoryReader } from '../readers/session-history-reader';
 import type { SessionQueue } from '../session-queue';
 import type { TranscriptWriter } from '../buffer/transcript-writer';
 import type { FirstOutputTracker } from './first-output-tracker';
+import type { SessionWriteCoordinator } from '../session-write-coordinator';
+import type { NativeIdleEvidence } from '../../activity-engine/native-idle-evidence';
 import { attachAdapter, disposeAdapterAttachment, disposeSpawnCleanup, removeAdapterHooks } from './adapter-lifecycle';
 import { safeKillPty } from './pty-kill';
 import { resolveShellArgs, buildSpawnEnv, resolveSpawnCwd } from '../spawn/pty-spawn';
@@ -53,6 +55,8 @@ export interface SpawnFlowContext {
   sessionHistoryReader: SessionHistoryReader;
   sessionQueue: SessionQueue;
   firstOutputTracker: FirstOutputTracker;
+  readonly writeCoordinator: SessionWriteCoordinator;
+  readonly nativeIdleEvidence: NativeIdleEvidence;
   getTranscriptWriter: () => TranscriptWriter | null;
   getShell: () => Promise<string>;
   /**
@@ -165,6 +169,8 @@ export async function performSpawn(
     // 30s after respawn.
     context.sessionIdManager.removeSession(existing.id);
     context.firstOutputTracker.removeSession(existing.id);
+    context.writeCoordinator.disposeSession(existing.id);
+    context.nativeIdleEvidence.removeSession(existing.id);
     // Tear down any adapter-attached work from the previous spawn.
     disposeAdapterAttachment(existing);
   }
@@ -264,6 +270,10 @@ export async function performSpawn(
   };
 
   context.registry.set(id, session);
+
+  // Coordinator 是唯一 generation owner；任何 reader 啟動前，evidence 必須使用它回傳的同一個 generation。
+  const sessionGeneration = context.writeCoordinator.initialize(id);
+  context.nativeIdleEvidence.initializeSession(id, sessionGeneration);
 
   // Initialize extracted modules for this session. Seed the buffer manager with
   // the ACTUAL spawn cols so the first renderer resize reports colsChanged
@@ -464,6 +474,10 @@ export async function performSpawn(
   // PTY exit cleanup sequence. Don't overwrite 'suspended' - suspend()
   // sets that before killing the PTY, and the new status must survive.
   const ptyExitDisposable = ptyProcess.onExit(({ exitCode }: { exitCode: number }) => {
+    const registeredSession = context.registry.get(id);
+    // 同 ID replacement 已成為 registry owner 時，舊 PTY 不可再清理新一輪資源或送出它的 exit。
+    if (registeredSession && registeredSession !== session) return;
+
     // Captured BEFORE the status mutation below. `intentional` means Kangentic
     // ended this session deliberately, so a non-zero force-kill exit must not be
     // misclassified as a crash. Two deliberate-end mechanisms set it:
@@ -476,6 +490,11 @@ export async function performSpawn(
     // The flag rides the 'exit' event so App.tsx can suppress the false crash
     // notification without depending on cross-channel store-status ordering.
     const intentional = session.status === 'suspended' || session.intentionalExit === true;
+    // 舊 PTY 的 onExit 可能晚於同 ID respawn；只有建立時的 generation 仍有效，才可清掉新一輪的 ownership。
+    if (context.writeCoordinator.getSessionGeneration(id) === sessionGeneration) {
+      context.writeCoordinator.disposeSession(id);
+      context.nativeIdleEvidence.removeSession(id);
+    }
     if (session.status !== 'suspended') {
       session.status = 'exited';
       // Synthetic session_end - Claude Code's hook won't fire on kill

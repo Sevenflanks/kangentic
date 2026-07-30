@@ -112,6 +112,16 @@ describe('SessionRepository.findByAnyId', () => {
     expect(result).toBeUndefined();
   });
 
+  it('finds a record by the exact Kangentic PTY primary key only', () => {
+    const expected = makeRecord({ id: 'pty-uuid', agent_session_id: 'agent-uuid' });
+    setup(expected);
+
+    expect(repository.findById('pty-uuid')).toEqual(expected);
+    expect(executedStatements[0]?.sql).toContain('WHERE id = ?');
+    expect(executedStatements[0]?.sql).not.toContain('agent_session_id');
+    expect(executedStatements[0]?.params).toEqual(['pty-uuid']);
+  });
+
   it('finds a record stored under agent_session_id when caller passes that flavor', () => {
     // The MCP handler accepts either the Kangentic PTY session id or the
     // Claude agent_session_id. With both columns OR'd in the SQL, the same

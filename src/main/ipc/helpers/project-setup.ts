@@ -59,7 +59,7 @@ export async function ensureGitignore(projectPath: string): Promise<void> {
       await fs.promises.writeFile(gitignorePath, content);
     }
 
-    // Note: the OpenCode activity plugin (`.opencode/plugins/kangentic-activity.mjs`)
+    // Note: the OpenCode activity plugin (`.opencode/plugins/kangentic-activity.js`)
     // is NOT ignored here. That entry is added lazily by the OpenCode adapter's
     // buildHooks() at spawn time, so projects that never use OpenCode never get
     // a stray ignore line.

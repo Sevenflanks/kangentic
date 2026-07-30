@@ -35,7 +35,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import type { Task, Swimlane } from '../../src/shared/types';
+import type { Session, Task, Swimlane } from '../../src/shared/types';
 
 const hoisted = vi.hoisted(() => ({
   activeRecord: null as Record<string, unknown> | null,
@@ -55,6 +55,7 @@ vi.mock('../../src/main/db/database', () => ({ getProjectDb: vi.fn(() => ({})) }
 vi.mock('../../src/main/db/repositories/task-repository', () => ({ TaskRepository: class {} }));
 vi.mock('../../src/main/db/repositories/session-repository', () => ({
   SessionRepository: class {
+    findById = vi.fn((sessionId: string) => hoisted.activeRecord?.id === sessionId ? hoisted.activeRecord : undefined);
     getLatestForTask = vi.fn(() => hoisted.activeRecord);
     getLatestForTaskByTypeAndIsolation = vi.fn(() => hoisted.activeRecord);
     updateGitStats = vi.fn();
@@ -110,7 +111,7 @@ vi.mock('../../src/main/agent/shared', () => ({
 const mockGetProjectRepos = vi.fn();
 const mockEnsureTaskWorktree = vi.fn(async () => null);
 const mockEnsureTaskBranchCheckout = vi.fn(async () => {});
-const mockSpawnAgent = vi.fn(async () => {});
+const mockSpawnAgent = vi.fn(async () => ({ kind: 'not-applicable' } as const));
 const mockCreateTransitionEngine = vi.fn(() => ({}));
 const mockBuildAutoCommandVars = vi.fn(() => ({}));
 
@@ -185,10 +186,29 @@ function makeSwimlane(id: string, overrides: Partial<Swimlane> = {}): Swimlane {
 }
 
 function makeContext(taskRepo: unknown, swimlaneRepo: unknown) {
+  const getSession = vi.fn((sessionId: string): Session | undefined => {
+    if (hoisted.activeRecord?.id !== sessionId) return undefined;
+    return {
+      id: sessionId,
+      taskId: 'task-aaa00001',
+      projectId: 'proj-test',
+      pid: 12345,
+      status: 'running',
+      shell: '/bin/bash',
+      cwd: '/mock/project',
+      startedAt: '2026-01-01T00:00:00.000Z',
+      exitCode: null,
+      resuming: false,
+      agentSessionId: 'agent-A',
+    };
+  });
   const sessionManager = {
     removeByTaskId: vi.fn(),
     killByTaskId: vi.fn(),
     listSessions: vi.fn(() => []),
+    getSession,
+    isWritable: vi.fn((sessionId: string) => getSession(sessionId) !== undefined),
+    snapshotNativeIdle: vi.fn(() => null),
     suspend: vi.fn(async () => {}),
   };
   const context = {
@@ -243,7 +263,7 @@ function setActiveRecord(
   appliedEffort: string | null = null,
 ) {
   hoisted.activeRecord = {
-    id: 'rec-main',
+    id: 'active-session-1',
     task_id: 'task-aaa00001',
     isolated_swimlane_id: null,
     agent_session_id: 'agent-A',
@@ -306,7 +326,7 @@ describe('handleTaskMove model/effort restart and live-injection', () => {
     hoisted.updateAppliedSettings.mockReset();
     mockEnsureTaskWorktree.mockResolvedValue(null);
     mockEnsureTaskBranchCheckout.mockResolvedValue(undefined);
-    mockSpawnAgent.mockResolvedValue(undefined);
+    mockSpawnAgent.mockResolvedValue({ kind: 'not-applicable' });
     vi.mocked(prepareInjectionPlan).mockReturnValue(null);
   });
 
@@ -360,7 +380,7 @@ describe('handleTaskMove model/effort restart and live-injection', () => {
       targetPosition: 0,
     });
 
-    expect(markRecordSuspended).toHaveBeenCalledWith(expect.anything(), 'rec-main', 'system');
+    expect(markRecordSuspended).toHaveBeenCalledWith(expect.anything(), 'active-session-1', 'system');
     expect(context.sessionManager.suspend).toHaveBeenCalledWith('active-session-1');
     expect(taskRepo.update).toHaveBeenCalledWith({ id: 'task-aaa00001', session_id: null });
     // Phase 3 spawns into the executing lane.

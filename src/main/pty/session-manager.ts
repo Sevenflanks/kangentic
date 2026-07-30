@@ -7,6 +7,8 @@ import { PtyBufferManager } from './buffer/pty-buffer-manager';
 import { SessionHistoryReader } from './readers/session-history-reader';
 import { StatusFileReader } from './readers/status-file-reader';
 import { SessionTelemetry } from '../activity-engine/session-telemetry';
+import { NativeIdleEvidence, type NativeIdleSnapshot } from '../activity-engine/native-idle-evidence';
+import { hasPrivateEventLinesHook } from '../agent/agent-adapter';
 import { TranscriptWriter } from './buffer/transcript-writer';
 import { SessionIdManager } from './lifecycle/session-id-manager';
 import { SessionFileManager } from './lifecycle/session-file-manager';
@@ -19,6 +21,12 @@ import { safeKillPty } from './lifecycle/pty-kill';
 import { DEFAULT_PTY_COLS, DEFAULT_PTY_ROWS, performSpawn } from './lifecycle/session-spawn-flow';
 import { SessionRegistry, toSession, filterCacheByProject, type ManagedSession } from './session-registry';
 import { createWriteQueue, type WriteQueue } from './write-queue';
+import {
+  SessionWriteCoordinator,
+  type OwnershipExpectation,
+  type SubmissionLease,
+  type UserSubmissionLease,
+} from './session-write-coordinator';
 import { BackpressureController } from './buffer/backpressure-controller';
 import { isShuttingDown } from '../shutdown-state';
 import type { TranscriptRepository } from '../db/repositories/transcript-repository';
@@ -32,6 +40,7 @@ import type {
   PerToolStat,
 } from '../../shared/types';
 import type { ActivityEngineOptions, ActivityStatsSnapshot } from '../activity-engine/engine';
+import type { TerminalFocusReport } from '../../shared/terminal-focus-report';
 
 export interface SessionManagerOptions {
   /**
@@ -118,6 +127,17 @@ export class SessionManager extends EventEmitter {
   private telemetry!: SessionTelemetry;
   private sessionHistoryReader!: SessionHistoryReader;
   private statusFileReader: StatusFileReader;
+  private readonly nativeIdleEvidence = new NativeIdleEvidence();
+  private readonly writeCoordinator = new SessionWriteCoordinator(
+    (sessionId) => this.getOrCreateWriteQueue(sessionId),
+    (sessionId, marker) => {
+      this.nativeIdleEvidence.recordUserInput(
+        sessionId,
+        marker.inputGeneration,
+        marker.occurredAt,
+      );
+    },
+  );
   private sessionFiles: SessionFileManager;
   private sessionIdManager: SessionIdManager;
   private activityEngineOptions: ActivityEngineOptions | undefined;
@@ -306,6 +326,15 @@ export class SessionManager extends EventEmitter {
     this.statusFileReader = new StatusFileReader({
       onUsageParsed: (sessionId, usage) => this.telemetry.processStatusUpdate(sessionId, usage),
       onEventsParsed: (sessionId, rawLines, events) => {
+        const adapter = this.registry.get(sessionId)?.agentParser;
+        // raw plugin identity 必須留在 main process；只有 adapter hook 可解析，public telemetry 仍只收到 allowlisted SessionEvent。
+        if (hasPrivateEventLinesHook(adapter)) {
+          adapter.ingestPrivateEventLines({
+            ptySessionId: sessionId,
+            rawLines,
+            nativeIdleEvidence: this.nativeIdleEvidence,
+          });
+        }
         this.telemetry.captureHookSessionIds(sessionId, rawLines);
         this.telemetry.ingestEvents(sessionId, events);
       },
@@ -490,10 +519,10 @@ export class SessionManager extends EventEmitter {
       return await this.doSpawn(ownedInput);
     } catch (error) {
       const isRegistered = ownedInput.id !== undefined && this.registry.has(ownedInput.id);
-      if (!isRegistered) {
-        disposeSpawnCleanup(ownedInput);
-        if (ownedInput.id !== undefined) removeAdapterHooks(ownedInput);
-      }
+      // performSpawn 轉移成功後會先清空 input；catch 必須釋放仍由本次 invocation 持有的 cleanup。
+      // hooks 則屬於 session ID，若同 ID registry owner 仍存在就不可釋放它。
+      disposeSpawnCleanup(ownedInput);
+      if (!isRegistered && ownedInput.id !== undefined) removeAdapterHooks(ownedInput);
       throw error;
     } finally {
       this.spawningCount--;
@@ -516,6 +545,8 @@ export class SessionManager extends EventEmitter {
       sessionHistoryReader: this.sessionHistoryReader,
       sessionQueue: this.sessionQueue,
       firstOutputTracker: this.firstOutputTracker,
+      writeCoordinator: this.writeCoordinator,
+      nativeIdleEvidence: this.nativeIdleEvidence,
       getTranscriptWriter: () => this.transcriptWriter,
       getShell: () => this.getShell(),
       takePendingResize: (sessionId) => {
@@ -539,19 +570,46 @@ export class SessionManager extends EventEmitter {
   }
 
   write(sessionId: string, data: string): void {
-    const session = this.registry.get(sessionId);
-    if (!session?.pty || data.length === 0) return;
+    if (data.length === 0) return;
+    this.getOrCreateWriteQueue(sessionId)?.enqueue(data);
+  }
 
-    let queue = this.writeQueues.get(sessionId);
-    if (!queue) {
-      queue = createWriteQueue(
-        () => this.registry.get(sessionId)?.pty ?? null,
-        undefined,
-        { onAutoDispose: () => this.writeQueues.delete(sessionId) },
-      );
-      this.writeQueues.set(sessionId, queue);
-    }
-    queue.enqueue(data);
+  getSessionGeneration(sessionId: string): number | null {
+    return this.writeCoordinator.getSessionGeneration(sessionId);
+  }
+
+  getInputGeneration(sessionId: string): number | null {
+    return this.writeCoordinator.getInputGeneration(sessionId);
+  }
+
+  snapshotNativeIdle(sessionId: string): NativeIdleSnapshot | null {
+    return this.nativeIdleEvidence.snapshot(sessionId);
+  }
+
+  subscribeNativeIdle(sessionId: string, listener: () => void): () => void {
+    return this.nativeIdleEvidence.subscribe(sessionId, listener);
+  }
+
+  acquireAutomation(
+    sessionId: string,
+    expected: OwnershipExpectation,
+    onFirstWrite: () => void,
+  ): SubmissionLease | null {
+    return this.writeCoordinator.acquireAutomation(sessionId, expected, onFirstWrite);
+  }
+
+  writeUserInput(sessionId: string, data: string, occurredAt = Date.now()): void {
+    if (data.length === 0 || this.writeCoordinator.getSessionGeneration(sessionId) === null) return;
+    this.writeCoordinator.recordUserInput(sessionId, data, occurredAt);
+  }
+
+  writeFocusReport(sessionId: string, report: TerminalFocusReport): void {
+    if (this.writeCoordinator.getSessionGeneration(sessionId) === null) return;
+    this.writeCoordinator.recordFocusReport(sessionId, report);
+  }
+
+  acquireUserSubmission(sessionId: string): UserSubmissionLease | null {
+    return this.writeCoordinator.acquireUserSubmission(sessionId);
   }
 
   /**
@@ -566,6 +624,19 @@ export class SessionManager extends EventEmitter {
     const queue = this.writeQueues.get(sessionId);
     if (!queue) return Promise.resolve();
     return queue.drained();
+  }
+
+  private getOrCreateWriteQueue(sessionId: string): WriteQueue | null {
+    if (!this.registry.get(sessionId)?.pty) return null;
+    let queue = this.writeQueues.get(sessionId);
+    if (queue) return queue;
+    queue = createWriteQueue(
+      () => this.registry.get(sessionId)?.pty ?? null,
+      undefined,
+      { onAutoDispose: () => this.writeQueues.delete(sessionId) },
+    );
+    this.writeQueues.set(sessionId, queue);
+    return queue;
   }
 
   /**
@@ -713,6 +784,7 @@ export class SessionManager extends EventEmitter {
 
   kill(sessionId: string): void {
     const session = this.registry.get(sessionId);
+    this.disposeInputCoordination(sessionId);
     // Every kill() is a deliberate Kangentic-initiated teardown (user kill,
     // session reset, task delete, worktree cleanup, move-to-To-Do/Backlog,
     // project relocate, shutdown), never a crash. Mark the session BEFORE the
@@ -826,6 +898,7 @@ export class SessionManager extends EventEmitter {
   async suspend(sessionId: string): Promise<void> {
     const session = this.registry.get(sessionId);
     if (!session) return;
+    this.disposeInputCoordination(sessionId);
 
     disposeSpawnCleanup(session);
 
@@ -1153,6 +1226,9 @@ export class SessionManager extends EventEmitter {
    * Returns task IDs so the caller can mark them as 'suspended' in the DB.
    */
   async suspendAll(timeoutMs = 2000): Promise<string[]> {
+    for (const session of this.registry.values()) {
+      this.disposeInputCoordination(session.id);
+    }
     return suspendAllSessions(this.shutdownContext(), timeoutMs);
   }
 
@@ -1163,7 +1239,16 @@ export class SessionManager extends EventEmitter {
    * .claude/rules/synchronous-shutdown.md.
    */
   killAll(): void {
+    for (const session of this.registry.values()) {
+      this.disposeInputCoordination(session.id);
+    }
     killAllSessions(this.shutdownContext());
+  }
+
+  private disposeInputCoordination(sessionId: string): void {
+    // Coordinator 與 evidence 必須同時退場，避免舊 generation 留在任一邊而授權下一次 automation。
+    this.writeCoordinator.disposeSession(sessionId);
+    this.nativeIdleEvidence.removeSession(sessionId);
   }
 
   private shutdownContext() {

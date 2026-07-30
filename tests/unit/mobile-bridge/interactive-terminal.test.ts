@@ -13,7 +13,7 @@ function fakeRequest(payload: Record<string, unknown>): CapabilityRequestMessage
 class FakeSessionManager extends EventEmitter {
   getSession = vi.fn((id: string) => ({ id, taskId: 'task-1' }));
   isWritable = vi.fn(() => true);
-  write = vi.fn();
+  writeUserInput = vi.fn();
   resize = vi.fn(() => ({ colsChanged: true }));
   getLastDesktopDimensions = vi.fn((): { cols: number; rows: number } | null => ({ cols: 120, rows: 30 }));
 }
@@ -37,13 +37,13 @@ describe('handleInteractiveTerminal', () => {
 
     expect(response.ok).toBe(true);
     expect(response.payload).toEqual({ written: true });
-    expect(sessionManager.write).toHaveBeenCalledWith('sess-1', 'npm login\r');
+    expect(sessionManager.writeUserInput).toHaveBeenCalledWith('sess-1', 'npm login\r');
   });
 
   it('rejects (never reports written:true) when the session exists but has no live PTY', () => {
     // A suspended/queued/exited session is still in the registry, so getSession
-    // is truthy, but write() would silently drop the bytes - the handler must
-    // surface that instead of a false written:true.
+    // is truthy, but user-input delivery would silently drop the bytes - the
+    // handler must surface that instead of a false written:true.
     const sessionManager = new FakeSessionManager();
     sessionManager.isWritable.mockReturnValue(false);
 
@@ -51,7 +51,7 @@ describe('handleInteractiveTerminal', () => {
 
     expect(response.ok).toBe(false);
     expect(response.error).toMatch(/not accepting input/i);
-    expect(sessionManager.write).not.toHaveBeenCalled();
+    expect(sessionManager.writeUserInput).not.toHaveBeenCalled();
   });
 
   it('resize calls sessionManager.resize with mobile origin and arms the restore guard', () => {

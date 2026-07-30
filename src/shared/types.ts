@@ -1,4 +1,7 @@
 import type { PopOutDescriptor, PopOutKind, PopOutParamsByKind } from './pop-out';
+import type { LiveDeliveryStatus } from './live-delivery-status';
+import type { TaskMoveResult } from './auto-command-outcome';
+import type { TerminalFocusReport } from './terminal-focus-report';
 
 // === Database Models ===
 
@@ -3421,7 +3424,7 @@ export interface ElectronAPI {
     create: (input: TaskCreateInput, projectId?: string | null) => Promise<Task>;
     update: (input: TaskUpdateInput, projectId?: string | null) => Promise<Task>;
     delete: (id: string, projectId?: string | null) => Promise<void>;
-    move: (input: TaskMoveInput, projectId?: string | null) => Promise<void>;
+    move: (input: TaskMoveInput, projectId?: string | null) => Promise<TaskMoveResult>;
     /**
      * Cancel an in-flight spawn for a task (e.g. while it is parked in the
      * git queue or fetching). Aborts the move's AbortController; the existing
@@ -3515,6 +3518,7 @@ export interface ElectronAPI {
     reconcile: (taskId: string, projectId?: string | null) => Promise<Session | null>;
     reset: (taskId: string, projectId?: string | null) => Promise<void>;
     write: (sessionId: string, data: string) => Promise<void>;
+    writeFocusReport: (sessionId: string, report: TerminalFocusReport, projectId: string | null) => Promise<void>;
     resize: (sessionId: string, cols: number, rows: number) => Promise<{ colsChanged: boolean }>;
     list: () => Promise<Session[]>;
     getScrollback: (sessionId: string) => Promise<string>;
@@ -3537,6 +3541,7 @@ export interface ElectronAPI {
     onFirstOutput: (callback: (sessionId: string, projectId?: string) => void) => () => void;
     onExit: (callback: (sessionId: string, exitCode: number, projectId?: string, intentional?: boolean) => void) => () => void;
     onStatus: (callback: (sessionId: string, session: Session, projectId?: string) => void) => () => void;
+    onLiveDeliveryStatus: (callback: (status: LiveDeliveryStatus) => void) => () => void;
     onUsage: (callback: (sessionId: string, data: SessionUsage, projectId?: string) => void) => () => void;
     getActivity: (projectId?: string) => Promise<Record<string, ActivityState>>;
     onActivity: (callback: (sessionId: string, state: ActivityState, reason: ActivityReason, projectId?: string, taskId?: string, taskTitle?: string) => void) => () => void;
@@ -3916,12 +3921,13 @@ export interface BrowserPickedElement {
 }
 
 export interface BrowserCaptureInput {
+  projectId: string;
   sessionId: string;
   taskId: string;
   /**
    * The agent's working directory (task.worktree_path ?? project.path).
-   * Captures are written under this path so any agent's sandboxed file
-   * tools can reach them via a relative path in the @-mention.
+   * Capture storage is rooted at the project resolved from required projectId.
+   * This path is only the base for the relative PNG path exposed to the agent.
    */
   cwd: string;
   url: string;

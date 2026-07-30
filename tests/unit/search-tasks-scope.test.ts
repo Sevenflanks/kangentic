@@ -62,7 +62,8 @@ function makeContext(): CommandContext {
     onTaskCreated: vi.fn(),
     onTaskUpdated: vi.fn(),
     onTaskDeleted: vi.fn(),
-    onTaskMove: vi.fn(async () => {}),
+    onTaskMove: vi.fn(async () => ({ ok: true, autoCommand: { kind: 'not-applicable' } })),
+    onTaskAutoSpawn: vi.fn(async () => ({ kind: 'not-applicable' })),
     onSwimlaneUpdated: vi.fn(),
   };
 }

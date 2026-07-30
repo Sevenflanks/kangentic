@@ -38,6 +38,7 @@ import {
  *  sessions, which have no associated task. The click handler routes this value
  *  through `setPendingOpenCommandTerminal` instead of opening a task detail dialog. */
 const COMMAND_TERMINAL_NOTIFICATION_TASK_ID = '__command_terminal__';
+const LIVE_DELIVERY_COMPLETE_DURATION_MS = 2000;
 
 export function App() {
   const loadProjects = useProjectStore((s) => s.loadProjects);
@@ -157,6 +158,7 @@ export function App() {
   // bridge may not be fully re-injected when useEffect fires.
   useEffect(() => {
     const cleanups: (() => void)[] = [];
+    const liveDeliveryTimers = new Set<ReturnType<typeof setTimeout>>();
     const sessions = window.electronAPI?.sessions;
     if (!sessions) return;
 
@@ -171,6 +173,34 @@ export function App() {
           upsertSession(session);
           scheduleAutoNameSuggestion(session);
         });
+      }));
+    }
+
+    cleanups.push(() => {
+      for (const timer of liveDeliveryTimers) clearTimeout(timer);
+      useSessionStore.getState().clearLiveDeliveryStatuses();
+      useSessionStore.getState().clearAutoCommandWarnings();
+    });
+
+    if (sessions.onLiveDeliveryStatus) {
+      cleanups.push(sessions.onLiveDeliveryStatus((status) => {
+        if (status.projectId !== useProjectStore.getState().currentProject?.id) return;
+        const sessionStore = useSessionStore.getState();
+        sessionStore.setLiveDeliveryStatus(status);
+        if (useSessionStore.getState().liveDeliveryByTaskId[status.taskId] !== status) return;
+        // async delivery outcome 只會經過這個 listener；toast 放在這裡可避免和 immediate skipped、silent cancellation 重複。
+        if (status.state === 'cancelled' && status.reason === 'delivery-error') {
+          useToastStore.getState().addToast({
+            message: 'Lane command could not be delivered safely.',
+            variant: 'warning',
+          });
+        }
+        if (status.state !== 'delivered') return;
+        const timer = setTimeout(() => {
+          liveDeliveryTimers.delete(timer);
+          useSessionStore.getState().clearDeliveredLiveDeliveryStatus(status);
+        }, LIVE_DELIVERY_COMPLETE_DURATION_MS);
+        liveDeliveryTimers.add(timer);
       }));
     }
 
@@ -300,9 +330,11 @@ export function App() {
     // Session exit events
     if (sessions.onExit) {
       cleanups.push(sessions.onExit((sessionId, exitCode, projectId, intentional) => {
+        useSessionStore.getState().clearLiveDeliveryStatusForSession(sessionId);
         const currentSession = useSessionStore.getState().sessions.find((s) => s.id === sessionId);
         const exitedTaskId = currentSession?.taskId;
         if (exitedTaskId) {
+          useSessionStore.getState().clearAutoCommandWarningForTask(exitedTaskId);
           const timer = autoNameTimers.get(exitedTaskId);
           if (timer) {
             clearTimeout(timer);
@@ -660,6 +692,7 @@ if (import.meta.hot) {
     // renderer-side pushes are stale; an HMR also tears down the DndContext
     // without firing dragEnd, so the gate must be force-cleared here.
     resetCoalescerForHmr();
+    useSessionStore.getState().clearLiveDeliveryStatuses();
 
     // Cancel stale drop highlights (HMR unmounts DndContext without firing dragEnd)
     document.querySelectorAll('.drop-highlight').forEach(element => element.classList.remove('drop-highlight'));

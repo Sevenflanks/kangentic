@@ -129,8 +129,12 @@ interface MockContext {
   currentProjectPath: string | null;
   sessionManager: {
     getSession: ReturnType<typeof vi.fn>;
+    isWritable: ReturnType<typeof vi.fn>;
   };
-  terminalSubmitScheduler: { scheduleKeystrokes: ReturnType<typeof vi.fn> };
+  terminalSubmitScheduler: {
+    cancel: ReturnType<typeof vi.fn>;
+    scheduleKeystrokes: ReturnType<typeof vi.fn>;
+  };
   boardConfigManager: {
     writeBack: ReturnType<typeof vi.fn>;
     exists: ReturnType<typeof vi.fn>;
@@ -155,8 +159,9 @@ function createMockContext(overrides: Partial<MockContext> = {}): MockContext {
     currentProjectPath: '/mock/board-project',
     sessionManager: {
       getSession: vi.fn(() => ({ status: 'running' })),
+      isWritable: vi.fn(() => true),
     },
-    terminalSubmitScheduler: { scheduleKeystrokes: vi.fn() },
+    terminalSubmitScheduler: { cancel: vi.fn(), scheduleKeystrokes: vi.fn() },
     boardConfigManager: {
       writeBack: vi.fn(),
       exists: vi.fn(() => false),

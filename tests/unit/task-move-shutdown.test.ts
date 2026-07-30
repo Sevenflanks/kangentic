@@ -129,7 +129,7 @@ vi.mock('../../src/main/shutdown-state', () => ({
 const mockGetProjectRepos = vi.fn();
 const mockEnsureTaskWorktree = vi.fn(async () => null);
 const mockEnsureTaskBranchCheckout = vi.fn(async () => {});
-const mockSpawnAgent = vi.fn(async () => {});
+const mockSpawnAgent = vi.fn(async () => ({ kind: 'not-applicable' } as const));
 const mockCreateTransitionEngine = vi.fn(() => ({}));
 const mockBuildAutoCommandVars = vi.fn(() => ({}));
 const mockCleanupTaskResources = vi.fn(async () => {});
@@ -357,7 +357,7 @@ describe('handleTaskMove shutdown protection', () => {
     mockEnsureTaskBranchCheckout.mockReset();
     mockEnsureTaskBranchCheckout.mockResolvedValue(undefined);
     mockSpawnAgent.mockReset();
-    mockSpawnAgent.mockResolvedValue(undefined);
+    mockSpawnAgent.mockResolvedValue({ kind: 'not-applicable' });
   });
 
   // =========================================================================
@@ -375,7 +375,7 @@ describe('handleTaskMove shutdown protection', () => {
 
     await expect(
       handleTaskMove(context as never, MOVE_INPUT),
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual({ ok: true, autoCommand: { kind: 'not-applicable' } });
 
     // Phase 1 forward move ran (DB write committed before shutdown checked).
     expect(taskRepo.move).toHaveBeenCalledTimes(1);
@@ -406,7 +406,7 @@ describe('handleTaskMove shutdown protection', () => {
 
     await expect(
       handleTaskMove(context as never, MOVE_INPUT),
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual({ ok: true, autoCommand: { kind: 'not-applicable' } });
 
     // Phase 2 ran (it's where the flag flipped).
     expect(mockEnsureTaskWorktree).toHaveBeenCalledTimes(1);
@@ -433,8 +433,8 @@ describe('handleTaskMove shutdown protection', () => {
   it('IPC handler swallows errors when shutdown is in progress', async () => {
     const context = makeContext(taskRepo, swimlaneRepo);
 
-    // Force a Phase 2 throw that resembles the real shutdown error.
-    mockEnsureTaskWorktree.mockImplementation(async () => {
+    // Force a Phase 1 throw so the registered IPC wrapper owns the shutdown swallow.
+    taskRepo.move.mockImplementation(() => {
       mockIsShuttingDown.mockReturnValue(true);
       throw new TypeError('The database connection is not open');
     });

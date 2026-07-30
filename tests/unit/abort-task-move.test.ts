@@ -109,7 +109,7 @@ vi.mock('../../src/main/shutdown-state', () => ({
 // Phase 2 helper - configurable per test
 const mockEnsureTaskWorktree = vi.fn(async () => null);
 const mockEnsureTaskBranchCheckout = vi.fn(async () => {});
-const mockSpawnAgent = vi.fn(async () => {});
+const mockSpawnAgent = vi.fn(async () => ({ kind: 'not-applicable' } as const));
 
 vi.mock('../../src/main/ipc/helpers/index', () => ({
   getProjectRepos: (...args: unknown[]) => mockGetProjectRepos(...args),
@@ -231,7 +231,7 @@ describe('abortTaskMove', () => {
     mockEnsureTaskBranchCheckout.mockReset();
     mockEnsureTaskBranchCheckout.mockResolvedValue(undefined);
     mockSpawnAgent.mockReset();
-    mockSpawnAgent.mockResolvedValue(undefined);
+    mockSpawnAgent.mockResolvedValue({ kind: 'not-applicable' });
   });
 
   // -------------------------------------------------------------------------
@@ -311,7 +311,10 @@ describe('abortTaskMove', () => {
     // Unblock Phase 2 so the aborted move can settle (it will take the AbortError path).
     unblockPhase2!();
 
-    // The move promise should resolve (not reject) - the abort path swallows the error.
-    await expect(movePromise).resolves.toBeUndefined();
+    // The move promise should resolve (not reject) with the structured success result.
+    await expect(movePromise).resolves.toEqual({
+      ok: true,
+      autoCommand: { kind: 'not-applicable' },
+    });
   });
 });

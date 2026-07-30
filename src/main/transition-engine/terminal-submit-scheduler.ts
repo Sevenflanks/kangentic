@@ -1,6 +1,15 @@
 import type { SessionManager } from '../pty/session-manager';
 import type { CommandVerifier, TerminalSubmit } from '../pty/terminal-submit';
+import type { SubmissionLease } from '../pty/session-write-coordinator';
 import type { SessionStatus, SubmissionVerifier } from '../../shared/types';
+import type {
+  LiveDeliveryCancellationReason,
+  LiveDeliveryStatus,
+} from '../../shared/live-delivery-status';
+import {
+  evaluateNativeIdleReadiness,
+  type NativeIdleRequest,
+} from './native-idle-waiter';
 
 /**
  * Re-export so callers in injection-plan and slash-command-verifier can keep
@@ -9,12 +18,17 @@ import type { SessionStatus, SubmissionVerifier } from '../../shared/types';
  */
 export type { CommandVerifier } from '../pty/terminal-submit';
 
+export interface LiveDeliveryRegistration {
+  readonly generation: number;
+  readonly accepted: true;
+}
+
 /** State for a task whose burst is in flight. `next` is the most-recently-
  *  scheduled follow-up that will run after the current one finishes; rapid
  *  drag-through transitions overwrite `next` so only the latest survives. */
 interface ActiveBurst {
   controller: AbortController;
-  next: { commands: string[]; opts: ScheduleKeystrokesOptions } | null;
+  next: ScheduledSubmission | null;
 }
 
 /** State for a task waiting on a fresh-spawn `'thinking'` event. */
@@ -23,16 +37,34 @@ interface PendingDeferred {
 }
 
 type ScheduledSubmission =
-  | { kind: 'content'; text: string; sessionId: string }
-  | { kind: 'keystrokes'; commands: string[]; sessionId: string; opts: ScheduleKeystrokesOptions };
+  | { kind: 'content'; text: string; sessionId: string; opts: ScheduleContentOptions }
+  | { kind: 'keystrokes'; commands: string[]; sessionId: string; opts: ScheduleKeystrokesOptions }
+  | { kind: 'native-idle'; entry: NativeIdleEntry };
 
 interface PendingContent {
   controller: AbortController;
   sessionId: string;
   cleanupReadiness: () => void;
   cleanupLifetime: () => void;
-  nextKeystrokes: Extract<ScheduledSubmission, { kind: 'keystrokes' }> | null;
+  next: ScheduledSubmission | null;
 }
+
+type NativeIdlePhase = 'waiting' | 'leased-uncommitted' | 'committed';
+
+interface NativeIdleEntry {
+  readonly token: object;
+  readonly request: NativeIdleRequest;
+  readonly generation: number;
+  readonly deadline: number;
+  phase: NativeIdlePhase;
+  unsubscribe: () => void;
+  timeout: ReturnType<typeof setTimeout> | null;
+  lease: SubmissionLease | null;
+  successor: ScheduledSubmission | null;
+  terminalStatus: boolean;
+}
+
+type LiveDeliveryStatusCallback = (status: LiveDeliveryStatus) => void;
 
 /** Options for `scheduleKeystrokes`. */
 export interface ScheduleKeystrokesOptions {
@@ -47,6 +79,8 @@ export interface ScheduleKeystrokesOptions {
   verifier?: CommandVerifier | null;
   /** Verifies leading prefix only; trailing commands fire-and-forget. */
   verifiedPrefixLength?: number;
+  strictVerification?: boolean;
+  onDelivered?: () => void | Promise<void>;
   /**
    * Hard timeout for the fresh-spawn wait. When the CLI never emits
    * `'thinking'` (e.g. agent hung at startup), we cancel this task's
@@ -88,7 +122,9 @@ export interface ScheduleContentOptions {
  * Cancellation tears down content and keystroke readiness listeners/timers,
  * drops queued content followers and burst follow-ups, and aborts in-flight
  * content or keystroke delivery through the per-task `AbortController`.
- * Re-scheduling for the same task cancels any prior pending injection.
+ * Re-scheduling for the same task cancels any prior pending injection. Native
+ * delivery becomes non-cancellable at its first byte; explicit cancellation
+ * then drops only its successor so settlement can report the real outcome.
  *
  * Used by every column-transition / lifecycle path that injects keystrokes:
  * auto_command on column move, `/model X` + `/effort Y` settings burst,
@@ -98,11 +134,36 @@ export class TerminalSubmitScheduler {
   private content = new Map<string, PendingContent>();
   private deferred = new Map<string, PendingDeferred>();
   private active = new Map<string, ActiveBurst>();
+  private nativeIdle = new Map<string, NativeIdleEntry>();
+  private nextNativeGeneration = 1;
+  private taskMutations = new Map<string, object>();
+  private acceptingSubmissions = true;
+  private suppressNativeLateStatuses = false;
 
   constructor(
     private sessionManager: SessionManager,
     private terminalSubmit: TerminalSubmit,
+    private onLiveDeliveryStatus: LiveDeliveryStatusCallback = () => undefined,
   ) {}
+
+  private beginTaskMutation(taskId: string): object {
+    const mutation = {};
+    this.taskMutations.set(taskId, mutation);
+    return mutation;
+  }
+
+  private isTaskMutationCurrent(taskId: string, mutation: object): boolean {
+    return this.taskMutations.get(taskId) === mutation;
+  }
+
+  private cleanupTaskMutation(taskId: string, expectedMutation?: object): void {
+    if (this.content.has(taskId)
+      || this.deferred.has(taskId)
+      || this.active.has(taskId)
+      || this.nativeIdle.has(taskId)) return;
+    if (expectedMutation && !this.isTaskMutationCurrent(taskId, expectedMutation)) return;
+    this.taskMutations.delete(taskId);
+  }
 
   scheduleContent(
     taskId: string,
@@ -110,12 +171,30 @@ export class TerminalSubmitScheduler {
     text: string,
     opts: ScheduleContentOptions = {},
   ): void {
-    if (text.length === 0) return;
+    if (!this.acceptingSubmissions || text.length === 0) return;
 
     const session = this.sessionManager.getSession(sessionId);
     if (!session) return;
+    const mutation = this.beginTaskMutation(taskId);
 
-    this.cancel(taskId);
+    const submission: Extract<ScheduledSubmission, { kind: 'content' }> = {
+      kind: 'content',
+      sessionId,
+      text,
+      opts,
+    };
+    const nativeEntry = this.nativeIdle.get(taskId);
+    if (nativeEntry?.phase === 'committed') {
+      this.replaceSuccessor(nativeEntry, submission, mutation);
+      return;
+    }
+    if (nativeEntry) this.cancelNativeEntry(nativeEntry, 'superseded');
+    if (!this.isTaskMutationCurrent(taskId, mutation)) {
+      return;
+    }
+
+    this.cancelTask(taskId, 'superseded', mutation);
+    if (!this.isTaskMutationCurrent(taskId, mutation)) return;
     const status: SessionStatus = session.status;
     let isQueued: boolean;
     switch (status) {
@@ -127,6 +206,7 @@ export class TerminalSubmitScheduler {
         break;
       case 'exited':
       case 'suspended':
+        this.cleanupTaskMutation(taskId, mutation);
         return;
       default: {
         const unhandledStatus: never = status;
@@ -139,12 +219,12 @@ export class TerminalSubmitScheduler {
       sessionId,
       cleanupReadiness: () => undefined,
       cleanupLifetime: () => undefined,
-      nextKeystrokes: null,
+      next: null,
     };
     this.content.set(taskId, entry);
     this.scheduleContentReadiness(
       taskId,
-      { kind: 'content', sessionId, text },
+      submission,
       opts,
       entry,
       isQueued,
@@ -163,13 +243,14 @@ export class TerminalSubmitScheduler {
     commands: string[],
     opts: ScheduleKeystrokesOptions = {},
   ): void {
-    if (commands.length === 0) return;
+    if (!this.acceptingSubmissions || commands.length === 0) return;
 
     const session = this.sessionManager.getSession(sessionId);
     if (!session) {
       console.log(`[TerminalSubmitScheduler] No session ${sessionId.slice(0, 8)} for task ${taskId.slice(0, 8)} -- skipping`);
       return;
     }
+    const mutation = this.beginTaskMutation(taskId);
 
     const submission: Extract<ScheduledSubmission, { kind: 'keystrokes' }> = {
       kind: 'keystrokes',
@@ -177,24 +258,101 @@ export class TerminalSubmitScheduler {
       sessionId,
       opts,
     };
+    const nativeEntry = this.nativeIdle.get(taskId);
+    if (nativeEntry?.phase === 'committed') {
+      this.replaceSuccessor(nativeEntry, submission, mutation);
+      return;
+    }
+    if (nativeEntry) this.cancelNativeEntry(nativeEntry, 'superseded');
+    if (!this.isTaskMutationCurrent(taskId, mutation)) return;
     const pendingContent = this.content.get(taskId);
     if (pendingContent) {
       if (pendingContent.sessionId === sessionId) {
-        pendingContent.nextKeystrokes = submission;
+        this.replaceContentSuccessor(taskId, pendingContent, submission);
         return;
       }
       this.cancelContent(taskId);
+      if (!this.isTaskMutationCurrent(taskId, mutation)) return;
     }
 
-    this.scheduleKeystrokeBurst(taskId, submission, session.status === 'queued');
+    this.scheduleKeystrokeBurst(taskId, submission, mutation);
+  }
+
+  scheduleNativeIdleSubmission(request: NativeIdleRequest): LiveDeliveryRegistration | null {
+    if (!this.acceptingSubmissions) return null;
+    const mutation = this.beginTaskMutation(request.taskId);
+    const entry: NativeIdleEntry = {
+      token: mutation,
+      request,
+      generation: this.nextNativeGeneration,
+      deadline: Date.now() + request.policy.timeoutMs,
+      phase: 'waiting',
+      unsubscribe: () => undefined,
+      timeout: null,
+      lease: null,
+      successor: null,
+      terminalStatus: false,
+    };
+    this.nextNativeGeneration += 1;
+
+    const currentNative = this.nativeIdle.get(request.taskId);
+    if (currentNative?.phase === 'committed') {
+      // committed request 仍握有同一條 FIFO；successor 只能保留最新一筆，否則會形成第二個 task queue。
+      if (!this.replaceSuccessor(currentNative, { kind: 'native-idle', entry }, mutation)) {
+        this.cancelNativeEntry(entry, 'superseded');
+        return null;
+      }
+      return this.watchNativeEntryAndRegister(entry);
+    }
+    if (currentNative) this.cancelNativeEntry(currentNative, 'superseded');
+    if (!this.isTaskMutationCurrent(request.taskId, mutation)) {
+      this.cancelNativeEntry(entry, 'superseded');
+      return null;
+    }
+
+    const pendingContent = this.content.get(request.taskId);
+    if (pendingContent) {
+      if (!this.replaceContentSuccessor(
+        request.taskId,
+        pendingContent,
+        { kind: 'native-idle', entry },
+      )) {
+        this.cancelNativeEntry(entry, 'superseded');
+        return null;
+      }
+      return this.watchNativeEntryAndRegister(entry);
+    }
+
+    const activeBurst = this.active.get(request.taskId);
+    if (activeBurst) {
+      if (!this.replaceActiveSuccessor(
+        request.taskId,
+        activeBurst,
+        { kind: 'native-idle', entry },
+      )) {
+        this.cancelNativeEntry(entry, 'superseded');
+        return null;
+      }
+      return this.watchNativeEntryAndRegister(entry);
+    }
+
+    this.cancelKeystrokeBurst(request.taskId);
+    if (!this.isTaskMutationCurrent(request.taskId, mutation)) {
+      this.cancelNativeEntry(entry, 'superseded');
+      return null;
+    }
+    this.nativeIdle.set(request.taskId, entry);
+    return this.watchNativeEntryAndRegister(entry);
   }
 
   private scheduleKeystrokeBurst(
     taskId: string,
     submission: Extract<ScheduledSubmission, { kind: 'keystrokes' }>,
-    isQueued: boolean,
+    mutation: object = this.beginTaskMutation(taskId),
   ): void {
+    if (!this.acceptingSubmissions || !this.isTaskMutationCurrent(taskId, mutation)) return;
     const { sessionId, commands, opts } = submission;
+    const isQueued = this.sessionManager.getSession(sessionId)?.status === 'queued';
     const freshlySpawned = opts.freshlySpawned ?? false;
 
     // Existing session, ready right now: try to claim the active-burst slot.
@@ -204,8 +362,9 @@ export class TerminalSubmitScheduler {
         // A burst is in flight. Stash this as "next"; the worker drains it
         // when the current burst finishes. Overwriting any previous "next"
         // intentionally coalesces transient drags.
-        existing.next = { commands, opts };
-        console.log(`[TerminalSubmitScheduler] Queueing burst for task ${taskId.slice(0, 8)} (in-flight burst running)`);
+        if (this.replaceActiveSuccessor(taskId, existing, submission)) {
+          console.log(`[TerminalSubmitScheduler] Queueing burst for task ${taskId.slice(0, 8)} (in-flight burst running)`);
+        }
         return;
       }
       this.startBurst(taskId, sessionId, commands, opts);
@@ -214,7 +373,82 @@ export class TerminalSubmitScheduler {
 
     // Fresh spawn or queued - wait for CLI to come alive, then start the burst.
     this.cancelKeystrokeBurst(taskId);
+    if (!this.isTaskMutationCurrent(taskId, mutation)) return;
     this.scheduleDeferred(taskId, sessionId, commands, opts, isQueued);
+  }
+
+  private replaceContentSuccessor(
+    taskId: string,
+    entry: PendingContent,
+    successor: ScheduledSubmission,
+  ): boolean {
+    const mutation = this.taskMutations.get(taskId);
+    if (!mutation) return false;
+    this.cancelScheduledNative(entry.next, 'superseded');
+    if (!this.isTaskMutationCurrent(taskId, mutation)) return false;
+    entry.next = successor;
+    return true;
+  }
+
+  private replaceActiveSuccessor(
+    taskId: string,
+    entry: ActiveBurst,
+    successor: ScheduledSubmission,
+  ): boolean {
+    const mutation = this.taskMutations.get(taskId);
+    if (!mutation) return false;
+    this.cancelScheduledNative(entry.next, 'superseded');
+    if (!this.isTaskMutationCurrent(taskId, mutation)) return false;
+    entry.next = successor;
+    return true;
+  }
+
+  private replaceSuccessor(
+    entry: NativeIdleEntry,
+    successor: ScheduledSubmission,
+    mutation: object,
+  ): boolean {
+    this.cancelScheduledNative(entry.successor, 'superseded');
+    if (!this.isTaskMutationCurrent(entry.request.taskId, mutation)) return false;
+    entry.successor = successor;
+    return true;
+  }
+
+  private cancelScheduledNative(
+    submission: ScheduledSubmission | null,
+    reason: LiveDeliveryCancellationReason,
+  ): void {
+    if (submission?.kind === 'native-idle') this.cancelNativeEntry(submission.entry, reason);
+  }
+
+  private cancelStrictNativeSuccessor(entry: ActiveBurst): void {
+    const successor = entry.next;
+    if (successor?.kind !== 'native-idle') return;
+    entry.next = null;
+    this.cancelNativeEntry(successor.entry, 'delivery-error');
+  }
+
+  private startScheduledSubmission(taskId: string, submission: ScheduledSubmission): void {
+    if (!this.acceptingSubmissions) return;
+    switch (submission.kind) {
+      case 'content':
+        this.scheduleContent(taskId, submission.sessionId, submission.text, submission.opts);
+        return;
+      case 'keystrokes': {
+        this.scheduleKeystrokes(taskId, submission.sessionId, submission.commands, submission.opts);
+        return;
+      }
+      case 'native-idle':
+        if (submission.entry.terminalStatus) return;
+        this.taskMutations.set(taskId, submission.entry.token);
+        this.nativeIdle.set(taskId, submission.entry);
+        this.evaluateNativeEntry(submission.entry);
+        return;
+      default: {
+        const unhandledSubmission: never = submission;
+        return unhandledSubmission;
+      }
+    }
   }
 
   /**
@@ -223,21 +457,49 @@ export class TerminalSubmitScheduler {
    * active worker's queued `next` sequence.
    */
   cancel(taskId: string): void {
-    this.cancelContent(taskId);
-    this.cancelKeystrokeBurst(taskId);
+    const mutation = this.beginTaskMutation(taskId);
+    this.cancelTask(taskId, 'superseded', mutation);
+    this.cleanupTaskMutation(taskId, mutation);
   }
 
-  private cancelContent(taskId: string): void {
+  private cancelTask(
+    taskId: string,
+    reason: LiveDeliveryCancellationReason,
+    mutation: object,
+  ): void {
+    this.cancelContent(taskId, reason);
+    if (!this.isTaskMutationCurrent(taskId, mutation)) return;
+    this.cancelKeystrokeBurst(taskId, reason);
+    if (!this.isTaskMutationCurrent(taskId, mutation)) return;
+    const nativeEntry = this.nativeIdle.get(taskId);
+    if (nativeEntry) {
+      this.cancelNativeEntry(nativeEntry, reason);
+      if (nativeEntry.phase === 'committed'
+        && this.nativeIdle.get(taskId) === nativeEntry
+        && this.isTaskMutationCurrent(taskId, mutation)) {
+        this.taskMutations.set(taskId, nativeEntry.token);
+      }
+    }
+  }
+
+  private cancelContent(
+    taskId: string,
+    nativeReason: LiveDeliveryCancellationReason = 'superseded',
+  ): void {
     const pending = this.content.get(taskId);
     if (!pending) return;
 
     this.content.delete(taskId);
-    pending.nextKeystrokes = null;
+    this.cancelScheduledNative(pending.next, nativeReason);
+    pending.next = null;
     pending.cleanupLifetime();
     pending.controller.abort();
   }
 
-  private cancelKeystrokeBurst(taskId: string): void {
+  private cancelKeystrokeBurst(
+    taskId: string,
+    nativeReason: LiveDeliveryCancellationReason = 'superseded',
+  ): void {
     const pending = this.deferred.get(taskId);
     if (pending) {
       this.deferred.delete(taskId);
@@ -245,27 +507,289 @@ export class TerminalSubmitScheduler {
     }
     const burst = this.active.get(taskId);
     if (burst) {
+      this.cancelScheduledNative(burst.next, nativeReason);
       burst.next = null;
       burst.controller.abort();
     }
   }
 
   /** Cancel all pending injections. Called on `killAll`/`suspendAll`. */
-  cancelAll(): void {
-    for (const taskId of [...this.content.keys()]) {
-      this.cancelContent(taskId);
+  cancelAll(reason?: 'shutdown'): void {
+    if (reason === 'shutdown') {
+      // admission 必須先關閉，否則 shutdown cancellation callback 可在 snapshot iteration 外建立新 owner。
+      this.acceptingSubmissions = false;
     }
-    this.cancelAllKeystrokeBursts();
+    const nativeReason: LiveDeliveryCancellationReason = reason ?? 'superseded';
+    const taskIds = new Set([
+      ...this.content.keys(),
+      ...this.deferred.keys(),
+      ...this.active.keys(),
+      ...this.nativeIdle.keys(),
+    ]);
+    for (const taskId of taskIds) {
+      const mutation = this.beginTaskMutation(taskId);
+      this.cancelTask(taskId, nativeReason, mutation);
+      this.cleanupTaskMutation(taskId, mutation);
+    }
+    if (reason === 'shutdown') {
+      this.suppressNativeLateStatuses = true;
+      this.taskMutations.clear();
+    }
   }
 
-  private cancelAllKeystrokeBursts(): void {
-    const pending = [...this.deferred.values()];
-    this.deferred.clear();
-    for (const entry of pending) entry.cleanup();
-    for (const burst of this.active.values()) {
-      burst.next = null;
-      burst.controller.abort();
+  private watchNativeEntry(entry: NativeIdleEntry): void {
+    const onEvidenceChanged = (): void => this.evaluateNativeEntry(entry);
+    entry.unsubscribe = this.sessionManager.subscribeNativeIdle(entry.request.sessionId, onEvidenceChanged);
+    const remaining = Math.max(0, entry.deadline - Date.now());
+    entry.timeout = setTimeout(() => {
+      if (!this.isNativeEntryOwned(entry) || entry.phase === 'committed') return;
+      this.cancelNativeEntry(entry, 'timeout');
+    }, remaining);
+    this.emitNativeStatus(entry, { state: 'waiting' });
+    this.evaluateNativeEntry(entry);
+  }
+
+  private watchNativeEntryAndRegister(entry: NativeIdleEntry): LiveDeliveryRegistration | null {
+    this.watchNativeEntry(entry);
+    // waiting status observer 會同步執行；若它替換目前 owner，這次 admission 不可回報 accepted。
+    return this.isNativeEntryOwned(entry) ? { accepted: true, generation: entry.generation } : null;
+  }
+
+  private evaluateNativeEntry(entry: NativeIdleEntry): void {
+    if (!this.acceptingSubmissions
+      || !this.isNativeEntryOwned(entry)
+      || entry.terminalStatus
+      || entry.phase !== 'waiting') return;
+    if (this.hasNativeDeadlineElapsed(entry)) {
+      this.cancelNativeEntry(entry, 'timeout');
+      return;
     }
+    // 只接受 expectation 指定的 root-native clean idle；不可退回 generic activity，否則 child idle 會提早放行。
+    const readiness = evaluateNativeIdleReadiness(
+      this.sessionManager.snapshotNativeIdle(entry.request.sessionId),
+      entry.request,
+    );
+    if (readiness !== 'waiting' && readiness !== 'ready') {
+      this.cancelNativeEntry(entry, readiness);
+      return;
+    }
+    const validation = entry.request.validateCurrent();
+    if (validation !== 'valid') {
+      this.cancelNativeEntry(entry, validation);
+      return;
+    }
+    if (readiness !== 'ready'
+      || entry.phase !== 'waiting'
+      || entry.terminalStatus
+      || this.nativeIdle.get(entry.request.taskId) !== entry) return;
+    this.acquireAndSubmitNative(entry);
+  }
+
+  private acquireAndSubmitNative(entry: NativeIdleEntry): void {
+    if (this.hasNativeDeadlineElapsed(entry)) {
+      this.cancelNativeEntry(entry, 'timeout');
+      return;
+    }
+    entry.phase = 'leased-uncommitted';
+    const lease = this.sessionManager.acquireAutomation(
+      entry.request.sessionId,
+      {
+        sessionGeneration: entry.request.sessionGeneration,
+        inputGeneration: entry.request.inputGeneration,
+      },
+      () => {
+        if (entry.phase === 'leased-uncommitted') entry.phase = 'committed';
+      },
+    );
+    entry.lease = lease;
+    if (!lease) {
+      entry.phase = 'waiting';
+      const reason = this.hasNativeDeadlineElapsed(entry)
+        ? 'timeout'
+        : this.classifyNativeAdmissionFailure(entry);
+      this.cancelNativeEntry(entry, reason);
+      return;
+    }
+    if (this.hasNativeDeadlineElapsed(entry)) {
+      this.cancelNativeEntry(entry, 'timeout');
+      return;
+    }
+
+    this.emitNativeStatus(entry, { state: 'sending' });
+
+    const readiness = evaluateNativeIdleReadiness(
+      this.sessionManager.snapshotNativeIdle(entry.request.sessionId),
+      entry.request,
+    );
+    const validation = entry.request.validateCurrent();
+    const deadlineElapsed = this.hasNativeDeadlineElapsed(entry);
+    const leaseMatches = lease.sessionId === entry.request.sessionId
+      && lease.sessionGeneration === entry.request.sessionGeneration
+      && lease.inputGeneration === entry.request.inputGeneration;
+    if (this.nativeIdle.get(entry.request.taskId) !== entry
+      || !this.isTaskMutationCurrent(entry.request.taskId, entry.token)
+      || entry.terminalStatus
+      || entry.phase !== 'leased-uncommitted'
+      || entry.lease !== lease
+      || !leaseMatches
+      || deadlineElapsed
+      || readiness !== 'ready'
+      || validation !== 'valid') {
+      if (!entry.terminalStatus) {
+        const reason = deadlineElapsed
+          ? 'timeout'
+          : validation === 'valid'
+          ? readiness === 'user-input' || readiness === 'turn-error' || readiness === 'session-exit'
+            ? readiness
+            : 'delivery-error'
+          : validation;
+        this.cancelNativeEntry(entry, reason);
+      }
+      return;
+    }
+
+    // final guard 後必須同 call stack 進入 writer；插入 await 會讓 user input 越過 first-byte commitment。
+    const delivery = this.terminalSubmit.submitKeystrokes(entry.request.sessionId, [entry.request.command], {
+      writer: lease,
+      sendCtrlC: false,
+      verifier: null,
+      verifiedPrefixLength: 0,
+      source: 'live-delivery',
+    });
+    this.settleNativeDelivery(entry, delivery);
+  }
+
+  private classifyNativeAdmissionFailure(entry: NativeIdleEntry): LiveDeliveryCancellationReason {
+    const readiness = evaluateNativeIdleReadiness(
+      this.sessionManager.snapshotNativeIdle(entry.request.sessionId),
+      entry.request,
+    );
+    if (readiness !== 'waiting' && readiness !== 'ready') return readiness;
+    const validation = entry.request.validateCurrent();
+    if (validation !== 'valid') return validation;
+    return 'delivery-error';
+  }
+
+  private hasNativeDeadlineElapsed(entry: NativeIdleEntry): boolean {
+    return Date.now() >= entry.deadline;
+  }
+
+  private settleNativeDelivery(entry: NativeIdleEntry, delivery: Promise<void>): void {
+    void delivery.then(
+      () => {
+        if (this.nativeIdle.get(entry.request.taskId) !== entry || entry.terminalStatus) return;
+        if (entry.phase === 'committed') this.finishNativeStatus(entry, { state: 'delivered' });
+        else this.finishNativeStatus(entry, { state: 'cancelled', reason: 'delivery-error' });
+      },
+      () => {
+        if (this.nativeIdle.get(entry.request.taskId) !== entry || entry.terminalStatus) return;
+        const snapshot = this.sessionManager.snapshotNativeIdle(entry.request.sessionId);
+        const reason: LiveDeliveryCancellationReason = snapshot === null
+          || snapshot.sessionGeneration !== entry.request.sessionGeneration
+          ? 'session-exit'
+          : 'delivery-error';
+        this.finishNativeStatus(entry, { state: 'cancelled', reason });
+      },
+    ).finally(() => {
+      entry.lease?.release();
+      entry.lease = null;
+      const successor = entry.successor;
+      entry.successor = null;
+      if (this.nativeIdle.get(entry.request.taskId) === entry) {
+        this.nativeIdle.delete(entry.request.taskId);
+      }
+      if (!this.suppressNativeLateStatuses && successor) {
+        this.startScheduledSubmission(entry.request.taskId, successor);
+      }
+      // Successor timeout 可先移除 owner 卻留下較新的 token；此時只在所有 owner 都結束後清 current token。
+      this.cleanupTaskMutation(
+        entry.request.taskId,
+        this.taskMutations.get(entry.request.taskId),
+      );
+    });
+  }
+
+  private cancelNativeEntry(entry: NativeIdleEntry, reason: LiveDeliveryCancellationReason): void {
+    const successor = entry.successor;
+    entry.successor = null;
+    if (entry.terminalStatus) {
+      this.cancelScheduledNative(successor, reason);
+      return;
+    }
+    if (entry.phase === 'committed' && reason !== 'shutdown') {
+      this.cancelScheduledNative(successor, reason);
+      return;
+    }
+    if (!this.closeNativeEntry(entry)) return;
+    if (entry.phase !== 'committed') {
+      entry.lease?.release();
+      entry.lease = null;
+      this.removeNativeEntryOwnership(entry);
+    }
+    this.emitNativeStatus(entry, { state: 'cancelled', reason });
+    this.cancelScheduledNative(successor, reason);
+    this.cleanupTaskMutation(entry.request.taskId, entry.token);
+  }
+
+  private finishNativeStatus(
+    entry: NativeIdleEntry,
+    status: { readonly state: 'delivered' }
+      | { readonly state: 'cancelled'; readonly reason: LiveDeliveryCancellationReason },
+  ): void {
+    if (!this.closeNativeEntry(entry)) return;
+    this.emitNativeStatus(entry, status);
+  }
+
+  private closeNativeEntry(entry: NativeIdleEntry): boolean {
+    if (entry.terminalStatus) return false;
+    entry.terminalStatus = true;
+    entry.unsubscribe();
+    entry.unsubscribe = () => undefined;
+    if (entry.timeout !== null) clearTimeout(entry.timeout);
+    entry.timeout = null;
+    return true;
+  }
+
+  private emitNativeStatus(
+    entry: NativeIdleEntry,
+    status: { readonly state: 'waiting' | 'sending' | 'delivered' }
+      | { readonly state: 'cancelled'; readonly reason: LiveDeliveryCancellationReason },
+  ): void {
+    if (this.suppressNativeLateStatuses) return;
+    try {
+      this.onLiveDeliveryStatus({
+        projectId: entry.request.projectId,
+        taskId: entry.request.taskId,
+        sessionId: entry.request.sessionId,
+        generation: entry.generation,
+        at: new Date().toISOString(),
+        ...status,
+      });
+    } catch {
+      return;
+    }
+  }
+
+  private isNativeEntryOwned(entry: NativeIdleEntry): boolean {
+    if (this.nativeIdle.get(entry.request.taskId) === entry) return true;
+    const content = this.content.get(entry.request.taskId)?.next;
+    if (content?.kind === 'native-idle' && content.entry === entry) return true;
+    const active = this.active.get(entry.request.taskId)?.next;
+    if (active?.kind === 'native-idle' && active.entry === entry) return true;
+    const successor = this.nativeIdle.get(entry.request.taskId)?.successor;
+    return successor?.kind === 'native-idle' && successor.entry === entry;
+  }
+
+  private removeNativeEntryOwnership(entry: NativeIdleEntry): void {
+    const taskId = entry.request.taskId;
+    if (this.nativeIdle.get(taskId) === entry) this.nativeIdle.delete(taskId);
+    const content = this.content.get(taskId);
+    if (content?.next?.kind === 'native-idle' && content.next.entry === entry) content.next = null;
+    const active = this.active.get(taskId);
+    if (active?.next?.kind === 'native-idle' && active.next.entry === entry) active.next = null;
+    const currentNative = this.nativeIdle.get(taskId);
+    if (currentNative?.successor?.kind === 'native-idle'
+      && currentNative.successor.entry === entry) currentNative.successor = null;
   }
 
   private scheduleContentReadiness(
@@ -298,7 +822,7 @@ export class TerminalSubmitScheduler {
     };
 
     const startContent = (): void => {
-      if (started || this.content.get(taskId) !== entry) return;
+      if (!this.acceptingSubmissions || started || this.content.get(taskId) !== entry) return;
       started = true;
       // Readiness 結束後仍保留 exit listener；session ownership 必須持續到 submitContent() settle。
       cleanupReadiness();
@@ -377,22 +901,31 @@ export class TerminalSubmitScheduler {
         );
         this.cancel(taskId);
       }
+      this.cleanupTaskMutation(taskId);
       return;
     }
 
-    if (this.content.get(taskId) !== entry || entry.controller.signal.aborted) return;
+    if (this.content.get(taskId) !== entry || entry.controller.signal.aborted) {
+      this.cleanupTaskMutation(taskId);
+      return;
+    }
 
-    const follower = entry.nextKeystrokes;
-    entry.nextKeystrokes = null;
+    const follower = entry.next;
+    entry.next = null;
     this.content.delete(taskId);
     entry.cleanupLifetime();
 
     if (follower) {
-      this.startBurst(taskId, follower.sessionId, follower.commands, {
-        ...follower.opts,
-        freshlySpawned: true,
-      });
+      if (follower.kind === 'keystrokes') {
+        this.startBurst(taskId, follower.sessionId, follower.commands, {
+          ...follower.opts,
+          freshlySpawned: true,
+        });
+      } else {
+        this.startScheduledSubmission(taskId, follower);
+      }
     }
+    this.cleanupTaskMutation(taskId);
   }
 
   /**
@@ -406,6 +939,7 @@ export class TerminalSubmitScheduler {
     commands: string[],
     opts: ScheduleKeystrokesOptions,
   ): void {
+    if (!this.acceptingSubmissions) return;
     const controller = new AbortController();
     const entry: ActiveBurst = { controller, next: null };
     this.active.set(taskId, entry);
@@ -419,6 +953,7 @@ export class TerminalSubmitScheduler {
     opts: ScheduleKeystrokesOptions,
     entry: ActiveBurst,
   ): Promise<void> {
+    let delivered = true;
     try {
       await this.terminalSubmit.submitKeystrokes(sessionId, commands, {
         // Fresh-spawn paths just consumed the CLI prompt arg and have nothing
@@ -431,13 +966,28 @@ export class TerminalSubmitScheduler {
         sendCtrlC: !opts.freshlySpawned,
         verifier: opts.verifier,
         verifiedPrefixLength: opts.verifiedPrefixLength,
+        strictVerification: opts.strictVerification,
         signal: entry.controller.signal,
         source: `task:${taskId.slice(0, 8)}`,
       });
     } catch (caughtError) {
+      delivered = false;
       const message = caughtError instanceof Error ? caughtError.message : String(caughtError);
       if (!message.includes('abort')) {
         console.error(`[TerminalSubmitScheduler] Burst failed for task ${taskId.slice(0, 8)}: ${message}`);
+      }
+      if (opts.strictVerification) {
+        this.cancelStrictNativeSuccessor(entry);
+      }
+    }
+
+    if (delivered && this.active.get(taskId) === entry && !entry.controller.signal.aborted) {
+      try {
+        await opts.onDelivered?.();
+      } catch (caughtError) {
+        const message = caughtError instanceof Error ? caughtError.message : String(caughtError);
+        console.error(`[TerminalSubmitScheduler] Burst completion failed for task ${taskId.slice(0, 8)}: ${message}`);
+        this.cancelStrictNativeSuccessor(entry);
       }
     }
 
@@ -447,16 +997,15 @@ export class TerminalSubmitScheduler {
     if (current === entry && entry.next) {
       const queued = entry.next;
       entry.next = null;
-      // Recurse into a fresh AbortController so the new burst is
-      // independently cancellable.
-      const next: ActiveBurst = { controller: new AbortController(), next: null };
-      this.active.set(taskId, next);
-      void this.runBurst(taskId, sessionId, queued.commands, queued.opts, next);
+      this.active.delete(taskId);
+      this.startScheduledSubmission(taskId, queued);
+      this.cleanupTaskMutation(taskId);
       return;
     }
     if (current === entry) {
       this.active.delete(taskId);
     }
+    this.cleanupTaskMutation(taskId);
   }
 
   /**

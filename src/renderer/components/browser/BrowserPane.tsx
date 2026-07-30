@@ -324,6 +324,8 @@ function BrowserPaneActive({
     setSending(true);
     setError(null);
     try {
+      const projectIdAtSend = useProjectStore.getState().currentProject?.id;
+      if (!projectIdAtSend) throw new Error('No project selected');
       const overlayRect = overlay.getBoundingClientRect();
       const pngBase64 = await compositeCapture({
         webview,
@@ -339,6 +341,7 @@ function BrowserPaneActive({
       })();
 
       await window.electronAPI.browser.captureAndSend({
+        projectId: projectIdAtSend,
         sessionId,
         taskId,
         cwd,
@@ -744,4 +747,3 @@ function notePlaceholder(strokeCount: number, pickedCount: number): string {
   if (strokeCount > 0) return 'e.g. "Match the circled spacing"';
   return 'What should the agent do with this?';
 }
-

@@ -169,4 +169,4 @@ tests/captures/fixtures/scrollback-*.json
 # machine-specific paths, so they must never enter this public repo.
 /debug-traces/
 *-probe-report.md
-.opencode/plugins/kangentic-activity.mjs
+.opencode/plugins/kangentic-activity.js
