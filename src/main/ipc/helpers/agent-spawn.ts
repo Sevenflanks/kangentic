@@ -26,6 +26,7 @@ import type { AgentAdapter } from '../../agent/agent-adapter';
 import type { IpcContext } from '../ipc-context';
 import { isAbortError } from '../../../shared/abort-utils';
 import { runSpawnPreamble } from '../../transition-engine/spawn-preamble';
+import type { CompatibilityRetryResult } from '../../compatibility/compatibility-requirement-coordinator';
 import { isResumeEligible } from '../../transition-engine/spawn-intent';
 import { resolveIsolatedSwimlaneId, resolveForceFresh } from '../../transition-engine/session-isolation';
 import { resolveEffectiveAutoCommand, applyProfileToLane } from '../../transition-engine/column-strategy';
@@ -71,6 +72,7 @@ function shouldConsumeTaskAutoCommand(outcome: AutoCommandImmediateOutcome): boo
     case 'skipped':
       return outcome.reason !== 'native-evidence-unavailable';
     case 'not-applicable':
+    case 'compatibility-required':
       return false;
     default: {
       const exhaustiveOutcome: never = outcome;
@@ -258,6 +260,105 @@ export interface AgentSpawnOptions {
   settingsSourceLane?: Swimlane | null;
 }
 
+type CompatibilityRetryDescriptor = {
+  readonly engine: TransitionEngine;
+  readonly projectId: string;
+  readonly taskId: string;
+  readonly sessionIdAtBlock: string | null;
+  readonly destinationSwimlaneId: string;
+  readonly fromSwimlaneId: string;
+  readonly mode: ExplicitResumeSpawnMode | undefined;
+  readonly skipPromptTemplate: boolean | undefined;
+  readonly continuationPrompt: string | undefined;
+  readonly suppressAutoCommand: boolean | undefined;
+  readonly autoCommandLifecycle: AutoCommandLifecycle | undefined;
+  readonly settingsSourceLane: { readonly kind: 'destination' } | { readonly kind: 'lane'; readonly swimlaneId: string } | { readonly kind: 'none' };
+};
+
+function toCompatibilityRetryDescriptor(options: AgentSpawnOptions, destinationSwimlaneId: string, projectId: string): CompatibilityRetryDescriptor {
+  let settingsSourceLane: CompatibilityRetryDescriptor['settingsSourceLane'];
+  if (options.settingsSourceLane === undefined) {
+    settingsSourceLane = { kind: 'destination' };
+  } else if (options.settingsSourceLane === null) {
+    settingsSourceLane = { kind: 'none' };
+  } else {
+    settingsSourceLane = { kind: 'lane', swimlaneId: options.settingsSourceLane.id };
+  }
+  return {
+    engine: options.engine,
+    projectId,
+    taskId: options.task.id,
+    sessionIdAtBlock: options.task.session_id,
+    destinationSwimlaneId,
+    fromSwimlaneId: options.fromSwimlaneId,
+    mode: options.mode,
+    skipPromptTemplate: options.skipPromptTemplate,
+    continuationPrompt: options.continuationPrompt,
+    suppressAutoCommand: options.suppressAutoCommand,
+    autoCommandLifecycle: options.autoCommandLifecycle,
+    settingsSourceLane,
+  };
+}
+
+async function retryCompatibilityBlockedSpawn(
+  context: IpcContext,
+  descriptor: CompatibilityRetryDescriptor,
+): Promise<CompatibilityRetryResult> {
+  return withTaskLock(descriptor.taskId, async () => {
+    const project = context.projectRepo.getById(descriptor.projectId);
+    if (!project) return { kind: 'superseded' };
+    const { tasks, attachments, swimlanes } = getProjectRepos(context, descriptor.projectId);
+    const task = tasks.getById(descriptor.taskId);
+    const toLane = swimlanes.getById(descriptor.destinationSwimlaneId);
+    if (!task
+      || !toLane
+      || task.swimlane_id !== descriptor.destinationSwimlaneId) {
+      return { kind: 'superseded' };
+    }
+    if (descriptor.mode?.kind === 'explicit-resume') {
+      if (task.session_id !== descriptor.sessionIdAtBlock
+        || context.sessionManager.findLiveSessionByTaskId(task.id) !== undefined) {
+        return { kind: 'superseded' };
+      }
+    } else if (task.session_id !== null) {
+      return { kind: 'superseded' };
+    }
+    const settingsSourceLane = (() => {
+      switch (descriptor.settingsSourceLane.kind) {
+        case 'destination':
+          return undefined;
+        case 'lane':
+          return swimlanes.getById(descriptor.settingsSourceLane.swimlaneId) ?? null;
+        case 'none':
+          return null;
+        default: {
+          const exhaustiveSource: never = descriptor.settingsSourceLane;
+          return exhaustiveSource;
+        }
+      }
+    })();
+    const outcome = await spawnAgent({
+      context,
+      engine: descriptor.engine,
+      tasks,
+      sessionRepo: new SessionRepository(getProjectDb(descriptor.projectId)),
+      task,
+      fromSwimlaneId: descriptor.fromSwimlaneId,
+      toLane,
+      projectId: descriptor.projectId,
+      projectPath: project.path,
+      mode: descriptor.mode,
+      skipPromptTemplate: descriptor.skipPromptTemplate,
+      continuationPrompt: descriptor.continuationPrompt,
+      suppressAutoCommand: descriptor.suppressAutoCommand,
+      autoCommandLifecycle: descriptor.autoCommandLifecycle,
+      settingsSourceLane,
+      attachments,
+    });
+    return outcome.kind === 'compatibility-required' ? { kind: 'failed' } : { kind: 'completed' };
+  });
+}
+
 /**
  * Single entry point for spawning or resuming an agent session for a task.
  *
@@ -292,7 +393,8 @@ export async function spawnAgent(options: AgentSpawnOptions): Promise<AutoComman
   // project-log-context.ts). When no project id is supplied the body runs
   // without establishing a new context, inheriting any ambient tag (e.g. from
   // an enclosing task-move).
-  const project = options.projectId ? context.projectRepo.getById(options.projectId) : null;
+  const projectId = options.projectId ?? context.currentProjectId;
+  const project = projectId ? context.projectRepo.getById(projectId) : null;
 
   const run = async (): Promise<AutoCommandImmediateOutcome> => {
   // Auto_command template vars for the current task snapshot. defaultBaseBranch
@@ -313,21 +415,35 @@ export async function spawnAgent(options: AgentSpawnOptions): Promise<AutoComman
   // first ever spawn, then resolve the target agent ONCE (single source of
   // truth) - a just-locked agent_override is what the resolution picks up,
   // and the in-flight spawn below already resolves against the locked values.
-  const { agent: targetAgent, isHandoff } = runSpawnPreamble({
+  const effectiveConfig = context.configManager.getEffectiveConfig(options.projectPath ?? project?.path ?? undefined);
+  const preamble = runSpawnPreamble({
     task,
+    projectId,
     hasSessionRecord: latestSession !== undefined,
     settingsLane: options.settingsSourceLane === undefined ? toLane : options.settingsSourceLane,
     destinationLane: toLane,
     project,
-    globalPermissionMode: () => context.configManager.getEffectiveConfig(options.projectPath || undefined).agent.permissionMode,
+    globalPermissionMode: () => effectiveConfig.agent.permissionMode,
+    compatibilityAcknowledgements: effectiveConfig.compatibilityAcknowledgements,
     tasks,
   });
+  if (preamble.kind === 'compatibility-required') {
+    if (projectId && toLane) {
+      const descriptor = toCompatibilityRetryDescriptor(options, toLane.id, projectId);
+      context.compatibilityRequirements.replace({
+        requirement: preamble.requirement,
+        retry: () => retryCompatibilityBlockedSpawn(context, descriptor),
+      });
+    }
+    return { kind: 'compatibility-required', requirement: preamble.requirement };
+  }
+  const { agent: targetAgent, isHandoff, permissionMode } = preamble;
 
   if (options.mode?.kind === 'explicit-resume') {
     await engine.resumeSuspendedSession(
       task,
-      toLane?.permission_mode,
-      undefined,
+      permissionMode,
+      skipPromptTemplate,
       options.mode.resumePrompt,
       signal,
       targetAgent,
@@ -423,7 +539,7 @@ export async function spawnAgent(options: AgentSpawnOptions): Promise<AutoComman
     emitSpawnProgress(context.mainWindow, task.id, 'detecting-agent');
 
     await engine.resumeSuspendedSession(
-      task, toLane.permission_mode, skipPromptTemplate, undefined, signal,
+      task, permissionMode, skipPromptTemplate, undefined, signal,
       targetAgent,
       handoffPromptPrefix,
       resolveSpawnOverrides(task, toLane, project),
@@ -481,7 +597,7 @@ export async function spawnAgent(options: AgentSpawnOptions): Promise<AutoComman
 
   try {
     await engine.executeTransition(
-      task, fromSwimlaneId, toLane.id, toLane.permission_mode, skipPromptTemplate, signal, targetAgent,
+      task, fromSwimlaneId, toLane.id, permissionMode, skipPromptTemplate, signal, targetAgent,
       resolveSpawnOverrides(task, toLane, project),
       // A create_worktree action runs inside the transition; give it the same
       // progress labels as the default task-move worktree path so its
@@ -589,7 +705,7 @@ export async function spawnAgent(options: AgentSpawnOptions): Promise<AutoComman
   // Without this, first-time spawns (task.agent=null, isHandoff=false)
   // would fall through to the project default or 'claude' hardcoded fallback.
   await engine.resumeSuspendedSession(
-    currentTask, toLane.permission_mode, skipPromptTemplate, resumePrompt, signal,
+    currentTask, permissionMode, skipPromptTemplate, resumePrompt, signal,
     targetAgent,
     undefined,
     resolveSpawnOverrides(currentTask, toLane, project),
@@ -680,8 +796,14 @@ export async function autoSpawnForTask(
 
       const outcome = await spawnAgent({ context, engine, tasks, sessionRepo, task: fullTask, fromSwimlaneId: '*', toLane, projectId, projectPath, attachments });
 
-      console.log(`[MCP auto-spawn] Spawned agent for "${task.title}" in ${toLane.name}`);
-      return outcome;
+      switch (outcome.kind) {
+        case 'compatibility-required':
+          console.log(`[MCP auto-spawn] Waiting for compatibility acknowledgement for "${task.title}" in ${toLane.name}`);
+          return outcome;
+        default:
+          console.log(`[MCP auto-spawn] Spawned agent for "${task.title}" in ${toLane.name}`);
+          return outcome;
+      }
     };
     return logProjectName ? runWithProjectLogContext(logProjectName, run) : run();
   });
