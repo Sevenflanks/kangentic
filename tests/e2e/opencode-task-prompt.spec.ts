@@ -21,6 +21,7 @@ import {
 type LaunchCapture = {
   readonly kind: 'launch';
   readonly argv: readonly string[];
+  readonly env: Readonly<Record<string, string>>;
 };
 
 type PromptCapture = {
@@ -28,7 +29,18 @@ type PromptCapture = {
   readonly text: string;
 };
 
-type CaptureEvent = LaunchCapture | PromptCapture;
+type RouteCapture = {
+  readonly kind: 'route';
+  readonly destination: string;
+  readonly sessionId: string;
+};
+
+type TuiConfigCapture = {
+  readonly kind: 'tui-config';
+  readonly config: { readonly plugin: readonly string[] };
+};
+
+type CaptureEvent = LaunchCapture | PromptCapture | RouteCapture | TuiConfigCapture;
 
 type ExpectedCaptureCounts = {
   readonly launches: number;
@@ -41,6 +53,16 @@ const PROMPTLESS_OBSERVATION_MS = 1_000;
 const MOCK_SESSION_ID = 'ses_2349b5c91ffeKd6qajuUTR4clq';
 const PROMPT_METACHARACTERS = ['`', '&', '|', '<', '>', '^', '%'] as const;
 
+function parseStringArray(value: unknown, errorMessage: string): readonly string[] {
+  if (!Array.isArray(value)) throw new TypeError(errorMessage);
+  const strings: string[] = [];
+  for (const item of value) {
+    if (typeof item !== 'string') throw new TypeError(errorMessage);
+    strings.push(item);
+  }
+  return strings;
+}
+
 function parseCaptureEvent(line: string): CaptureEvent {
   const value: unknown = JSON.parse(line);
   if (typeof value !== 'object' || value === null || !('kind' in value)) {
@@ -48,10 +70,21 @@ function parseCaptureEvent(line: string): CaptureEvent {
   }
 
   if (value.kind === 'launch') {
-    if (!('argv' in value) || !Array.isArray(value.argv) || !value.argv.every((item) => typeof item === 'string')) {
+    if (!('argv' in value)) {
       throw new TypeError('OpenCode launch capture must contain a string argv array');
     }
-    return { kind: 'launch', argv: value.argv };
+    const argv = parseStringArray(value.argv, 'OpenCode launch capture must contain a string argv array');
+    if (!('env' in value) || typeof value.env !== 'object' || value.env === null) {
+      throw new TypeError('OpenCode launch capture must contain string environment values');
+    }
+    const env: Record<string, string> = {};
+    for (const [key, item] of Object.entries(value.env)) {
+      if (typeof item !== 'string') {
+        throw new TypeError('OpenCode launch capture must contain string environment values');
+      }
+      env[key] = item;
+    }
+    return { kind: 'launch', argv, env };
   }
 
   if (value.kind === 'prompt') {
@@ -59,6 +92,26 @@ function parseCaptureEvent(line: string): CaptureEvent {
       throw new TypeError('OpenCode prompt capture must contain text');
     }
     return { kind: 'prompt', text: value.text };
+  }
+
+  if (value.kind === 'route') {
+    if (!('destination' in value) || typeof value.destination !== 'string'
+      || !('sessionId' in value) || typeof value.sessionId !== 'string') {
+      throw new TypeError('OpenCode route capture must contain destination and sessionId');
+    }
+    return { kind: 'route', destination: value.destination, sessionId: value.sessionId };
+  }
+
+  if (value.kind === 'tui-config') {
+    if (!('config' in value) || typeof value.config !== 'object' || value.config === null
+      || !('plugin' in value.config)) {
+      throw new TypeError('OpenCode TUI config capture must contain plugin URLs');
+    }
+    const plugin = parseStringArray(
+      value.config.plugin,
+      'OpenCode TUI config capture must contain plugin URLs',
+    );
+    return { kind: 'tui-config', config: { plugin } };
   }
 
   throw new TypeError(`Unknown OpenCode capture kind: ${String(value.kind)}`);
@@ -95,7 +148,11 @@ async function waitForCapture(
   );
 }
 
-function expectPromptFreeLaunch(argv: readonly string[], excludedContent: readonly string[]): void {
+function expectPromptFreeLaunch(
+  launch: LaunchCapture,
+  excludedContent: readonly string[],
+): void {
+  const { argv, env } = launch;
   expect(argv).not.toContain('--prompt');
   expect(argv.some((argument) => argument.startsWith('--prompt='))).toBe(false);
   const commandLineData = argv.join('\0');
@@ -104,6 +161,13 @@ function expectPromptFreeLaunch(argv: readonly string[], excludedContent: readon
   }
   for (const metacharacter of PROMPT_METACHARACTERS) {
     expect(commandLineData).not.toContain(metacharacter);
+  }
+  const environmentData = Object.values(env).join('\0');
+  for (const content of excludedContent) {
+    expect(environmentData).not.toContain(content);
+  }
+  for (const metacharacter of PROMPT_METACHARACTERS) {
+    expect(environmentData).not.toContain(metacharacter);
   }
 }
 
@@ -205,7 +269,23 @@ test.describe('OpenCode multiline prompt transport', () => {
     let prompts = events.filter((event) => event.kind === 'prompt');
     expect(launches).toHaveLength(1);
     expect(prompts).toHaveLength(1);
-    expectPromptFreeLaunch(launches[0].argv, [title, description, expectedTaskXml, '<task>', sentinelPath]);
+    expectPromptFreeLaunch(launches[0], [title, description, expectedTaskXml, '<task>', sentinelPath]);
+    const tuiConfigs = events.filter((event) => event.kind === 'tui-config');
+    expect(tuiConfigs).toHaveLength(1);
+    const tuiConfig = tuiConfigs.at(0);
+    if (!tuiConfig) throw new TypeError('Missing fresh TUI config capture');
+    expect(Object.keys(tuiConfig.config)).toEqual(['plugin']);
+    expect(tuiConfig.config.plugin).toHaveLength(1);
+    expect(tuiConfig.config.plugin[0]).toMatch(/^file:\/\//);
+    expect(JSON.stringify(tuiConfig.config)).not.toContain(expectedTaskXml);
+    const freshRouteIndex = events.findIndex((event) => event.kind === 'route');
+    const freshPromptIndex = events.findIndex((event) => event.kind === 'prompt');
+    expect(events[freshRouteIndex]).toEqual({
+      kind: 'route',
+      destination: 'session',
+      sessionId: MOCK_SESSION_ID,
+    });
+    expect(freshRouteIndex).toBeLessThan(freshPromptIndex);
     expect(prompts[0].text).toBe(expectedTaskXml);
     expect(fs.existsSync(sentinelPath)).toBe(false);
     await waitForAgentSessionId(page, task.id, MOCK_SESSION_ID);
@@ -224,9 +304,10 @@ test.describe('OpenCode multiline prompt transport', () => {
     prompts = events.filter((event) => event.kind === 'prompt');
     expect(launches).toHaveLength(2);
     expect(prompts).toHaveLength(2);
+    expect(events.filter((event) => event.kind === 'route')).toHaveLength(1);
     expect(launches[1].argv).toContain('--session');
     expect(launches[1].argv).toContain(MOCK_SESSION_ID);
-    expectPromptFreeLaunch(launches[1].argv, [title, description, expectedTaskXml, resumePrompt, '<task>', sentinelPath]);
+    expectPromptFreeLaunch(launches[1], [title, description, expectedTaskXml, resumePrompt, '<task>', sentinelPath]);
     expect(prompts[1].text).toBe(resumePrompt);
     expect(prompts[1].text).not.toContain('<task>');
     expect(fs.existsSync(sentinelPath)).toBe(false);
@@ -247,7 +328,7 @@ test.describe('OpenCode multiline prompt transport', () => {
     expect(prompts).toHaveLength(2);
     expect(launches[2].argv).toContain('--session');
     expect(launches[2].argv).toContain(MOCK_SESSION_ID);
-    expectPromptFreeLaunch(launches[2].argv, [title, description, expectedTaskXml, resumePrompt, '<task>', sentinelPath]);
+    expectPromptFreeLaunch(launches[2], [title, description, expectedTaskXml, resumePrompt, '<task>', sentinelPath]);
     expect(fs.existsSync(sentinelPath)).toBe(false);
 
     await new Promise<void>((resolve) => setTimeout(resolve, PROMPTLESS_OBSERVATION_MS));

@@ -550,6 +550,7 @@ describe('OpenCode Adapter', () => {
     });
 
     afterEach(() => {
+      vi.restoreAllMocks();
       fs.rmSync(projectDir, { recursive: true, force: true });
     });
 
@@ -564,7 +565,8 @@ describe('OpenCode Adapter', () => {
     }
 
     function payloadPathFrom(env: Record<string, string> | undefined): string {
-      const sourcePath = env?.KANGENTIC_OPENCODE_INITIAL_PROMPT_PATH;
+      const sourcePath = env?.KANGENTIC_OPENCODE_TUI_INITIAL_PROMPT_PATH
+        ?? env?.KANGENTIC_OPENCODE_INITIAL_PROMPT_PATH;
       expect(sourcePath).toEqual(expect.any(String));
       if (typeof sourcePath !== 'string') throw new TypeError('Missing initial prompt payload path');
       return sourcePath;
@@ -602,6 +604,53 @@ describe('OpenCode Adapter', () => {
       expect(chmodSync).not.toHaveBeenCalled();
     });
 
+    it('writes a private TUI config containing only the packaged startup plugin URL', () => {
+      const writeFileSync = vi.spyOn(fs, 'writeFileSync');
+      const preparation = adapter.prepareInitialPrompt(freshPreparationInput());
+      const configPath = preparation.env?.OPENCODE_TUI_CONFIG;
+      expect(configPath).toEqual(expect.any(String));
+      if (typeof configPath !== 'string') throw new TypeError('Missing TUI bootstrap config path');
+
+      const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+      expect(config).toEqual({
+        plugin: [expect.stringMatching(/^file:\/\//)],
+      });
+      expect(JSON.stringify(config)).not.toContain('adapter-owned prompt');
+      expect(writeFileSync).toHaveBeenCalledWith(
+        configPath,
+        expect.any(String),
+        expect.objectContaining({ encoding: 'utf8', flag: 'wx', mode: 0o600 }),
+      );
+    });
+
+    it('fails closed when a user-owned TUI config is already set', () => {
+      const originalConfig = process.env.OPENCODE_TUI_CONFIG;
+      process.env.OPENCODE_TUI_CONFIG = path.join(projectDir, 'user-tui-config.jsonc');
+      try {
+        expect(() => adapter.prepareInitialPrompt(freshPreparationInput()))
+          .toThrow('OpenCode TUI bootstrap config is already set');
+        expect(fs.existsSync(path.join(projectDir, 'opencode-initial-prompt.json'))).toBe(false);
+      } finally {
+        if (originalConfig === undefined) delete process.env.OPENCODE_TUI_CONFIG;
+        else process.env.OPENCODE_TUI_CONFIG = originalConfig;
+      }
+    });
+
+    it('rolls back its fresh payload when private TUI config creation fails', () => {
+      const writeFileSync = fs.writeFileSync.bind(fs);
+      vi.spyOn(fs, 'writeFileSync').mockImplementation((target, data, options) => {
+        if (String(target).endsWith('opencode-tui-bootstrap.json')) {
+          throw Object.assign(new Error('private config write failure'), { code: 'EACCES' });
+        }
+        return writeFileSync(target, data, options);
+      });
+
+      expect(() => adapter.prepareInitialPrompt(freshPreparationInput()))
+        .toThrow('private config write failure');
+      expect(fs.existsSync(path.join(projectDir, 'opencode-initial-prompt.json'))).toBe(false);
+      expect(fs.existsSync(path.join(projectDir, 'opencode-tui-bootstrap.json'))).toBe(false);
+    });
+
     it('writes a resume payload with only the native session ID and current prompt', () => {
       const preparation = adapter.prepareInitialPrompt({
         prompt: 'resume prompt',
@@ -623,9 +672,11 @@ describe('OpenCode Adapter', () => {
 
     it('fails exclusively when a session payload source already exists', () => {
       const input = freshPreparationInput();
-      adapter.prepareInitialPrompt(input);
+      const firstPreparation = adapter.prepareInitialPrompt(input);
+      const firstSourcePath = payloadPathFrom(firstPreparation.env);
 
       expect(() => adapter.prepareInitialPrompt(input)).toThrowError(expect.objectContaining({ code: 'EEXIST' }));
+      expect(fs.existsSync(firstSourcePath)).toBe(true);
     });
 
     it('returns the prompt-path environment independently from MCP environment', () => {
@@ -635,7 +686,7 @@ describe('OpenCode Adapter', () => {
         mcpServerUrl: 'http://127.0.0.1:51234/mcp/project',
         mcpServerToken: 'token-deadbeef',
       }));
-      expect(preparation.env).toHaveProperty('KANGENTIC_OPENCODE_INITIAL_PROMPT_PATH');
+      expect(preparation.env).toHaveProperty('KANGENTIC_OPENCODE_TUI_INITIAL_PROMPT_PATH');
       expect(mcpEnv).toHaveProperty('OPENCODE_CONFIG_CONTENT');
 
       const secondProjectDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kangentic-opencode-payload-disabled-'));
@@ -646,7 +697,8 @@ describe('OpenCode Adapter', () => {
         }));
         const disabledMcpEnv = adapter.buildEnv(makeOptions({ mcpServerEnabled: false }));
         expect(disabledPreparation.env).toEqual({
-          KANGENTIC_OPENCODE_INITIAL_PROMPT_PATH: expect.any(String),
+          KANGENTIC_OPENCODE_TUI_INITIAL_PROMPT_PATH: expect.any(String),
+          OPENCODE_TUI_CONFIG: expect.any(String),
         });
         expect(disabledMcpEnv).toBeNull();
       } finally {
@@ -663,6 +715,11 @@ describe('OpenCode Adapter', () => {
       const second = adapter.prepareInitialPrompt(freshPreparationInput({ sessionDirectory: secondDirectory }));
       const firstPath = payloadPathFrom(first.env);
       const secondPath = payloadPathFrom(second.env);
+      const firstConfigPath = first.env?.OPENCODE_TUI_CONFIG;
+      const secondConfigPath = second.env?.OPENCODE_TUI_CONFIG;
+      if (typeof firstConfigPath !== 'string' || typeof secondConfigPath !== 'string') {
+        throw new TypeError('Missing TUI bootstrap config paths');
+      }
       const firstCleanup = first.cleanup;
       if (!firstCleanup) throw new TypeError('Missing first preparation cleanup');
 
@@ -670,6 +727,8 @@ describe('OpenCode Adapter', () => {
 
       expect(fs.existsSync(firstPath)).toBe(false);
       expect(fs.existsSync(secondPath)).toBe(true);
+      expect(fs.existsSync(firstConfigPath)).toBe(false);
+      expect(fs.existsSync(secondConfigPath)).toBe(true);
     });
 
     it('keeps cleanup idempotent and treats a plugin-claimed source as already cleaned', () => {
@@ -702,14 +761,17 @@ describe('OpenCode Adapter', () => {
         sessionDirectory,
       }));
       const sourcePath = payloadPathFrom(preparation.env);
+      const configPath = preparation.env?.OPENCODE_TUI_CONFIG;
+      if (typeof configPath !== 'string') throw new TypeError('Missing TUI bootstrap config path');
       const cleanup = preparation.cleanup;
       if (!cleanup) throw new TypeError('Missing preparation cleanup');
       const unlinkError = errorCode
         ? Object.assign(new Error(secretError), { code: errorCode })
         : new Error(secretError);
+      const unlinkSync = fs.unlinkSync.bind(fs);
       const unlinkSpy = vi.spyOn(fs, 'unlinkSync').mockImplementation((target) => {
-        expect(target).toBe(sourcePath);
-        throw unlinkError;
+        if (target === sourcePath) throw unlinkError;
+        unlinkSync(target);
       });
       const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
       const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
@@ -718,8 +780,9 @@ describe('OpenCode Adapter', () => {
       try {
         expect(() => cleanup.dispose()).not.toThrow();
         expect(() => cleanup.dispose()).not.toThrow();
-        expect(unlinkSpy).toHaveBeenCalledOnce();
+        expect(unlinkSpy).toHaveBeenCalledTimes(2);
         expect(unlinkSpy).toHaveBeenCalledWith(sourcePath);
+        expect(fs.existsSync(configPath)).toBe(false);
         expect(warnSpy).not.toHaveBeenCalled();
         expect(errorSpy).not.toHaveBeenCalled();
         expect(logSpy).not.toHaveBeenCalled();

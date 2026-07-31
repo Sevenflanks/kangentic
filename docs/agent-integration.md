@@ -598,12 +598,13 @@ P0 不提供 permission picker、permission discovery、`nativeAgent`、role swi
 opencode [--session <id>]
 ```
 
-重要形狀限制已依 OpenCode 1.18.4 本機原始碼窄幅確認。完整 Task 5 QA 尚未成功，現有證據限於 automated 與 runtime boundary：
+重要形狀限制已依 OpenCode 1.18.9 source 確認：
 
 - The TUI's positional argument is a **project directory**, not a prompt. The PTY layer already sets the shell cwd, so Kangentic never emits a positional or `--dir` value.
-- OpenCode initial prompt delivery 不是 terminal paste 或 shell argument parsing。專案本機 plugin discovery 掃描 `.ts` 與 `.js`，因此安裝檔為 `.opencode/plugins/kangentic-activity.js`；來源與 packaged build asset 仍為 `kangentic-activity.mjs`。loader await factory，Kangentic 同步回傳 hooks，然後以一個零延遲 macrotask 延後 bootstrap。這個 timer 只處理 ordering，不是 readiness evidence，也不是 upstream 的未來保證。
-- `prepareInitialPrompt` 寫入私有 payload，由同一 OpenCode process 的 activity plugin claim 並刪除，之後使用 generated SDK。fresh payload 會建立 session、取得 `session.create().data.id`，把早到或晚到的 matching `session.created` reconcile 為一個成功 bootstrap 的 `session_start`，重播不相關 starts，以 `client.tui.publish` 發布 `tui.session.select`，最後呼叫 `promptAsync`。resume payload 會用 `session.get` 驗證 known ID，reconcile 一個 `session_start`，不發布 selection，然後呼叫 `promptAsync`。每個 generated SDK request 都帶物件內的 `throwOnError: true`。
-- Shell command 不含 prompt content。每條 bootstrap failure path 至多 best-effort 附加一筆 sanitized public `idle` error 與相同 timestamp 的 private native error boundary；publish 或 prompt failure 前可能已有 `session_start`，start append failure 也可由後續 matching native event 補寫。錯誤 telemetry 不含 raw data，SDK call 沒有 retry 或 fallback。successful bootstrap `session_start` reconciliation exactly once 只適用 telemetry event，不代表 prompt execution 或 live-command delivery exactly once。
+- OpenCode initial prompt delivery 不是 terminal paste 或 shell argument parsing。fresh spawn 會以私有 0600 config 載入 packaged `kangentic-startup.mjs`，由 mounted TUI plugin 建立 session，先 `route.navigate('session', { sessionID })` 再用 v2 client 提交 prompt。activity plugin 仍由 `.opencode/plugins/kangentic-activity.js` discovery 載入，僅負責 telemetry 與 resume bootstrap；來源與 packaged build asset 維持 `.mjs`。
+- 若 parent process 已提供非空 `OPENCODE_TUI_CONFIG`，Kangentic 會拒絕 fresh local OpenCode startup，不會靜默覆蓋使用者明示的 TUI config。使用者可將該設定移到 OpenCode 正常的 global 或 project `tui.json` / `tui.jsonc` discovery，移除 inherited environment variable 後再啟動。
+- `prepareInitialPrompt` 寫入私有 payload；fresh TUI plugin claim 並刪除後建立 session、navigate、最後 `promptAsync`。server activity plugin 觀察 `session.created` 寫 telemetry。resume payload 仍由 activity plugin 用 `session.get` 驗證 known ID，reconcile 一個 `session_start` 後呼叫 `promptAsync`。fresh 不使用 `tui.session.select`，因為 mounted route API 才是 session selection 的同步生命週期點。
+- Shell command 不含 prompt content。每條 bootstrap failure path 至多 best-effort 附加一筆 sanitized public `idle` error 與相同 timestamp 的 private native error boundary；navigation 或 prompt failure 前可能已有 `session_start`。錯誤 telemetry 不含 raw data，SDK call 沒有 retry 或 fallback。
 - The session record still retains the intended prompt for existing lifecycle and audit display, while errors log metadata only and never prompt content.
 
 ### Permission Modes
@@ -619,7 +620,7 @@ None. OpenCode reads MCP and provider configuration from `opencode.json` (projec
 
 Not caller-owned (`supportsCallerSessionId = false`). Three capture pathways run concurrently and the first to succeed wins:
 
-- **Plugin JSONL:** activity plugin 會為 `session.created` 與 `session.start` 寫入帶 OpenCode session ID 的 `session_start`，也會寫入 `session.idle`、`session.error` 與 `tool.execute.before` / `tool.execute.after` telemetry。fresh bootstrap 成功時，matching `session.created` 的 reconciliation 僅產生一個 `session_start` telemetry event，早到與晚到 event 都依相同規則處理。不相關 starts 會重播。Public parsing 只暴露 sanitized `SessionEvent` fields。Private `privateNativeBoundary` 提供 native-idle path 的 native identity evidence，不對 renderer 可見。
+- **Plugin JSONL:** activity plugin 會為 `session.created` 與 `session.start` 寫入帶 OpenCode session ID 的 `session_start`，也會寫入 `session.idle`、`session.error` 與 `tool.execute.before` / `tool.execute.after` telemetry。fresh startup plugin 建立的 session 由同一 activity plugin event flow 寫入 telemetry；Public parsing 只暴露 sanitized `SessionEvent` fields。Private `privateNativeBoundary` 提供 native-idle path 的 native identity evidence，不對 renderer 可見。
 - **`sessionId.fromOutput`:** `SessionIdScanner` strips ANSI escapes from each PTY chunk and matches an announced session label with a `:` or `=` separator. It accepts OpenCode's native `ses_<16-64 alphanumeric>` shape and canonical UUID format, while excluding bare `--session` command echoes.
 - **`sessionId.fromFilesystem`:** Polls the OpenCode SQLite database at `~/.local/share/opencode/opencode.db` (read-only, WAL-friendly handle) for a `session` row whose `directory` equals the spawn cwd and whose `time_created` falls within `[spawnedAt - 5s, spawnedAt + 30s]`. Polls every 500 ms for up to ~10 s. Direct DB read avoids ~200-500 ms `opencode` CLI spin-up per poll, and avoids the Windows `child_process.execFile` rejection of `.cmd` shims.
 
