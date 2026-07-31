@@ -4,6 +4,8 @@ import path from 'node:path';
 import { vi } from 'vitest';
 
 export const INITIAL_PROMPT_PATH_ENV = 'KANGENTIC_OPENCODE_INITIAL_PROMPT_PATH';
+export const TUI_INITIAL_PROMPT_PATH_ENV = 'KANGENTIC_OPENCODE_TUI_INITIAL_PROMPT_PATH';
+export const TUI_CONFIG_PATH_ENV = 'OPENCODE_TUI_CONFIG';
 export const EVENTS_PATH_ENV = 'KANGENTIC_EVENTS_PATH';
 
 export type Deferred<T> = {
@@ -27,7 +29,6 @@ type InitialPromptPayload = {
   readonly mode: 'fresh' | 'resume';
   readonly prompt: string;
   readonly sessionId?: string;
-  readonly agent?: string;
   readonly model?: {
     readonly providerID: string;
     readonly modelID: string;
@@ -103,6 +104,8 @@ export function createOpenCodePluginFixture() {
 
   function cleanup(): void {
     delete process.env[INITIAL_PROMPT_PATH_ENV];
+    delete process.env[TUI_INITIAL_PROMPT_PATH_ENV];
+    delete process.env[TUI_CONFIG_PATH_ENV];
     delete process.env[EVENTS_PATH_ENV];
     for (const directory of temporaryDirectories.splice(0)) {
       fs.rmSync(directory, { recursive: true, force: true });

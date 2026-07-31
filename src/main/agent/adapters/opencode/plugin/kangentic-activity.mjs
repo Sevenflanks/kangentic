@@ -165,14 +165,13 @@ function readInitialPromptPayload(rawText) {
     return null;
   }
   if (payload.mode === 'fresh') {
-    const validAgent = payload.agent === undefined || typeof payload.agent === 'string';
     const validModel = payload.model === undefined || (
       payload.model
       && typeof payload.model === 'object'
       && typeof payload.model.providerID === 'string'
       && typeof payload.model.modelID === 'string'
     );
-    return validAgent && validModel ? payload : null;
+    return payload.agent === undefined && validModel ? payload : null;
   }
   if (payload.mode === 'resume' && typeof payload.sessionId === 'string' && payload.sessionId.length > 0 && payload.agent === undefined && payload.model === undefined) {
     return payload;
@@ -204,10 +203,8 @@ export const KangenticActivity = ({ client, directory } = {}) => {
   const eventsPath = process.env.KANGENTIC_EVENTS_PATH;
   const initialPromptSourcePath = process.env[INITIAL_PROMPT_PATH_ENV];
   let bootstrapTimerScheduled = false;
-  let freshCreatePending = false;
   let bootstrapSessionID;
   let bootstrapSessionStartWritten = false;
-  const bufferedSessionStarts = [];
   let bootstrapFailureReported = false;
 
   const appendBootstrapSessionStart = (event) => {
@@ -228,10 +225,6 @@ export const KangenticActivity = ({ client, directory } = {}) => {
   const reportSanitizedBootstrapFailure = (claimPath = null) => {
     if (bootstrapFailureReported) return;
     bootstrapFailureReported = true;
-    freshCreatePending = false;
-    for (const bufferedEvent of bufferedSessionStarts.splice(0)) {
-      appendEvent(eventsPath, bufferedEvent);
-    }
     if (claimPath) removeClaimPath(claimPath);
     appendSanitizedError(eventsPath, bootstrapSessionID ?? null);
   };
@@ -241,10 +234,6 @@ export const KangenticActivity = ({ client, directory } = {}) => {
       const extracted = extractSessionEvent(event);
       if (extracted?.type === 'session_start') {
         const nativeSessionID = extracted.privateNativeBoundary?.nativeSessionId ?? null;
-        if (freshCreatePending) {
-          bufferedSessionStarts.push(extracted);
-          return;
-        }
         if (nativeSessionID !== null && nativeSessionID === bootstrapSessionID) {
           appendBootstrapSessionStart(extracted);
           return;
@@ -295,75 +284,20 @@ export const KangenticActivity = ({ client, directory } = {}) => {
           return;
         }
 
-        let sessionID;
-        if (payload.mode === 'fresh') {
-          freshCreatePending = true;
-          let result;
-          try {
-            result = await client.session.create({
-              query: { directory },
-              body: {},
-              throwOnError: true,
-            });
-          } catch {
-            freshCreatePending = false;
-            for (const bufferedEvent of bufferedSessionStarts.splice(0)) {
-              appendEvent(eventsPath, bufferedEvent);
-            }
-            reportSanitizedBootstrapFailure();
-            return;
-          }
-
-          sessionID = result.data.id;
-          bootstrapSessionID = sessionID;
-          rootSessionId = sessionID;
-          freshCreatePending = false;
-          const pendingStarts = bufferedSessionStarts.splice(0);
-          let claimedStart = null;
-          const unrelatedStarts = [];
-          // 先 claim 完整 buffer 再做任何 append，避免 telemetry I/O 期間讓 matching duplicate 穿透。
-          for (const bufferedEvent of pendingStarts) {
-            const nativeSessionID = bufferedEvent.privateNativeBoundary?.nativeSessionId ?? null;
-            if (nativeSessionID === sessionID) {
-              claimedStart ??= bufferedEvent;
-            } else {
-              unrelatedStarts.push(bufferedEvent);
-            }
-          }
-          appendBootstrapSessionStart(claimedStart ?? makeBootstrapSessionStart(sessionID));
-          for (const unrelatedStart of unrelatedStarts) {
-            appendEvent(eventsPath, unrelatedStart);
-          }
-
-          try {
-            await client.tui.publish({
-              query: { directory },
-              body: {
-                type: 'tui.session.select',
-                properties: { sessionID },
-              },
-              throwOnError: true,
-            });
-          } catch {
-            reportSanitizedBootstrapFailure();
-            return;
-          }
-        } else {
-          sessionID = payload.sessionId;
-          bootstrapSessionID = sessionID;
-          rootSessionId = sessionID;
-          try {
-            await client.session.get({
-              path: { id: sessionID },
-              query: { directory },
-              throwOnError: true,
-            });
-          } catch {
-            reportSanitizedBootstrapFailure();
-            return;
-          }
-          appendBootstrapSessionStart(makeBootstrapSessionStart(sessionID));
+        const sessionID = payload.sessionId;
+        bootstrapSessionID = sessionID;
+        rootSessionId = sessionID;
+        try {
+          await client.session.get({
+            path: { id: sessionID },
+            query: { directory },
+            throwOnError: true,
+          });
+        } catch {
+          reportSanitizedBootstrapFailure();
+          return;
         }
+        appendBootstrapSessionStart(makeBootstrapSessionStart(sessionID));
 
         try {
           await client.session.promptAsync({
@@ -371,8 +305,6 @@ export const KangenticActivity = ({ client, directory } = {}) => {
             query: { directory },
             body: {
               parts: [{ type: 'text', text: payload.prompt }],
-              ...(payload.mode === 'fresh' && payload.agent ? { agent: payload.agent } : {}),
-              ...(payload.mode === 'fresh' && payload.model ? { model: payload.model } : {}),
             },
             throwOnError: true,
           });
