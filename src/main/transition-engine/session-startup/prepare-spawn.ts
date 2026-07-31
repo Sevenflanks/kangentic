@@ -6,9 +6,10 @@ import type { AgentAdapter } from '../../agent/agent-adapter';
 import type { McpHttpServerHandle } from '../../agent/mcp-http-server';
 import { appendCallerSession } from '../../agent/mcp-http/caller-url';
 import type { AppConfig, BoardProfile, Swimlane, Task } from '../../../shared/types';
+import type { CompatibilityRequirement } from '../../../shared/compatibility-requirement';
 import type { TaskRepository } from '../../db/repositories/task-repository';
 import { removeAdapterHooks } from '../../pty/lifecycle/adapter-lifecycle';
-import { runSpawnPreamble, resolveEffectivePermissionMode } from '../spawn-preamble';
+import { runSpawnPreamble } from '../spawn-preamble';
 import { applyProfileToLane, findTaskProfile } from '../column-strategy';
 import { sessionOutputPaths } from '../session-paths';
 import { resolveExecutionTarget } from '../../agent/shared/execution-target';
@@ -51,7 +52,8 @@ export interface PreparedSpawn {
 
 export type PrepareResult =
   | { ok: true; data: PreparedSpawn }
-  | { ok: false; reason: 'unknown-agent' | 'cli-not-found' };
+  | { ok: false; reason: 'unknown-agent' | 'cli-not-found' }
+  | { ok: false; reason: 'compatibility-required'; requirement: CompatibilityRequirement };
 
 /**
  * Shared pre-flight for both session recovery and reconciliation. This is
@@ -123,8 +125,9 @@ export async function prepareAgentSpawn(input: {
   // The task sits in the lane it is spawning into on the startup paths, so
   // the settings lane and the destination lane are the same lane here: the
   // lane whose inherited values the Edit dialog displays for the task now.
-  const { agent } = runSpawnPreamble({
+  const preamble = runSpawnPreamble({
     task,
+    projectId,
     hasSessionRecord: input.hasSessionRecord,
     settingsLane: swimlane,
     destinationLane: swimlane,
@@ -134,8 +137,13 @@ export async function prepareAgentSpawn(input: {
       default_effort: input.projectDefaultEffort,
     },
     globalPermissionMode: () => config.agent.permissionMode,
+    compatibilityAcknowledgements: config.compatibilityAcknowledgements,
     tasks: input.tasks,
   });
+  if (preamble.kind === 'compatibility-required') {
+    return { ok: false, reason: 'compatibility-required', requirement: preamble.requirement };
+  }
+  const { agent, permissionMode } = preamble;
   const adapter = agentRegistry.get(agent);
   if (!adapter) return { ok: false, reason: 'unknown-agent' };
 
@@ -144,12 +152,6 @@ export async function prepareAgentSpawn(input: {
   if (!detection.found || !detection.path) return { ok: false, reason: 'cli-not-found' };
 
   await adapter.ensureTrust(cwd);
-
-  // "Plan always wins, else task -> lane -> global" - the rule lives in
-  // resolveEffectivePermissionMode (spawn-preamble.ts).
-  const permissionMode = resolveEffectivePermissionMode(
-    task.permission_mode, swimlane?.permission_mode, config.agent.permissionMode,
-  );
 
   let agentSessionId: string | null;
   const canResume = input.resume !== null;

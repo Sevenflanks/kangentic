@@ -14,6 +14,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import fs from 'node:fs';
 import type { AgentAdapter, SpawnCommandOptions } from '../../src/main/agent/agent-adapter';
 import type { Task, Swimlane, AppConfig } from '../../src/shared/types';
 import { OpenCodeCommandBuilder, type OpenCodeCommandOptions } from '../../src/main/agent/adapters/opencode';
@@ -279,6 +280,35 @@ beforeEach(() => {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+it('returns compatibility-required before detect, trust, UUID, mkdir, or command construction', async () => {
+  // Given
+  const adapter = makeAdapter();
+  const detect = vi.spyOn(adapter, 'detect');
+  const ensureTrust = vi.spyOn(adapter, 'ensureTrust');
+  const buildCommand = vi.spyOn(adapter, 'buildCommand');
+  adapter.getCompatibilityRequirement = () => ({
+    acknowledgementId: 'runtime-default-v1',
+    title: 'Runtime default required',
+    description: 'Compatibility acknowledgement required.',
+  });
+  agentRegistryGetMock.mockReturnValue(adapter);
+  const config = makeAppConfig({
+    agent: { permissionMode: 'plan' },
+    compatibilityAcknowledgements: {},
+  } as Partial<AppConfig>);
+
+  // When
+  const result = await prepareAgentSpawn(makeSpawnInput({ effectiveConfig: config }));
+
+  // Then
+  expect(result).toMatchObject({ ok: false, reason: 'compatibility-required' });
+  expect(detect).not.toHaveBeenCalled();
+  expect(ensureTrust).not.toHaveBeenCalled();
+  expect(buildCommand).not.toHaveBeenCalled();
+  expect(randomUUIDMock).not.toHaveBeenCalled();
+  expect(fs.mkdirSync).not.toHaveBeenCalled();
+});
 
 // ---------------------------------------------------------------------------
 // Helper: build a capture adapter whose buildCommand records what it receives.
