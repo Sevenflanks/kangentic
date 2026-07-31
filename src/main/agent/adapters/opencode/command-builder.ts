@@ -39,12 +39,9 @@ export interface OpenCodeCommandOptions {
  *
  * - There is no `--dangerously-skip-permissions` flag in TUI mode.
  *   That flag is only documented for `opencode run` (non-interactive).
- *   OpenCode's autonomy model is "agents" (Build, Plan, custom) cycled
- *   at runtime via Tab. We map Kangentic's permission-mode dropdown to
- *   the `--agent <name>` flag for the initial spawn only - resume
- *   preserves the user's runtime Tab selection rather than overriding
- *   it. See `mapPermissionModeToAgent` below for the mode-to-agent
- *   table.
+ *   OpenCode 的 agent 由 runtime config 與 Tab 管理。Kangentic 仍儲存
+ *   通用 `PermissionMode` 供其他 adapter 使用，但這裡絕不轉成 `--agent`，
+ *   避免覆寫 runtime default。
  *
  * - There is no merged settings file and no `--mcp-config` CLI flag.
  *   OpenCode reads MCP and provider config from `opencode.json` (project)
@@ -82,17 +79,8 @@ export class OpenCodeCommandBuilder {
 
     if (options.resume && options.sessionId) {
       parts.push('--session', quoteArg(options.sessionId, shell));
-      // Resume carries no prompt in the command. We also omit --agent because the saved session
-      // may have a user-selected agent that this command must not shadow.
+      // Resume carries no prompt in the command; OpenCode runtime config owns agent selection.
       return parts.join(' ');
-    }
-
-    // Map Kangentic's permission-mode dropdown to OpenCode's --agent
-    // flag for fresh spawns. Once the TUI is running the user controls
-    // autonomy via Tab, so this only sets the initial state.
-    const agentName = mapPermissionModeToAgent(options.permissionMode);
-    if (agentName) {
-      parts.push('--agent', quoteArg(agentName, shell));
     }
 
     // Per-column model override (format: provider/model, e.g., anthropic/claude-sonnet)
@@ -169,8 +157,8 @@ export class OpenCodeCommandBuilder {
  * Verified against the OpenCode CLI docs: `attach` accepts `--dir`,
  * `--continue`/`-c`, `--session`/`-s`, `--fork`, `--username`/`-u`,
  * `--password`/`-p`. Fresh prompts use the existing post-attach terminal
- * submission path after the TUI is writable. Attach has no agent-selection
- * flag, so a primary-agent request fails instead of being silently ignored.
+ * submission path after the TUI is writable. Attach 不解讀 Kangentic 的
+ * `PermissionMode`；remote server runtime config 決定 agent。
  *
  * No `--model` is ever emitted here: per the task's acceptance criteria the
  * remote server is the authority for providers and models.
@@ -196,53 +184,5 @@ function buildOpenCodeAttachCommand(
     return parts.join(' ');
   }
 
-  const requestedAgent = mapPermissionModeToAgent(options.permissionMode);
-  if (requestedAgent) {
-    throw new RemoteOpenCodeAttachPrimaryAgentUnsupportedError(requestedAgent);
-  }
-
   return parts.join(' ');
-}
-
-export class RemoteOpenCodeAttachPrimaryAgentUnsupportedError extends Error {
-  readonly name = 'RemoteOpenCodeAttachPrimaryAgentUnsupportedError';
-  readonly code = 'OPENCODE_REMOTE_ATTACH_PRIMARY_AGENT_UNSUPPORTED';
-
-  constructor(readonly requestedAgent: string) {
-    super(
-      `Remote OpenCode attach cannot select primary agent "${requestedAgent}". `
-      + 'Configure the remote server default agent and use Default permission mode in Kangentic.',
-    );
-  }
-}
-
-/**
- * Map Kangentic's `PermissionMode` to the OpenCode primary-agent name
- * passed via `--agent <name>` on fresh spawn.
- *
- *   plan              -> "plan"  (built-in: read-only, no edits/bash)
- *   default           -> null    (omit flag - defer to user's `default_agent` config, falls back to "build")
- *   acceptEdits       -> "build" (built-in: full tool access)
- *   bypassPermissions -> "build" (closest built-in - users wanting full bypass define their own agent and set it as `default_agent`)
- *   dontAsk / auto    -> null    (Claude/Gemini-shaped modes that can leak through; safe to defer)
- *
- * OpenCode's primary agents define their own per-tool permissions, so
- * we do not need to (and should not) inject a global `permission` block.
- * The Tab keybind cycles agents at runtime; this only sets the initial
- * pick. See `runtime.activity.kind = 'hooks_and_pty'` in the adapter
- * for the broader OpenCode integration model.
- */
-export function mapPermissionModeToAgent(mode: PermissionMode): string | null {
-  switch (mode) {
-    case 'plan':
-      return 'plan';
-    case 'acceptEdits':
-    case 'bypassPermissions':
-      return 'build';
-    case 'default':
-    case 'dontAsk':
-    case 'auto':
-    default:
-      return null;
-  }
 }
