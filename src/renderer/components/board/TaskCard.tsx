@@ -37,7 +37,7 @@ const TaskCardInner = function TaskCard({ task, isDragOverlay, compact, onDelete
   // Scaling: 100 cards × 4 subs each = 400 selector invocations per session-store
   // update; with one selector it drops to 100, and shallow equality still skips
   // re-renders when the projected object hasn't actually changed.
-  const { sessionId, isHighlighted, isResuming, activityReason } = useSessionStore(
+  const { sessionId, isHighlighted, isResuming, activityReason, compatibilityRequirement } = useSessionStore(
     useShallow(
       useCallback(
         (s: ReturnType<typeof useSessionStore.getState>) => {
@@ -47,6 +47,7 @@ const TaskCardInner = function TaskCard({ task, isDragOverlay, compact, onDelete
             isHighlighted: !!resolvedSessionId && resolvedSessionId === s.activeSessionId,
             isResuming: s._sessionByTaskId.get(task.id)?.resuming ?? false,
             activityReason: resolvedSessionId ? s.sessionActivityReason[resolvedSessionId] : undefined,
+            compatibilityRequirement: s.compatibilityRequirementsByTaskId[task.id] ?? null,
           };
         },
         [task.id],
@@ -59,6 +60,7 @@ const TaskCardInner = function TaskCard({ task, isDragOverlay, compact, onDelete
   const liveDeliveryLabel = liveDeliveryStatus ? getLiveDeliveryLabel(liveDeliveryStatus) : null;
   const autoCommandWarning = useAutoCommandWarning(task.id);
   const clearAutoCommandWarningForTask = useSessionStore((s) => s.clearAutoCommandWarningForTask);
+  const resolveCompatibilityRequirement = useSessionStore((s) => s.resolveCompatibilityRequirement);
 
   const {
     attributes,
@@ -186,6 +188,12 @@ const TaskCardInner = function TaskCard({ task, isDragOverlay, compact, onDelete
   const handleDismissAutoCommandWarning = (event: React.MouseEvent<HTMLButtonElement>) => {
     event.stopPropagation();
     clearAutoCommandWarningForTask(task.id);
+  };
+
+  const handleResolveCompatibilityRequirement = (event: React.MouseEvent<HTMLButtonElement>) => {
+    event.stopPropagation();
+    if (!compatibilityRequirement) return;
+    void resolveCompatibilityRequirement(compatibilityRequirement);
   };
 
   if (compact) {
@@ -352,6 +360,31 @@ const TaskCardInner = function TaskCard({ task, isDragOverlay, compact, onDelete
             >
               <X size={12} />
             </button>
+          </div>
+        )}
+
+        {compatibilityRequirement && (
+          <div
+            className="mt-2 pt-2 border-t border-edge flex items-start gap-1 text-xs text-attention"
+            data-testid="compatibility-requirement"
+            role="alert"
+          >
+            <CircleAlert size={12} className="shrink-0 mt-0.5" />
+            <div className="min-w-0 flex-1 whitespace-normal">
+              <span className="block font-medium">{compatibilityRequirement.title}</span>
+              <span className="block">{compatibilityRequirement.description}</span>
+              <button
+                type="button"
+                aria-label={compatibilityRequirement.actionLabel ?? 'Acknowledge compatibility requirement'}
+                className="mt-1 min-h-6 max-w-full px-1.5 flex items-center rounded text-left text-attention hover:text-fg hover:bg-surface-hover transition-colors"
+                data-testid="compatibility-requirement-action"
+                onClick={handleResolveCompatibilityRequirement}
+                onKeyDown={(event) => event.stopPropagation()}
+                onPointerDown={(event) => event.stopPropagation()}
+              >
+                {compatibilityRequirement.actionLabel ?? 'Acknowledge'}
+              </button>
+            </div>
           </div>
         )}
 
