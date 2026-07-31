@@ -141,6 +141,17 @@ const api: ElectronAPI = {
     },
   },
 
+  compatibility: {
+    list: (projectId) => ipcRenderer.invoke(IPC.COMPATIBILITY_LIST, projectId),
+    get: (projectId, requirementId) => ipcRenderer.invoke(IPC.COMPATIBILITY_GET, projectId, requirementId),
+    resolve: (projectId, requirementId) => ipcRenderer.invoke(IPC.COMPATIBILITY_RESOLVE, projectId, requirementId),
+    onChanged: (callback) => {
+      const handler = (_event: Electron.IpcRendererEvent, projectId: string) => callback(projectId);
+      ipcRenderer.on(IPC.COMPATIBILITY_CHANGED, handler);
+      return () => ipcRenderer.removeListener(IPC.COMPATIBILITY_CHANGED, handler);
+    },
+  },
+
   attachments: {
     list: (taskId: string) => ipcRenderer.invoke(IPC.ATTACHMENT_LIST, taskId),
     add: (input: { task_id: string; filename: string; data: string; media_type: string }) => ipcRenderer.invoke(IPC.ATTACHMENT_ADD, input),
