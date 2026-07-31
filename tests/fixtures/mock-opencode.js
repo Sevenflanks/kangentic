@@ -62,42 +62,88 @@ function appendCapture(event) {
   fs.appendFileSync(capturePath, `${JSON.stringify(event)}\n`, 'utf8');
 }
 
-appendCapture({ kind: 'launch', argv: process.argv.slice(2) });
+const relevantEnvKeys = [
+  'KANGENTIC_OPENCODE_TUI_INITIAL_PROMPT_PATH',
+  'KANGENTIC_OPENCODE_INITIAL_PROMPT_PATH',
+  'OPENCODE_TUI_CONFIG',
+  'OPENCODE_CONFIG_CONTENT',
+];
+const relevantEnv = Object.fromEntries(
+  relevantEnvKeys.flatMap((key) => process.env[key] === undefined ? [] : [[key, process.env[key]]]),
+);
+appendCapture({ kind: 'launch', argv: process.argv.slice(2), env: relevantEnv });
 
 // Fixed session ID for new sessions - uses the native ses_* format
 // (ses_<26 alphanumeric>) that the adapter's fromOutput regex matches.
 const MOCK_SESSION_ID = 'ses_2349b5c91ffeKd6qajuUTR4clq';
 
-async function activateInstalledPlugin() {
+async function activateInstalledPlugins() {
   const pluginPath = path.join(process.cwd(), '.opencode', 'plugins', 'kangentic-activity.js');
   // 以 data URL 固定用 ESM 解析，避免 disposable project 的 package type 將 installed `.js` 當成 CommonJS。
   const pluginBytes = fs.readFileSync(pluginPath);
   const pluginUrl = `data:text/javascript;base64,${pluginBytes.toString('base64')}`;
   const { KangenticActivity } = await import(pluginUrl);
-  const hooks = KangenticActivity({
-    client: {
-      session: {
-        create: async () => {
-          hooks.event({
-            event: {
-              type: 'session.created',
-              properties: { info: { id: MOCK_SESSION_ID } },
-            },
-          });
-          return { data: { id: MOCK_SESSION_ID } };
-        },
-        get: async ({ path: requestPath }) => ({ data: { id: requestPath.id } }),
-        promptAsync: async ({ body }) => {
-          const textPart = body.parts.find((part) => part.type === 'text');
-          if (textPart) appendCapture({ kind: 'prompt', text: textPart.text });
-          if (livePaths) fs.writeFileSync(livePaths.initialReceipt, 'received\n', 'utf8');
-        },
-      },
-      tui: {
-        publish: async () => ({ data: true }),
+  let activityHooks;
+  const activityClient = {
+    session: {
+      get: async ({ path: requestPath }) => ({ data: { id: requestPath.id } }),
+      promptAsync: async (request) => {
+        const expectedKeys = ['body', 'path', 'query', 'throwOnError'];
+        if (JSON.stringify(Object.keys(request).sort()) !== JSON.stringify(expectedKeys)) {
+          throw new TypeError('resume promptAsync requires the legacy server-plugin request shape');
+        }
+        const parts = request.body.parts;
+        const textPart = parts.find((part) => part.type === 'text');
+        if (textPart) appendCapture({ kind: 'prompt', text: textPart.text });
+        if (livePaths) fs.writeFileSync(livePaths.initialReceipt, 'received\n', 'utf8');
+        return undefined;
       },
     },
+  };
+  activityHooks = KangenticActivity({
+    client: activityClient,
     directory: process.cwd(),
+  });
+
+  const startupConfigPath = process.env.OPENCODE_TUI_CONFIG;
+  if (!startupConfigPath) return;
+  const startupConfig = JSON.parse(fs.readFileSync(startupConfigPath, 'utf8'));
+  appendCapture({ kind: 'tui-config', config: startupConfig });
+  const startupPluginUrl = startupConfig.plugin[0];
+  const { default: KangenticStartup } = await import(startupPluginUrl);
+  const startupClient = {
+    session: {
+      create: async () => {
+        activityHooks.event({
+          event: {
+            type: 'session.created',
+            properties: { info: { id: MOCK_SESSION_ID } },
+          },
+        });
+        return { data: { id: MOCK_SESSION_ID } };
+      },
+      promptAsync: async (request) => {
+        const expectedKeys = request.model === undefined
+          ? ['parts', 'sessionID']
+          : ['model', 'parts', 'sessionID'];
+        if (JSON.stringify(Object.keys(request).sort()) !== JSON.stringify(expectedKeys)) {
+          throw new TypeError('fresh promptAsync requires the flat TUI request shape');
+        }
+        const textPart = request.parts.find((part) => part.type === 'text');
+        if (textPart) appendCapture({ kind: 'prompt', text: textPart.text });
+        if (livePaths) fs.writeFileSync(livePaths.initialReceipt, 'received\n', 'utf8');
+        return { data: undefined, error: undefined };
+      },
+    },
+  };
+  await KangenticStartup.tui({
+    client: startupClient,
+    directory: process.cwd(),
+    route: {
+      navigate: (destination, params) => {
+        appendCapture({ kind: 'route', destination, sessionId: params.sessionID });
+      },
+    },
   });
 }
 
@@ -195,7 +241,7 @@ const triggerInterval = livePaths ? setInterval(() => {
   });
 }, 25) : null;
 
-activateInstalledPlugin().catch((error) => {
+activateInstalledPlugins().catch((error) => {
   console.error('MOCK_OPENCODE_PLUGIN_ERROR:', error);
   clearTimeout(timeout);
   process.exit(1);
