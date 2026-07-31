@@ -7,6 +7,7 @@ import type { SessionStore, PendingTuiAnchor } from './session-store/types';
 import { buildSessionByTaskId } from './session-store/session-index';
 import { createTaskChangesPanelSlice } from './session-store/task-changes-panel-slice';
 import { createTransientSessionSlice, transientKey, type TransientSessionEntry } from './session-store/transient-session-slice';
+import { createSpawnCompatibilitySlice } from './session-store/spawn-compatibility-slice';
 import { mergeRateLimitSnapshot } from '../utils/rate-limit-window';
 import type { LiveDeliveryStatus } from '../../shared/live-delivery-status';
 import type { AutoCommandWarning } from '../../shared/auto-command-outcome';
@@ -488,6 +489,8 @@ export const useSessionStore = create<SessionStore>((set, get, api) => ({
       autoCommandWarningsByTaskId: nextAutoCommandWarningsByTaskId,
     });
 
+    await get().syncCompatibilityRequirements();
+
     // Recover transient session entries after a full page reload. The main
     // process keeps transient PTYs alive, but the renderer's in-memory map is
     // lost on a hard reload (HMR preserves it via import.meta.hot.data, so this
@@ -587,6 +590,7 @@ export const useSessionStore = create<SessionStore>((set, get, api) => ({
 
   resumeSession: async (taskId, resumePrompt?) => {
     const newSession = await window.electronAPI.sessions.resume(taskId, resumePrompt, useProjectStore.getState().currentProject?.id ?? null);
+    if (!newSession) return null;
     set((s) => {
       const sessions = [
         ...s.sessions.filter((sess) => sess.taskId !== taskId),
@@ -998,4 +1002,5 @@ export const useSessionStore = create<SessionStore>((set, get, api) => ({
 
   ...createTaskChangesPanelSlice(set, get, api),
   ...createTransientSessionSlice(preservedTransientState)(set, get, api),
+  ...createSpawnCompatibilitySlice(set, get, api),
 }));
