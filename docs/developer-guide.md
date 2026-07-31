@@ -180,7 +180,7 @@ Flags:
 1. `tsc --noEmit` (type check)
 2. Vite builds renderer → `.vite/build/renderer/main_window/`
 3. esbuild bundles main + preload (minified)
-4. Copies bridge scripts (`status-bridge.js`, `event-bridge.js`) to `.vite/build/`
+4. Copies external bridge/plugin assets (`status-bridge.js`, `event-bridge.js`, OpenCode plugins) to `.vite/build/`
 
 ### Worktree Dev
 
