@@ -236,6 +236,7 @@ function makeContext(taskRepo: unknown, swimlaneRepo: unknown) {
     boardConfigManager: { getDefaultBaseBranch: vi.fn(() => null), getBoardProfiles: vi.fn(() => []) },
     terminalSubmitScheduler: { cancel: vi.fn(), scheduleKeystrokes: vi.fn() },
     projectRepo: { getById: vi.fn(() => ({ id: 'proj-test', default_agent: 'claude' })) },
+    compatibilityRequirements: { clearTask: vi.fn() },
   };
   mockGetProjectRepos.mockReturnValue({
     tasks: taskRepo,
@@ -368,6 +369,47 @@ describe('handleTaskMove model/effort restart and live-injection', () => {
     expect(markRecordSuspended).not.toHaveBeenCalled();
     expect(context.sessionManager.suspend).not.toHaveBeenCalled();
     expect(mockSpawnAgent).not.toHaveBeenCalled();
+  });
+
+  it('same-lane reorder persists the move and keeps compatibility requirements intact', async () => {
+    const { planningLane, swimlaneRepo } = makeLanes();
+    setActiveRecord('plan');
+    const taskRepo = makeTaskRepo();
+    const context = makeContext(taskRepo, swimlaneRepo);
+
+    await handleTaskMove(context as never, {
+      taskId: 'task-aaa00001',
+      targetSwimlaneId: PLANNING_LANE_ID,
+      targetPosition: 3,
+    });
+
+    expect(taskRepo.move).toHaveBeenCalledWith({
+      taskId: 'task-aaa00001',
+      targetSwimlaneId: PLANNING_LANE_ID,
+      targetPosition: 3,
+    });
+    expect(context.compatibilityRequirements.clearTask).not.toHaveBeenCalled();
+    expect(planningLane.id).toBe(PLANNING_LANE_ID);
+  });
+
+  it('cross-lane move clears compatibility requirements after persisting the move', async () => {
+    const { swimlaneRepo } = makeLanes();
+    setActiveRecord('plan');
+    const taskRepo = makeTaskRepo();
+    const context = makeContext(taskRepo, swimlaneRepo);
+
+    await handleTaskMove(context as never, {
+      taskId: 'task-aaa00001',
+      targetSwimlaneId: EXECUTING_LANE_ID,
+      targetPosition: 0,
+    });
+
+    expect(taskRepo.move).toHaveBeenCalledWith({
+      taskId: 'task-aaa00001',
+      targetSwimlaneId: EXECUTING_LANE_ID,
+      targetPosition: 0,
+    });
+    expect(context.compatibilityRequirements.clearTask).toHaveBeenCalledWith('proj-test', 'task-aaa00001');
   });
 
   // =========================================================================

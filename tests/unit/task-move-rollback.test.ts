@@ -179,6 +179,7 @@ interface MockContext {
     scheduleKeystrokes: ReturnType<typeof vi.fn>;
   };
   projectRepo: { getById: ReturnType<typeof vi.fn> };
+  compatibilityRequirements: { clearTask: ReturnType<typeof vi.fn> };
 }
 
 function makeTask(overrides: Partial<Task> = {}): Task {
@@ -297,6 +298,7 @@ function makeContext(
     projectRepo: {
       getById: vi.fn(() => ({ id: 'proj-test', default_agent: 'claude' })),
     },
+    compatibilityRequirements: { clearTask: vi.fn(() => null) },
   };
 
   mockGetProjectRepos.mockReturnValue({
@@ -369,6 +371,7 @@ describe('handleTaskMove outer-catch rollback', () => {
 
   it('skips column revert when swimlane_id no longer matches the destination', async () => {
     const concurrentLaneId = 'lane-review';
+    const restore = vi.fn();
 
     // Phase 1 call: returns task with session_id=null (standard plan path).
     // Rollback call: task is now in the concurrent lane (concurrent handler won).
@@ -377,6 +380,7 @@ describe('handleTaskMove outer-catch rollback', () => {
       .mockReturnValueOnce({ ...task, swimlane_id: concurrentLaneId, session_id: null });
 
     const context = makeContext(taskRepo, swimlaneRepo);
+    context.compatibilityRequirements.clearTask.mockReturnValue(restore);
 
     await expect(
       handleTaskMove(context as never, MOVE_INPUT),
@@ -389,6 +393,8 @@ describe('handleTaskMove outer-catch rollback', () => {
     // tasks.move called exactly once: the Phase 1 forward move.
     // Rollback must NOT add a second call (CAS guard blocked it).
     expect(taskRepo.move).toHaveBeenCalledTimes(1);
+    expect(context.compatibilityRequirements.clearTask).toHaveBeenCalledWith('proj-test', task.id);
+    expect(restore).not.toHaveBeenCalled();
   });
 
   // =========================================================================
@@ -411,6 +417,7 @@ describe('handleTaskMove outer-catch rollback', () => {
     mockEnsureTaskWorktree.mockRejectedValue(abortError);
 
     const partialSessionId = 'partial-session-abort';
+    const restore = vi.fn();
 
     // Phase 1 call: session_id=null so Phase 1 returns a plan.
     // Rollback call: a partial session_id was written before the abort fired.
@@ -419,6 +426,7 @@ describe('handleTaskMove outer-catch rollback', () => {
       .mockReturnValueOnce({ ...task, swimlane_id: TARGET_LANE_ID, session_id: partialSessionId });
 
     const context = makeContext(taskRepo, swimlaneRepo);
+    context.compatibilityRequirements.clearTask.mockReturnValue(restore);
 
     // Abort errors are swallowed - the handler reports no applicable Auto-command outcome.
     await expect(
@@ -432,6 +440,8 @@ describe('handleTaskMove outer-catch rollback', () => {
     // tasks.move called once only (Phase 1 forward). Rollback skips the revert
     // on abort to avoid clobbering the superseding move's column placement.
     expect(taskRepo.move).toHaveBeenCalledTimes(1);
+    expect(context.compatibilityRequirements.clearTask).toHaveBeenCalledWith('proj-test', task.id);
+    expect(restore).not.toHaveBeenCalled();
   });
 
   // =========================================================================
@@ -443,6 +453,7 @@ describe('handleTaskMove outer-catch rollback', () => {
   // =========================================================================
 
   it('exits rollback early when task is deleted mid-flight without secondary throw', async () => {
+    const restore = vi.fn();
     // Phase 1 call: task exists with no session.
     // Rollback call: task was deleted (getById returns null).
     taskRepo.getById
@@ -450,6 +461,7 @@ describe('handleTaskMove outer-catch rollback', () => {
       .mockReturnValueOnce(null);
 
     const context = makeContext(taskRepo, swimlaneRepo);
+    context.compatibilityRequirements.clearTask.mockReturnValue(restore);
 
     // Original Phase 2 error must surface (wrapped by the inner worktree catch).
     await expect(
@@ -462,6 +474,8 @@ describe('handleTaskMove outer-catch rollback', () => {
     expect(taskRepo.update).not.toHaveBeenCalled();
     // Phase 1 forward move only. Rollback bailed before move.
     expect(taskRepo.move).toHaveBeenCalledTimes(1);
+    expect(context.compatibilityRequirements.clearTask).toHaveBeenCalledWith('proj-test', task.id);
+    expect(restore).not.toHaveBeenCalled();
   });
 
   // =========================================================================
@@ -474,6 +488,7 @@ describe('handleTaskMove outer-catch rollback', () => {
 
   it('calls removeByTaskId and clears session_id when a partial session row exists', async () => {
     const partialSessionId = 'session-partial-001';
+    const restore = vi.fn();
 
     // Phase 1 call: no session (so Phase 1 returns a plan).
     // Rollback call: partial session was written before Phase 2 threw.
@@ -482,6 +497,7 @@ describe('handleTaskMove outer-catch rollback', () => {
       .mockReturnValueOnce({ ...task, swimlane_id: TARGET_LANE_ID, session_id: partialSessionId });
 
     const context = makeContext(taskRepo, swimlaneRepo);
+    context.compatibilityRequirements.clearTask.mockReturnValue(restore);
 
     await expect(
       handleTaskMove(context as never, MOVE_INPUT),
@@ -500,6 +516,8 @@ describe('handleTaskMove outer-catch rollback', () => {
       targetSwimlaneId: SOURCE_LANE_ID,
       targetPosition: task.position,
     });
+    expect(restore).toHaveBeenCalledTimes(1);
+    expect(taskRepo.move.mock.invocationCallOrder[1]).toBeLessThan(restore.mock.invocationCallOrder[0]);
   });
 
   // =========================================================================
@@ -513,6 +531,7 @@ describe('handleTaskMove outer-catch rollback', () => {
 
   it('surfaces the original Phase 2 error even when rollback tasks.move throws', async () => {
     const rollbackMoveError = new Error('rollback move failed: DB locked');
+    const restore = vi.fn();
 
     // Phase 1 call: task in source with no session.
     // Rollback call: task still in target lane, no session.
@@ -528,6 +547,7 @@ describe('handleTaskMove outer-catch rollback', () => {
       }); // rollback reverse move
 
     const context = makeContext(taskRepo, swimlaneRepo);
+    context.compatibilityRequirements.clearTask.mockReturnValue(restore);
 
     // Must throw the ORIGINAL error ('Worktree setup failed'), not the
     // rollback error ('rollback move failed: DB locked').
@@ -539,5 +559,7 @@ describe('handleTaskMove outer-catch rollback', () => {
     expect(context.sessionManager.removeByTaskId).toHaveBeenCalledWith(task.id);
     // Both move calls were attempted.
     expect(taskRepo.move).toHaveBeenCalledTimes(2);
+    expect(context.compatibilityRequirements.clearTask).toHaveBeenCalledWith('proj-test', task.id);
+    expect(restore).not.toHaveBeenCalled();
   });
 });

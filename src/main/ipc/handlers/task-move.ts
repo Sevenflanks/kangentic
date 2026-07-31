@@ -195,6 +195,7 @@ function shouldConsumeTaskAutoCommand(outcome: AutoCommandImmediateOutcome): boo
     case 'skipped':
       return outcome.reason !== 'native-evidence-unavailable';
     case 'not-applicable':
+    case 'compatibility-required':
       return false;
     default: {
       const exhaustiveOutcome: never = outcome;
@@ -256,6 +257,7 @@ export async function handleTaskMove(
     : null;
   const runMove = async (): Promise<TaskMoveResult> => {
   let phaseOneAutoCommand: AutoCommandImmediateOutcome = { kind: 'not-applicable' };
+  let restoreCompatibilityRequirements: (() => void) | null = null;
   try {
     // === Phase 1 (locked, short) ===
     // All DB mutations and PTY kill/suspend dispatch for priorities 1-3.
@@ -317,6 +319,8 @@ export async function handleTaskMove(
 
       // Within-column reorder: no side effects needed
       if (fromSwimlaneId === input.targetSwimlaneId) return null;
+
+      restoreCompatibilityRequirements = context.compatibilityRequirements.clearTask(resolvedProjectId, task.id);
 
       const db = getProjectDb(resolvedProjectId);
       const sessionRepo = new SessionRepository(db);
@@ -1297,6 +1301,7 @@ export async function handleTaskMove(
               targetSwimlaneId: fromSwimlaneId,
               targetPosition: originalPosition,
             });
+            restoreCompatibilityRequirements?.();
           }
         } catch (rollbackError) {
           console.error('[TASK_MOVE] Rollback after move failure failed:', rollbackError);
