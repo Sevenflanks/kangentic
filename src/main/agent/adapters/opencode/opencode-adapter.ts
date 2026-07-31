@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { OpenCodeDetector } from './detector';
 import { OpenCodeCommandBuilder } from './command-builder';
 import { OpenCodeSessionHistoryParser } from './session-history-parser';
@@ -9,6 +10,7 @@ import { migrateOpenCodeProjectData } from './project-relocation';
 import { removeHooks as removeOpenCodeHooks } from './hook-manager';
 import { discoverOpenCodeCapabilities } from './capability-discovery';
 import { getOpenCodeAutoCommandDisposition } from './auto-command-policy';
+import { resolvePluginScript } from '../../shared/bridge-utils';
 import { runCliPrintSummarize, buildSummarizePrompt } from '../../shared/auto-name';
 import type {
   AgentAdapter,
@@ -43,6 +45,9 @@ import type {
 
 const INITIAL_PROMPT_PAYLOAD_FILENAME = 'opencode-initial-prompt.json';
 const INITIAL_PROMPT_PAYLOAD_PATH_ENV = 'KANGENTIC_OPENCODE_INITIAL_PROMPT_PATH';
+const TUI_BOOTSTRAP_CONFIG_FILENAME = 'opencode-tui-bootstrap.json';
+const TUI_INITIAL_PROMPT_PATH_ENV = 'KANGENTIC_OPENCODE_TUI_INITIAL_PROMPT_PATH';
+const TUI_BOOTSTRAP_CONFIG_PATH_ENV = 'OPENCODE_TUI_CONFIG';
 const RUNTIME_DEFAULT_COMPATIBILITY_REQUIREMENT: AdapterCompatibilityRequirement = {
   acknowledgementId: 'opencode-runtime-default-v1',
   title: 'OpenCode runtime default',
@@ -343,7 +348,11 @@ export class OpenCodeAdapter implements AgentAdapter {
     if (input.executionTarget) {
       return { delivery: 'terminal-submit' };
     }
+    if (!input.resume && process.env[TUI_BOOTSTRAP_CONFIG_PATH_ENV]) {
+      throw new Error('OpenCode TUI bootstrap config is already set');
+    }
     const sourcePath = path.join(input.sessionDirectory, INITIAL_PROMPT_PAYLOAD_FILENAME);
+    const tuiBootstrapConfigPath = path.join(input.sessionDirectory, TUI_BOOTSTRAP_CONFIG_FILENAME);
     const payload: OpenCodeInitialPromptPayload = input.resume
       ? {
           version: 1,
@@ -358,23 +367,52 @@ export class OpenCodeAdapter implements AgentAdapter {
           ...parseOpenCodeModel(input.model),
         };
 
-    fs.writeFileSync(sourcePath, JSON.stringify(payload), {
-      encoding: 'utf8',
-      mode: 0o600,
-      flag: 'wx',
-    });
+    let tuiBootstrapConfig: string | undefined;
+    if (!input.resume) {
+      const startupPluginPath = resolvePluginScript('opencode', 'kangentic-startup');
+      if (!fs.existsSync(startupPluginPath)) {
+        throw new Error('Required OpenCode TUI bootstrap plugin source not found');
+      }
+      tuiBootstrapConfig = JSON.stringify({ plugin: [pathToFileURL(startupPluginPath).href] });
+    }
+    let sourceWritten = false;
+    let tuiConfigWritten = false;
+    try {
+      fs.writeFileSync(sourcePath, JSON.stringify(payload), {
+        encoding: 'utf8',
+        mode: 0o600,
+        flag: 'wx',
+      });
+      sourceWritten = true;
+      if (tuiBootstrapConfig) {
+        fs.writeFileSync(tuiBootstrapConfigPath, tuiBootstrapConfig, {
+          encoding: 'utf8',
+          mode: 0o600,
+          flag: 'wx',
+        });
+        tuiConfigWritten = true;
+      }
+    } catch (error) {
+      if (sourceWritten) removePreparedPromptFile(sourcePath);
+      if (tuiConfigWritten) removePreparedPromptFile(tuiBootstrapConfigPath);
+      throw error;
+    }
     let disposed = false;
     return {
-      env: { [INITIAL_PROMPT_PAYLOAD_PATH_ENV]: sourcePath },
+      env: {
+        ...(tuiBootstrapConfig
+          ? {
+              [TUI_INITIAL_PROMPT_PATH_ENV]: sourcePath,
+              [TUI_BOOTSTRAP_CONFIG_PATH_ENV]: tuiBootstrapConfigPath,
+            }
+          : { [INITIAL_PROMPT_PAYLOAD_PATH_ENV]: sourcePath }),
+      },
       cleanup: {
         dispose: () => {
           if (disposed) return;
           disposed = true;
-          try {
-            fs.unlinkSync(sourcePath);
-          } catch {
-            // Cleanup must not replace the original spawn failure; disposed prevents retries.
-          }
+          removePreparedPromptFile(sourcePath);
+          if (tuiBootstrapConfig) removePreparedPromptFile(tuiBootstrapConfigPath);
         },
       },
     };
@@ -564,6 +602,15 @@ export class OpenCodeAdapter implements AgentAdapter {
    */
   async onProjectRelocated(oldPath: string, newPath: string): Promise<void> {
     await migrateOpenCodeProjectData(oldPath, newPath);
+  }
+}
+
+function removePreparedPromptFile(filePath: string): boolean {
+  try {
+    fs.unlinkSync(filePath);
+    return true;
+  } catch {
+    return false;
   }
 }
 
