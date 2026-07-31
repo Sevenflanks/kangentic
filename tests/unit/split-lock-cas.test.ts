@@ -238,6 +238,7 @@ function createMockContext() {
     projectRepo: {
       getById: vi.fn(() => ({ default_agent: 'claude' })),
     },
+    compatibilityRequirements: { clearTask: vi.fn() },
   };
 }
 
@@ -908,6 +909,18 @@ describe('SESSION_RESUME split-lock dedup', () => {
       task: expect.objectContaining({ profile_id: 'profile-codex' }),
       toLane: doingLane,
     }));
+  });
+
+  it('returns null without session lookup when spawnAgent requires compatibility acknowledgement', async () => {
+    mockSpawnAgent.mockResolvedValueOnce({ kind: 'compatibility-required' });
+    const handler = capturedHandlers.get(IPC.SESSION_RESUME);
+    if (!handler) throw new Error('SESSION_RESUME handler not registered');
+
+    const result = await handler(null, 'task-2');
+
+    expect(result).toBeNull();
+    expect(context.sessionManager.getSession).not.toHaveBeenCalled();
+    expect(context.compatibilityRequirements.clearTask).not.toHaveBeenCalled();
   });
 });
 
