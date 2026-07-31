@@ -28,8 +28,8 @@ import { modelRowLabel } from '../../utils/format-tokens';
 import {
   getPermissionLabel,
   DEFAULT_PERMISSIONS,
+  DEFAULT_PERMISSION,
   DEFAULT_AGENT,
-  getAgentDefaultPermission,
   resolvePermissionForAgent,
   type Swimlane,
   type SwimlaneRole,
@@ -1503,11 +1503,12 @@ export function BoardManagerDialog({ initialColumnId, seedNewDraft, addDraftRequ
                         title="Reset to project setting"
                         onClick={() => {
                           updateDraft((current) => {
-                            let nextPermission = current.permission_mode;
-                            if (current.permission_mode) {
-                              const newDefault = getAgentDefaultPermission(agentList, projectDefaultAgent);
-                              if (newDefault !== current.permission_mode) nextPermission = newDefault;
-                            }
+                            const projectDefaultAgentInfo = agentList.find((agent) => agent.name === projectDefaultAgent);
+                            const nextPermission = current.permission_mode
+                              ? projectDefaultAgentInfo?.preserveLegacyPermissionOnAgentSelection
+                                ? current.permission_mode
+                                : projectDefaultAgentInfo?.defaultPermission ?? DEFAULT_PERMISSION
+                              : current.permission_mode;
                             return { ...current, agent_override: null, permission_mode: nextPermission };
                           });
                         }}
