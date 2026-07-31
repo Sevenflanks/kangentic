@@ -195,6 +195,9 @@ interface MockContext {
   currentProjectId: string | null;
   currentProjectPath: string | null;
   mainWindow: MockMainWindow;
+  compatibilityRequirements: {
+    clearTask: ReturnType<typeof vi.fn>;
+  };
   sessionManager: {
     listSessions: ReturnType<typeof vi.fn>;
     getActivityCache: ReturnType<typeof vi.fn>;
@@ -242,6 +245,9 @@ function createMockContext(): MockContext {
     mainWindow: {
       isDestroyed: vi.fn(() => false),
       webContents: { send: vi.fn() },
+    },
+    compatibilityRequirements: {
+      clearTask: vi.fn(() => null),
     },
     sessionManager: {
       listSessions: vi.fn(() => []),
@@ -343,6 +349,10 @@ describe('TASK_BULK_DELETE handler', () => {
     expect(taskRepo.delete).toHaveBeenCalledTimes(3);
     expect(attachmentRepo.deleteByTaskId).toHaveBeenCalledTimes(3);
     expect(mockCleanupTaskResources).toHaveBeenCalledTimes(3);
+    expect(context.compatibilityRequirements.clearTask).toHaveBeenCalledTimes(3);
+    expect(context.compatibilityRequirements.clearTask).toHaveBeenNthCalledWith(1, 'proj-123', 'task-a');
+    expect(context.compatibilityRequirements.clearTask).toHaveBeenNthCalledWith(2, 'proj-123', 'task-b');
+    expect(context.compatibilityRequirements.clearTask).toHaveBeenNthCalledWith(3, 'proj-123', 'task-c');
 
     // Contract: the handler forces a progress emit at start (completed=0) and
     // at end (completed=total). Mid-loop emits are throttled and may or may
@@ -396,6 +406,7 @@ describe('TASK_BULK_DELETE handler', () => {
     expect(result.failures[0].id).toBe('task-orphan');
     expect(result.failures[0].error).toContain('Worktree directory could not be removed');
     expect(result.failures[0].error).toContain(worktreePath);
+    expect(context.compatibilityRequirements.clearTask).toHaveBeenCalledWith('proj-123', 'task-orphan');
 
     // deleted count reflects the failure: total(1) - failures(1) = 0
     expect(result.deleted).toBe(0);
@@ -425,6 +436,7 @@ describe('TASK_BULK_DELETE handler', () => {
 
     expect(result.failures).toHaveLength(0);
     expect(result.deleted).toBe(1);
+    expect(context.compatibilityRequirements.clearTask).toHaveBeenCalledWith('proj-123', 'task-clean');
   });
 
   // -------------------------------------------------------------------------
@@ -463,6 +475,7 @@ describe('TASK_BULK_DELETE handler', () => {
 
     // The two successful tasks still deleted
     expect(result.deleted).toBe(2);
+    expect(context.compatibilityRequirements.clearTask).toHaveBeenCalledTimes(3);
 
     // completed counter reached 3 even though one failed (finally block increments)
     const progressCalls = context.mainWindow.webContents.send.mock.calls.filter(
@@ -498,6 +511,70 @@ describe('TASK_BULK_DELETE handler', () => {
     const result = await callBulkDeleteHandler(context, ['task-string-throw']);
 
     expect(result.failures[0].error).toBe('something went wrong');
+    expect(context.compatibilityRequirements.clearTask).toHaveBeenCalledWith('proj-123', 'task-string-throw');
+  });
+
+  it('does not clear compatibility requirements when DB deletion fails', async () => {
+    const task = createMockTask('task-db-fails');
+    taskRepo = createMockTaskRepo([task]);
+    taskRepo.delete.mockImplementation(() => {
+      throw new Error('db delete failed');
+    });
+    mockGetProjectRepos.mockReturnValue({
+      tasks: taskRepo,
+      attachments: attachmentRepo,
+      swimlanes: { list: vi.fn(() => []), getById: vi.fn() },
+      actions: { getTransitionsFor: vi.fn(() => []) },
+    });
+
+    const result = await callBulkDeleteHandler(context, ['task-db-fails']);
+
+    expect(result.deleted).toBe(0);
+    expect(result.failures).toEqual([
+      { id: 'task-db-fails', error: 'db delete failed' },
+    ]);
+
+    expect(context.compatibilityRequirements.clearTask).not.toHaveBeenCalled();
+  });
+
+  it('clears compatibility requirements after a successful single-task delete', async () => {
+    const task = createMockTask('task-single-delete');
+    taskRepo = createMockTaskRepo([task]);
+    mockGetProjectRepos.mockReturnValue({
+      tasks: taskRepo,
+      attachments: attachmentRepo,
+      swimlanes: { list: vi.fn(() => []), getById: vi.fn() },
+      actions: { getTransitionsFor: vi.fn(() => []) },
+    });
+
+    const handler = capturedHandlers.get(IPC.TASK_DELETE);
+    if (!handler) throw new Error(`Handler for ${IPC.TASK_DELETE} was not registered`);
+
+    await handler(null, 'task-single-delete');
+
+    expect(taskRepo.delete).toHaveBeenCalledWith('task-single-delete');
+    expect(context.compatibilityRequirements.clearTask).toHaveBeenCalledWith('proj-123', 'task-single-delete');
+  });
+
+  it('does not clear compatibility requirements when single-task DB deletion fails', async () => {
+    const task = createMockTask('task-single-db-fails');
+    taskRepo = createMockTaskRepo([task]);
+    taskRepo.delete.mockImplementation(() => {
+      throw new Error('single db delete failed');
+    });
+    mockGetProjectRepos.mockReturnValue({
+      tasks: taskRepo,
+      attachments: attachmentRepo,
+      swimlanes: { list: vi.fn(() => []), getById: vi.fn() },
+      actions: { getTransitionsFor: vi.fn(() => []) },
+    });
+
+    const handler = capturedHandlers.get(IPC.TASK_DELETE);
+    if (!handler) throw new Error(`Handler for ${IPC.TASK_DELETE} was not registered`);
+
+    await expect(handler(null, 'task-single-db-fails')).rejects.toThrow('single db delete failed');
+
+    expect(context.compatibilityRequirements.clearTask).not.toHaveBeenCalled();
   });
 
   // -------------------------------------------------------------------------
