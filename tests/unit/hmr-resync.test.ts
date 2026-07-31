@@ -77,6 +77,14 @@ describe('HMR store re-sync', () => {
     ).toHaveLength(0);
   });
 
+  it('App.tsx guards the compatibility subscription for an older preload bridge', () => {
+    const appSource = fs.readFileSync(APP_TSX, 'utf-8');
+
+    expect(appSource).toMatch(
+      /const compatibility = window\.electronAPI\.compatibility;\s*if \(!compatibility\?\.onChanged\) return;\s*return compatibility\.onChanged/,
+    );
+  });
+
   // Catch new top-level mutable module state under stores/ and utils/ that
   // would silently reset on every Fast Refresh. Each such declaration must
   // either preserve itself via `import.meta.hot.dispose(` (the canonical

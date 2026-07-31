@@ -39,6 +39,7 @@ export function App() {
   const loadProjects = useProjectStore((s) => s.loadProjects);
   const loadCurrent = useProjectStore((s) => s.loadCurrent);
   const currentProject = useProjectStore((s) => s.currentProject);
+  const currentProjectId = currentProject?.id ?? null;
   const loadConfig = useConfigStore((s) => s.loadConfig);
   const loadAppVersion = useConfigStore((s) => s.loadAppVersion);
   const loadAgentList = useConfigStore((s) => s.loadAgentList);
@@ -46,6 +47,23 @@ export function App() {
   const upsertSession = useSessionStore((s) => s.upsertSession);
   const updateSessionStatus = useSessionStore((s) => s.updateSessionStatus);
   const updateActivity = useSessionStore((s) => s.updateActivity);
+
+  useEffect(() => {
+    if (!currentProjectId) {
+      useSessionStore.getState().clearCompatibilityRequirements();
+      return;
+    }
+    void useSessionStore.getState().syncCompatibilityRequirements();
+  }, [currentProjectId]);
+
+  useEffect(() => {
+    const compatibility = window.electronAPI.compatibility;
+    if (!compatibility?.onChanged) return;
+    return compatibility.onChanged((projectId) => {
+      if (projectId !== useProjectStore.getState().currentProject?.id) return;
+      void useSessionStore.getState().syncCompatibilityRequirements();
+    });
+  }, []);
 
   useEffect(() => {
     if (process.env.NODE_ENV !== 'production') {
@@ -740,6 +758,7 @@ if (import.meta.hot) {
     useBacklogStore.getState().loadBacklog();
     useMobileStore.getState().loadStatus();
     useMobileStore.getState().loadDevices();
+    useSessionStore.getState().syncCompatibilityRequirements();
     // Usage dashboard Pattern B: refetch the composite payload from
     // main-process truth (no-ops while the dashboard is closed).
     useUsageDashboardStore.getState().loadDashboardStats();
