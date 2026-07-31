@@ -2,6 +2,7 @@ import type { PopOutDescriptor, PopOutKind, PopOutParamsByKind } from './pop-out
 import type { LiveDeliveryStatus } from './live-delivery-status';
 import type { TaskMoveResult } from './auto-command-outcome';
 import type { TerminalFocusReport } from './terminal-focus-report';
+import type { CompatibilityRequirement, CompatibilityResolveResult } from './compatibility-requirement';
 
 // === Database Models ===
 
@@ -92,6 +93,8 @@ export interface AgentDetectionInfo {
   authenticated?: boolean | null;
   permissions: AgentPermissionEntry[];
   defaultPermission: PermissionMode;
+  /** Preserves the existing generic permission mode when this agent is selected. */
+  readonly preserveLegacyPermissionOnAgentSelection?: boolean;
   /** Set by adapters that have no live-telemetry channel - drives the ContextBar fallback pill. */
   liveTelemetryUnsupported?: AgentLiveTelemetryUnsupported;
   /** True if the adapter streams account-wide rate-limit windows; gates the ContextBar
@@ -1753,12 +1756,14 @@ export function getAgentDefaultPermission(agentList: AgentDetectionInfo[], agent
 
 /**
  * Resolve permission mode when switching agents.
- * Preserves the current mode if the new agent supports it; otherwise falls back
- * to the new agent's recommended default.
+ * Preserves the current mode when the selected agent declares the legacy
+ * selection policy or supports it; otherwise falls back to the selected
+ * agent's recommended default.
  */
 export function resolvePermissionForAgent(agentList: AgentDetectionInfo[], agentName: string, currentMode: PermissionMode): PermissionMode {
   const agentInfo = agentList.find((agent) => agent.name === agentName);
   if (!agentInfo) return DEFAULT_PERMISSION;
+  if (agentInfo.preserveLegacyPermissionOnAgentSelection) return currentMode;
   if (agentInfo.permissions.some((entry) => entry.mode === currentMode)) return currentMode;
   return agentInfo.defaultPermission;
 }
@@ -2061,6 +2066,9 @@ export interface AppConfig {
      *  to the adapter's declared `AgentLaunchOptionInfo.default`. */
     launchOptions: Record<string, Record<string, boolean>>;
   };
+
+  /** Adapter 宣告的相容性確認。Effective config 可繼承 global 值；inline action 只寫入明確的 project override。 */
+  compatibilityAcknowledgements: Record<string, boolean>;
 
   sidebar: {
     width: number;
@@ -2461,6 +2469,7 @@ export const DEFAULT_CONFIG: AppConfig = {
     execution: {},
     launchOptions: {},
   },
+  compatibilityAcknowledgements: {},
   sidebar: {
     width: 400,
   },
@@ -3968,6 +3977,13 @@ export interface ElectronAPI {
     onBulkDeleteProgress: (callback: (progress: TaskBulkDeleteProgress) => void) => () => void;
   };
 
+  compatibility: {
+    list: (projectId: string) => Promise<readonly CompatibilityRequirement[]>;
+    get: (projectId: string, requirementId: string) => Promise<CompatibilityRequirement | null>;
+    resolve: (projectId: string, requirementId: string) => Promise<CompatibilityResolveResult>;
+    onChanged: (callback: (projectId: string) => void) => () => void;
+  };
+
   // Attachments
   attachments: {
     list: (taskId: string) => Promise<TaskAttachment[]>;
@@ -4011,7 +4027,7 @@ export interface ElectronAPI {
     spawn: (input: SpawnSessionInput, projectId?: string | null) => Promise<Session>;
     kill: (sessionId: string) => Promise<void>;
     suspend: (taskId: string, projectId?: string | null) => Promise<void>;
-    resume: (taskId: string, resumePrompt?: string, projectId?: string | null) => Promise<Session>;
+    resume: (taskId: string, resumePrompt?: string, projectId?: string | null) => Promise<Session | null>;
     /**
      * Targeted "is this task's session alive right now?" probe. Returns
      * the live registry Session if main has one for this task, or null

@@ -1,3 +1,5 @@
+import type { CompatibilityRequirement } from './compatibility-requirement';
+
 export type AutoCommandSkipReason =
   | 'no-active-main-session'
   | 'native-evidence-unavailable'
@@ -23,7 +25,8 @@ export type AutoCommandImmediateOutcome =
   | { readonly kind: 'scheduled'; readonly transport: 'native-idle'; readonly generation: number }
   | { readonly kind: 'scheduled'; readonly transport: 'legacy' }
   | { readonly kind: 'skipped'; readonly reason: AutoCommandSkipReason; readonly warning: string }
-  | { readonly kind: 'not-applicable' };
+  | { readonly kind: 'not-applicable' }
+  | { readonly kind: 'compatibility-required'; readonly requirement: CompatibilityRequirement };
 
 export interface TaskMoveResult {
   readonly ok: true;
