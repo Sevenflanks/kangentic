@@ -259,7 +259,40 @@ npx playwright test --project=electron
 | Component rendering, user interaction, form validation | UI |
 | Real IPC, PTY spawning, terminal output, file I/O | E2E |
 
-Local Windows installer validation lives in [release-checklist.md](release-checklist.md). Automated tests use mock fixtures and intentionally do not exercise real model latency, real tool calls, or conversation continuity across resume.
+### OpenCode Compatibility Tests
+
+OpenCode compatibility 的 P0 verification matrix 如下。各組指令可單獨執行：
+
+```bash
+# Adapter/runtime, local and remote, fresh and resume
+npx vitest run tests/unit/opencode-adapter.test.ts tests/unit/opencode-remote-execution.test.ts tests/unit/opencode-compatibility.test.ts
+
+# Gate, config normalization, inheritance, and IPC
+npx vitest run tests/unit/config-manager-compatibility.test.ts tests/unit/config-overridable-subset.test.ts tests/unit/compatibility-requirements.test.ts tests/unit/compatibility-ipc.test.ts tests/unit/prepare-agent-spawn.test.ts tests/unit/spawn-preamble-compatibility.test.ts
+
+# Retry and lifecycle, including fresh start, resume, restart, startup manual handling, and project-switch safety
+npx vitest run tests/unit/spawn-agent-compatibility-retry.test.ts tests/unit/startup-compatibility-retry.test.ts tests/unit/restart-session-for-settings-change.test.ts tests/unit/task-move-settings-restart.test.ts tests/unit/split-lock-cas.test.ts
+
+# Startup manual handling, stale guards, and normalization
+npx vitest run tests/unit/startup-compatibility-retry.test.ts tests/unit/spawn-compatibility-slice.test.ts tests/unit/config-manager-compatibility.test.ts tests/unit/compatibility-requirements.test.ts
+
+# Task cleanup, including bulk delete and config persistence
+npx vitest run tests/unit/bulk-delete-handler.test.ts tests/unit/delete-task-worktree.test.ts tests/unit/config-manager-compatibility.test.ts tests/unit/compatibility-ipc.test.ts
+
+# Renderer UI and store reconciliation
+npx vitest run tests/unit/spawn-compatibility-slice.test.ts tests/unit/session-store-cache-reconcile.test.ts
+npx playwright test tests/ui/opencode-permission-compatibility.spec.ts --project=ui
+
+# Structural parity
+npx vitest run tests/unit/spawn-entry-point-parity.test.ts
+
+# Production checks
+npm run typecheck
+npm run lint
+npm run build
+```
+
+Adapter/runtime tests cover local and remote execution in both fresh and resume paths. Retry and lifecycle tests cover the corresponding startup, restart, task-move, and lock behavior. The gate/config/IPC, renderer UI/store, and structural parity groups verify the shared permission protection and project-switch boundaries. Automated tests use mock fixtures, so mocked coverage does not prove real model latency or conversation continuity across resume. Local Windows installer validation lives in [release-checklist.md](release-checklist.md).
 
 ### Run All
 

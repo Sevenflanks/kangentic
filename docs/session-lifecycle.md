@@ -1,6 +1,6 @@
 # Session Lifecycle
 
-This document describes the full session state machine in Kangentic, covering how Claude Code CLI sessions are spawned, queued, suspended, resumed, and recovered.
+This document describes the full session state machine in Kangentic, covering how agent CLI sessions are spawned, queued, suspended, resumed, and recovered.
 
 ## State Machine
 
@@ -72,6 +72,22 @@ module's `resolveEffectivePermissionMode` (a lane forcing `plan` always wins, el
 -> global). Guarded by root `CLAUDE.md` and
 `tests/unit/spawn-entry-point-parity.test.ts`.
 
+For OpenCode, the preamble also evaluates the runtime-default compatibility requirement. When the
+effective permission is a non-`default` legacy value and the effective project acknowledgement is
+missing, the spawn stops before detection, trust, session-directory creation, transition actions,
+or PTY creation. Global acknowledgement is inherited during project config normalization. A
+project-targeted inline action writes only the captured project to
+`<project>/.kangentic/config.json` under
+`compatibilityAcknowledgements["opencode-runtime-default-v1"] = true`.
+Board fresh and explicit resume, plus startup fresh and startup resume, use the same gate. A board
+action performs one ordinary automatic retry after acknowledgement. Startup acknowledgement only
+clears the startup gate. It does not spawn or recover automatically: a blocked startup resume keeps
+its resumable record and suspended placeholder for manual Resume; a blocked fresh spawn remains
+sessionless until the user manually retriggers it. The acknowledgement is written to the captured
+project first; if the task or project lifecycle has changed, the retry resolves as `superseded`
+without spawning.
+Deleting a task, including bulk delete, clears its pending requirement, placeholder, and retry state.
+
 | Entry point | Trigger | Route |
 |---|---|---|
 | Task move (Phase 3 deferred spawn) | drag into an auto_spawn column | `spawnAgent` (`src/main/ipc/helpers/agent-spawn.ts`), `settingsSourceLane` = source lane |
@@ -83,9 +99,9 @@ module's `resolveEffectivePermissionMode` (a lane forcing `plan` always wins, el
 | Startup reconcile | project open, `autoSpawnTasks` | `prepareAgentSpawn` |
 
 `SESSION_RESUME` routes through `spawnAgent` with `mode: { kind: 'explicit-resume' }` so it runs the
-shared spawn preamble and resume path. `restartSessionForSettingsChange` stays a direct-engine
-`resumeSuspendedSession` in-place restart and is not a first spawn. Transient Command Terminal
-sessions bypass all of this (not task agents).
+shared spawn preamble and resume path. `restartSessionForSettingsChange` also uses the normal
+task-agent spawn path, so settings restarts do not bypass compatibility checks or project scoping.
+Transient Command Terminal sessions bypass all of this (not task agents).
 
 ### Engine spawn (board-driven path)
 
@@ -189,7 +205,7 @@ When a suspended task moves to an active column:
 
 ### OpenCode Auto-command
 
-OpenCode Auto-command is separate from the ordinary Task prompt and is delivered only to an active writable compatible Main Session through the native-idle live path with `sendCtrlC: false` and user-input cancellation. Fresh, resume, handoff, restart, isolated, and no-active lifecycle cases finalizes a skip while their normal lifecycle continues. Ordinary Task prompt, continuation prompt, and action prompt remain intact; non-OpenCode existing legacy behavior remains intact.
+OpenCode Auto-command is separate from the ordinary Task prompt and is delivered only to an active writable compatible Main Session through the native-idle live path with `sendCtrlC: false` and user-input cancellation. Ordinary automatic retry remains enabled for the normal submission path. Fresh, resume, handoff, restart, isolated, and no-active lifecycle cases finalize a skip while their normal lifecycle continues. Ordinary Task prompt, continuation prompt, and action prompt remain intact; non-OpenCode existing legacy behavior remains intact.
 
 An action-backed spawn runs its own prompt and still finalizes the central Auto-command disposition.
 
