@@ -160,6 +160,7 @@ export function AdvancedOverridesSection({
   const boardProfiles = useBoardStore((state) => state.boardProfiles);
   const openBoardManager = useBoardStore((state) => state.openBoardManager);
   const globalPermissionMode = useConfigStore((state) => state.config.agent.permissionMode);
+  const agentList = useConfigStore((state) => state.agentList);
   // The three-arg PROJECT open, never `openSettingsToTab`: the Agent tab's
   // Project Defaults are `scope: 'project'`, and `updateProjectOverride`
   // returns early when `projectSettingsPath` is null, so the panel would open
@@ -224,12 +225,15 @@ export function AdvancedOverridesSection({
   const permissionInheritLabel = fallbackPermissionLabel;
 
   const handleAgentChange = (nextAgent: string) => {
+    const nextEffectiveAgent = nextAgent || fallbackAgent;
+    const keepsLegacyPermission = agentList.find((agent) => agent.name === nextEffectiveAgent)
+      ?.preserveLegacyPermissionOnAgentSelection ?? false;
     setAgentOverride(nextAgent);
-    // Previous model/effort/permission picks were valid for the previous
-    // agent's capability matrix; clear so the user re-picks from the new agent.
+    // Model and effort belong to the prior capability matrix. Permission only
+    // survives when the effective next adapter explicitly owns that compatibility policy.
     setModelOverride('');
     setEffortOverride('');
-    setPermissionOverride('');
+    if (!keepsLegacyPermission) setPermissionOverride('');
   };
 
   if (!showAdvancedSection) return null;

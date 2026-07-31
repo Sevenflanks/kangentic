@@ -62,6 +62,19 @@ async function selectCombobox(target: Page, testId: string, optionValue: string)
   await target.locator(`[data-testid="${testId}-option-${optionValue}"]`).click();
 }
 
+async function recordSubmittedTaskOverrides(target: Page) {
+  await target.evaluate(() => {
+    const createTask = window.electronAPI.tasks.create;
+    window.electronAPI.tasks.create = async (input) => {
+      document.body.dataset.submittedAgentOverride = input.agent_override ?? '';
+      document.body.dataset.submittedModelOverride = input.model_override ?? '';
+      document.body.dataset.submittedEffortOverride = input.effort_override ?? '';
+      document.body.dataset.submittedPermissionMode = input.permission_mode ?? '';
+      return createTask(input);
+    };
+  });
+}
+
 test.describe('NewTaskDialog Advanced section', () => {
   test('Agent Override is offered as the unselected half of the run-mode choice', async () => {
     await openNewTaskDialog();
@@ -596,6 +609,11 @@ test.describe('NewTaskDialog Advanced - Agent picker (multi-agent fixture)', () 
             models: ['gpt-5', 'gpt-5-mini'],
           },
         },
+        opencode: {
+          found: true,
+          path: '/usr/bin/opencode',
+          version: '1.0.0',
+        },
       };
     });
     await multiPage.addInitScript({ path: MOCK_SCRIPT });
@@ -714,6 +732,107 @@ test.describe('NewTaskDialog Advanced - Agent picker (multi-agent fixture)', () 
     const task = taskData.find((t: { title: string }) => t.title === 'No Agent Override Task');
     expect(task).toBeDefined();
     expect(task!.agent_override).toBeNull();
+  });
+
+  test('selecting a policy adapter keeps task permission while clearing model and effort overrides', async () => {
+    await openDialog();
+    await recordSubmittedTaskOverrides(multiPage);
+
+    await multiPage.locator('input[placeholder="Task title"]').fill('OpenCode Permission Task');
+    await multiPage.locator('input[data-testid="task-model-override"]').click();
+    await multiPage.locator('[data-model-option]:has-text("opus")').click();
+    await selectCombobox(multiPage, 'task-effort-override', 'high');
+    await selectCombobox(multiPage, 'task-permission-override', 'plan');
+
+    await selectCombobox(multiPage, 'task-agent-override', 'opencode');
+    await multiPage.locator('button[type="submit"]:has-text("Create")').click();
+    await multiPage.locator('input[placeholder="Task title"]').waitFor({ state: 'hidden', timeout: 3000 });
+
+    await expect(multiPage.locator('body')).toHaveAttribute('data-submitted-agent-override', 'opencode');
+    await expect(multiPage.locator('body')).toHaveAttribute('data-submitted-model-override', '');
+    await expect(multiPage.locator('body')).toHaveAttribute('data-submitted-effort-override', '');
+    await expect(multiPage.locator('body')).toHaveAttribute('data-submitted-permission-mode', 'plan');
+
+    const taskData = await multiPage.evaluate(() => window.electronAPI.tasks.list());
+    const task = taskData.find((entry: { title: string }) => entry.title === 'OpenCode Permission Task');
+    expect(task).toBeDefined();
+    expect(task!.model_override).toBeNull();
+    expect(task!.effort_override).toBeNull();
+    expect(task!.permission_mode).toBe('plan');
+  });
+
+  test('selecting an adapter without the policy clears a prior task permission override', async () => {
+    await openDialog();
+    await recordSubmittedTaskOverrides(multiPage);
+
+    await multiPage.locator('input[placeholder="Task title"]').fill('Codex Permission Reset Task');
+    await selectCombobox(multiPage, 'task-permission-override', 'plan');
+    await selectCombobox(multiPage, 'task-agent-override', 'codex');
+    await multiPage.locator('button[type="submit"]:has-text("Create")').click();
+    await multiPage.locator('input[placeholder="Task title"]').waitFor({ state: 'hidden', timeout: 3000 });
+
+    await expect(multiPage.locator('body')).toHaveAttribute('data-submitted-permission-mode', '');
+
+    const taskData = await multiPage.evaluate(() => window.electronAPI.tasks.list());
+    const task = taskData.find((entry: { title: string }) => entry.title === 'Codex Permission Reset Task');
+    expect(task).toBeDefined();
+    expect(task!.permission_mode).toBeNull();
+  });
+});
+
+test.describe('NewTaskDialog Advanced - OpenCode fallback', () => {
+  let fallbackBrowser: Browser;
+  let fallbackPage: Page;
+
+  test.beforeAll(async () => {
+    await waitForViteReady();
+    fallbackBrowser = await chromium.launch({ headless: true });
+    const context = await fallbackBrowser.newContext({ viewport: { width: 1920, height: 1080 } });
+    fallbackPage = await context.newPage();
+
+    await fallbackPage.addInitScript(() => {
+      (window as Record<string, unknown>).__mockDefaultAgentOverride = 'opencode';
+      (window as Record<string, unknown>).__mockAgentListOverrides = {
+        opencode: {
+          found: true,
+          path: '/usr/bin/opencode',
+          version: '1.0.0',
+        },
+      };
+    });
+    await fallbackPage.addInitScript({ path: MOCK_SCRIPT });
+    await fallbackPage.goto(VITE_URL);
+    await fallbackPage.waitForLoadState('load');
+    await fallbackPage.waitForSelector('text=Kangentic', { timeout: 15000 });
+    await createProject(fallbackPage, `OpenCodeFallback ${Date.now()}`);
+  });
+
+  test.afterAll(async () => {
+    await fallbackBrowser?.close();
+  });
+
+  test('clearing a task agent override preserves task permission when the effective fallback declares the policy', async () => {
+    const column = fallbackPage.locator('[data-swimlane-name="To Do"]');
+    await column.locator('text=Add task').click();
+    await fallbackPage.locator('input[placeholder="Task title"]').waitFor({ state: 'visible' });
+    await fallbackPage.locator('[data-testid="task-advanced-toggle"]').click();
+    await recordSubmittedTaskOverrides(fallbackPage);
+
+    await fallbackPage.locator('input[placeholder="Task title"]').fill('OpenCode Fallback Permission Task');
+    await selectCombobox(fallbackPage, 'task-agent-override', 'claude');
+    await selectCombobox(fallbackPage, 'task-permission-override', 'plan');
+    await fallbackPage.locator('[data-testid="task-agent-field"] button[title="Clear"]').click();
+    await fallbackPage.locator('button[type="submit"]:has-text("Create")').click();
+    await fallbackPage.locator('input[placeholder="Task title"]').waitFor({ state: 'hidden', timeout: 3000 });
+
+    await expect(fallbackPage.locator('body')).toHaveAttribute('data-submitted-agent-override', '');
+    await expect(fallbackPage.locator('body')).toHaveAttribute('data-submitted-permission-mode', 'plan');
+
+    const taskData = await fallbackPage.evaluate(() => window.electronAPI.tasks.list());
+    const task = taskData.find((entry: { title: string }) => entry.title === 'OpenCode Fallback Permission Task');
+    expect(task).toBeDefined();
+    expect(task!.agent_override).toBeNull();
+    expect(task!.permission_mode).toBe('plan');
   });
 });
 
