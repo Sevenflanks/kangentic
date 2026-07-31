@@ -17,6 +17,8 @@
   let activityCache = {};
   let eventCache = {};
   let summaryCache = {};
+  let compatibilityRequirementsByProject = {};
+  let compatibilityChangedListeners = [];
   let currentProjectId = null;
   let projectConfigs = {};
   let nextDisplayId = 1;
@@ -1411,6 +1413,47 @@
       },
     },
 
+    compatibility: {
+      __resolveCalls: [],
+      list: async function (projectId) {
+        return (compatibilityRequirementsByProject[projectId] || []).slice();
+      },
+      get: async function (projectId, requirementId) {
+        return (compatibilityRequirementsByProject[projectId] || []).find(function (requirement) {
+          return requirement.requirementId === requirementId;
+        }) || null;
+      },
+      resolve: async function (projectId, requirementId) {
+        window.electronAPI.compatibility.__resolveCalls.push({
+          projectId: projectId,
+          requirementId: requirementId,
+        });
+        if (window.__mockCompatibilityResolveDeferred) {
+          window.__mockCompatibilityResolveDeferred = false;
+          var resolvePending;
+          var pending = new Promise(function (resolve) { resolvePending = resolve; });
+          window.__mockCompatibilityResolve = resolvePending;
+          await pending;
+        }
+        var result = window.__mockCompatibilityResolveResult || { kind: 'resolved' };
+        window.__mockCompatibilityResolveResult = null;
+        if (result.kind === 'resolved' || result.kind === 'not-found') {
+          compatibilityRequirementsByProject[projectId] = (compatibilityRequirementsByProject[projectId] || []).filter(function (requirement) {
+            return requirement.requirementId !== requirementId;
+          });
+          window.__mockFireCompatibilityChanged(projectId);
+        }
+        return result;
+      },
+      onChanged: function (callback) {
+        compatibilityChangedListeners.push(callback);
+        return function () {
+          var index = compatibilityChangedListeners.indexOf(callback);
+          if (index >= 0) compatibilityChangedListeners.splice(index, 1);
+        };
+      },
+    },
+
     sessions: {
       spawn: async function () {
         throw new Error('Mock: session spawn not available in UI tests');
@@ -2171,10 +2214,10 @@
             name: 'opencode', displayName: 'OpenCode', found: false, path: null, version: null,
             // KEEP IN SYNC with OpenCodeAdapter.permissions in src/main/agent/adapters/opencode/opencode-adapter.ts
             permissions: [
-              { mode: 'plan', label: 'Plan' },
-              { mode: 'acceptEdits', label: 'Build' },
+              { mode: 'default', label: 'Runtime Default' },
             ],
-            defaultPermission: 'acceptEdits',
+            defaultPermission: 'default',
+            preserveLegacyPermissionOnAgentSelection: true,
             supportsSummarize: true,
             // KEEP IN SYNC with OpenCodeAdapter.remoteExecution.info - the only
             // agent that declares this capability today, so the Agent tab's
@@ -3258,6 +3301,10 @@
     },
   };
 
+  window.__mockFireCompatibilityChanged = function (projectId) {
+    compatibilityChangedListeners.slice().forEach(function (listener) { listener(projectId); });
+  };
+
   /**
    * Expose mock internals for test state pre-configuration.
    * Called from addInitScript before React mounts to set up complex scenarios
@@ -3275,6 +3322,7 @@
       activityCache: activityCache,
       eventCache: eventCache,
       summaryCache: summaryCache,
+      compatibilityRequirementsByProject: compatibilityRequirementsByProject,
       projectConfigs: projectConfigs,
       uuid: uuid,
       now: now,

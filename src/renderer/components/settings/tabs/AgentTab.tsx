@@ -68,10 +68,12 @@ export function AgentTab({ config, globalConfig, agentList }: {
   const handleDefaultAgentChange = async (agentName: string) => {
     if (!currentProject) return;
     await window.electronAPI.projects.setDefaultAgent(currentProject.id, agentName);
-    // Switch to the new agent's recommended default permission mode
-    const newDefault = getAgentDefaultPermission(agentList, agentName);
-    if (newDefault !== config.agent.permissionMode) {
-      updateProject({ agent: { permissionMode: newDefault } });
+    const selectedAgent = agentList.find((agent) => agent.name === agentName);
+    const nextPermissionMode = selectedAgent?.preserveLegacyPermissionOnAgentSelection
+      ? config.agent.permissionMode
+      : getAgentDefaultPermission(agentList, agentName);
+    if (nextPermissionMode !== config.agent.permissionMode) {
+      updateProject({ agent: { permissionMode: nextPermissionMode } });
     }
     // Previous model/effort defaults were valid for the previous agent's
     // capability matrix; clear so the user re-picks from the new agent.
