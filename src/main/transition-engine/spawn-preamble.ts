@@ -1,7 +1,9 @@
 import { DEFAULT_AGENT } from '../../shared/types';
 import type { Task, Swimlane, PermissionMode } from '../../shared/types';
+import type { CompatibilityRequirement } from '../../shared/compatibility-requirement';
 import type { TaskRepository } from '../db/repositories/task-repository';
 import { resolveTargetAgent, type AgentResolution } from './agent-resolver';
+import { agentRegistry } from '../agent/agent-registry';
 
 /**
  * The project-level defaults the preamble resolves inherited fields against.
@@ -127,19 +129,36 @@ export function lockAdvancedOverridesOnFirstSpawn(options: {
  * per engine call via `resolveSpawnOverrides` against re-read task rows, and
  * the startup path inlines the same chain over scalar project defaults.
  */
+export type SpawnPreambleResult =
+  | {
+      readonly kind: 'ready';
+      readonly agent: string;
+      readonly isHandoff: boolean;
+      readonly permissionMode: PermissionMode;
+    }
+  | {
+      readonly kind: 'compatibility-required';
+      readonly agent: string;
+      readonly isHandoff: boolean;
+      readonly permissionMode: PermissionMode;
+      readonly requirement: CompatibilityRequirement;
+    };
+
 export function runSpawnPreamble(options: {
   task: Task;
+  projectId: string | null;
   /** Whether any session row exists for the task (first-ever-spawn detection). */
   hasSessionRecord: boolean;
   /** See `lockAdvancedOverridesOnFirstSpawn`. */
   settingsLane: Pick<Swimlane, 'agent_override' | 'model_override' | 'effort_override' | 'permission_mode'> | null;
   /** The lane the task is spawning into; its `agent_override` participates in agent resolution (never in the lock). */
-  destinationLane: Pick<Swimlane, 'agent_override'> | null;
+  destinationLane: Pick<Swimlane, 'agent_override' | 'permission_mode'> | null;
   project: SpawnPreambleProjectDefaults | null | undefined;
   /** See `lockAdvancedOverridesOnFirstSpawn`. */
   globalPermissionMode: () => PermissionMode;
+  compatibilityAcknowledgements: Readonly<Record<string, boolean>>;
   tasks: Pick<TaskRepository, 'update'>;
-}): AgentResolution {
+}): SpawnPreambleResult {
   lockAdvancedOverridesOnFirstSpawn({
     task: options.task,
     hasSessionRecord: options.hasSessionRecord,
@@ -149,12 +168,37 @@ export function runSpawnPreamble(options: {
     tasks: options.tasks,
   });
 
-  return resolveTargetAgent({
+  const resolution: AgentResolution = resolveTargetAgent({
     taskAgentOverride: options.task.agent_override,
     columnAgent: options.destinationLane?.agent_override ?? null,
     taskAgent: options.task.agent,
     projectDefaultAgent: options.project?.default_agent ?? null,
   });
+  const permissionMode = resolveEffectivePermissionMode(
+    options.task.permission_mode,
+    options.destinationLane?.permission_mode,
+    options.globalPermissionMode(),
+  );
+  const adapterRequirement = agentRegistry.get(resolution.agent)
+    ?.getCompatibilityRequirement?.(permissionMode) ?? null;
+  if (adapterRequirement !== null
+    && options.projectId !== null
+    && !options.compatibilityAcknowledgements[adapterRequirement.acknowledgementId]) {
+    return {
+      kind: 'compatibility-required',
+      ...resolution,
+      permissionMode,
+      requirement: {
+        requirementId: `compatibility:${options.projectId}:${options.task.id}:${adapterRequirement.acknowledgementId}`,
+        projectId: options.projectId,
+        taskId: options.task.id,
+        acknowledgementId: adapterRequirement.acknowledgementId,
+        title: adapterRequirement.title,
+        description: adapterRequirement.description,
+      },
+    };
+  }
+  return { kind: 'ready', ...resolution, permissionMode };
 }
 
 /**
