@@ -132,6 +132,22 @@ These settings appear in both App Settings (as defaults) and Project Settings (a
 | `agent.execution` | Record\<string, AgentProjectExecution\> | `{}` | Per-project, agent-keyed: `{ mode: 'local' \| 'remote', workingDirectory }`. An absent entry means local. `workingDirectory` is a path ON THE SERVER for this project's tasks. See [Remote Execution](#remote-execution). |
 | `agent.launchOptions` | Record\<string, Record\<string, boolean\>\> | `{}` | Global, agent-keyed boolean startup toggles: agent name -> option id -> enabled. An absent entry falls back to the adapter's declared default. Machine-scoped like `agent.cliPaths`. Global-only. Today only Codex declares one option, `disableApps` (launches with `--disable apps` to skip the optional cloud ChatGPT Apps MCP connector, which can hang startup at "Booting MCP server: codex_apps"). |
 
+### OpenCode Runtime Default Compatibility
+
+OpenCode 的 product permission surface 只有 `Runtime Default`。Kangentic 不從 `plan` 或 `build` 推導或送出 primary agent，local 與 remote、fresh 與 resume 都由 OpenCode runtime config 決定 primary-agent selection。Kangentic 的 `Agent` 仍是 CLI adapter；其他 adapters 的 generic permission 仍照常儲存與套用。
+
+當 effective agent 為 OpenCode，且 resolved permission 是非 `default` 的 legacy permission，而 effective project config 尚未確認相容性時，共用 spawn preamble 會先阻擋。global acknowledgement 會在 config normalization 後被 project effective config 繼承；inline card action 只會以互動當下 captured 的明確 `projectId` 寫入目標專案的 `<project>/.kangentic/config.json`：
+
+```json
+"compatibilityAcknowledgements": {
+  "opencode-runtime-default-v1": true
+}
+```
+
+inline card action 會先把 acknowledgement 寫入 captured project，並對原始 board action 做一次 ordinary automatic retry。project switch 不會把 acknowledgement 寫到錯誤專案；若 task 或 project lifecycle 已改變，retry 會回報 `superseded` 且不 spawn。Board fresh、explicit resume、startup fresh、startup resume 共用此 gate。startup acknowledgement 只解除 startup gate，不會自動 spawn 或 recovery。startup resume 被阻擋時保留 resumable record 與 suspended placeholder，使用者必須手動 Resume；fresh 則保持 sessionless，必須手動重新觸發。task delete 與 bulk delete 會清除 compatibility requirement、placeholder 與 pending retry state。
+
+P0 沒有 picker、discovery、`nativeAgent`、role switching、permission migration、SQLite migration 或 remote prompt transport。
+
 PermissionMode values:
 
 - `default` -- uses `--settings` (project-settings behavior)
@@ -141,7 +157,7 @@ PermissionMode values:
 - `auto` -- `--permission-mode auto` (classifier-based auto-approval)
 - `bypassPermissions` -- `--dangerously-skip-permissions` (no prompts at all)
 
-All six modes are available in both the global App Settings "Permissions" dropdown and the per-column Edit Column dialog. The dropdown shows only the modes supported by the active agent (e.g., Cursor CLI only exposes Interactive and Non-Interactive; Oz CLI exposes Plan, Default, and Auto via Warp agent profiles).
+Generic permission modes remain available to adapters that support them. OpenCode 的 product surface 不提供 `plan` 或 `build` picker，只有 `Runtime Default`；OpenCode primary-agent selection 由 runtime config 負責。
 
 ### Remote Execution
 
