@@ -1,7 +1,7 @@
 import { SessionRepository } from '../../db/repositories/session-repository';
 import { UsageHistoryRepository } from '../../db/repositories/usage-history-repository';
 import { getProjectDb } from '../../db/database';
-import { getProjectRepos, createTransitionEngine, resolveSpawnOverrides } from '../helpers';
+import { getProjectRepos, createTransitionEngine, spawnAgent } from '../helpers';
 import { captureSessionMetrics, refineTranscriptTokens, refineTranscriptToolCounts } from './session-metrics';
 import { captureGitChurn, resolveDefaultBaseBranch } from './git-stats-capture';
 import { markRecordExited, markRecordSuspended } from '../../transition-engine/session-lifecycle';
@@ -126,24 +126,26 @@ export async function restartSessionForSettingsChange(
       swimlanes.getById(updatedTask.swimlane_id),
       loadTaskProfile(context, updatedTask, projectPath),
     );
-    const project = context.projectRepo.getById(projectId);
-
     const sessionRepo = new SessionRepository(getProjectDb(projectId));
     const engine = createTransitionEngine(
       context, actions, tasks, sessionRepo, attachments, projectId, projectPath,
     );
 
     try {
-      await engine.resumeSuspendedSession(
-        updatedTask,
-        updatedLane?.permission_mode,
-        true, // skipPromptTemplate - resume idle, do not re-send the original prompt
-        undefined, // resumePrompt - no continuation; this is a settings change, not a handoff
-        undefined, // signal
-        undefined, // targetAgent - resolved internally from the task/session
-        undefined, // handoffPromptPrefix
-        resolveSpawnOverrides(updatedTask, updatedLane, project),
-      );
+      await spawnAgent({
+        context,
+        engine,
+        tasks,
+        sessionRepo,
+        task: updatedTask,
+        fromSwimlaneId: updatedTask.swimlane_id,
+        toLane: updatedLane ?? null,
+        mode: { kind: 'explicit-resume' },
+        skipPromptTemplate: true,
+        projectId,
+        projectPath,
+        attachments,
+      });
       return { ok: true };
     } catch (respawnError) {
       if (isAbortError(respawnError)) return { ok: false, reason: 'respawn aborted' };

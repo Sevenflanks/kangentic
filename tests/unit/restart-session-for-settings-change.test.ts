@@ -10,13 +10,14 @@
  *      (benign no-op; the persisted override is picked up on the next spawn).
  *   2. Calls applySuspendDbWrites (same module) -> sessionManager.suspend.
  *   3. Re-reads the task + swimlane (in case they changed during the unlocked
- *      suspend), builds a TransitionEngine, and calls resumeSuspendedSession
- *      with skipPromptTemplate=true so the session resumes idle.
+ *      suspend), builds a TransitionEngine, and routes through spawnAgent's
+ *      explicit-resume mode with skipPromptTemplate=true so the session
+ *      resumes idle after the shared compatibility preamble.
  *   4. Returns { ok: false, reason: 'suspend failed: ...' } when suspend rejects.
- *   5. Returns { ok: false, reason: 'respawn failed: ...' } when
- *      resumeSuspendedSession rejects with a normal Error.
+ *   5. Returns { ok: false, reason: 'respawn failed: ...' } when spawnAgent
+ *      rejects with a normal Error.
  *   6. Returns { ok: false, reason: 'respawn aborted' } when
- *      resumeSuspendedSession rejects with a DOMException named 'AbortError'.
+ *      spawnAgent rejects with a DOMException named 'AbortError'.
  *
  * Mock strategy: we cannot mock `applySuspendDbWrites` in isolation (same module),
  * so we let it run through its mocked deps: getProjectRepos (for task read +
@@ -88,24 +89,14 @@ vi.mock('../../src/main/pty/session-registry', () => ({
   isLiveSession: vi.fn(() => true),
 }));
 
-// resolveSpawnOverrides is the key output of this path; we verify it was called
-// with the re-read task and lane.
-const mockResolveSpawnOverrides = vi.fn((
-  task: { model_override?: string | null; effort_override?: string | null } | undefined,
-  lane: { model_override?: string | null; effort_override?: string | null } | null | undefined,
-) => ({
-  model: task?.model_override ?? lane?.model_override ?? undefined,
-  effort: task?.effort_override ?? lane?.effort_override ?? undefined,
-}));
-
 const mockCreateTransitionEngine = vi.fn();
 const mockGetProjectRepos = vi.fn();
+const mockSpawnAgent = vi.fn();
 
 vi.mock('../../src/main/ipc/helpers', () => ({
   getProjectRepos: (...args: unknown[]) => mockGetProjectRepos(...args),
   createTransitionEngine: (...args: unknown[]) => mockCreateTransitionEngine(...args),
-  resolveSpawnOverrides: (...args: unknown[]) =>
-    mockResolveSpawnOverrides(...(args as [never, never])),
+  spawnAgent: (...args: unknown[]) => mockSpawnAgent(...args),
 }));
 
 // ---------------------------------------------------------------------------
@@ -159,6 +150,7 @@ function makeContext(sessionSuspend: ReturnType<typeof vi.fn> = vi.fn(async () =
     currentProjectPath: PROJECT_PATH,
     sessionManager: {
       suspend: sessionSuspend,
+      spawn: vi.fn(),
       getSession: vi.fn(() => null),
     },
     configManager: {
@@ -198,6 +190,7 @@ describe('restartSessionForSettingsChange', () => {
 
     engine = makeEngine();
     mockCreateTransitionEngine.mockReturnValue(engine);
+    mockSpawnAgent.mockResolvedValue({ kind: 'not-applicable' });
   });
 
   // =========================================================================
@@ -223,15 +216,15 @@ describe('restartSessionForSettingsChange', () => {
     expect(result).toEqual({ ok: true });
     // No suspend and no respawn when there is no live session to act on.
     expect(context.sessionManager.suspend).not.toHaveBeenCalled();
-    expect(engine.resumeSuspendedSession).not.toHaveBeenCalled();
+    expect(mockSpawnAgent).not.toHaveBeenCalled();
     expect(hoisted.markRecordSuspended).not.toHaveBeenCalled();
   });
 
   // =========================================================================
-  // Happy path: full suspend + re-read + resumeSuspendedSession
+  // Happy path: full suspend + re-read + spawnAgent explicit resume
   // =========================================================================
 
-  it('suspends the session, re-reads task and lane, and calls resumeSuspendedSession idle', async () => {
+  it('suspends the session, re-reads task and lane, and routes an idle explicit resume through spawnAgent', async () => {
     // First getById call (inside applySuspendDbWrites) returns task with session.
     // Second getById call (re-read after applySuspendDbWrites) returns task without
     // session_id (cleared by applySuspendDbWrites's tasks.update).
@@ -271,34 +264,62 @@ describe('restartSessionForSettingsChange', () => {
     // session_id was cleared on the task.
     expect(taskRepo.update).toHaveBeenCalledWith({ id: TASK_ID, session_id: null });
 
-    // Engine was built and resumeSuspendedSession was called.
+    // Engine was built, but only spawnAgent may invoke its resume sink.
     expect(mockCreateTransitionEngine).toHaveBeenCalled();
-    expect(engine.resumeSuspendedSession).toHaveBeenCalledTimes(1);
+    expect(mockSpawnAgent).toHaveBeenCalledWith(expect.objectContaining({
+      context,
+      engine,
+      tasks: taskRepo,
+      task: updatedTask,
+      fromSwimlaneId: 'lane-executing',
+      toLane: expect.objectContaining({ id: 'lane-executing' }),
+      mode: { kind: 'explicit-resume' },
+      skipPromptTemplate: true,
+      projectId: PROJECT_ID,
+      projectPath: PROJECT_PATH,
+      attachments: expect.anything(),
+    }));
+    expect(engine.resumeSuspendedSession).not.toHaveBeenCalled();
+  });
 
-    // Key contract: skipPromptTemplate=true (resume idle, no re-send of original prompt).
-    const [
-      passedTask,
-      passedPermissionMode,
-      skipPromptTemplate,
-      resumePrompt,
-      signal,
-      targetAgent,
-      handoffPromptPrefix,
-    ] = engine.resumeSuspendedSession.mock.calls[0] as unknown[];
-    expect(passedTask).toBe(updatedTask);
-    expect(passedPermissionMode).toBe('auto'); // from lane.permission_mode
-    expect(skipPromptTemplate).toBe(true);
-    expect(resumePrompt).toBeUndefined();
-    expect(signal).toBeUndefined();
-    expect(targetAgent).toBeUndefined();
-    expect(handoffPromptPrefix).toBeUndefined();
+  it('treats a compatibility-required explicit resume as handled after suspension without creating a replacement PTY', async () => {
+    // Given
+    const liveTask = makeTask(SESSION_ID);
+    const updatedTask = makeTask(null);
+    const taskRepo = {
+      getById: vi.fn()
+        .mockReturnValueOnce(liveTask)
+        .mockReturnValueOnce(liveTask)
+        .mockReturnValueOnce(updatedTask),
+      update: vi.fn(),
+    };
+    mockGetProjectRepos.mockReturnValue({
+      tasks: taskRepo,
+      swimlanes: { getById: vi.fn(() => makeLane()) },
+      actions: {},
+      attachments: {},
+    });
+    mockSpawnAgent.mockResolvedValue({
+      kind: 'compatibility-required',
+      requirement: { requirementId: 'compatibility:proj-restart:task-restart-1:opencode-runtime-default-v1' },
+    });
+    const context = makeContext();
 
-    // resolveSpawnOverrides was called to build spawn overrides from task + lane + project.
-    expect(mockResolveSpawnOverrides).toHaveBeenCalledWith(
-      expect.objectContaining({ id: TASK_ID }),
-      expect.objectContaining({ id: 'lane-executing' }),
-      expect.objectContaining({ id: PROJECT_ID }),
-    );
+    // When
+    const result = await restartSessionForSettingsChange(context as never, PROJECT_ID, PROJECT_PATH, TASK_ID);
+
+    // Then
+    expect(result).toEqual({ ok: true });
+    expect(context.sessionManager.suspend).toHaveBeenCalledWith(SESSION_ID);
+    expect(hoisted.markRecordSuspended).toHaveBeenCalledWith(expect.anything(), 'rec-1', 'system');
+    expect(mockSpawnAgent).toHaveBeenCalledWith(expect.objectContaining({
+      mode: { kind: 'explicit-resume' },
+      skipPromptTemplate: true,
+      projectId: PROJECT_ID,
+      projectPath: PROJECT_PATH,
+    }));
+    expect(engine.resumeSuspendedSession).not.toHaveBeenCalled();
+    expect(context.sessionManager.spawn).not.toHaveBeenCalled();
   });
 
   // =========================================================================
@@ -306,14 +327,13 @@ describe('restartSessionForSettingsChange', () => {
   //
   // A task riding a Board Profile carries model_override / effort_override /
   // permission_mode all null (the profile-vs-pins exclusivity invariant), so
-  // resolveSpawnOverrides falls through to whatever LANE object it is handed.
-  // restartSessionForSettingsChange must fold the task's Board Profile over
-  // the re-read lane (applyProfileToLane + loadTaskProfile) before calling
-  // resolveSpawnOverrides and before reading permission_mode for
-  // resumeSuspendedSession. Reading the lane raw (swimlanes.getById alone)
-  // silently demotes the task back to the column's BASE rung on every
-  // settings-change restart, even though the delta was correctly detected
-  // upstream in propagateBoardProfileChange.
+  // spawnAgent's resolveSpawnOverrides falls through to whatever LANE object
+  // it receives. restartSessionForSettingsChange must fold the task's Board
+  // Profile over the re-read lane (applyProfileToLane + loadTaskProfile)
+  // before passing it into spawnAgent. Reading the raw lane instead silently
+  // demotes the task back to the column's BASE rung on every settings-change
+  // restart, even though the delta was correctly detected upstream in
+  // propagateBoardProfileChange.
   // =========================================================================
 
   const PROFILE_ID = 'profile-heavy';
@@ -363,7 +383,7 @@ describe('restartSessionForSettingsChange', () => {
 
   /**
    * Shared arrange + act for the Board Profile fold tests below. Returns the
-   * result plus the raw args `resumeSuspendedSession` was called with, so
+   * result plus the spawnAgent options, so
    * each test can assert its own seam independently - a revert of the fold
    * must fail BOTH seams, not just whichever assertion happens to run first.
    */
@@ -388,40 +408,32 @@ describe('restartSessionForSettingsChange', () => {
     context.boardConfigManager.getBoardProfiles.mockReturnValue([heavyProfile]);
 
     const result = await restartSessionForSettingsChange(context as never, PROJECT_ID, PROJECT_PATH, TASK_ID);
-    const callArgs = engine.resumeSuspendedSession.mock.calls[0] as unknown[];
-    return { result, callArgs };
+    const spawnOptions = mockSpawnAgent.mock.calls[0]?.[0];
+    return { result, spawnOptions };
   }
 
-  it('passes the profile\'s permission_mode to resumeSuspendedSession, not the column base', async () => {
-    const { result, callArgs } = await runProfileRestart();
+  it('passes the profile-folded lane to spawnAgent instead of the column base', async () => {
+    const { result, spawnOptions } = await runProfileRestart();
 
     expect(result).toEqual({ ok: true });
 
-    // The profile's permission_mode ('plan') must reach resumeSuspendedSession,
-    // not the column's base ('auto'). Reverting the fold back to
-    // `swimlanes.getById(...)` alone makes this 'auto' and fails the test.
-    const passedPermissionMode = callArgs[1];
-    expect(passedPermissionMode).toBe('plan');
+    // The profile's permission_mode ('plan') must reach spawnAgent through the
+    // lane, not the column's base ('auto').
+    expect(spawnOptions).toMatchObject({
+      toLane: { id: PROFILE_LANE_ID, permission_mode: 'plan' },
+    });
   });
 
-  it('resolves spawn overrides from the profile-folded lane, not the column base model', async () => {
-    const { result, callArgs } = await runProfileRestart();
+  it('passes the profile-folded model lane to spawnAgent, not the column base model', async () => {
+    const { result, spawnOptions } = await runProfileRestart();
 
     expect(result).toEqual({ ok: true });
 
-    // resolveSpawnOverrides must receive a profile-folded lane (model 'opus'),
-    // never the column's raw base model ('sonnet'). Reverting the fold back to
-    // `swimlanes.getById(...)` alone makes this 'sonnet' and fails the test.
-    const passedSpawnOverrides = callArgs[7];
-    expect(passedSpawnOverrides).toEqual({ model: 'opus', effort: undefined });
-
-    // Directly confirm the LANE object handed to resolveSpawnOverrides was
-    // profile-folded, not the raw column lane.
-    expect(mockResolveSpawnOverrides).toHaveBeenCalledWith(
-      expect.objectContaining({ id: TASK_ID }),
-      expect.objectContaining({ id: PROFILE_LANE_ID, model_override: 'opus', permission_mode: 'plan' }),
-      expect.objectContaining({ id: PROJECT_ID }),
-    );
+    // spawnAgent must receive a profile-folded lane (model 'opus'), never the
+    // column's raw base model ('sonnet').
+    expect(spawnOptions).toMatchObject({
+      toLane: { id: PROFILE_LANE_ID, model_override: 'opus', permission_mode: 'plan' },
+    });
   });
 
   // =========================================================================
@@ -452,15 +464,15 @@ describe('restartSessionForSettingsChange', () => {
       expect(result.reason).toMatch(/^suspend failed:/);
       expect(result.reason).toContain('PTY already exited');
     }
-    // resumeSuspendedSession must NOT have been called after a suspend failure.
-    expect(engine.resumeSuspendedSession).not.toHaveBeenCalled();
+    // spawnAgent must NOT have been called after a suspend failure.
+    expect(mockSpawnAgent).not.toHaveBeenCalled();
   });
 
   // =========================================================================
   // Respawn failures
   // =========================================================================
 
-  it('returns { ok: false, reason matching /^respawn failed:/ } when resumeSuspendedSession rejects', async () => {
+  it('returns { ok: false, reason matching /^respawn failed:/ } when spawnAgent rejects', async () => {
     const liveTask = makeTask(SESSION_ID);
     const updatedTask = makeTask(null);
     const taskRepo = {
@@ -476,8 +488,7 @@ describe('restartSessionForSettingsChange', () => {
       actions: {},
       attachments: {},
     });
-    engine.resumeSuspendedSession.mockRejectedValue(new Error('CLI exited'));
-    mockCreateTransitionEngine.mockReturnValue(engine);
+    mockSpawnAgent.mockRejectedValue(new Error('CLI exited'));
     const context = makeContext();
 
     const result = await restartSessionForSettingsChange(context as never, PROJECT_ID, PROJECT_PATH, TASK_ID);
@@ -489,7 +500,7 @@ describe('restartSessionForSettingsChange', () => {
     }
   });
 
-  it('returns { ok: false, reason: "respawn aborted" } when resumeSuspendedSession rejects with an AbortError', async () => {
+  it('returns { ok: false, reason: "respawn aborted" } when spawnAgent rejects with an AbortError', async () => {
     // isAbortError checks: error instanceof DOMException && error.name === 'AbortError'.
     const liveTask = makeTask(SESSION_ID);
     const updatedTask = makeTask(null);
@@ -507,8 +518,7 @@ describe('restartSessionForSettingsChange', () => {
       attachments: {},
     });
     const abortError = new DOMException('The operation was aborted.', 'AbortError');
-    engine.resumeSuspendedSession.mockRejectedValue(abortError);
-    mockCreateTransitionEngine.mockReturnValue(engine);
+    mockSpawnAgent.mockRejectedValue(abortError);
     const context = makeContext();
 
     const result = await restartSessionForSettingsChange(context as never, PROJECT_ID, PROJECT_PATH, TASK_ID);
