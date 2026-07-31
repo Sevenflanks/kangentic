@@ -12,6 +12,7 @@ import { deepMerge, deepMergeConfig } from '../../shared/object-utils';
  *  renderer always writes in full. Every other typed-struct field gets MERGE
  *  semantics. Update this list when adding such a field to AppConfig. */
 const CONFIG_DICTIONARY_PATHS = [
+  'compatibilityAcknowledgements',
   'backlog.labelColors',
   'agent.cliPaths',
   'agent.executionServers',
@@ -213,6 +214,17 @@ export class ConfigManager {
     fs.mkdirSync(dir, { recursive: true });
     const configPath = path.join(dir, 'config.json');
     fs.writeFileSync(configPath, JSON.stringify(overrides, null, 2));
+  }
+
+  acknowledgeProjectCompatibility(projectPath: string, acknowledgementId: string): void {
+    const overrides = this.loadProjectOverrides(projectPath) ?? {};
+    this.saveProjectOverrides(projectPath, {
+      ...overrides,
+      compatibilityAcknowledgements: {
+        ...overrides.compatibilityAcknowledgements,
+        [acknowledgementId]: true,
+      },
+    });
   }
 
   /** Extract the project-overridable subset of the current global config.
