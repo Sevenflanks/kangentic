@@ -209,6 +209,7 @@ function makeContext(overrides: Record<string, unknown> = {}) {
       scheduleKeystrokes: vi.fn(),
     },
     projectRepo: { getById: vi.fn(() => ({ id: 'proj-abort-test', default_agent: 'claude' })) },
+    compatibilityRequirements: { clearTask: vi.fn() },
     ...overrides,
   };
   return context;
