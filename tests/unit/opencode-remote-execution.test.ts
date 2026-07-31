@@ -19,14 +19,13 @@ import { describe, it, expect, vi } from 'vitest';
 import {
   OpenCodeAdapter,
   OpenCodeCommandBuilder,
-  RemoteOpenCodeAttachPrimaryAgentUnsupportedError,
 } from '../../src/main/agent/adapters/opencode';
 import { OpenCodeSessionHistoryParser } from '../../src/main/agent/adapters/opencode/session-history-parser';
 import { mapOpenCodeRemoteEntries } from '../../src/main/agent/adapters/opencode/transcript-parser';
 import { probeOpenCodeServer, fetchOpenCodeSessionMessages, type FetchLike } from '../../src/main/agent/adapters/opencode/remote-client';
 import { resolveExecutionTarget } from '../../src/main/agent/shared/execution-target';
 import type { SpawnCommandOptions } from '../../src/main/agent/agent-adapter';
-import type { AgentExecutionServer, ResolvedExecutionTarget } from '../../src/shared/types';
+import type { AgentExecutionServer, PermissionMode, ResolvedExecutionTarget } from '../../src/shared/types';
 
 const REMOTE_TARGET: ResolvedExecutionTarget = {
   url: 'http://10.0.0.5:4096',
@@ -108,21 +107,33 @@ describe('OpenCodeCommandBuilder - remote attach', () => {
     expect(command).not.toContain('--model');
   });
 
-  it('resumes via --session and omits the prompt, mirroring local resume', () => {
-    const command = builder.buildOpenCodeCommand({
-      opencodePath: '/usr/bin/opencode',
-      taskId: 'task-001',
-      cwd: '/home/dev/kangentic-worktree',
-      permissionMode: 'default',
-      resume: true,
-      sessionId: 'ses_abc123',
-      prompt: 'this should be dropped',
-      executionTarget: REMOTE_TARGET,
-    });
-    expect(command).toContain('--session');
-    expect(command).toContain('ses_abc123');
-    expect(command).not.toContain('--prompt');
-    expect(command).not.toContain('this should be dropped');
+  it('resumes without prompt or --agent regardless of PermissionMode', () => {
+    const permissionModes: PermissionMode[] = [
+      'default',
+      'plan',
+      'dontAsk',
+      'acceptEdits',
+      'auto',
+      'bypassPermissions',
+    ];
+
+    for (const permissionMode of permissionModes) {
+      const command = builder.buildOpenCodeCommand({
+        opencodePath: '/usr/bin/opencode',
+        taskId: 'task-001',
+        cwd: '/home/dev/kangentic-worktree',
+        permissionMode,
+        resume: true,
+        sessionId: 'ses_abc123',
+        prompt: 'this should be dropped',
+        executionTarget: REMOTE_TARGET,
+      });
+      expect(command).toContain('--session');
+      expect(command).toContain('ses_abc123');
+      expect(command).not.toContain('--prompt');
+      expect(command).not.toContain('this should be dropped');
+      expect(command).not.toContain('--agent');
+    }
   });
 
   it('emits only documented flags for a fresh attach and keeps the prompt out of the command', () => {
@@ -138,27 +149,26 @@ describe('OpenCodeCommandBuilder - remote attach', () => {
     expect(command).not.toContain('prompt-token-0b1ea74f');
   });
 
-  it('rejects a remote Plan request because attach cannot select a primary agent', () => {
-    expect(() => builder.buildOpenCodeCommand({
-      opencodePath: '/usr/bin/opencode',
-      taskId: 'task-001',
-      cwd: '/home/dev/kangentic-worktree',
-      permissionMode: 'plan',
-      executionTarget: REMOTE_TARGET,
-    })).toThrowError(RemoteOpenCodeAttachPrimaryAgentUnsupportedError);
-  });
+  it('never derives --agent from PermissionMode for a fresh attach', () => {
+    const permissionModes: PermissionMode[] = [
+      'default',
+      'plan',
+      'dontAsk',
+      'acceptEdits',
+      'auto',
+      'bypassPermissions',
+    ];
 
-  it('rejects a remote Build request because attach cannot select a primary agent', () => {
-    expect(() => builder.buildOpenCodeCommand({
-      opencodePath: '/usr/bin/opencode',
-      taskId: 'task-001',
-      cwd: '/home/dev/kangentic-worktree',
-      permissionMode: 'acceptEdits',
-      executionTarget: REMOTE_TARGET,
-    })).toThrowError(expect.objectContaining({
-      code: 'OPENCODE_REMOTE_ATTACH_PRIMARY_AGENT_UNSUPPORTED',
-      requestedAgent: 'build',
-    }));
+    for (const permissionMode of permissionModes) {
+      const command = builder.buildOpenCodeCommand({
+        opencodePath: '/usr/bin/opencode',
+        taskId: 'task-001',
+        cwd: '/home/dev/kangentic-worktree',
+        permissionMode,
+        executionTarget: REMOTE_TARGET,
+      });
+      expect(command).not.toContain('--agent');
+    }
   });
 
   it('does not install the activity plugin in remote mode', () => {

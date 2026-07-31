@@ -208,7 +208,7 @@ export function registerSessionHandlers(context: IpcContext): void {
             resolvedProjectId, resolvedProjectPath,
           );
 
-          await spawnAgent({
+          const spawnOutcome = await spawnAgent({
             context,
             engine,
             tasks,
@@ -224,6 +224,8 @@ export function registerSessionHandlers(context: IpcContext): void {
               ? { kind: 'explicit-resume' }
               : { kind: 'explicit-resume', resumePrompt },
           });
+
+          if (spawnOutcome.kind === 'compatibility-required') return null;
 
           const updated = tasks.getById(taskId);
           if (!updated?.session_id) throw new Error('Session resume failed - no session_id on task');

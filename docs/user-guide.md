@@ -17,7 +17,7 @@ New projects start with seven columns:
 | Column | Role | Behavior |
 |--------|------|----------|
 | **To Do** | todo | Holding area. No agent runs here. Moving a task here deletes its session history and worktree; the branch is also deleted when **git.autoCleanup** is enabled. |
-| **Planning** | (plan mode) | Spawns the resolved adapter in plan mode. The adapter creates a plan, then the task auto-moves to Executing. |
+| **Planning** | (board column) | Spawns the resolved adapter with the column's settings. OpenCode keeps primary-agent selection in its runtime config. |
 | **Executing** | (auto) | Spawns the resolved adapter in its default permission mode. The adapter works on the task. |
 | **Code Review** | (auto) | Agent keeps running. Can attach an auto-command for review prompts. |
 | **Tests** | (auto) | Agent keeps running. Can attach an auto-command (e.g. open a PR and drive its checks green). |
@@ -95,6 +95,22 @@ Drag a task from To Do to any active column (Planning, Executing, etc.). Kangent
 1. Create a git worktree for the task (if worktrees are enabled)
 2. Resolve an adapter through task, column, project, and global precedence, then start it through the shared spawn pipeline with the task title and description as the prompt
 3. The task card shows a spinner while the agent is thinking
+
+#### OpenCode Runtime Default
+
+OpenCode 在 Kangentic 只顯示 `Runtime Default`。Kangentic 不提供 `plan` 或 `build` picker，也不會把它們送成 OpenCode primary agent。OpenCode runtime config 仍是 primary-agent selection 的來源；Kangentic 的 `Agent` 選項仍代表 CLI adapter。其他 adapters 的 generic permission 設定不受影響。
+
+若 OpenCode 使用非 `default` 的 legacy permission，第一次 spawn 或 resume 會先顯示 inline compatibility card。選擇 action 後，確認值會寫入目前專案的 `<project>/.kangentic/config.json`：
+
+```json
+"compatibilityAcknowledgements": {
+  "opencode-runtime-default-v1": true
+}
+```
+
+Board 上的 action 會先把 acknowledgement 寫入互動當下 captured 的明確 `projectId`，然後對原本的操作做一次 ordinary automatic retry；切換專案不會寫到錯誤專案。若 task 或 project lifecycle 已改變，retry 會被判定為 `superseded` 且不 spawn。global acknowledgement 會由 project effective config 繼承。Board fresh、explicit resume，以及 app startup 的 fresh、resume 都共用這個 gate。startup acknowledgement 只解除 gate，不會自動 spawn 或 recovery。若 startup resume 被阻擋，resumable record 與 suspended placeholder 會保留，請按 **Resume**；fresh 操作不會建立 session，請手動重新觸發。刪除 task，包含 bulk delete，也會清掉 pending compatibility card、placeholder 與 retry state。
+
+P0 不包含 permission picker、discovery、`nativeAgent`、role switching、permission migration、SQLite migration 或 remote prompt transport。
 
 ### Monitor Progress
 

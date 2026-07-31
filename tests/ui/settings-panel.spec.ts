@@ -600,45 +600,75 @@ test.describe('Settings Panel', () => {
     }
   });
 
-  test('permission mode dropdown shows OpenCode-specific modes after switching to OpenCode agent', async () => {
+  test('selecting a non-policy adapter resets a shared permission mode to its default', async () => {
     await openSettings();
     await page.getByRole('button', { name: 'Agent', exact: true }).click();
 
-    // Switch default agent to OpenCode via the Default Agent combobox.
     const agentInput = page.locator('input[data-testid="project-default-agent"]');
-    await agentInput.click();
-    await page.locator('[data-testid="project-default-agent-option-opencode"]').click();
+    const permInput = page.locator('input[data-testid="agent-permission-mode"]');
+    const storedProjectPermissionMode = () => page.evaluate(async () => {
+      const overrides = await window.electronAPI.config.getProjectOverrides();
+      return overrides?.agent?.permissionMode ?? null;
+    });
 
-    // Cleanup MUST run even if the assertions below throw - otherwise a
-    // failing assertion would leak the OpenCode-default into subsequent tests
-    // and produce confusing cascading failures. try/finally is the only
-    // way to guarantee restoration in Playwright tests that mutate shared
-    // app state (this test fixture uses module-scoped page + beforeAll).
     try {
-      const permRow = page.locator('div:has(> input[data-testid="agent-permission-mode"])');
-      const permInput = page.locator('input[data-testid="agent-permission-mode"]');
+      // Given Claude's `plan` mode, which Kimi also supports.
+      await permInput.click();
+      await page.getByTestId('agent-permission-mode-option-plan').click();
+      await expect.poll(storedProjectPermissionMode, { timeout: 3000 }).toBe('plan');
 
-      // OpenCode exposes exactly 2 modes: Plan and Build (trimmed from the
-      // original 4-entry Claude-shaped list). Verify exact order and no extras.
+      // When selecting Kimi, which does not declare the preservation policy.
+      await agentInput.click();
+      await page.getByTestId('project-default-agent-option-kimi').click();
+
+      // Then the saved project payload uses Kimi's declared default, not `plan`.
+      await expect.poll(storedProjectPermissionMode, { timeout: 3000 }).toBe('default');
+      await expect(permInput).toHaveValue('Default (Confirm Actions)');
+    } finally {
+      await agentInput.click();
+      await page.getByTestId('project-default-agent-option-claude').click();
+      await closeSettings();
+    }
+  });
+
+  test('selecting OpenCode preserves the stored project permission mode', async () => {
+    await openSettings();
+    await page.getByRole('button', { name: 'Agent', exact: true }).click();
+
+    const agentInput = page.locator('input[data-testid="project-default-agent"]');
+    const permRow = page.locator('div:has(> input[data-testid="agent-permission-mode"])');
+    const permInput = page.locator('input[data-testid="agent-permission-mode"]');
+    const storedProjectPermissionMode = () => page.evaluate(async () => {
+      const overrides = await window.electronAPI.config.getProjectOverrides();
+      return overrides?.agent?.permissionMode ?? null;
+    });
+    const originalPermissionMode = await storedProjectPermissionMode();
+
+    try {
+      await permInput.click();
+      await page.getByTestId('agent-permission-mode-option-acceptEdits').click();
+      await expect.poll(storedProjectPermissionMode, { timeout: 3000 }).toBe('acceptEdits');
+
+      await agentInput.click();
+      await page.locator('[data-testid="project-default-agent-option-opencode"]').click();
+
       await expect.poll(async () => {
         await permInput.click();
-        const texts = await page.locator('[data-combobox-option]').allTextContents();
-        // Close via the chevron toggle, not Escape - see the Kimi test above.
+        const texts = await page.getByTestId('agent-permission-mode-menu').locator('[data-combobox-option]').allTextContents();
         await permRow.locator('button[title="Close dropdown"]').click();
         return texts;
       }, { timeout: 3000 }).toEqual([
-        'Plan',
-        'Build',
+        'Runtime Default',
       ]);
-
-      // The OpenCode adapter declares "acceptEdits" as its defaultPermission.
-      // After switching the agent, the permission mode should be set to
-      // "acceptEdits" - shown here as its label (see the Kimi test above).
-      await expect(permInput).toHaveValue('Build');
+      await expect.poll(storedProjectPermissionMode, { timeout: 3000 }).toBe('acceptEdits');
     } finally {
-      // Restore to Claude so later tests are unaffected.
       await agentInput.click();
       await page.locator('[data-testid="project-default-agent-option-claude"]').click();
+      if (originalPermissionMode) {
+        await permInput.click();
+        await page.getByTestId(`agent-permission-mode-option-${originalPermissionMode}`).click();
+        await expect.poll(storedProjectPermissionMode, { timeout: 3000 }).toBe(originalPermissionMode);
+      }
       await closeSettings();
     }
   });

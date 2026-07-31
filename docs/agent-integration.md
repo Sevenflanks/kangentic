@@ -566,6 +566,26 @@ Caller-owned via `--session-id <uuid>`, mirroring Claude. `supportsCallerSession
 
 ## OpenCode
 
+### Runtime Default Compatibility
+
+OpenCode 在 Kangentic 的 permission surface 只有 `Runtime Default`。Kangentic 不會從 `plan` 或 `build` 推導或送出 primary agent，也不會在 local 或 remote、fresh 或 resume session 中覆寫 OpenCode runtime 的 primary-agent selection。這項選擇由 OpenCode runtime config 負責。Kangentic 的 `Agent` 仍只代表要使用的 CLI adapter。
+
+通用的 permission mode 仍會照常儲存，並繼續套用到其他 adapters。若 effective agent 是 OpenCode、resolved permission 是非 `default` 的 legacy permission，且目前專案尚未確認相容性，shared spawn preamble 會在 `detect`、trust、session directory、transition 與 PTY 之前阻擋 spawn。global acknowledgement 會被 effective project config 正規化後繼承到專案；專案也可以用自己的 acknowledgement 覆寫。明確的 project-targeted action 只會寫入該專案的 `<project>/.kangentic/config.json`：
+
+```json
+{
+  "compatibilityAcknowledgements": {
+    "opencode-runtime-default-v1": true
+  }
+}
+```
+
+阻擋狀態可由 inline card action resolve，之後沿原始 lifecycle 進行一次 ordinary automatic retry。acknowledgement 先寫入 captured、明確的 `projectId`；互動期間切換專案不會把它寫到另一個專案。Board fresh、explicit resume，以及 startup fresh、startup resume 都經過同一個 gate。startup acknowledgement 只解除 startup gate，不會自動 spawn 或 recovery：startup resume 被阻擋時保留可恢復的 session record 與 suspended placeholder，使用者必須手動 Resume；startup fresh 被阻擋時保持無 session，必須手動重新觸發。若 retry 前 task 或 project lifecycle 已變更，retry 會被判定為 `superseded`，不會 spawn 錯誤目標。
+
+Task delete 會清除該 task 的 compatibility requirement、placeholder 與 pending retry state；bulk delete 使用相同的 cleanup 規則。
+
+P0 不提供 permission picker、permission discovery、`nativeAgent`、role switching、permission migration、SQLite migration 或 remote prompt transport。`compatibility:list`、`compatibility:get`、`compatibility:resolve`、`compatibility:changed` 只支援這個相容性 acknowledgement flow。
+
 ### CLI Detection
 
 `config.agent.cliPaths.opencode` override, then `PATH` lookup for `opencode` (with the `.cmd` shim on Windows for `npm i -g opencode-ai` installs), then the standard Unix fallback paths. Distributed via Homebrew, Scoop, Chocolatey, Pacman, the curl|sh installer, and `npm i -g opencode-ai` - all install methods publish the same `opencode` binary name. The version probe runs `opencode --version` and strips an optional `opencode ` product prefix from the output.
@@ -588,7 +608,7 @@ opencode [--session <id>]
 
 ### Permission Modes
 
-The `permissions` list exposes two entries in OpenCode's own vocabulary: `plan` (label "Plan", OpenCode's built-in read-only agent) and `acceptEdits` (label "Build", full tool access). On fresh spawns, `plan` maps to `--agent plan` and `acceptEdits` maps to `--agent build`; historical `bypassPermissions` also maps to `--agent build`, while `default`, `dontAsk`, and `auto` omit `--agent`. Resume also omits `--agent` to preserve the user's runtime Tab selection. There is no `--dangerously-skip-permissions` flag in TUI mode (it exists only on the non-interactive `opencode run` subcommand), and agent-level tool permissions remain OpenCode-native. Users who want auto-approval must enable it in `opencode.json`. The default mode is `acceptEdits`.
+OpenCode 的 primary-agent selection 完全由 runtime config 負責。Kangentic 不將 `plan` 或 `build` 暴露為 OpenCode product permission，也不在 command 或 resume path 發送 `--agent plan`、`--agent build`。OpenCode 的 tool permission 仍由 OpenCode 自己的 runtime config 管理；Kangentic 不提供 picker、discovery 或 permission migration。
 
 ### Settings Merge
 

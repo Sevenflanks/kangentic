@@ -15,6 +15,7 @@ import type { TranscriptionService } from '../transcription/transcription-servic
 import type { MobileBridgeService } from '../mobile-bridge/mobile-bridge-service';
 import type { BoardEventBus } from '../mobile-bridge/board-event-bus';
 import type { DesktopNotifier } from '../notifications/desktop-notifier';
+import type { CompatibilityRequirementCoordinator } from '../compatibility/compatibility-requirement-coordinator';
 
 export interface IpcContext {
   mainWindow: BrowserWindow;
@@ -103,4 +104,5 @@ export interface IpcContext {
    * src/main/notifications/desktop-notifier.ts.
    */
   desktopNotifier: DesktopNotifier;
+  compatibilityRequirements: CompatibilityRequirementCoordinator;
 }

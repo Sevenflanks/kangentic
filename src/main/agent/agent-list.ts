@@ -55,6 +55,8 @@ async function buildAgentList(
         authenticated,
         permissions: adapter.permissions,
         defaultPermission: adapter.defaultPermission,
+        preserveLegacyPermissionOnAgentSelection:
+          adapter.preserveLegacyPermissionOnAgentSelection,
         liveTelemetryUnsupported: adapter.liveTelemetryUnsupported,
         reportsRateLimits: adapter.reportsRateLimits,
         pastedImageReferenceTemplate: adapter.pastedImageReferenceTemplate,

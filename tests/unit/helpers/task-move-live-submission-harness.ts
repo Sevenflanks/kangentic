@@ -47,6 +47,7 @@ function shouldConsumeTaskAutoCommand(outcome: AutoCommandImmediateOutcome): boo
     case 'skipped':
       return outcome.reason !== 'native-evidence-unavailable';
     case 'not-applicable':
+    case 'compatibility-required':
       return false;
     default: {
       const exhaustiveOutcome: never = outcome;
@@ -240,4 +241,5 @@ export const context = {
   configManager: { getEffectiveConfig: vi.fn(() => ({ git: { defaultBaseBranch: 'main' }, agent: { permissionMode: 'auto' } })) },
   boardConfigManager: { getDefaultBaseBranch: vi.fn(() => null) },
   projectRepo: { getById: vi.fn(() => state.project) },
+  compatibilityRequirements: { clearTask: vi.fn() },
 };

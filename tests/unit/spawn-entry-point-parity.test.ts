@@ -56,9 +56,6 @@ const SOURCE_EXTENSIONS = new Set(['.ts', '.tsx']);
 const ENGINE_SINK_FILES: Record<string, string> = {
   'src/main/ipc/helpers/agent-spawn.ts':
     'spawnAgent: the shared board-spawn chokepoint itself; runs runSpawnPreamble before every engine call',
-  'src/main/ipc/handlers/session-reconcile.ts':
-    'restartSessionForSettingsChange: suspend-and-respawn in place to apply CLI flags to an EXISTING '
-    + 'session; not a first-spawn entry point',
 };
 
 /**
@@ -191,16 +188,22 @@ describe('spawn entry-point parity: chokepoints actually run the shared preamble
     ).toBe(true);
   });
 
-  it.each([
-    'src/main/transition-engine/transition-engine.ts',
-    'src/main/transition-engine/session-startup/prepare-spawn.ts',
-  ])('%s resolves permission via resolveEffectivePermissionMode(', (relativePath) => {
+  it('transition-engine.ts resolves permission via resolveEffectivePermissionMode(', () => {
+    const relativePath = 'src/main/transition-engine/transition-engine.ts';
     expect(
       fileHasNonCommentCall(relativePath, 'resolveEffectivePermissionMode'),
       `${relativePath} must resolve the effective permission mode via `
         + `resolveEffectivePermissionMode() (lane 'plan' always wins, else task -> lane -> global) `
         + `instead of an inline ternary. See ${ROOT_GUIDANCE_FILE}.`,
     ).toBe(true);
+  });
+
+  it('prepare-spawn.ts consumes the preamble permission decision', () => {
+    const source = fs.readFileSync(
+      path.join(REPO_ROOT, 'src/main/transition-engine/session-startup/prepare-spawn.ts'),
+      'utf-8',
+    );
+    expect(source.includes('const { agent, permissionMode } = preamble;')).toBe(true);
   });
 
   it.each([

@@ -143,6 +143,12 @@ export const IPC = {
   // no payload; subscribers re-fetch via config:get.
   CONFIG_CHANGED: 'config:changed',
 
+  // Compatibility requirements
+  COMPATIBILITY_LIST: 'compatibility:list',
+  COMPATIBILITY_GET: 'compatibility:get',
+  COMPATIBILITY_RESOLVE: 'compatibility:resolve',
+  COMPATIBILITY_CHANGED: 'compatibility:changed',
+
   // Keybindings
   KEYBINDINGS_PROBE_GLOBAL: 'keybindings:probeGlobal',
 

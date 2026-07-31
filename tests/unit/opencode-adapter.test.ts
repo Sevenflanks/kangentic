@@ -106,21 +106,13 @@ describe('OpenCode Adapter', () => {
       }
     });
 
-    it('declares only OpenCode-native permission options (Plan and Build)', () => {
-      // OpenCode's autonomy is expressed through agents, not the
-      // Claude-shaped 4-mode union. The dropdown should only offer
-      // OpenCode's native vocabulary so users do not pick modes
-      // (default / bypassPermissions / dontAsk / auto) that have no
-      // distinct OpenCode meaning.
+    it('declares only the runtime-default permission option', () => {
       const entries = adapter.permissions.map((entry) => ({ mode: entry.mode, label: entry.label }));
-      expect(entries).toEqual([
-        { mode: 'plan', label: 'Plan' },
-        { mode: 'acceptEdits', label: 'Build' },
-      ]);
+      expect(entries).toEqual([{ mode: 'default', label: 'Runtime Default' }]);
     });
 
-    it('uses acceptEdits (Build) as default permission', () => {
-      expect(adapter.defaultPermission).toBe('acceptEdits');
+    it('uses the runtime default as its default permission', () => {
+      expect(adapter.defaultPermission).toBe('default');
     });
   });
 
@@ -141,37 +133,20 @@ describe('OpenCode Adapter', () => {
       }
     });
 
-    describe('--agent flag (permission mode → OpenCode primary agent)', () => {
-      // Agent names "plan" and "build" have no whitespace, so quoteArg
-      // emits them bare on every platform. Asserting on the literal
-      // unquoted form keeps the tests platform-agnostic.
+    it('never emits --agent for a fresh command regardless of PermissionMode', () => {
+      const permissionModes: PermissionMode[] = [
+        'default',
+        'plan',
+        'dontAsk',
+        'acceptEdits',
+        'auto',
+        'bypassPermissions',
+      ];
 
-      it('emits --agent plan for the plan permission mode', () => {
-        const command = adapter.buildCommand(makeOptions({ permissionMode: 'plan', prompt: 'go' }));
-        expect(command).toContain('--agent plan');
-      });
-
-      it('emits --agent build for acceptEdits', () => {
-        const command = adapter.buildCommand(makeOptions({ permissionMode: 'acceptEdits', prompt: 'go' }));
-        expect(command).toContain('--agent build');
-      });
-
-      it('emits --agent build for bypassPermissions', () => {
-        const command = adapter.buildCommand(makeOptions({ permissionMode: 'bypassPermissions', prompt: 'go' }));
-        expect(command).toContain('--agent build');
-      });
-
-      it('omits --agent for default mode (defers to user opencode.json default_agent)', () => {
-        const command = adapter.buildCommand(makeOptions({ permissionMode: 'default', prompt: 'go' }));
+      for (const permissionMode of permissionModes) {
+        const command = adapter.buildCommand(makeOptions({ permissionMode, prompt: 'go' }));
         expect(command).not.toContain('--agent');
-      });
-
-      it('omits --agent for non-OpenCode modes that may leak through (dontAsk, auto)', () => {
-        for (const permissionMode of ['dontAsk', 'auto'] as PermissionMode[]) {
-          const command = adapter.buildCommand(makeOptions({ permissionMode, prompt: 'go' }));
-          expect(command).not.toContain('--agent');
-        }
-      });
+      }
     });
   });
 
@@ -187,18 +162,24 @@ describe('OpenCode Adapter', () => {
       expect(command).not.toContain('current resume prompt');
     });
 
-    it('omits --agent on resume so the user\'s runtime Tab choice is preserved', () => {
-      // Even when permissionMode is 'plan', resuming an existing
-      // OpenCode session must not force --agent. The saved session
-      // already has an active agent and the user may have Tab-switched
-      // to a different one mid-conversation. Forcing --agent here
-      // would shadow that runtime choice.
-      const command = adapter.buildCommand(makeOptions({
-        resume: true,
-        sessionId: 'ses_abc123def456',
-        permissionMode: 'plan',
-      }));
-      expect(command).not.toContain('--agent');
+    it('never emits --agent on resume regardless of PermissionMode', () => {
+      const permissionModes: PermissionMode[] = [
+        'default',
+        'plan',
+        'dontAsk',
+        'acceptEdits',
+        'auto',
+        'bypassPermissions',
+      ];
+
+      for (const permissionMode of permissionModes) {
+        const command = adapter.buildCommand(makeOptions({
+          resume: true,
+          sessionId: 'ses_abc123def456',
+          permissionMode,
+        }));
+        expect(command).not.toContain('--agent');
+      }
     });
   });
 
@@ -589,7 +570,7 @@ describe('OpenCode Adapter', () => {
       return sourcePath;
     }
 
-    it('writes a private exclusive fresh payload and keeps its prompt out of command and environment values', () => {
+    it('writes a private exclusive fresh payload without agent and keeps its prompt out of command and environment values', () => {
       const writeFileSync = vi.spyOn(fs, 'writeFileSync');
       const chmodSync = vi.spyOn(fs, 'chmodSync');
       const preparation = adapter.prepareInitialPrompt(freshPreparationInput({
@@ -611,7 +592,6 @@ describe('OpenCode Adapter', () => {
         version: 1,
         mode: 'fresh',
         prompt: 'adapter-owned prompt',
-        agent: 'plan',
         model: { providerID: 'anthropic', modelID: 'claude-sonnet' },
       });
       expect(writeFileSync).toHaveBeenCalledWith(

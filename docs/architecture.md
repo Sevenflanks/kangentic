@@ -235,6 +235,14 @@ Build-excluded from production via `__KANGENTIC_DEV__` (esbuild dead-code elimin
 | `config:syncDefaultToProjects` | invoke | Sync default config values to all project configs |
 | `config:changed` | on | Bare-signal event fanned to every window (main + open pop-outs) after any `config:set` persists; subscribers re-fetch via `config:get` so theme/settings sync live across windows |
 
+### Compatibility (4 channels)
+| Channel | Pattern | Purpose |
+|---------|---------|---------|
+| `compatibility:list` | invoke | List pending project-scoped compatibility requirements |
+| `compatibility:get` | invoke | Get one pending requirement for a project |
+| `compatibility:resolve` | invoke | Persist the project acknowledgement and retry the blocked lifecycle |
+| `compatibility:changed` | on | Notify the renderer that pending requirements changed for a project |
+
 ### Keybindings (1 channel)
 | Channel | Pattern | Purpose |
 |---------|---------|---------|
@@ -479,6 +487,10 @@ Repositories follow a simple pattern -- one class per table, all queries are syn
 4. **Global fallback** - `'claude'`
 
 This function is used by task-move (to detect cross-agent handoff), session-recovery (to respawn with the correct agent), and agent-spawn (to build the right CLI command).
+
+OpenCode 的 product permission surface 只有 `Runtime Default`。Kangentic 不從 `plan` 或 `build` 推導或發送 primary agent，因為 primary-agent selection 屬於 OpenCode runtime config。`Agent` 在 Kangentic 仍表示 CLI adapter，generic permission 仍保留給其他 adapters。
+
+所有 task-agent spawn 都先通過 `runSpawnPreamble()`: 它解析 effective agent 與 permission，若是 OpenCode 加上非 `default` 的 legacy permission 且 effective project config 沒有 `compatibilityAcknowledgements["opencode-runtime-default-v1"] = true`，就在 `detect`、trust、session directory、transition 與 PTY 之前回傳 compatibility-required。global acknowledgement 會在 config normalization 時繼承到 effective project config；inline action 的 acknowledgement 則以 captured `projectId` 明確寫入目標專案的 `<project>/.kangentic/config.json`。這個 gate 同時涵蓋 board fresh、explicit resume、startup fresh 與 startup resume。board action 會沿原始 lifecycle ordinary automatic retry 一次；startup acknowledgement 只解除 startup gate，不會自動 spawn 或 recovery。阻擋的 startup resume 保留 resumable record 與 suspended placeholder，使用者必須手動 Resume；fresh 則無 session，必須手動重新觸發。若 task 或 project lifecycle 已變更，stale retry 會被判定為 `superseded`，不會 spawn。task delete 與 bulk delete 會清除 pending requirement、placeholder 與 retry state。
 
 ### Board Profiles (the column tier)
 

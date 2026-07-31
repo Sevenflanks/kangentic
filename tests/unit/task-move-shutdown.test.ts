@@ -295,6 +295,7 @@ function makeContext(
     projectRepo: {
       getById: vi.fn(() => ({ id: 'proj-test', default_agent: 'claude' })),
     },
+    compatibilityRequirements: { clearTask: vi.fn() },
   };
 
   mockGetProjectRepos.mockReturnValue({

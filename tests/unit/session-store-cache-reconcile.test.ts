@@ -546,6 +546,41 @@ async function reconcileWith(
   }
 }
 
+/** Temporarily replace sessions.resume for one call, then restore. */
+async function resumeWith(
+  returnValue: Session | null,
+): Promise<Session | null> {
+  const sessionsApi = window.electronAPI.sessions;
+  const original = sessionsApi.resume;
+  sessionsApi.resume = async () => returnValue;
+  try {
+    return await useSessionStore.getState().resumeSession('task-a');
+  } finally {
+    sessionsApi.resume = original;
+  }
+}
+
+describe('resumeSession - null no-op', () => {
+  beforeEach(resetStore);
+
+  it('returns null without changing sessions or activeSessionId when resume() returns null', async () => {
+    const suspended = makeSession({ id: 'sess-suspended', taskId: 'task-a', status: 'suspended' });
+    const active = makeSession({ id: 'sess-active', taskId: 'task-b', status: 'running' });
+    useSessionStore.setState({
+      sessions: [suspended, active],
+      _sessionByTaskId: new Map([['task-a', suspended], ['task-b', active]]),
+      activeSessionId: active.id,
+    });
+
+    const result = await resumeWith(null);
+
+    const state = useSessionStore.getState();
+    expect(result).toBeNull();
+    expect(state.sessions).toEqual([suspended, active]);
+    expect(state.activeSessionId).toBe(active.id);
+  });
+});
+
 describe('reconcileSession - null no-op', () => {
   beforeEach(resetStore);
 

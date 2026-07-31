@@ -32,6 +32,7 @@ function withAutoCommandOutcome(
   switch (autoCommand.kind) {
     case 'scheduled':
     case 'not-applicable':
+    case 'compatibility-required':
       return { ...data, autoCommand };
     case 'skipped':
       return { ...data, autoCommand, warning: autoCommand.warning };

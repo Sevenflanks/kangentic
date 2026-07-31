@@ -236,6 +236,7 @@ function makeDeps(args: {
       getEffectiveConfig: vi.fn(() => ({
         agent: { permissionMode: 'acceptEdits' },
         git: { defaultBaseBranch: 'main' },
+        compatibilityAcknowledgements: { 'opencode-runtime-default-v1': true },
       })),
     },
     // resolveDefaultBaseBranch (git-stats-capture.ts) reads this for the
@@ -592,6 +593,7 @@ describe('spawnAgent auto_command suppression on recovery move out of Done (hand
     });
     vi.mocked(resolveTargetAgent).mockReturnValueOnce({ agent: 'opencode', isHandoff: true });
     vi.mocked(agentRegistry.get)
+      .mockReturnValueOnce(new OpenCodeAdapter())
       .mockReturnValueOnce(new OpenCodeAdapter())
       .mockReturnValueOnce(null)
       .mockReturnValueOnce(new OpenCodeAdapter());

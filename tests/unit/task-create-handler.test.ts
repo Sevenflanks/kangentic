@@ -95,7 +95,9 @@ vi.mock('../../src/main/db/repositories/session-repository', () => ({
 }));
 vi.mock('../../src/main/db/repositories/swimlane-repository', () => ({
   SwimlaneRepository: class {
-    getById = mockSwimlaneRepoGetById;
+    getById(id: string) {
+      return mockSwimlaneRepoGetById(id);
+    }
   },
 }));
 vi.mock('../../src/main/db/repositories/action-repository', () => ({
@@ -234,6 +236,7 @@ interface MockTask {
 
 interface MockSwimlane {
   id: string;
+  name: string;
   role: string | null;
   auto_spawn: boolean;
   auto_command: string | null;
@@ -287,6 +290,9 @@ interface MockContext {
   projectRepo: {
     getById: ReturnType<typeof vi.fn>;
   };
+  compatibilityRequirements: {
+    replace: ReturnType<typeof vi.fn>;
+  };
 }
 
 function createMockTask(id: string, overrides: Partial<MockTask> = {}): MockTask {
@@ -306,6 +312,7 @@ function createMockTask(id: string, overrides: Partial<MockTask> = {}): MockTask
 function createMockSwimlane(id: string, overrides: Partial<MockSwimlane> = {}): MockSwimlane {
   return {
     id,
+    name: `Lane ${id}`,
     role: null,
     auto_spawn: true,
     auto_command: null,
@@ -378,6 +385,9 @@ function createMockContext(overrides: Partial<MockContext> = {}): MockContext {
     },
     projectRepo: {
       getById: vi.fn(() => ({ id: 'proj-123', default_agent: 'claude', default_model: null, default_effort: null })),
+    },
+    compatibilityRequirements: {
+      replace: vi.fn(),
     },
     ...overrides,
   };
@@ -593,7 +603,15 @@ describe('TASK_CREATE handler', () => {
         getPathsForTask: vi.fn(() => []),
       },
     });
-    mockSwimlaneRepoGetById.mockReturnValue(targetLane);
+    mockSwimlaneRepoGetById.mockImplementation((id: string) => (id === targetLane.id
+      ? {
+          id: targetLane.id,
+          role: targetLane.role,
+          auto_spawn: true,
+          auto_command: targetLane.auto_command,
+          permission_mode: targetLane.permission_mode,
+        }
+      : null));
     mockAgentRegistryGet.mockReturnValue({
       sessionType: 'mock-session',
       getAutoCommandDisposition: () => ({
@@ -650,6 +668,63 @@ describe('TASK_CREATE handler', () => {
       autoSpawnForTask(context as never, 'proj-123', task, targetLane.id),
     ).rejects.toThrow('session launch failed');
     expect(taskRepo.clearAutoCommand).not.toHaveBeenCalled();
+  });
+
+  it('returns compatibility-required and logs the acknowledgement wait without success logging', async () => {
+    task = createMockTask('task-mcp-compatibility-required', {
+      auto_command: '/review',
+      swimlane_id: 'lane-doing',
+    });
+    taskRepo = createMockTaskRepo(task);
+    targetLane = createMockSwimlane('lane-doing', { auto_spawn: true });
+    context.projectRepo.getById.mockReturnValue({
+      id: 'proj-123',
+      name: 'Example project',
+      path: '/mock/project',
+      default_agent: 'mock-agent',
+      default_model: null,
+      default_effort: null,
+    });
+    mockDirectGetProjectRepos.mockReturnValue({
+      tasks: taskRepo,
+      actions: {},
+      attachments: {
+        getPathsForTask: vi.fn(() => []),
+      },
+    });
+    mockSwimlaneRepoGetById.mockImplementation((id: string) => (id === targetLane.id ? targetLane : null));
+    const requirement = {
+      requirementId: 'req-123',
+      projectId: 'proj-123',
+      taskId: task.id,
+      acknowledgementId: 'ack-123',
+      title: 'Compatibility acknowledgement needed',
+      description: 'Wait for compatibility acknowledgement before spawning.',
+    };
+    mockDirectRunSpawnPreamble.mockReturnValueOnce({
+      kind: 'compatibility-required',
+      agent: 'mock-agent',
+      isHandoff: false,
+      permissionMode: 'acceptEdits',
+      requirement,
+    });
+
+    const consoleLogSpy = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+
+    const outcome = await autoSpawnForTask(context as never, 'proj-123', task, targetLane.id);
+
+    expect(outcome).toEqual({
+      kind: 'compatibility-required',
+      requirement,
+    });
+    expect(context.compatibilityRequirements.replace).toHaveBeenCalledOnce();
+    expect(consoleLogSpy).toHaveBeenCalledOnce();
+    expect(consoleLogSpy).toHaveBeenCalledWith(
+      `[MCP auto-spawn] Waiting for compatibility acknowledgement for "${task.title}" in ${targetLane.name}`,
+    );
+    expect(consoleLogSpy.mock.calls.some(call => String(call[0]).includes('Spawned agent'))).toBe(false);
+
+    consoleLogSpy.mockRestore();
   });
 
   it('returns the created task even when spawnAgent rejects', async () => {

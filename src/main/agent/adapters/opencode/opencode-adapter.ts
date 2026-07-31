@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { OpenCodeDetector } from './detector';
-import { OpenCodeCommandBuilder, mapPermissionModeToAgent } from './command-builder';
+import { OpenCodeCommandBuilder } from './command-builder';
 import { OpenCodeSessionHistoryParser } from './session-history-parser';
 import { parseOpenCodeTranscript, openCodeTranscriptSourcePath, mapOpenCodeRemoteEntries } from './transcript-parser';
 import { migrateOpenCodeProjectData } from './project-relocation';
@@ -18,6 +18,7 @@ import type {
   SpawnCommandOptions,
   SettingsChangeSpec,
   ParsedTranscript,
+  AdapterCompatibilityRequirement,
 } from '../../agent-adapter';
 import { probeOpenCodeServer, fetchOpenCodeSessionMessages } from './remote-client';
 import type {
@@ -42,13 +43,17 @@ import type {
 
 const INITIAL_PROMPT_PAYLOAD_FILENAME = 'opencode-initial-prompt.json';
 const INITIAL_PROMPT_PAYLOAD_PATH_ENV = 'KANGENTIC_OPENCODE_INITIAL_PROMPT_PATH';
+const RUNTIME_DEFAULT_COMPATIBILITY_REQUIREMENT: AdapterCompatibilityRequirement = {
+  acknowledgementId: 'opencode-runtime-default-v1',
+  title: 'OpenCode runtime default',
+  description: 'OpenCode resolves the runtime permission to its runtime-configured default approval configuration instead of Kangentic permission-mode overrides.',
+};
 
 type OpenCodeInitialPromptPayload =
   | {
       readonly version: 1;
       readonly mode: 'fresh';
       readonly prompt: string;
-      readonly agent?: string;
       readonly model?: { readonly providerID: string; readonly modelID: string };
     }
   | {
@@ -189,25 +194,22 @@ export class OpenCodeAdapter implements AgentAdapter {
       if (boundary) input.nativeIdleEvidence.recordBoundary(input.ptySessionId, boundary);
     }
   }
-  // OpenCode's autonomy is expressed through "agents" (Build, Plan,
-  // and any custom agents the user defines in opencode.json), cycled
-  // at runtime via Tab. We expose those native concepts directly
-  // rather than the Claude-shaped 4-mode union, mapping to OpenCode's
-  // built-in primary agents:
-  //   Plan  -> --agent plan  (built-in: read-only, no edits/bash)
-  //   Build -> --agent build (built-in: full tool access)
-  // The `mode` field reuses existing PermissionMode enum values for
-  // storage compatibility (a swimlane setting set under Claude as
-  // 'acceptEdits' continues to mean "Build" under OpenCode), but the
-  // user-facing label is OpenCode's vocabulary. Historical values
-  // outside this list (`default`, `bypassPermissions`, `dontAsk`,
-  // `auto`) are still handled by mapPermissionModeToAgent for
-  // backward compat with mixed-agent projects.
+  // OpenCode 的 agent 由 runtime config 與 Tab 管理。Kangentic 仍保存通用
+  // `PermissionMode` 供其他 adapter 使用，但不可在此轉成 agent，避免覆寫 runtime default。
   readonly permissions: AgentPermissionEntry[] = [
-    { mode: 'plan', label: 'Plan' },
-    { mode: 'acceptEdits', label: 'Build' },
+    { mode: 'default', label: 'Runtime Default' },
   ];
-  readonly defaultPermission: PermissionMode = 'acceptEdits';
+  readonly defaultPermission: PermissionMode = 'default';
+  readonly preserveLegacyPermissionOnAgentSelection = true;
+
+  getCompatibilityRequirement(permissionMode: PermissionMode): AdapterCompatibilityRequirement | null {
+    if (permissionMode === 'default') return null;
+
+    return {
+      ...RUNTIME_DEFAULT_COMPATIBILITY_REQUIREMENT,
+      description: `OpenCode resolves ${permissionMode} to its runtime-configured default approval configuration instead of Kangentic permission-mode overrides.`,
+    };
+  }
 
   private readonly detector = new OpenCodeDetector();
   private readonly commandBuilder = new OpenCodeCommandBuilder();
@@ -342,7 +344,6 @@ export class OpenCodeAdapter implements AgentAdapter {
       return { delivery: 'terminal-submit' };
     }
     const sourcePath = path.join(input.sessionDirectory, INITIAL_PROMPT_PAYLOAD_FILENAME);
-    const mappedAgent = mapPermissionModeToAgent(input.permissionMode);
     const payload: OpenCodeInitialPromptPayload = input.resume
       ? {
           version: 1,
@@ -354,7 +355,6 @@ export class OpenCodeAdapter implements AgentAdapter {
           version: 1,
           mode: 'fresh',
           prompt: input.prompt,
-          ...(mappedAgent ? { agent: mappedAgent } : {}),
           ...parseOpenCodeModel(input.model),
         };
 

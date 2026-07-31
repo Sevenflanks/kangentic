@@ -12,6 +12,7 @@ import { applyProfileToLane, findTaskProfile } from '../column-strategy';
 import { resolveIsolatedSwimlaneId } from '../session-isolation';
 import { prepareAgentSpawn, type PreparedSpawn } from './prepare-spawn';
 import { startStartupTimer } from './timing';
+import type { CompatibilityRequirementCoordinator } from '../../compatibility/compatibility-requirement-coordinator';
 
 /**
  * Enforce the auto-spawn invariant on project open: find tasks in
@@ -38,8 +39,9 @@ export async function autoSpawnTasks(
   projectDefaultEffort?: string | null,
   /** Board Board Profiles, so a profiled task spawns on its own rung for this column. */
   boardProfiles?: ReadonlyArray<BoardProfile>,
-): Promise<void> {
-  if (isShuttingDown()) return;
+  options: { readonly compatibilityRequirements?: CompatibilityRequirementCoordinator } = {},
+): Promise<number> {
+  if (isShuttingDown()) return 0;
 
   const done = startStartupTimer('autoSpawnTasks', projectId, 'spawned');
   const db = getProjectDb(projectId);
@@ -65,7 +67,7 @@ export async function autoSpawnTasks(
   const lanesToScan = allLanes.filter((lane) => lane.auto_spawn || laneIdsSomeProfileEnables.has(lane.id));
   if (lanesToScan.length === 0) {
     done(0);
-    return;
+    return 0;
   }
 
   // --- Cheap discovery pass: find tasks in active lanes that lack a session.
@@ -93,7 +95,7 @@ export async function autoSpawnTasks(
   }
   if (candidates.length === 0) {
     done(0);
-    return;
+    return 0;
   }
 
   const resolvedShell = await sessionManager.getShell();
@@ -166,10 +168,26 @@ export async function autoSpawnTasks(
       });
 
       if (!prep.ok) {
-        if (prep.reason === 'unknown-agent') {
-          console.warn(`[AUTO_SPAWN] Unknown agent for task ${task.id.slice(0, 8)} -- skipping`);
-        } else {
-          console.warn(`[AUTO_SPAWN] CLI not found for task ${task.id.slice(0, 8)} -- skipping`);
+        switch (prep.reason) {
+          case 'compatibility-required':
+            if (options.compatibilityRequirements) {
+              options.compatibilityRequirements.replace({
+                requirement: prep.requirement,
+                // 相容性確認只解除 startup gate；使用者必須手動重新觸發 task。
+                retry: async () => ({ kind: 'completed' }),
+              });
+            }
+            break;
+          case 'unknown-agent':
+            console.warn(`[AUTO_SPAWN] Unknown agent for task ${task.id.slice(0, 8)} -- skipping`);
+            break;
+          case 'cli-not-found':
+            console.warn(`[AUTO_SPAWN] CLI not found for task ${task.id.slice(0, 8)} -- skipping`);
+            break;
+          default: {
+            const exhaustiveReason: never = prep;
+            return exhaustiveReason;
+          }
         }
         continue;
       }
@@ -191,7 +209,7 @@ export async function autoSpawnTasks(
       });
     }
     done(0);
-    return;
+    return 0;
   }
 
   const spawnResults = await Promise.allSettled(
@@ -279,4 +297,5 @@ export async function autoSpawnTasks(
     console.log(`[AUTO_SPAWN] Spawned ${spawned} session(s) for tasks without agents`);
   }
   done(spawned);
+  return spawned;
 }

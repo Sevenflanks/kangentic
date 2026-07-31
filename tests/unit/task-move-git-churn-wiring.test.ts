@@ -195,6 +195,7 @@ function makeContext(taskRepo: unknown, swimlaneRepo: unknown) {
     boardConfigManager: { getDefaultBaseBranch: vi.fn(() => null) },
     terminalSubmitScheduler: { cancel: vi.fn(), scheduleKeystrokes: vi.fn() },
     projectRepo: { getById: vi.fn(() => ({ id: 'proj-test', default_agent: 'claude' })) },
+    compatibilityRequirements: { clearTask: vi.fn() },
   };
   mockGetProjectRepos.mockReturnValue({
     tasks: taskRepo,

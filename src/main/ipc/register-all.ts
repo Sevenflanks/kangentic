@@ -43,10 +43,12 @@ import { registerTranscriptHandlers } from './handlers/transcripts';
 import { registerMobileBridgeHandlers } from './handlers/mobile-bridge';
 import { registerUsageStatsHandlers } from './handlers/usage-stats';
 import { registerPopOutHandlers } from './handlers/pop-out';
+import { registerCompatibilityHandlers } from './handlers/compatibility';
 import { retrievalService } from '../retrieval/retrieval-service';
 import { MobileBridgeService } from '../mobile-bridge/mobile-bridge-service';
 import { BoardEventBus } from '../mobile-bridge/board-event-bus';
 import { DesktopNotifier } from '../notifications/desktop-notifier';
+import { CompatibilityRequirementCoordinator } from '../compatibility/compatibility-requirement-coordinator';
 import { ActivityIntervalRecorder } from '../activity-engine/activity-interval-recorder';
 import { ActivityIntervalStore } from '../activity-engine/activity-interval-store';
 import { getProjectDb } from '../db/database';
@@ -138,6 +140,14 @@ export function registerAllIpc(mainWindow: BrowserWindow, mcpServerHandle: McpHt
     resolveProjectName: (projectId) => requireContext().projectRepo.getById(projectId)?.name,
     showNotification: (input) => showDesktopNotification(requireContext(), input),
   });
+  const compatibilityRequirements = new CompatibilityRequirementCoordinator({
+    onChanged: (projectId) => {
+      const mainWindow = context?.mainWindow;
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send(IPC.COMPATIBILITY_CHANGED, projectId);
+      }
+    },
+  });
 
   // Lazy-initialize heavy objects on first access
   let projectRepo: ProjectRepository | null = null;
@@ -186,6 +196,7 @@ export function registerAllIpc(mainWindow: BrowserWindow, mcpServerHandle: McpHt
     mobileBridgeService,
     boardEvents,
     desktopNotifier,
+    compatibilityRequirements,
   };
 
   // The bridge needs IpcContext (SessionManager, repos, DiffService,
@@ -237,6 +248,7 @@ export function registerAllIpc(mainWindow: BrowserWindow, mcpServerHandle: McpHt
   registerSystemHandlers(context);
   registerMobileBridgeHandlers(context);
   registerPopOutHandlers(context);
+  registerCompatibilityHandlers(context);
 
   // Start the central embedding engine's background drain loop at boot, not
   // lazily on the first project:open. attach() is idempotent, so the later

@@ -98,7 +98,13 @@ describe('agent adapter auto-command policy contract', () => {
       .sort();
 
     // Then
-    expect(outcomeKinds).toEqual(['not-applicable', 'scheduled', 'scheduled', 'skipped']);
+    expect(outcomeKinds).toEqual([
+      'compatibility-required',
+      'not-applicable',
+      'scheduled',
+      'scheduled',
+      'skipped',
+    ]);
     expect(transports).toEqual(['legacy', 'native-idle']);
     expect(outcomeSource).not.toMatch(/\b(?:delivered|failed)\b/);
     expect(outcomeSource).not.toMatch(/\b(?:policy|fingerprint|nativeEvidence|nativeIdleEvidence|nativeSessionId|rootNativeSessionId|sessionGeneration|inputGeneration|sessionId|command|cwd|path|raw)\b/);

@@ -11,6 +11,7 @@ import type { TransientSessionSlice } from './transient-session-slice';
 import type { RateLimitSnapshot } from '../../utils/rate-limit-window';
 import type { LiveDeliveryStatus } from '../../../shared/live-delivery-status';
 import type { AutoCommandWarning } from '../../../shared/auto-command-outcome';
+import type { SpawnCompatibilitySlice } from './spawn-compatibility-slice';
 
 /** A one-shot capture of a task's terminal scrollback viewport at the moment
  *  its conversation viewer was opened. See `pendingTuiAnchor` below. */
@@ -141,7 +142,7 @@ export interface CoreSessionSlice {
   killSession: (id: string) => Promise<void>;
   resetSession: (taskId: string) => Promise<void>;
   suspendSession: (taskId: string) => Promise<void>;
-  resumeSession: (taskId: string, resumePrompt?: string) => Promise<Session>;
+  resumeSession: (taskId: string, resumePrompt?: string) => Promise<Session | null>;
   /**
    * Probe main's registry for the live session of `taskId` and reconcile
    * the renderer cache. If main returns a live Session (running/queued),
@@ -206,4 +207,4 @@ export interface CoreSessionSlice {
   getQueuePosition: (sessionId: string) => { position: number; total: number } | null;
 }
 
-export type SessionStore = CoreSessionSlice & TaskChangesPanelSlice & TransientSessionSlice;
+export type SessionStore = CoreSessionSlice & TaskChangesPanelSlice & TransientSessionSlice & SpawnCompatibilitySlice;

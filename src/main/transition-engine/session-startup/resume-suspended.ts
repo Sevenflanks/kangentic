@@ -14,6 +14,7 @@ import { isShuttingDown } from '../../shutdown-state';
 import { removeAdapterHooks } from '../../pty/lifecycle/adapter-lifecycle';
 import { prepareAgentSpawn, type PreparedSpawn } from './prepare-spawn';
 import { startStartupTimer } from './timing';
+import type { CompatibilityRequirementCoordinator } from '../../compatibility/compatibility-requirement-coordinator';
 
 /**
  * Recover suspended and orphaned agent sessions on project open.
@@ -46,8 +47,9 @@ export async function resumeSuspendedSessions(
   projectDefaultEffort?: string | null,
   /** Board Board Profiles, so a profiled task resumes on the same rung it spawned under. */
   boardProfiles?: ReadonlyArray<BoardProfile>,
-): Promise<void> {
-  if (isShuttingDown()) return;
+  options: { readonly compatibilityRequirements?: CompatibilityRequirementCoordinator } = {},
+): Promise<number> {
+  if (isShuttingDown()) return 0;
 
   const done = startStartupTimer('resumeSuspendedSessions', projectId, 'resumed');
   const db = getProjectDb(projectId);
@@ -79,7 +81,7 @@ export async function resumeSuspendedSessions(
   const allRecords = [...suspended, ...orphaned, ...interruptedExited];
   if (allRecords.length === 0) {
     done(0);
-    return;
+    return 0;
   }
 
   const now = new Date().toISOString();
@@ -268,7 +270,7 @@ export async function resumeSuspendedSessions(
       );
     }
     done(0);
-    return;
+    return 0;
   }
 
   const config = configManager.getEffectiveConfig(projectPath);
@@ -320,10 +322,29 @@ export async function resumeSuspendedSessions(
       });
 
       if (!prep.ok) {
-        if (prep.reason === 'unknown-agent') {
-          console.warn(`[SESSION_RECOVERY] Unknown agent for task ${task.id.slice(0, 8)} -- skipping`);
-        } else {
-          console.warn(`[SESSION_RECOVERY] CLI not found for task ${task.id.slice(0, 8)} -- skipping`);
+        switch (prep.reason) {
+          case 'compatibility-required':
+            sessionManager.registerSuspendedPlaceholder({ taskId: task.id, projectId, cwd: record.cwd });
+            if (task.session_id) taskRepo.update({ id: task.id, session_id: null });
+            if (options.compatibilityRequirements) {
+              options.compatibilityRequirements.replace({
+                requirement: prep.requirement,
+                // 相容性確認只解除 startup gate；使用者必須手動按 Resume。
+                retry: async () => ({ kind: 'completed' }),
+              });
+            }
+            skipped++;
+            continue;
+          case 'unknown-agent':
+            console.warn(`[SESSION_RECOVERY] Unknown agent for task ${task.id.slice(0, 8)} -- skipping`);
+            break;
+          case 'cli-not-found':
+            console.warn(`[SESSION_RECOVERY] CLI not found for task ${task.id.slice(0, 8)} -- skipping`);
+            break;
+          default: {
+            const exhaustiveReason: never = prep;
+            return exhaustiveReason;
+          }
         }
         retireRecord(sessionRepo, record.id);
         skipped++;
@@ -358,7 +379,7 @@ export async function resumeSuspendedSessions(
       });
     }
     done(0);
-    return;
+    return 0;
   }
 
   const spawnResults = await Promise.allSettled(
@@ -459,4 +480,5 @@ export async function resumeSuspendedSessions(
     );
   }
   done(recovered);
+  return recovered;
 }

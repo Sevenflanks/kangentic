@@ -116,6 +116,7 @@ export async function launchApp(options?: {
   cwd?: string;
   dataDir?: string;
   extraEnv?: Record<string, string>;
+  acknowledgeOpenCodeRuntimeDefault?: boolean;
 }): Promise<{ app: ElectronApplication; page: Page }> {
   const mainEntry = path.join(__dirname, '../../.vite/build/index.js');
 
@@ -153,6 +154,11 @@ export async function launchApp(options?: {
     toasts: { onAgentIdle: false, onAgentCrash: false, onPlanComplete: false, durationSeconds: 4, maxCount: 5 },
     cooldownSeconds: 60,
   };
+  // Ordinary E2E scenarios exercise post-acknowledgement behavior; the gate spec opts out explicitly.
+  const compatibilityAcknowledgements = options?.acknowledgeOpenCodeRuntimeDefault === false
+    ? {}
+    : { 'opencode-runtime-default-v1': true };
+
   try {
     const existing = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
     let changed = false;
@@ -164,11 +170,19 @@ export async function launchApp(options?: {
       existing.notifications = notificationDefaults;
       changed = true;
     }
+    if (options?.acknowledgeOpenCodeRuntimeDefault !== false) {
+      existing.compatibilityAcknowledgements = {
+        ...(existing.compatibilityAcknowledgements ?? {}),
+        ...compatibilityAcknowledgements,
+      };
+      changed = true;
+    }
     if (changed) fs.writeFileSync(configPath, JSON.stringify(existing));
   } catch {
     fs.writeFileSync(configPath, JSON.stringify({
       hasCompletedFirstRun: true,
       notifications: notificationDefaults,
+      compatibilityAcknowledgements,
     }));
   }
 

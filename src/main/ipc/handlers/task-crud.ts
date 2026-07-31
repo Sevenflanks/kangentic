@@ -225,6 +225,9 @@ export function registerTaskCrudHandlers(context: IpcContext): void {
         await cleanupTaskResources(context, task, tasks, resolvedProjectId, resolvedProjectPath);
       }
       tasks.delete(id);
+      if (resolvedProjectId) {
+        context.compatibilityRequirements.clearTask(resolvedProjectId, id);
+      }
     });
     drainAutoNameAskedIds(context, [id]);
   });
@@ -309,6 +312,9 @@ export function registerTaskCrudHandlers(context: IpcContext): void {
             // the user sees exactly what needs manual cleanup.
             attachments.deleteByTaskId(id);
             tasks.delete(id);
+            if (resolvedProjectId) {
+              context.compatibilityRequirements.clearTask(resolvedProjectId, id);
+            }
           });
 
           if (cleanupError) {

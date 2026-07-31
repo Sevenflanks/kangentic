@@ -159,6 +159,7 @@ function makeDeps(args: {
       getEffectiveConfig: vi.fn(() => ({
         agent: { permissionMode: 'acceptEdits' },
         git: { defaultBaseBranch: 'main' },
+        compatibilityAcknowledgements: { 'opencode-runtime-default-v1': true },
       })),
     },
     // resolveDefaultBaseBranch (git-stats-capture.ts) reads this for the
@@ -271,7 +272,9 @@ describe('spawnAgent continuationPrompt delivery', () => {
     const executingLane = makeSwimlane(EXECUTING_LANE_ID, { auto_command: '/implement' });
     const deps = makeDeps({ resumeRecord: makeRecord() });
     vi.mocked(resolveTargetAgent).mockReturnValueOnce({ agent: 'opencode', isHandoff: false });
-    vi.mocked(agentRegistry.get).mockReturnValueOnce(new OpenCodeAdapter());
+    vi.mocked(agentRegistry.get)
+      .mockReturnValueOnce(new OpenCodeAdapter())
+      .mockReturnValueOnce(new OpenCodeAdapter());
 
     await runSpawn(executingLane, deps, CONTINUATION);
 
@@ -284,7 +287,9 @@ describe('spawnAgent continuationPrompt delivery', () => {
     const executingLane = makeSwimlane(EXECUTING_LANE_ID, { auto_command: '/implement' });
     const deps = makeDeps({ resumeRecord: makeRecord(), actionCreatedSession: true });
     vi.mocked(resolveTargetAgent).mockReturnValueOnce({ agent: 'opencode', isHandoff: false });
-    vi.mocked(agentRegistry.get).mockReturnValueOnce(new OpenCodeAdapter());
+    vi.mocked(agentRegistry.get)
+      .mockReturnValueOnce(new OpenCodeAdapter())
+      .mockReturnValueOnce(new OpenCodeAdapter());
 
     // When
     const outcome = await runSpawn(executingLane, deps, ACTION_CONTINUATION);
@@ -303,7 +308,9 @@ describe('spawnAgent continuationPrompt delivery', () => {
     const executingLane = makeSwimlane(EXECUTING_LANE_ID, { auto_command: '/implement' });
     const deps = makeDeps({ resumeRecord: undefined });
     vi.mocked(resolveTargetAgent).mockReturnValueOnce({ agent: 'opencode', isHandoff: false });
-    vi.mocked(agentRegistry.get).mockReturnValueOnce(new OpenCodeAdapter());
+    vi.mocked(agentRegistry.get)
+      .mockReturnValueOnce(new OpenCodeAdapter())
+      .mockReturnValueOnce(new OpenCodeAdapter());
 
     const outcome = await runSpawn(executingLane, deps, undefined);
 

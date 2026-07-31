@@ -2,7 +2,6 @@ export { OpenCodeAdapter } from './opencode-adapter';
 export { OpenCodeDetector } from './detector';
 export {
   OpenCodeCommandBuilder,
-  RemoteOpenCodeAttachPrimaryAgentUnsupportedError,
   type OpenCodeCommandOptions,
 } from './command-builder';
 export { OpenCodeSessionHistoryParser } from './session-history-parser';

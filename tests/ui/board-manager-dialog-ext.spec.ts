@@ -58,6 +58,23 @@ async function closeManager() {
   await dialog.waitFor({ state: 'detached', timeout: 2000 });
 }
 
+async function makeAgentsAvailable(agentNames: string[]) {
+  await page.evaluate(async (names: string[]) => {
+    const pageWindow = window as unknown as {
+      __mockAgentListOverrides?: Record<string, { found: boolean; path: string }>;
+      __zustandStores?: {
+        config?: { getState: () => { loadAgentList: (forceRefresh?: boolean) => Promise<void> } };
+      };
+    };
+    pageWindow.__mockAgentListOverrides = Object.fromEntries(
+      names.map((name) => [name, { found: true, path: `/usr/bin/${name}` }]),
+    );
+    const configStore = pageWindow.__zustandStores?.config;
+    if (!configStore) throw new Error('Config store is not exposed');
+    await configStore.getState().loadAgentList(true);
+  }, agentNames);
+}
+
 test.describe('BoardManagerDialog extended', () => {
   test.afterEach(async () => {
     if (await page.locator('[data-testid="board-manager-dialog"]').isVisible({ timeout: 200 }).catch(() => false)) {
@@ -546,6 +563,225 @@ test.describe('BoardManagerDialog extended', () => {
       const lanes = await window.electronAPI.swimlanes.list();
       const lane = lanes.find((s) => s.name === 'Code Review');
       if (lane) await window.electronAPI.swimlanes.update({ id: lane.id, agent_override: null });
+    });
+  });
+
+  test('selecting OpenCode preserves a column legacy permission in the saved payload', async () => {
+    await makeAgentsAvailable(['opencode']);
+    await openManagerByHeader('Code Review');
+    const dialog = page.locator('[data-testid="board-manager-dialog"]');
+
+    const permissionInput = dialog.locator('input[data-testid="column-permission-mode"]');
+    await permissionInput.click();
+    await page.locator('[data-testid="column-permission-mode-option-acceptEdits"]').click();
+    await expect(permissionInput).toHaveValue('Accept Edits');
+
+    const agentInput = dialog.locator('input[data-testid="column-agent-override"]');
+    await agentInput.click();
+    await page.locator('[data-testid="column-agent-override-option-opencode"]').click();
+    await expect(agentInput).toHaveValue('OpenCode');
+    await expect(permissionInput).toHaveValue('acceptEdits');
+
+    await dialog.locator('[data-testid="board-manager-save"]').click();
+    await dialog.waitFor({ state: 'detached', timeout: 3000 });
+
+    const saved = await page.evaluate(async () => {
+      const lane = (await window.electronAPI.swimlanes.list()).find((candidate) => candidate.name === 'Code Review');
+      return lane ? { agentOverride: lane.agent_override, permissionMode: lane.permission_mode } : null;
+    });
+    expect(saved).toEqual({ agentOverride: 'opencode', permissionMode: 'acceptEdits' });
+
+    await page.evaluate(async () => {
+      const lane = (await window.electronAPI.swimlanes.list()).find((candidate) => candidate.name === 'Code Review');
+      if (!lane) throw new Error('Code Review column is missing');
+      await window.electronAPI.swimlanes.update({ id: lane.id, agent_override: null, permission_mode: null });
+      const stores = (window as unknown as {
+        __zustandStores?: { board?: { getState: () => { loadBoard: () => void } } };
+      }).__zustandStores;
+      stores?.board?.getState().loadBoard();
+    });
+  });
+
+  test('resetting a Claude override to an OpenCode project default preserves the legacy permission payload', async () => {
+    await makeAgentsAvailable(['opencode']);
+    await page.evaluate(async () => {
+      const projects = await window.electronAPI.projects.list();
+      const project = projects[0];
+      if (!project) throw new Error('Current project is missing');
+      await window.electronAPI.projects.setDefaultAgent(project.id, 'opencode');
+
+      const lane = (await window.electronAPI.swimlanes.list()).find((candidate) => candidate.name === 'Code Review');
+      if (!lane) throw new Error('Code Review column is missing');
+      await window.electronAPI.swimlanes.update({
+        id: lane.id,
+        agent_override: 'claude',
+        permission_mode: 'acceptEdits',
+      });
+
+      const stores = (window as unknown as {
+        __zustandStores?: {
+          board?: { getState: () => { loadBoard: () => void } };
+          project?: { getState: () => { loadCurrent: () => Promise<void> } };
+        };
+      }).__zustandStores;
+      if (!stores?.project) throw new Error('Project store is not exposed');
+      await stores.project.getState().loadCurrent();
+      stores.board?.getState().loadBoard();
+    });
+
+    try {
+      await openManagerByHeader('Code Review');
+      const dialog = page.locator('[data-testid="board-manager-dialog"]');
+      const agentInput = dialog.locator('input[data-testid="column-agent-override"]');
+      const permissionInput = dialog.locator('input[data-testid="column-permission-mode"]');
+      await expect(agentInput).toHaveValue('Claude Code');
+      await expect(permissionInput).toHaveValue('Accept Edits');
+
+      await dialog.locator('button[title="Reset to project setting"]').first().click();
+      await expect(agentInput).toHaveValue('');
+      await expect(agentInput).toHaveAttribute('placeholder', 'OpenCode');
+      await expect(permissionInput).toHaveValue('acceptEdits');
+
+      await dialog.locator('[data-testid="board-manager-save"]').click();
+      await dialog.waitFor({ state: 'detached', timeout: 3000 });
+
+      const saved = await page.evaluate(async () => {
+        const lane = (await window.electronAPI.swimlanes.list()).find((candidate) => candidate.name === 'Code Review');
+        return lane ? { agentOverride: lane.agent_override, permissionMode: lane.permission_mode } : null;
+      });
+      expect(saved).toEqual({ agentOverride: null, permissionMode: 'acceptEdits' });
+    } finally {
+      await page.evaluate(async () => {
+        const projects = await window.electronAPI.projects.list();
+        const project = projects[0];
+        if (!project) throw new Error('Current project is missing');
+        await window.electronAPI.projects.setDefaultAgent(project.id, 'claude');
+
+        const lane = (await window.electronAPI.swimlanes.list()).find((candidate) => candidate.name === 'Code Review');
+        if (!lane) throw new Error('Code Review column is missing');
+        await window.electronAPI.swimlanes.update({ id: lane.id, agent_override: null, permission_mode: null });
+
+        const stores = (window as unknown as {
+          __zustandStores?: {
+            board?: { getState: () => { loadBoard: () => void } };
+            project?: { getState: () => { loadCurrent: () => Promise<void> } };
+          };
+        }).__zustandStores;
+        if (!stores?.project) throw new Error('Project store is not exposed');
+        await stores.project.getState().loadCurrent();
+        stores.board?.getState().loadBoard();
+      });
+    }
+  });
+
+  test('resetting a Claude override to a non-policy project default restores that adapter default permission', async () => {
+    await makeAgentsAvailable(['aider']);
+    await page.evaluate(async () => {
+      const projects = await window.electronAPI.projects.list();
+      const project = projects[0];
+      if (!project) throw new Error('Current project is missing');
+      await window.electronAPI.projects.setDefaultAgent(project.id, 'aider');
+
+      const lane = (await window.electronAPI.swimlanes.list()).find((candidate) => candidate.name === 'Code Review');
+      if (!lane) throw new Error('Code Review column is missing');
+      await window.electronAPI.swimlanes.update({
+        id: lane.id,
+        agent_override: 'claude',
+        permission_mode: 'default',
+      });
+
+      const stores = (window as unknown as {
+        __zustandStores?: {
+          board?: { getState: () => { loadBoard: () => void } };
+          project?: { getState: () => { loadCurrent: () => Promise<void> } };
+        };
+      }).__zustandStores;
+      if (!stores?.project) throw new Error('Project store is not exposed');
+      await stores.project.getState().loadCurrent();
+      stores.board?.getState().loadBoard();
+    });
+
+    try {
+      await openManagerByHeader('Code Review');
+      const dialog = page.locator('[data-testid="board-manager-dialog"]');
+      const agentInput = dialog.locator('input[data-testid="column-agent-override"]');
+      const permissionInput = dialog.locator('input[data-testid="column-permission-mode"]');
+      await expect(agentInput).toHaveValue('Claude Code');
+      await expect(permissionInput).toHaveValue('Default (Allowlist)');
+
+      await dialog.locator('button[title="Reset to project setting"]').first().click();
+      await expect(agentInput).toHaveValue('');
+      await expect(agentInput).toHaveAttribute('placeholder', 'Aider');
+      await expect(permissionInput).toHaveValue('Auto-Approve (--yes)');
+
+      await dialog.locator('[data-testid="board-manager-save"]').click();
+      await dialog.waitFor({ state: 'detached', timeout: 3000 });
+
+      const saved = await page.evaluate(async () => {
+        const lane = (await window.electronAPI.swimlanes.list()).find((candidate) => candidate.name === 'Code Review');
+        return lane ? { agentOverride: lane.agent_override, permissionMode: lane.permission_mode } : null;
+      });
+      expect(saved).toEqual({ agentOverride: null, permissionMode: 'bypassPermissions' });
+    } finally {
+      await page.evaluate(async () => {
+        const projects = await window.electronAPI.projects.list();
+        const project = projects[0];
+        if (!project) throw new Error('Current project is missing');
+        await window.electronAPI.projects.setDefaultAgent(project.id, 'claude');
+
+        const lane = (await window.electronAPI.swimlanes.list()).find((candidate) => candidate.name === 'Code Review');
+        if (!lane) throw new Error('Code Review column is missing');
+        await window.electronAPI.swimlanes.update({ id: lane.id, agent_override: null, permission_mode: null });
+
+        const stores = (window as unknown as {
+          __zustandStores?: {
+            board?: { getState: () => { loadBoard: () => void } };
+            project?: { getState: () => { loadCurrent: () => Promise<void> } };
+          };
+        }).__zustandStores;
+        if (!stores?.project) throw new Error('Project store is not exposed');
+        await stores.project.getState().loadCurrent();
+        stores.board?.getState().loadBoard();
+      });
+    }
+  });
+
+  test('switching between non-policy adapters retains existing permission normalization', async () => {
+    await makeAgentsAvailable(['aider']);
+    await openManagerByHeader('Code Review');
+    const dialog = page.locator('[data-testid="board-manager-dialog"]');
+
+    const permissionInput = dialog.locator('input[data-testid="column-permission-mode"]');
+    await permissionInput.click();
+    await page.locator('[data-testid="column-permission-mode-option-dontAsk"]').click();
+    await expect(permissionInput).toHaveValue("Don't Ask (Deny Unless Allowed)");
+
+    const agentInput = dialog.locator('input[data-testid="column-agent-override"]');
+    await agentInput.click();
+    await page.locator('[data-testid="column-agent-override-option-aider"]').click();
+    await expect(permissionInput).toHaveValue('Auto-Approve (--yes)');
+
+    await agentInput.click();
+    await page.locator('[data-testid="column-agent-override-option-claude"]').click();
+    await expect(permissionInput).toHaveValue('Bypass (Unsafe)');
+
+    await dialog.locator('[data-testid="board-manager-save"]').click();
+    await dialog.waitFor({ state: 'detached', timeout: 3000 });
+
+    const saved = await page.evaluate(async () => {
+      const lane = (await window.electronAPI.swimlanes.list()).find((candidate) => candidate.name === 'Code Review');
+      return lane ? { agentOverride: lane.agent_override, permissionMode: lane.permission_mode } : null;
+    });
+    expect(saved).toEqual({ agentOverride: 'claude', permissionMode: 'bypassPermissions' });
+
+    await page.evaluate(async () => {
+      const lane = (await window.electronAPI.swimlanes.list()).find((candidate) => candidate.name === 'Code Review');
+      if (!lane) throw new Error('Code Review column is missing');
+      await window.electronAPI.swimlanes.update({ id: lane.id, agent_override: null, permission_mode: null });
+      const stores = (window as unknown as {
+        __zustandStores?: { board?: { getState: () => { loadBoard: () => void } } };
+      }).__zustandStores;
+      stores?.board?.getState().loadBoard();
     });
   });
 
