@@ -53,6 +53,13 @@ export interface SettingsChangeSpec {
   effortChanged: boolean;
 }
 
+/** Adapter-authored compatibility metadata for a resolved permission mode. */
+export interface AdapterCompatibilityRequirement {
+  readonly acknowledgementId: string;
+  readonly title: string;
+  readonly description: string;
+}
+
 
 /** CLI detection result returned by all agent detectors. */
 export interface AgentInfo {
@@ -187,6 +194,15 @@ export interface AgentAdapter {
 
   /** Recommended default permission mode for this agent. */
   readonly defaultPermission: PermissionMode;
+
+  /** Preserves the existing generic permission mode when this agent is selected. */
+  readonly preserveLegacyPermissionOnAgentSelection?: boolean;
+
+  /**
+   * Returns adapter-authored compatibility context required before using a
+   * resolved permission mode, or null when no acknowledgement is needed.
+   */
+  getCompatibilityRequirement?(permissionMode: PermissionMode): AdapterCompatibilityRequirement | null;
 
   /** Detect whether the agent CLI is installed and return path + version. */
   detect(overridePath?: string | null): Promise<AgentInfo>;

@@ -75,6 +75,7 @@ type MockAdapter = {
   displayName: string;
   permissions: { mode: string; label: string }[];
   defaultPermission: string;
+  preserveLegacyPermissionOnAgentSelection?: boolean;
   detect: () => Promise<{ found: boolean; path: string | null; version: string | null }>;
   probeAuth?: () => Promise<boolean | null>;
   discoverCapabilities?: (cliPath: string, forceRefresh?: boolean) => Promise<unknown>;
@@ -368,6 +369,34 @@ describe('AGENT_LIST IPC handler - probeAuth integration', () => {
     expect(result.version).toBe('1.0.0');
     expect(Array.isArray(result.permissions)).toBe(true);
     expect(result.defaultPermission).toBe('default');
+  });
+
+  it('projects a true legacy-permission selection policy verbatim', async () => {
+    mockRegistryAdapters = [
+      makeAdapter({ name: 'opencode', preserveLegacyPermissionOnAgentSelection: true }),
+    ];
+
+    const results = await invokeAgentList();
+
+    expect(results[0].preserveLegacyPermissionOnAgentSelection).toBe(true);
+  });
+
+  it('projects a false legacy-permission selection policy verbatim', async () => {
+    mockRegistryAdapters = [
+      makeAdapter({ name: 'claude', preserveLegacyPermissionOnAgentSelection: false }),
+    ];
+
+    const results = await invokeAgentList();
+
+    expect(results[0].preserveLegacyPermissionOnAgentSelection).toBe(false);
+  });
+
+  it('leaves the legacy-permission selection policy undefined when the adapter does not declare it', async () => {
+    mockRegistryAdapters = [makeAdapter({ name: 'claude' })];
+
+    const results = await invokeAgentList();
+
+    expect(results[0].preserveLegacyPermissionOnAgentSelection).toBeUndefined();
   });
 
   it('surfaces adapter.remoteExecution.info verbatim, without leaking the probeServer function', async () => {
