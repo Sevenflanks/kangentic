@@ -199,4 +199,23 @@ describe('resolvePluginScript', () => {
     expect(bridgeResult.endsWith('some-other-plugin.mjs')).toBe(true);
     expect(activityResult).not.toBe(bridgeResult);
   });
+
+  it('resolves the TUI bootstrap plugin from packaged and source layouts', () => {
+    const packagedCandidate = resolvePluginScript('opencode', 'kangentic-startup');
+    expect(packagedCandidate.endsWith('kangentic-startup.mjs')).toBe(true);
+
+    const sourceCandidate = path.resolve(
+      process.cwd(),
+      'src',
+      'main',
+      'agent',
+      'adapters',
+      'opencode',
+      'plugin',
+      'kangentic-startup.mjs',
+    );
+    existingPaths.add(sourceCandidate);
+
+    expect(resolvePluginScript('opencode', 'kangentic-startup')).toBe(sourceCandidate);
+  });
 });

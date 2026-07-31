@@ -124,8 +124,9 @@ function ensurePluginGitignored(directory: string): void {
  * destination file is byte-identical to the packaged source. Concurrent
  * OpenCode sessions in the same working directory share one plugin file
  * (refcount in `OpenCodeAdapter.hookHolders`).
- * Installation is required because this plugin transports the initial prompt;
- * source, directory, or copy failures must abort command construction.
+ * Installation is required for activity telemetry and resume prompt bootstrap;
+ * fresh prompt bootstrap is owned by the separately configured TUI plugin.
+ * Source, directory, or copy failures must abort command construction.
  */
 export function buildHooks(cwd: string): void {
   const sourcePath = resolvePluginScript('opencode', 'kangentic-activity');

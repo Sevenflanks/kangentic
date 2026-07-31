@@ -36,6 +36,14 @@ const EXTERNAL_SCRIPTS = [
     destDir: 'plugins/opencode',
     destFile: 'kangentic-activity.mjs',
   },
+  {
+    kind: 'plugin',
+    adapter: 'opencode',
+    name: 'kangentic-startup',
+    src: 'src/main/agent/adapters/opencode/plugin/kangentic-startup.mjs',
+    destDir: 'plugins/opencode',
+    destFile: 'kangentic-startup.mjs',
+  },
 ];
 
 // Copy every registered external script into `<projectDir>/.vite/build/`,
