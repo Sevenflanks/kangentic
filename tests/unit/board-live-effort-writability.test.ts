@@ -1,10 +1,20 @@
 import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { EventEmitter } from 'node:events';
 
 const handlers = new Map<string, (...args: readonly unknown[]) => unknown>();
 const cancel = vi.fn();
 const isWritable = vi.fn(() => false);
+const getUsageCache = vi.fn(() => ({}));
+const listSessions = vi.fn(() => []);
 const scheduleKeystrokes = vi.fn();
 const updateAppliedSettings = vi.fn();
+const boardEventEmitter = new EventEmitter();
+const onBoardChanged = vi.fn((listener: (event: unknown) => void) => {
+  boardEventEmitter.on('board-changed', listener);
+  return () => {
+    boardEventEmitter.off('board-changed', listener);
+  };
+});
 const prepareInjectionPlan = vi.fn(() => ({
   sequence: ['/effort xhigh'],
   verifier: null,
@@ -12,6 +22,7 @@ const prepareInjectionPlan = vi.fn(() => ({
   needsRestartForModel: false,
   appliedSettings: { effort: 'xhigh' },
 }));
+const resolveLiveEffort = vi.fn(() => null);
 
 vi.mock('electron', () => ({
   ipcMain: {
@@ -30,7 +41,7 @@ vi.mock('../../src/main/db/repositories/session-repository', () => ({
   },
 }));
 vi.mock('../../src/main/agent/agent-registry', () => ({ agentRegistry: { get: vi.fn() } }));
-vi.mock('../../src/main/transition-engine/injection-plan', () => ({ prepareInjectionPlan }));
+vi.mock('../../src/main/transition-engine/injection-plan', () => ({ prepareInjectionPlan, resolveLiveEffort }));
 vi.mock('../../src/main/ipc/handlers/session-reconcile', () => ({ restartSessionForSettingsChange: vi.fn() }));
 vi.mock('../../src/main/diagnostics/project-log-context', () => ({
   runWithProjectLogContext: vi.fn((_name: string, operation: () => unknown) => operation()),
@@ -65,7 +76,12 @@ let IPC: typeof import('../../src/shared/ipc-channels').IPC;
 const context = {
   currentProjectId: 'project-board',
   currentProjectPath: '/project-board',
-  sessionManager: { getSession: vi.fn(() => ({ status: 'running' })), isWritable },
+  sessionManager: {
+    getSession: vi.fn(() => ({ status: 'running' })),
+    isWritable,
+    getUsageCache,
+    listSessions,
+  },
   terminalSubmitScheduler: { cancel, scheduleKeystrokes },
   boardConfigManager: {
     writeBack: vi.fn(), exists: vi.fn(), exportFromDb: vi.fn(), applyFileChange: vi.fn(),
@@ -74,6 +90,7 @@ const context = {
   },
   projectRepo: { getById: vi.fn(() => ({ id: 'project-board' })) },
   mainWindow: { isDestroyed: vi.fn(() => false), webContents: { send: vi.fn() } },
+  boardEvents: { onBoardChanged },
 };
 
 async function updateEffort(): Promise<void> {
@@ -91,6 +108,7 @@ describe('SWIMLANE_UPDATE live effort writability', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     handlers.clear();
+    boardEventEmitter.removeAllListeners();
     isWritable.mockReturnValue(false);
     registerBoardHandlers(context as never);
   });
@@ -116,7 +134,7 @@ describe('SWIMLANE_UPDATE live effort writability', () => {
       task.id,
       task.session_id,
       ['/effort xhigh'],
-      { verifier: null, verifiedPrefixLength: 1 },
+      { verifier: null },
     );
     expect(updateAppliedSettings).toHaveBeenCalledTimes(1);
     expect(updateAppliedSettings).toHaveBeenCalledWith(task.session_id, { effort: 'xhigh' });

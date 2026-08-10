@@ -167,6 +167,33 @@ describe('Scrollback', () => {
     expect(scrollback.length).toBeLessThanOrEqual(512 * 1024 + 4);
     expect(scrollback.length).toBeGreaterThan(512 * 1024 - 32);
   });
+
+  it('serves the parsed grid for an alt-screen session, not the byte log', async () => {
+    const { session, feedData } = await spawnSession();
+
+    // A fullscreen TUI: enter the alt screen, draw AAA, then overwrite the
+    // same cells with BBB.
+    feedData('\x1b[?1049h\x1b[2J\x1b[1;1HAAA');
+    feedData('\x1b[1;1HBBB');
+
+    const replay = await manager.getScrollback(session.id);
+    // A byte log carries both draws; the parsed-grid frame holds only the
+    // cells as they stand now, and its own alt-screen switch.
+    expect(replay).toContain('BBB');
+    expect(replay).not.toContain('AAA');
+    expect(replay).toContain('\x1b[?1049h');
+  });
+
+  it('keeps the byte replay, history included, for a non-alt-screen session', async () => {
+    const { session, feedData } = await spawnSession();
+
+    feedData('first draw AAA\r\n');
+    feedData('second draw BBB\r\n');
+
+    const replay = await manager.getScrollback(session.id);
+    expect(replay).toContain('AAA');
+    expect(replay).toContain('BBB');
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -219,6 +246,86 @@ describe('Scrollback clearing on resize', () => {
 
     const scrollback = await manager.getScrollback(session.id);
     expect(scrollback).toContain('hello world');
+  });
+
+  it('a rows-only resize arms the repaint settle (arming widens; the report stays colsChanged)', async () => {
+    const { session, feedData } = await spawnSession();
+
+    // A fullscreen TUI frame so the settle's TUI gate holds.
+    feedData('\x1b[2Jframe at 120x30');
+
+    const result = manager.resize(session.id, 120, 50);
+    // The wire/IPC report is unchanged - colsChanged only, exact shape.
+    expect(result).toEqual({ colsChanged: false });
+
+    // But the settle armed on the rows change, visible via the diagnostics row.
+    const dimensions = manager.getTerminalDimensions().find((row) => row.sessionId === session.id);
+    expect(dimensions?.pendingRepaintAt).not.toBeNull();
+    expect(dimensions?.lastRows).toBe(50);
+
+    // The rows repaint lands with the erase marker; the settled sample has it.
+    feedData('\x1b[2Jrepaint at 120x50');
+    const scrollback = await manager.getScrollback(session.id);
+    expect(scrollback).toContain('repaint at 120x50');
+  });
+
+  it('getScrollback skips the repaint-settle wait once the PTY is gone (killed before sampling)', async () => {
+    const { session, feedData } = await spawnSession();
+
+    // A fullscreen TUI frame so the settle's TUI-marker gate holds.
+    feedData('\x1b[2Jframe at 120x30');
+
+    // A rows-only resize arms the settle. No repaint marker ever follows, so
+    // an AWAITED settle here would ride the full REPAINT_MAX_WAIT_MS (400ms)
+    // deadline - confirm it actually armed before killing.
+    manager.resize(session.id, 120, 50);
+    const dimensionsBeforeKill = manager.getTerminalDimensions().find((row) => row.sessionId === session.id);
+    expect(dimensionsBeforeKill?.pendingRepaintAt).not.toBeNull();
+
+    // kill() nulls session.pty (unlike remove(), it does NOT clear the
+    // buffer manager's per-session state), so the pending-repaint stamp
+    // survives in the buffer manager, but the session has no live PTY that
+    // could ever deliver the repaint SIGWINCH triggers.
+    manager.kill(session.id);
+    spawnedSessionId = null; // already torn down; afterEach must not re-suspend it
+
+    const startedAt = Date.now();
+    const scrollback = await manager.getScrollback(session.id);
+    const elapsedMs = Date.now() - startedAt;
+
+    expect(scrollback).toContain('frame at 120x30');
+    // Reverting the live-PTY guard measured 418ms here (rides the full 400ms
+    // REPAINT_MAX_WAIT_MS deadline with no post-resize marker ever arriving).
+    // 300ms keeps a CI-safe margin below that measured red while staying well
+    // above the skipped-wait green path (native microtask time).
+    expect(elapsedMs).toBeLessThan(300);
+  });
+
+  it('getSerializedFrame skips the repaint-settle wait once the PTY is gone (killed before sampling)', async () => {
+    const { session, feedData } = await spawnSession();
+
+    // A fullscreen TUI frame so the settle's TUI-marker gate holds.
+    feedData('\x1b[2Jframe at 120x30');
+
+    // A rows-only resize arms the settle. No repaint marker ever follows, so
+    // an AWAITED settle here would ride the full REPAINT_MAX_WAIT_MS (400ms)
+    // deadline - confirm it actually armed before killing.
+    manager.resize(session.id, 120, 50);
+    const dimensionsBeforeKill = manager.getTerminalDimensions().find((row) => row.sessionId === session.id);
+    expect(dimensionsBeforeKill?.pendingRepaintAt).not.toBeNull();
+
+    // Same guard as getScrollback (see the sibling test above), applied to
+    // getSerializedFrame's own live-PTY check.
+    manager.kill(session.id);
+    spawnedSessionId = null; // already torn down; afterEach must not re-suspend it
+
+    const startedAt = Date.now();
+    const serializedFrame = await manager.getSerializedFrame(session.id);
+    const elapsedMs = Date.now() - startedAt;
+
+    expect(serializedFrame).toContain('frame at 120x30');
+    // Same CI-safe margin as the getScrollback sibling above.
+    expect(elapsedMs).toBeLessThan(300);
   });
 
   it('preserves scrollback when cols change (no write-time clearing)', async () => {
@@ -1438,16 +1545,60 @@ describe('Dimension tracking', () => {
     expect(manager.getDimensions('nonexistent')).toBeNull();
   });
 
-  it('every resize emits pty-resize with the clamped grid', async () => {
+  it('every grid-changing resize emits pty-resize with the clamped grid and its origin', async () => {
     const mock = createMockPty();
     vi.mocked(pty.spawn).mockReturnValue(mock.mockPty as unknown as pty.IPty);
     const session = await manager.spawn({ taskId: 'task-dims-emit', command: '', cwd: tmpDir });
 
-    const resizes: Array<[string, number, number]> = [];
-    manager.on('pty-resize', (sessionId: string, cols: number, rows: number) => resizes.push([sessionId, cols, rows]));
+    const resizes: Array<[string, number, number, string]> = [];
+    manager.on('pty-resize', (sessionId: string, cols: number, rows: number, origin: string) => resizes.push([sessionId, cols, rows, origin]));
 
     manager.resize(session.id, 80.7, 0);
-    expect(resizes).toEqual([[session.id, 80, 1]]);
+    expect(resizes).toEqual([[session.id, 80, 1, 'desktop']]);
+
+    // Explicit origins ride the emit unchanged, so the renderer's echo
+    // listener can leave phone- and park-held grids alone (foreign-hold).
+    manager.resize(session.id, 90, 20, 'mobile');
+    manager.resize(session.id, 210, 48, 'park');
+    expect(resizes.slice(1)).toEqual([
+      [session.id, 90, 20, 'mobile'],
+      [session.id, 210, 48, 'park'],
+    ]);
+  });
+
+  it('the spawn announces its grid with the spawn origin', async () => {
+    const mock = createMockPty();
+    vi.mocked(pty.spawn).mockReturnValue(mock.mockPty as unknown as pty.IPty);
+
+    const resizes: Array<[number, number, string]> = [];
+    manager.on('pty-resize', (_sessionId: string, cols: number, rows: number, origin: string) => resizes.push([cols, rows, origin]));
+
+    await manager.spawn({ taskId: 'task-dims-spawn-origin', command: '', cwd: tmpDir });
+    expect(resizes).toEqual([[120, 30, 'spawn']]);
+  });
+
+  it('a resize to the current grid neither reshapes the PTY nor emits pty-resize', async () => {
+    // A task-detail remount (a desktop project switch away and back) re-sends
+    // its unchanged fit: xterm only skips re-sending dims within one
+    // instance's lifetime. Broadcasting that no-op made every subscribed
+    // phone re-seed a byte-identical frame over the relay (measured live
+    // 2026-08-02), and the PTY paid a pointless reshape.
+    const mock = createMockPty();
+    vi.mocked(pty.spawn).mockReturnValue(mock.mockPty as unknown as pty.IPty);
+    const session = await manager.spawn({ taskId: 'task-dims-noop', command: '', cwd: tmpDir });
+
+    manager.resize(session.id, 210, 48);
+    const resizes: Array<[string, number, number]> = [];
+    manager.on('pty-resize', (sessionId: string, cols: number, rows: number) => resizes.push([sessionId, cols, rows]));
+    mock.mockPty.resize.mockClear();
+
+    const result = manager.resize(session.id, 210, 48);
+
+    expect(result).toEqual({ colsChanged: false });
+    expect(resizes).toEqual([]);
+    expect(mock.mockPty.resize).not.toHaveBeenCalled();
+    // The desktop restore target still records the re-asserted intent.
+    expect(manager.getLastDesktopDimensions(session.id)).toEqual({ cols: 210, rows: 48 });
   });
 
   it('a mobile resize snapshots the desktop grid as the restore target; desktop resizes update it', async () => {
@@ -1546,14 +1697,14 @@ describe('Transcript-fallback handoff', () => {
       agentParser: adapter,
     });
 
-    const priv = manager as unknown as {
+    const managerInternals = manager as unknown as {
       sessionHistoryReader: { isAttached(id: string): boolean };
       statusFileReader: { handleStatusChange(id: string): void };
     };
 
     // Let the fire-and-forget eager attach (awaits the mocked locate) settle.
     await new Promise((resolve) => setTimeout(resolve, 30));
-    expect(priv.sessionHistoryReader.isAttached(session.id)).toBe(true);
+    expect(managerInternals.sessionHistoryReader.isAttached(session.id)).toBe(true);
     // The fallback populated the card model + token occupancy from the
     // transcript, but NO window (it is not derivable from a model id): window
     // stays the 0 "unknown size" sentinel and the percentage stays 0, so the
@@ -1580,9 +1731,9 @@ describe('Transcript-fallback handoff', () => {
         model: { id: 'claude-opus-4-8', display_name: 'Opus 4.8' },
       }),
     );
-    priv.statusFileReader.handleStatusChange(session.id);
+    managerInternals.statusFileReader.handleStatusChange(session.id);
 
-    expect(priv.sessionHistoryReader.isAttached(session.id)).toBe(false);
+    expect(managerInternals.sessionHistoryReader.isAttached(session.id)).toBe(false);
   });
 
   // On a RESUME the transcript already holds the PRE-suspend conversation, whose
@@ -1681,14 +1832,14 @@ describe('Transcript-fallback handoff', () => {
       agentParser: adapter,
     });
 
-    const priv = manager as unknown as {
+    const managerInternals = manager as unknown as {
       sessionHistoryReader: { isAttached(id: string): boolean };
       statusFileReader: { handleStatusChange(id: string): void };
     };
 
     // Let the fire-and-forget eager attach (awaits the mocked locate) settle.
     await new Promise((resolve) => setTimeout(resolve, 30));
-    expect(priv.sessionHistoryReader.isAttached(session.id)).toBe(true);
+    expect(managerInternals.sessionHistoryReader.isAttached(session.id)).toBe(true);
 
     const capturedAgentSessionIds: string[] = [];
     manager.on('agent-session-id', (_sessionId: string, _taskId: string, _projectId: string, agentReportedId: string) => {
@@ -1713,7 +1864,7 @@ describe('Transcript-fallback handoff', () => {
         model: { id: 'claude-opus-4-8', display_name: 'Opus 4.8' },
       }),
     );
-    priv.statusFileReader.handleStatusChange(session.id);
+    managerInternals.statusFileReader.handleStatusChange(session.id);
 
     // Proves the nested onAgentSessionId capture actually fired - without
     // this, the assertion below would pass for the wrong reason (like the
@@ -1722,7 +1873,84 @@ describe('Transcript-fallback handoff', () => {
     // The fallback still ends up detached: onFirstStatus's detach (fired
     // immediately after onUsageParsed, in the same synchronous call stack)
     // must win over the nested re-attach.
-    expect(priv.sessionHistoryReader.isAttached(session.id)).toBe(false);
+    expect(managerInternals.sessionHistoryReader.isAttached(session.id)).toBe(false);
+  });
+
+  // Mid-session fork (Claude /clear moves the live conversation to a NEW
+  // session id and the statusline re-reports it): a status.json rewrite with a
+  // DIFFERENT session_id must fire a SECOND 'agent-session-id' (the
+  // change-sensitive status channel), mutate the live session (so the renderer
+  // observes the flip via 'session-changed'), and must NOT re-attach the
+  // deliberately-detached transcript fallback - the `!hasReceivedStatus` guard
+  // in session-manager's onAgentSessionId is load-bearing for the fork case.
+  it('a mid-session fork (new session_id in status.json) re-fires agent-session-id without re-attaching the fallback', async () => {
+    const historyFile = path.join(tmpDir, 'fork-transcript.jsonl');
+    fs.writeFileSync(historyFile, JSON.stringify({ type: 'assistant', message: { id: 'm1', model: 'claude-opus-4-8', usage: { input_tokens: 10, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 1 } } }) + '\n');
+    vi.spyOn(ClaudeSessionHistoryParser, 'locate').mockResolvedValue(historyFile);
+    const adapter = new ClaudeAdapter();
+
+    const statusPath = path.join(tmpDir, 'fork-status.json');
+    const mock = createMockPty();
+    vi.mocked(pty.spawn).mockReturnValue(mock.mockPty as unknown as pty.IPty);
+    const session = await manager.spawn({
+      taskId: 'task-fork',
+      command: '',
+      cwd: tmpDir,
+      agentSessionId: 'fork-uuid-original',
+      statusOutputPath: statusPath,
+      agentParser: adapter,
+    });
+
+    const managerInternals = manager as unknown as {
+      sessionHistoryReader: { isAttached(id: string): boolean };
+      statusFileReader: { handleStatusChange(id: string): void };
+    };
+
+    // Let the fire-and-forget eager attach (awaits the mocked locate) settle.
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    const capturedAgentSessionIds: string[] = [];
+    manager.on('agent-session-id', (_sessionId: string, _taskId: string, _projectId: string, agentReportedId: string) => {
+      capturedAgentSessionIds.push(agentReportedId);
+    });
+    const sessionChangedAgentIds: Array<string | null> = [];
+    manager.on('session-changed', (_sessionId: string, changedSession: { agentSessionId: string | null }) => {
+      sessionChangedAgentIds.push(changedSession.agentSessionId);
+    });
+
+    const statusPayload = (sessionId: string) => JSON.stringify({
+      session_id: sessionId,
+      context_window: {
+        used_percentage: 12,
+        total_input_tokens: 24000,
+        total_output_tokens: 500,
+        context_window_size: 200000,
+        current_usage: { input_tokens: 24000 },
+      },
+      cost: { total_cost_usd: 0.02, total_duration_ms: 5000 },
+      model: { id: 'claude-opus-4-8', display_name: 'Opus 4.8' },
+    });
+
+    // First status write: normal capture of the launch id, fallback detaches.
+    fs.writeFileSync(statusPath, statusPayload('fork-uuid-original'));
+    managerInternals.statusFileReader.handleStatusChange(session.id);
+    expect(capturedAgentSessionIds).toEqual(['fork-uuid-original']);
+    expect(managerInternals.sessionHistoryReader.isAttached(session.id)).toBe(false);
+
+    // The fork: status.json re-reports a DIFFERENT id.
+    fs.writeFileSync(statusPath, statusPayload('fork-uuid-after-clear'));
+    managerInternals.statusFileReader.handleStatusChange(session.id);
+
+    expect(capturedAgentSessionIds).toEqual(['fork-uuid-original', 'fork-uuid-after-clear']);
+    // The live session mutated and 'session-changed' carried the new id out.
+    expect(sessionChangedAgentIds).toContain('fork-uuid-after-clear');
+    // The deliberately-detached transcript fallback stays detached.
+    expect(managerInternals.sessionHistoryReader.isAttached(session.id)).toBe(false);
+
+    // Same-id churn after the fork stays quiet.
+    fs.writeFileSync(statusPath, statusPayload('fork-uuid-after-clear'));
+    managerInternals.statusFileReader.handleStatusChange(session.id);
+    expect(capturedAgentSessionIds).toEqual(['fork-uuid-original', 'fork-uuid-after-clear']);
   });
 });
 
@@ -1847,13 +2075,15 @@ describe('Synthetic session_end', () => {
   }
 
   it('suspend injects synthetic session_end into event cache', async () => {
-    const { session, eventsPath } = await spawnWithEvents('task-synth-suspend');
+    const { session, eventsPath, triggerExit } = await spawnWithEvents('task-synth-suspend');
 
     // Write a tool_start event so the cache has content
     appendEvent(eventsPath, { ts: Date.now(), type: EventType.ToolStart, tool: 'Read' });
     await waitForWatcher();
 
-    await manager.suspend(session.id);
+    const suspension = manager.suspend(session.id);
+    triggerExit(0);
+    await suspension;
     spawnedSessionId = null; // already suspended
 
     const events = manager.getEventsForSession(session.id);
@@ -1862,7 +2092,7 @@ describe('Synthetic session_end', () => {
   });
 
   it('suspend does not duplicate session_end if already present', async () => {
-    const { session, eventsPath } = await spawnWithEvents('task-synth-nodup');
+    const { session, eventsPath, triggerExit } = await spawnWithEvents('task-synth-nodup');
 
     // Write a session_end event from Claude Code's hook
     appendEvent(eventsPath, { ts: Date.now(), type: EventType.SessionEnd });
@@ -1873,7 +2103,9 @@ describe('Synthetic session_end', () => {
       (event) => event.type === EventType.SessionEnd
     ).length;
 
-    await manager.suspend(session.id);
+    const suspension = manager.suspend(session.id);
+    triggerExit(0);
+    await suspension;
     spawnedSessionId = null;
 
     const eventsAfter = manager.getEventsForSession(session.id);
@@ -1901,7 +2133,9 @@ describe('Synthetic session_end', () => {
     // Verify no events cached yet
     expect(manager.getEventsForSession(session.id)).toEqual([]);
 
-    await manager.suspend(session.id);
+    const suspension = manager.suspend(session.id);
+    mock.triggerExit(0);
+    await suspension;
     spawnedSessionId = null;
 
     const events = manager.getEventsForSession(session.id);
@@ -3165,5 +3399,627 @@ describe('Input coordination', () => {
     // Then
     expectInputCoordinationRemoved(session.id);
     await suspension;
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 17. Per-renderer focus scoping (setFocusedSessions / clearFocusedSessionsFor)
+// ---------------------------------------------------------------------------
+
+describe('Per-renderer focus scoping', () => {
+  // More than one renderer can publish a focused-session set (the main window
+  // via useFocusedSessionsSync, a detached Agent Monitor window publishing its
+  // own). setFocusedSessions and clearFocusedSessionsFor must only release
+  // backpressure accounting for sessions the CALLING renderer actually
+  // affected - never another renderer's sessions, and never a session another
+  // renderer still has focused. Both used to be blanket operations
+  // (`backpressure.reset()` / an unconditional release loop) that were safe
+  // only with a single publisher.
+  let manager: SessionManager;
+  let spawnedSessionIds: string[] = [];
+
+  beforeEach(() => {
+    manager = new SessionManager();
+    spawnedSessionIds = [];
+  });
+
+  afterEach(async () => {
+    manager.killAll();
+    spawnedSessionIds = [];
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  });
+
+  async function spawnSession(taskId: string) {
+    const mock = createMockPty();
+    vi.mocked(pty.spawn).mockReturnValue(mock.mockPty as unknown as pty.IPty);
+    const session = await manager.spawn({ taskId, command: '', cwd: tmpDir });
+    spawnedSessionIds.push(session.id);
+    return { session, ...mock };
+  }
+
+  /** Bytes emitted-but-unacknowledged for a session, via the public pipeline-stats seam. */
+  function inFlightBytesFor(sessionId: string): number {
+    const stats = manager.getPipelineStats();
+    return stats.find((row) => row.sessionId === sessionId)?.inFlightBytes ?? 0;
+  }
+
+  it('setFocusedSessions releases only the calling renderer\'s own affected sessions', async () => {
+    const RENDERER_1 = 1;
+    const RENDERER_2 = 2;
+    const { session: sessionA, feedData: feedA } = await spawnSession('task-scope-a');
+    const { session: sessionB, feedData: feedB } = await spawnSession('task-scope-b');
+
+    manager.setFocusedSessions([sessionA.id], RENDERER_1);
+    manager.setFocusedSessions([sessionB.id], RENDERER_2);
+
+    feedA('hello-a');
+    feedB('hello-b');
+    // Let the 16ms flush window land both emissions before reading inFlight.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    // Sanity: both sessions actually accumulated in-flight accounting, or the
+    // assertions below would pass vacuously.
+    expect(inFlightBytesFor(sessionA.id)).toBeGreaterThan(0);
+    expect(inFlightBytesFor(sessionB.id)).toBeGreaterThan(0);
+
+    // Renderer 2 changes its OWN focus away from session B. Session B was in
+    // renderer 2's affected set (previous ∪ new), so it is released. Session A
+    // was never in renderer 2's set and must be left alone.
+    manager.setFocusedSessions([], RENDERER_2);
+
+    expect(inFlightBytesFor(sessionB.id)).toBe(0);
+    expect(inFlightBytesFor(sessionA.id)).toBeGreaterThan(0);
+  });
+
+  it('clearFocusedSessionsFor releases only sessions no other renderer still has focused', async () => {
+    const RENDERER_1 = 1;
+    const RENDERER_2 = 2;
+    const { session: sessionA, feedData: feedA } = await spawnSession('task-scope-c');
+    const { session: sessionB, feedData: feedB } = await spawnSession('task-scope-d');
+
+    // Renderer 1 has both sessions visible; renderer 2 also has session B
+    // (e.g. the same terminal shown in a detached monitor window).
+    manager.setFocusedSessions([sessionA.id, sessionB.id], RENDERER_1);
+    manager.setFocusedSessions([sessionB.id], RENDERER_2);
+
+    feedA('hello-a');
+    feedB('hello-b');
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect(inFlightBytesFor(sessionA.id)).toBeGreaterThan(0);
+    expect(inFlightBytesFor(sessionB.id)).toBeGreaterThan(0);
+
+    // Renderer 1's window closes. Session A had no other consumer, so its
+    // accounting is released. Session B is still held by renderer 2 and must
+    // keep its in-flight accounting intact.
+    manager.clearFocusedSessionsFor(RENDERER_1);
+
+    expect(inFlightBytesFor(sessionA.id)).toBe(0);
+    expect(inFlightBytesFor(sessionB.id)).toBeGreaterThan(0);
+  });
+
+  it('getRenderersFocusedOn reports every renderer currently showing a session', async () => {
+    const RENDERER_1 = 1;
+    const RENDERER_2 = 2;
+    const { session: sessionA } = await spawnSession('task-scope-e');
+    const { session: sessionB } = await spawnSession('task-scope-f');
+
+    manager.setFocusedSessions([sessionA.id, sessionB.id], RENDERER_1);
+    manager.setFocusedSessions([sessionB.id], RENDERER_2);
+
+    expect(manager.getRenderersFocusedOn(sessionA.id)).toEqual([RENDERER_1]);
+    expect(manager.getRenderersFocusedOn(sessionB.id).slice().sort()).toEqual([RENDERER_1, RENDERER_2]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Resting grid: a session nobody is showing goes back to the spawn grid
+// ---------------------------------------------------------------------------
+
+describe('Resting grid restore', () => {
+  // Every surface fits the ONE PTY grid to its own box, and the bottom panel is
+  // a wide short strip - so a session last shown there was left at 306x14 and
+  // nothing ever gave it back. The agent kept working in a 14-row window, and a
+  // paired phone (which mirrors the grid 1:1) could not fill its screen from 14
+  // rows no matter what it did locally.
+  let manager: SessionManager;
+  let spawnedSessionIds: string[] = [];
+  // The bottom panel's real geometry, measured live on a 2154px-wide window.
+  const PANEL_COLS = 306;
+  const PANEL_ROWS = 14;
+  // The probe stands in for the mobile bridge (production registers it in
+  // attachContext): the guard registry's armed entries and the read-stream
+  // subscriptions. Default: no holds, every session watched - the park is a
+  // mobile feature and fires only for sessions a phone streams, so tests of
+  // the park itself need a watcher.
+  let mobileSizeHolds: Set<string>;
+  let mobileStreamWatchers: Set<string> | 'all';
+
+  beforeEach(() => {
+    // 10ms rather than the production second: what is under test is the
+    // debounce, not its length.
+    manager = new SessionManager({ restingGridDelayMs: 10 });
+    spawnedSessionIds = [];
+    mobileSizeHolds = new Set();
+    mobileStreamWatchers = 'all';
+    manager.setMobileTerminalProbe({
+      isSizeHeld: (sessionId) => mobileSizeHolds.has(sessionId),
+      hasStreamSubscriber: (sessionId) => mobileStreamWatchers === 'all' || mobileStreamWatchers.has(sessionId),
+    });
+  });
+
+  afterEach(async () => {
+    manager.killAll();
+    spawnedSessionIds = [];
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  });
+
+  async function spawnSession(taskId: string) {
+    const mock = createMockPty();
+    vi.mocked(pty.spawn).mockReturnValue(mock.mockPty as unknown as pty.IPty);
+    const session = await manager.spawn({ taskId, command: '', cwd: tmpDir });
+    spawnedSessionIds.push(session.id);
+    return { session, ...mock };
+  }
+
+  /** Wait past the (shrunk) debounce. */
+  const settle = (): Promise<unknown> => new Promise((resolve) => setTimeout(resolve, 40));
+
+  /**
+   * Acquire the panel's strip grid the only way it can be acquired now: with
+   * no phone streaming. The floor policy makes resize() refuse a sub-floor
+   * desktop grid while a phone streams, so every "session left at the strip"
+   * scenario begins before the phone subscribed.
+   */
+  function grabPanelGridUnwatched(sessionId: string): void {
+    const previousWatchers = mobileStreamWatchers;
+    mobileStreamWatchers = new Set();
+    manager.resize(sessionId, PANEL_COLS, PANEL_ROWS);
+    mobileStreamWatchers = previousWatchers;
+  }
+
+  // The resting grid is DETAIL-shaped (210x48), deliberately not the 120x30
+  // spawn default: the phone mirrors it 1:1, and the desktop-sized layout
+  // proved more readable there than any phone-fitted grid.
+  const REST_COLS = 210;
+  const REST_ROWS = 48;
+
+  it('parks a session at the resting grid once no renderer shows it', async () => {
+    const { session, mockPty } = await spawnSession('task-rest-a');
+    manager.setFocusedSessions([session.id]);
+    grabPanelGridUnwatched(session.id);
+    expect([mockPty.cols, mockPty.rows]).toEqual([PANEL_COLS, PANEL_ROWS]);
+
+    manager.setFocusedSessions([]);
+    await settle();
+
+    expect([mockPty.cols, mockPty.rows]).toEqual([REST_COLS, REST_ROWS]);
+  });
+
+  it('leaves a session another window still shows alone', async () => {
+    const { session, mockPty } = await spawnSession('task-rest-b');
+    manager.setFocusedSessions([session.id], 1);
+    manager.setFocusedSessions([session.id], 2);
+    grabPanelGridUnwatched(session.id);
+
+    manager.setFocusedSessions([], 1);
+    await settle();
+
+    expect([mockPty.cols, mockPty.rows]).toEqual([PANEL_COLS, PANEL_ROWS]);
+  });
+
+  it('is cancelled by a surface switch inside the delay', async () => {
+    const { session, mockPty } = await spawnSession('task-rest-c');
+    manager.setFocusedSessions([session.id]);
+    grabPanelGridUnwatched(session.id);
+
+    // Dispose then mount elsewhere: the session blinks out of the focused set
+    // and straight back in. Reshaping the PTY in that gap would add two
+    // reflows to every switch.
+    manager.setFocusedSessions([]);
+    manager.setFocusedSessions([session.id]);
+    await settle();
+
+    expect([mockPty.cols, mockPty.rows]).toEqual([PANEL_COLS, PANEL_ROWS]);
+  });
+
+  it('never takes back a grid a phone is holding', async () => {
+    const { session, mockPty } = await spawnSession('task-rest-d');
+    manager.setFocusedSessions([session.id]);
+    // The interactive-terminal handler arms the guard BEFORE resizing; the
+    // probe's hold entry is that guard.
+    mobileSizeHolds.add(session.id);
+    manager.resize(session.id, 80, 40, 'mobile');
+
+    manager.setFocusedSessions([]);
+    await settle();
+
+    // The phone owns the grid until it releases (interactive-terminal
+    // release-size), which restores the desktop's own dimensions.
+    expect([mockPty.cols, mockPty.rows]).toEqual([80, 40]);
+  });
+
+  /**
+   * The hold must be read from the guard registry, never inferred from who
+   * resized last: contention is latest-writer-wins for the GRID, but the
+   * guard stays armed until the phone releases, and a desktop resize in
+   * between makes the desktop the last writer while the phone still holds.
+   */
+  it('honors a phone hold even after a desktop resize made itself the last writer', async () => {
+    const { session, mockPty } = await spawnSession('task-rest-hold-vs-writer');
+    manager.setFocusedSessions([session.id]);
+    mobileSizeHolds.add(session.id);
+    manager.resize(session.id, 80, 40, 'mobile');
+    // Desktop wins the grid (an above-floor grid, so the floor policy lets it
+    // through); the guard stays armed.
+    manager.resize(session.id, 190, 50);
+
+    manager.setFocusedSessions([]);
+    await settle();
+
+    // A last-writer heuristic parks here, reshaping the PTY out from under
+    // the still-holding phone.
+    expect([mockPty.cols, mockPty.rows]).toEqual([190, 50]);
+  });
+
+  /**
+   * The park goes through resize() for the buffer settle, the activity
+   * suppression, and the pty-resize emit - but it must NOT record itself as
+   * the desktop's grid, or a phone's later release-size "restores" to the
+   * park instead of the real desktop geometry (observed live on three
+   * sessions: parked PTYs reporting 120x30 as their desktop dims).
+   */
+  it('parks without recording itself as the desktop grid', async () => {
+    const { session, mockPty } = await spawnSession('task-rest-restore-target');
+    manager.setFocusedSessions([session.id]);
+    grabPanelGridUnwatched(session.id);
+
+    manager.setFocusedSessions([]);
+    await settle();
+
+    expect([mockPty.cols, mockPty.rows]).toEqual([REST_COLS, REST_ROWS]);
+    expect(manager.getLastDesktopDimensions(session.id)).toEqual({ cols: PANEL_COLS, rows: PANEL_ROWS });
+  });
+
+  /**
+   * The park is a MOBILE feature (it normalizes the resting grid so a phone
+   * does not mirror a strip): a session no phone streams must never pay its
+   * SIGWINCH + reflow + repaint.
+   */
+  it('never parks a session no phone is streaming', async () => {
+    const { session, mockPty } = await spawnSession('task-rest-no-watcher');
+    mobileStreamWatchers = new Set();
+    manager.setFocusedSessions([session.id]);
+    manager.resize(session.id, PANEL_COLS, PANEL_ROWS);
+
+    manager.setFocusedSessions([]);
+    await settle();
+
+    expect([mockPty.cols, mockPty.rows]).toEqual([PANEL_COLS, PANEL_ROWS]);
+  });
+
+  /** An unpaired desktop (no bridge ever attached) is untouched by the park. */
+  it('never parks when no mobile bridge ever attached', async () => {
+    const unpairedManager = new SessionManager({ restingGridDelayMs: 10 });
+    const mock = createMockPty();
+    vi.mocked(pty.spawn).mockReturnValue(mock.mockPty as unknown as pty.IPty);
+    const session = await unpairedManager.spawn({ taskId: 'task-rest-unpaired', command: '', cwd: tmpDir });
+    unpairedManager.setFocusedSessions([session.id]);
+    unpairedManager.resize(session.id, PANEL_COLS, PANEL_ROWS);
+
+    unpairedManager.setFocusedSessions([]);
+    await settle();
+
+    expect([mock.mockPty.cols, mock.mockPty.rows]).toEqual([PANEL_COLS, PANEL_ROWS]);
+    unpairedManager.killAll();
+  });
+
+  /**
+   * The full phone visit, end to end: hold blocks the park, release restores
+   * the real desktop grid, and the re-park (requested by the guard teardown
+   * in production) returns the session to the resting grid so the NEXT phone
+   * visit finds park dims again.
+   */
+  it('re-parks after the phone releases its hold', async () => {
+    const { session, mockPty } = await spawnSession('task-rest-release');
+    manager.setFocusedSessions([session.id]);
+    grabPanelGridUnwatched(session.id);
+    mobileSizeHolds.add(session.id);
+    manager.resize(session.id, 80, 40, 'mobile');
+
+    manager.setFocusedSessions([]);
+    await settle();
+    expect([mockPty.cols, mockPty.rows]).toEqual([80, 40]);
+
+    // The guard teardown: drop the hold, restore desktop dims, re-run the
+    // park decision (terminal-size-guard.ts does exactly this sequence).
+    // The restore target is the sub-floor strip and the phone is still
+    // STREAMING, so the floor policy refuses the restore itself - the
+    // reconsider then parks the unheld session either way.
+    mobileSizeHolds.delete(session.id);
+    const restore = manager.getLastDesktopDimensions(session.id);
+    expect(restore).toEqual({ cols: PANEL_COLS, rows: PANEL_ROWS });
+    manager.resize(session.id, PANEL_COLS, PANEL_ROWS);
+    manager.reconsiderRestingGridAfterMobileRelease(session.id);
+    await settle();
+
+    expect([mockPty.cols, mockPty.rows]).toEqual([REST_COLS, REST_ROWS]);
+  });
+
+  /**
+   * A phone subscribing to a session that went unheld BEFORE the phone was
+   * watching (or before pairing existed) must not inherit the strip: the
+   * read-stream handler parks immediately - no debounce - so the one seed it
+   * builds next already carries the resting grid. A desktop surface holding
+   * a USABLE grid is respected; a surface holding a sub-floor strip is not
+   * (user decision 2026-08-02): the phone would otherwise be stuck in a
+   * sliver view with no recovery available away from the desk, so the
+   * subscribe-time park overrides that hold and the panel renders the
+   * resting grid clipped instead.
+   */
+  it('parks immediately for a subscribing phone, overriding only a sub-floor hold', async () => {
+    const { session, mockPty } = await spawnSession('task-rest-subscribe');
+    manager.setFocusedSessions([session.id]);
+
+    // Held at a usable grid: respected, never touched.
+    manager.resize(session.id, 190, 50);
+    manager.parkRestingGridForMobileSubscriber(session.id);
+    expect([mockPty.cols, mockPty.rows]).toEqual([190, 50]);
+
+    // Held at the panel's sub-floor strip: the rescue parks it anyway.
+    grabPanelGridUnwatched(session.id);
+    expect([mockPty.cols, mockPty.rows]).toEqual([PANEL_COLS, PANEL_ROWS]);
+    manager.parkRestingGridForMobileSubscriber(session.id);
+    expect([mockPty.cols, mockPty.rows]).toEqual([REST_COLS, REST_ROWS]);
+
+    // Unheld: parks as before.
+    grabPanelGridUnwatched(session.id);
+    manager.setFocusedSessions([]);
+    manager.parkRestingGridForMobileSubscriber(session.id);
+    expect([mockPty.cols, mockPty.rows]).toEqual([REST_COLS, REST_ROWS]);
+  });
+
+  it('a size-guard hold blocks even the subscribe-time rescue', async () => {
+    const { session, mockPty } = await spawnSession('task-rest-subscribe-guard');
+    manager.setFocusedSessions([session.id]);
+    // A mobile-origin resize is not floor-gated (the phone asked for it), so
+    // a sub-floor phone grid with the guard armed is reachable.
+    mobileSizeHolds.add(session.id);
+    manager.resize(session.id, 80, 10, 'mobile');
+
+    manager.parkRestingGridForMobileSubscriber(session.id);
+
+    expect([mockPty.cols, mockPty.rows]).toEqual([80, 10]);
+  });
+
+  it('does not resize a session already at the resting grid', async () => {
+    const { session, mockPty } = await spawnSession('task-rest-e');
+    manager.setFocusedSessions([session.id]);
+    manager.resize(session.id, REST_COLS, REST_ROWS);
+    mockPty.resize.mockClear();
+
+    manager.setFocusedSessions([]);
+    await settle();
+
+    // No reflow, no repaint, no settle to pay on the next open.
+    expect(mockPty.resize).not.toHaveBeenCalled();
+  });
+
+  /**
+   * The case that makes focus alone the WRONG signal. A parked terminal
+   * (Backlog view, or a window occluded by a maximized one) is unfocused but
+   * still mounted at its own grid, and it will never re-send that grid - xterm
+   * emits a resize only when its OWN size changes. Reshaping the PTY under it
+   * leaves the two permanently disagreeing, and the reveal (which deliberately
+   * skips the resize, having assumed the PTY could not have moved) would then
+   * replay a frame drawn for the wrong grid.
+   */
+  it('leaves a parked-but-mounted terminal\'s grid alone', async () => {
+    const { session, mockPty } = await spawnSession('task-rest-parked');
+    manager.setFocusedSessions([session.id]);
+    manager.setMountedSessions([session.id]);
+    grabPanelGridUnwatched(session.id);
+
+    // Board -> Backlog: the terminal parks. Unfocused, still mounted.
+    manager.setFocusedSessions([]);
+    await settle();
+
+    expect([mockPty.cols, mockPty.rows]).toEqual([PANEL_COLS, PANEL_ROWS]);
+  });
+
+  it('parks once the last terminal holding the grid unmounts', async () => {
+    const { session, mockPty } = await spawnSession('task-rest-unmount');
+    manager.setFocusedSessions([session.id]);
+    manager.setMountedSessions([session.id]);
+    grabPanelGridUnwatched(session.id);
+    manager.setFocusedSessions([]);
+    await settle();
+    expect([mockPty.cols, mockPty.rows]).toEqual([PANEL_COLS, PANEL_ROWS]);
+
+    // The pane unmounts: nothing holds the grid now.
+    manager.setMountedSessions([]);
+    await settle();
+
+    expect([mockPty.cols, mockPty.rows]).toEqual([REST_COLS, REST_ROWS]);
+  });
+
+  it('keeps a grid another window still has mounted', async () => {
+    const { session, mockPty } = await spawnSession('task-rest-two-windows');
+    manager.setFocusedSessions([session.id], 1);
+    manager.setMountedSessions([session.id], 1);
+    manager.setMountedSessions([session.id], 2);
+    grabPanelGridUnwatched(session.id);
+
+    manager.setFocusedSessions([], 1);
+    manager.setMountedSessions([], 1);
+    await settle();
+
+    expect([mockPty.cols, mockPty.rows]).toEqual([PANEL_COLS, PANEL_ROWS]);
+  });
+
+  it('parks the sessions of a window that closes', async () => {
+    const { session, mockPty } = await spawnSession('task-rest-f');
+    manager.setFocusedSessions([session.id], 7);
+    manager.setMountedSessions([session.id], 7);
+    grabPanelGridUnwatched(session.id);
+
+    // The window is gone: both its focused and its mounted claims die with it.
+    manager.clearFocusedSessionsFor(7);
+    await settle();
+
+    expect([mockPty.cols, mockPty.rows]).toEqual([REST_COLS, REST_ROWS]);
+  });
+
+  /**
+   * The floor policy itself (user decision 2026-08-02): while a phone streams
+   * a session, a desktop-origin resize below MOBILE_USABLE_MIN_ROWS is
+   * refused outright - the phone mirrors the grid 1:1 and cannot make a
+   * strip taller, so the panel's ~14-row grab must never reach it. The
+   * refusal is invisible to an unpaired desktop and to any usable grid.
+   */
+  it('refuses a sub-floor desktop resize while a phone streams the session', async () => {
+    const { session, mockPty } = await spawnSession('task-floor-refuse');
+    manager.setFocusedSessions([session.id]);
+    const resizes: Array<[number, number]> = [];
+    manager.on('pty-resize', (_sessionId: string, cols: number, rows: number) => resizes.push([cols, rows]));
+    mockPty.resize.mockClear();
+
+    const result = manager.resize(session.id, PANEL_COLS, PANEL_ROWS);
+
+    // `refused` marks the one outcome where main deliberately HOLDS the grid
+    // against the caller. The echo re-assert (width-drift self-heal) reads it
+    // to stop after a single refused IPC instead of retrying to its cap; every
+    // other early return stays the bare { colsChanged: false }.
+    expect(result).toEqual({ colsChanged: false, refused: true });
+    expect(mockPty.resize).not.toHaveBeenCalled();
+    expect(resizes).toEqual([]);
+    expect([mockPty.cols, mockPty.rows]).toEqual([120, 30]);
+    // The refused grid still records what the desktop WANTED, so a later
+    // restore (phone gone, panel still up) has the right target.
+    expect(manager.getLastDesktopDimensions(session.id)).toEqual({ cols: PANEL_COLS, rows: PANEL_ROWS });
+  });
+
+  it('lets the same sub-floor resize through when no phone streams', async () => {
+    const { session, mockPty } = await spawnSession('task-floor-unwatched');
+    manager.setFocusedSessions([session.id]);
+    mobileStreamWatchers = new Set();
+
+    manager.resize(session.id, PANEL_COLS, PANEL_ROWS);
+
+    expect([mockPty.cols, mockPty.rows]).toEqual([PANEL_COLS, PANEL_ROWS]);
+  });
+
+  it('lets an above-floor desktop resize through while a phone streams', async () => {
+    const { session, mockPty } = await spawnSession('task-floor-above');
+    manager.setFocusedSessions([session.id]);
+
+    manager.resize(session.id, 150, 35);
+
+    expect([mockPty.cols, mockPty.rows]).toEqual([150, 35]);
+  });
+
+  /**
+   * A REFUSED resize must not eat a pending park: resize() cancels the
+   * debounced restore up front on the assumption the resize will be honored,
+   * and without a reschedule in the refusal branch a sub-floor session whose
+   * rescue was mid-debounce would strand on the sliver.
+   */
+  it('a refused resize re-arms a pending park instead of consuming it', async () => {
+    const { session, mockPty } = await spawnSession('task-floor-rearm');
+    manager.setFocusedSessions([session.id]);
+    grabPanelGridUnwatched(session.id);
+    manager.setFocusedSessions([]);
+
+    // The debounced park is now pending. A trailing desktop-origin sub-floor
+    // resize (a stale in-flight panel fit) is refused - and must reschedule.
+    manager.resize(session.id, PANEL_COLS, PANEL_ROWS);
+    await settle();
+
+    expect([mockPty.cols, mockPty.rows]).toEqual([REST_COLS, REST_ROWS]);
+  });
+
+  /**
+   * The floor applies to the pre-spawn stash too: a sub-floor desktop fit
+   * landing while the PTY is down (mid-suspend, pre-respawn) would otherwise
+  * respawn the session at the strip while a phone streams it.
+  */
+  it('does not stash a sub-floor desktop grid for a suspended session a phone streams', async () => {
+    const { session, triggerExit } = await spawnSession('task-floor-stash');
+    const suspension = manager.suspend(session.id);
+    triggerExit(0);
+    await suspension;
+
+    manager.resize(session.id, PANEL_COLS, PANEL_ROWS);
+
+    // The stash was skipped (dimensions fall back to the spawn default), but
+    // the desktop's INTENT is still the restore target.
+    expect(manager.getDimensions(session.id)).toEqual({ cols: 120, rows: 30 });
+    expect(manager.getLastDesktopDimensions(session.id)).toEqual({ cols: PANEL_COLS, rows: PANEL_ROWS });
+  });
+
+  it('still stashes a sub-floor grid for a suspended session when no phone streams', async () => {
+    const { session, triggerExit } = await spawnSession('task-floor-stash-unwatched');
+    const suspension = manager.suspend(session.id);
+    triggerExit(0);
+    await suspension;
+    mobileStreamWatchers = new Set();
+
+    manager.resize(session.id, PANEL_COLS, PANEL_ROWS);
+
+    expect(manager.getDimensions(session.id)).toEqual({ cols: PANEL_COLS, rows: PANEL_ROWS });
+  });
+
+  /**
+   * The pre-spawn stash is a deferral, not a refusal: the PTY does not exist,
+   * so nothing was held AGAINST the caller and nothing changed that could
+   * echo. `refused` must stay reserved for the floor's deliberate hold, or the
+   * echo re-assert would burn its budget on a session that is merely
+   * mid-respawn.
+  */
+  it('a stashed resize neither emits pty-resize nor reports refused', async () => {
+    const { session, triggerExit } = await spawnSession('task-floor-stash-shape');
+    const suspension = manager.suspend(session.id);
+    triggerExit(0);
+    await suspension;
+    mobileStreamWatchers = new Set();
+
+    const resizes: Array<[number, number]> = [];
+    manager.on('pty-resize', (_sessionId: string, cols: number, rows: number) => resizes.push([cols, rows]));
+
+    const result = manager.resize(session.id, PANEL_COLS, PANEL_ROWS);
+
+    expect(result).toEqual({ colsChanged: false });
+    expect(resizes).toEqual([]);
+  });
+
+  /**
+   * suspend() marks the record 'suspended' BEFORE gracefulPtyShutdown
+   * resolves, so the PTY stays non-null for up to ~3s of teardown. A resize
+   * landing in that window must stash like any suspended-session resize:
+   * reshaping the dying PTY would SIGWINCH a mid-exit agent and re-broadcast
+   * a pty-resize echo that arms re-asserts on other mounted terminals during
+   * teardown.
+  */
+  it('a resize in suspend\'s marked-but-alive window stashes instead of reshaping the dying PTY', async () => {
+    const { session, mockPty, triggerExit } = await spawnSession('task-floor-suspend-window');
+    mobileStreamWatchers = new Set();
+
+    const resizes: Array<[number, number]> = [];
+    manager.on('pty-resize', (_sessionId: string, cols: number, rows: number) => resizes.push([cols, rows]));
+    mockPty.resize.mockClear();
+
+    // Deliberately not awaited yet: the status flip is synchronous, the PTY
+    // teardown is not - this is the marked-but-alive window.
+    const suspendPromise = manager.suspend(session.id);
+    const result = manager.resize(session.id, PANEL_COLS, PANEL_ROWS);
+
+    expect(result).toEqual({ colsChanged: false });
+    expect(mockPty.resize).not.toHaveBeenCalled();
+    expect(resizes).toEqual([]);
+
+    triggerExit(0);
+    await suspendPromise;
+    // The stash recorded the intent, so the respawn lands at the real size.
+    expect(manager.getDimensions(session.id)).toEqual({ cols: PANEL_COLS, rows: PANEL_ROWS });
   });
 });

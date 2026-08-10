@@ -6,6 +6,8 @@ This guide walks through all features of Kangentic from a user's perspective.
 
 When you first open Kangentic with no existing projects, a welcome screen greets you with an **Open a Project** button. Click it to select a project folder and get started.
 
+The welcome screen also detects Git and your installed agent CLIs, showing each one's version, or an install link when it is missing and a login command when it is found but unauthenticated. Two links in the footer open in your browser: **Read the setup guide** and **Pair a phone**, the latter covering the mobile companion app (see [Mobile Bridge](mobile-bridge.md)).
+
 On subsequent launches, Kangentic automatically re-opens the last activated project so you pick up right where you left off. If you launch with the `--cwd` flag, that path takes priority.
 
 When a project is opened, Kangentic initializes a `.kangentic/` directory inside the project folder (auto-added to `.gitignore`) and creates a board with default columns.
@@ -128,6 +130,9 @@ P0 不包含 permission picker、discovery、`nativeAgent`、role switching、pe
 ### Move Between Active Columns
 
 Dragging between active columns (e.g., Executing to Code Review) normally keeps the same live agent session alive and injects the target column's `auto_command` (e.g., `/code-review`) directly into it. A move can require a respawn when the session track changes, the target requires a fresh session, or the agent or model changes. An adapter that cannot live-apply a concrete effort value may also respawn to apply it at launch. Permission mode differences alone do not restart the session, and a move with no applicable setting or command change keeps it alive.
+Dragging between active columns (e.g., Executing to Code Review) keeps the session alive. If the target column has an `auto_command` configured (e.g., `/code-review`), it is typed straight into the running agent as keystrokes - no suspend, no restart. A suspend and respawn happens only when the move needs one for its own reasons (a permission-mode change, or a model/effort change the agent cannot swap live); in that case the `auto_command` rides along as the resume prompt instead.
+
+Each column chooses WHEN its command arrives via **Auto-command timing**: `immediate` sends it on arrival (the agent queues it if mid-turn), while `deferred` holds it until the current turn genuinely finishes.
 
 ### Complete a Task
 
@@ -156,6 +161,8 @@ The bottom panel shows terminal output for running sessions.
 ### Session Tabs
 
 Each running session gets a tab. Click a tab to switch between sessions. The active tab is highlighted. Double-click a tab to open the corresponding task detail dialog.
+
+Opening a task's detail moves its terminal out of the panel, so that tab disappears while the detail is open - on the board and in the [Agent Monitor](#agent-monitor) alike. The other tabs stay where they are. Close the detail and the tab comes back, still selected. When the last tab goes, the panel collapses to its thin strip.
 
 Tab indicators show session state at a glance:
 - **Green spinner** - agent is actively working
@@ -192,9 +199,9 @@ Click a task card to open the detail dialog. From here you can:
 - View and manage attachments of any file type (drag-and-drop files onto the dialog, or paste from clipboard)
 - Right-click an attachment thumbnail to copy the image to clipboard
 - Click any attachment thumbnail to open a full-size preview modal (press Escape to close)
-- See the full terminal output (takes ownership from the bottom panel while open)
+- See the full terminal output (takes the terminal from the bottom panel, whose tab for this task disappears while the detail is open)
 - View session status, usage stats, and model info
-- Pause or resume the agent session using the circular play/pause button in the header
+- Pause or resume the agent session using the circular play/pause button in the header. Pausing also closes the detail window, so you do not have to dismiss it separately; the session stays paused and resumable from the board
 - Run shortcuts from the header bar (configurable pills that launch external tools)
 - Open the **Commands & Skills** popover to browse and run Claude Code commands (`.claude/commands/`) and skills (`.claude/skills/`) from the project directory. Search by name, navigate with arrow keys, press Enter to invoke.
 - Open the task's transcript in the read-only [conversation viewer](#the-conversation-viewer) via the **View conversation** pill (speech-bubble icon). Muted until the task has session history, live or historical.
@@ -204,10 +211,12 @@ Click a task card to open the detail dialog. From here you can:
   - **View conversation** - same as the header pill
   - **View PR** - open the associated pull request. PR URLs are populated automatically when an agent runs `gh pr create` or `gh pr view` (GitHub), explicitly via the `kangentic_create_task` / `kangentic_update_task` MCP tools (any platform), or manually through the PR URL field in edit mode. Those are the only ways to link a PR: writing a PR URL into the task description does not link it, so you can cite another task's PR as background without it being mistaken for this task's own. Also shown as a pill in the header bar and a clickable badge on the task card.
   - **Commands & Skills** - submenu of available Claude Code commands and skills (same as the header popover)
-  - **Pause / Resume session** - manually suspend or resume the agent
+  - **Pause / Resume session** - manually suspend or resume the agent (pausing closes the detail window, same as the header button)
   - **Move to** - submenu listing all other columns as move targets
   - **Archive** - move the task to Done and archive it
   - **Delete** - permanently delete the task, session, and worktree
+
+**Closing by clicking outside.** Task-detail windows are modeless, so clicking empty space outside one closes it. The rule is a denylist, not an allowlist: a control, a task card, or a running terminal still acts on your first click, so clicking outside never costs you a click you meant for something else, and overlays mounted outside the window shell (the settings panel, palettes, dialogs) never dismiss it either. Set the policy at **Settings > Behavior > Windows > Close on Outside Click**: `Off`, `Single Window` (only when one is open), `Focused Window` (the default), or `All Windows`. Closing a window never kills its session; the agent keeps running and reattaches when you reopen the task.
 
 ### Changes Panel
 
@@ -225,13 +234,13 @@ The panel persists its expanded/collapsed state, selected file, selected commit,
 
 The Changes panel is available for all tasks, whether or not worktrees are enabled. It uses `git merge-base` to show only branch-specific changes, excluding upstream commits.
 
-When the dialog is open, it claims the terminal session. The bottom panel releases it. When you close the dialog, the bottom panel reclaims the session.
+When the dialog is open, it claims the terminal session and the bottom panel drops that task's tab. Any other running session keeps its tab and its live terminal; the panel only collapses once nothing is left in it. Closing the dialog returns the tab, still selected.
 
 ### Browser Pane
 
 Tasks can host an embedded browser inside the task detail dialog. Use it to preview your dev server, capture screenshots with annotations, and submit framed prompts back to the agent without leaving Kangentic. Each worktree gets its own persistent webview partition (cookie jar), so two tasks logged into dev servers on the same localhost host don't clobber each other's sessions; tasks without a worktree share a single fallback jar.
 
-Agents can drive the pane themselves through the `kangentic_browser_*` MCP tools (navigate, screenshot, DOM queries, click, type, eval), governed by the [Agent Browser](#agent-browser) settings tab.
+Agents can drive the pane themselves through the `kangentic_browser_*` MCP tools (navigate, screenshot, DOM queries, click, type, eval), governed by the [Agent Browser](#agent-browser) settings tab. An agent can also open and close its own task's pane rather than waiting for you to do it, which means it may open that task's detail window on its own if none is open.
 
 | Action | Shortcut |
 |--------|----------|
@@ -367,6 +376,7 @@ Click the column header's settings icon. You can configure:
 | **Permission Mode** | Override the global permission mode for agents in this column |
 | **Auto Spawn** | Whether moving a task here spawns an agent (default: on) |
 | **Auto Command** | Command injected into running sessions when tasks arrive |
+| **Auto Command Timing** | Whether that command interrupts the agent or waits for its current turn to finish |
 | **Plan Exit Target** | For plan-mode columns: where tasks move when planning completes |
 
 When a column's adapter override differs from the current session's adapter, a cross-agent history passthrough requires that agent change, an existing session, and the destination column's `handoff_context` option. When enabled, the target's initial prompt receives a reference to adapter-resolved native history when available. Kangentic does not inline full history or synthesize transcript, git, or metrics context, and the target agent may not read the reference.
@@ -505,7 +515,7 @@ These are global-only settings that apply to the entire app.
 | Auto-Focus Idle Sessions | Automatically switch the bottom panel to idle sessions. Idle tabs stay highlighted either way. |
 | Auto-Resume Agents on Restart | Resume agent sessions that were running when the project last closed. Turn off if resuming many at once slows your machine. |
 | Idle Timeout (minutes) | Auto-suspend sessions after N minutes idle; 0 to disable |
-| Close on Outside Click | Click-outside (light-dismiss) policy for modeless task-detail windows. Closing a window does not kill its session. |
+| Close on Outside Click | Click empty space outside a task window to close it. Controls, task cards, and running terminals still act on the first click. Closing a window does not kill its session. |
 | Restore Window Position | Remember window size and position between launches |
 
 The Board tab has its own Auto-Apply Board Config Changes toggle - see [Applying Changes](#applying-changes) below.
@@ -537,6 +547,8 @@ Kangentic can export your board layout to a `kangentic.json` file in the project
 ### Sharing with Your Team
 
 When you open a project, Kangentic automatically writes `kangentic.json` with the current board state. Commit and push this file. When teammates pull it, Kangentic detects the change and shows a banner offering to apply the new configuration.
+
+The sync runs both ways. Opening a project also reads an existing `kangentic.json` back INTO your database first, before that write - so editing the file by hand is a genuine way to change the board, not just a record of it. That read happens with no banner and no prompt, and the file wins where the two disagree. See [Board Config Sync](configuration.md#board-config-sync-kangenticjson) for the full rules, including the one case where an invalid file gets silently overwritten from the database.
 
 ### Personal Overrides
 
@@ -596,15 +608,29 @@ Command Terminals keep running when you hide the layer and when you switch proje
 
 Desktop and toast notifications fire when an agent needs attention and the user can't already see it - either the window is minimized/unfocused, or a different project is active. Notification events: agent idle, permission-blocked idle (body shows "Needs permission"), session crash (non-zero exit), and plan-completion auto-moves. The task name is the title and the project name is the body. Clicking a desktop notification brings the window to the foreground, switches to the correct project, and opens the task detail dialog. The taskbar also flashes on Windows. A 10-second per-session cooldown prevents repeated desktop notifications from the same agent.
 
-The Settings > Notifications panel exposes three configurable events: **Agent Idle**, **Plan Complete**, and **Spawn Stalled** (a task spawn that waits too long on the git queue while preparing). Each can be set to Desktop & Toast, Desktop Only, Toast Only, or Off. Toast duration and max visible count are also configurable. The **Agent Crash** notification (non-zero exit) is always on and not exposed in the settings UI.
+The Settings > Notifications panel exposes four configurable events: **Agent Idle**, **Agent Crash** (session exit; desktop alerts on error exits only, toasts also cover clean exits), **Plan Complete**, and **Spawn Stalled** (a task spawn that waits too long on the git queue while preparing). Each can be set to Off, Desktop only, Toast only, or Both. Toast duration and max visible count are also configurable.
+
+### Announcements
+
+Occasionally Kangentic shows a product announcement (for example, a call for mobile-app beta
+testers) as a slim banner above the board. **Learn more** opens the full message with links and
+a QR code; the **X** dismisses that announcement permanently on this machine. Announcements are
+fetched from a static file on the public GitHub repo - no account, no tracking, and if the feed
+is unreachable (offline or self-hosted setups) the banner simply never appears. See
+[Configuration - In-App Announcements](configuration.md#in-app-announcements) for the feed
+mechanics.
 
 ### Mobile Devices
 
-The Mobile Devices tab is the desktop half of the mobile companion app's pairing link - global (applies to this desktop installation, not any one project) and off by default. Enable the **Mobile Bridge** toggle, then pick a **Relay**: *Kangentic Cloud* (the default hosted relay) or *Custom Relay* (your own self-hosted address, entered in the field that appears below). Dev builds also offer a *Local* option pointing at a relay on localhost. The address actually being dialed is shown beneath the picker, and **Test connection** probes it for reachability before you pair. The relay only ever sees encrypted traffic. A custom address must use `wss://`, or `ws://` for localhost only, since the phone refuses to pair over an untrusted transport.
+The Mobile Devices tab is the desktop half of the mobile companion app's pairing link - global (applies to this desktop installation, not any one project) and off by default. Below the **Mobile Bridge** toggle it splits into two sections: **Relay** (where this desktop connects) and **Mobile** (which phones may use it). Each ends in a documentation link that stays usable with the bridge off, since someone still deciding whether to enable it is exactly the person who has not.
 
-Click **Pair a Device** to display a QR code; scanning it with the Kangentic mobile app starts an end-to-end encrypted pairing handshake. Once the handshake completes, both the desktop and the phone show the same short code - compare them, then tap **Confirm** on the phone. The desktop auto-enrolls the device as soon as it hears back; there is no second confirmation to make on the desktop. This catches a photographed or relayed QR, since an attacker cannot make both sides show the same code. To back out, cancel on the phone (or close the desktop's pairing panel) before confirming.
+Enable the toggle, then pick a **Relay**: *Kangentic Relay* (the default, the one Kangentic operates) or *Custom Relay* (your own self-hosted address). Dev builds also offer a *Local* option pointing at a relay on localhost. The address being dialed always sits in the field directly beneath the picker, read-only for the presets and editable for a custom relay, so there is one place to look regardless of which you chose; a shield in front of it marks the Kangentic-operated relay and appears for nothing else. **Test connection** probes that address before you pair: it reports whether the relay answered and how long it took, or prints why it did not. The relay forwards encrypted traffic and never holds your keys; **How the relay works** opens the relay documentation, which covers what it does, what an operator can still observe, and how to run your own. A custom address must use `wss://`, or `ws://` for localhost only, since the phone refuses to pair over an untrusted transport.
+
+Click **Pair a device** to display a QR code; scanning it with the Kangentic mobile app starts an end-to-end encrypted pairing handshake. Once the handshake completes, both the desktop and the phone show the same short code - compare them, then tap **Confirm** on the phone. The desktop auto-enrolls the device as soon as it hears back; there is no second confirmation to make on the desktop. This catches a photographed or relayed QR, since an attacker cannot make both sides show the same code. To back out, cancel on the phone (or close the desktop's pairing panel) before confirming.
 
 The phone is treated as an extension of your own desktop, not a separate integration to configure: pairing grants it full access to the same ten capabilities the protocol defines (there is no shell, file, or arbitrary-command access in the protocol at all). Paired devices appear in a list below, identified by a key fingerprint you can compare against the phone's own Settings > Devices screen, along with their connection status and paired date. Rename a device from that list, or revoke it - revoking removes it from the desktop's signed roster immediately, and a revoked phone must be paired again from scratch to reconnect. See [Mobile Bridge](mobile-bridge.md) for the underlying protocol, pairing ceremony, and security design.
+
+The Mobile section closes with **How to install and pair**, which opens the [Kangentic Mobile docs](https://www.kangentic.com/mobile/): installing the app, pairing a phone, and push notifications. It is always present, in both directions - it stays usable with the bridge toggle off, since someone who has not installed the app yet is exactly the person who has not enabled the bridge, and it does not disappear once phones are paired, since that link is a docs landing page rather than an install page and you may well be adding a second device. Install instructions live on the website so they stay current between desktop releases; while a store rollout is in progress, the in-app Announcements dialog carries the signup steps for the current phase.
 
 ### Privacy
 
@@ -671,13 +697,14 @@ The viewer opens positioned at the latest message, or centered on the turn match
 
 The Command Terminal provides quick, ephemeral access to Claude Code without creating a task on the board. Useful for one-off actions like creating releases, running queries, or any ad-hoc interaction.
 
-**Opening:** Press `Ctrl+Shift+P` (or `Cmd+Shift+P` on macOS), or click the terminal icon in the title bar (next to the settings gear). The same button **toggles** the layer closed again, so there is always a one-click way to hide it, even when a window is maximized. The terminal icon's border reflects activity across your open terminals: it marches in green while an agent is working, holds a steady warm amber when one needs your input, and stays plain when idle.
+**Opening:** Press `Ctrl+Shift+P` (or `Cmd+Shift+P` on macOS), or click the terminal icon in the title bar (next to the settings gear). The same button **toggles** the layer closed again, so there is always a one-click way to hide it, even when a window is maximized. The terminal icon reflects activity across your open terminals: its prompt blinks in green while an agent is working, it holds a steady warm amber when one needs your input, and it stays plain when idle.
 
 **Behavior:**
 - Spawns Claude Code at the project root on the configured default base branch
 - It opens as a **window** over a slight backdrop blur: drag it by the header, resize it from any edge or corner, maximize / restore it (double-click the header or use the maximize button), and snap it to a screen half or full screen (Windows-style). The layout (size, position, maximized state) **persists globally** across all projects and app restarts.
 - **Run more than one at once.** While the layer is open, a second terminal icon (with a `+` in its center) appears in the title bar just to the left of the main terminal icon - click it to open another terminal (up to four); it disables once you hit the cap. New terminals split into the current window's footprint (side by side, keeping the size you set) so you can keep two ad-hoc tasks cooking and glance between them; drag the seam to rebalance, or maximize one to focus it.
-- **Layout controls (same as task windows).** The header's tile-layout button offers one-click snap (left / right / top / bottom) and tilings (columns / grid). When a terminal is tiled, a **pop-out** button floats it back out of the tile group. The title always wins the header's space: the quick-action pills (Commands, Project, Changes, shortcuts) fold into the `...` menu as the window narrows.
+- **Each window is numbered.** A terminal titles itself `Command Terminal 1`, `Command Terminal 2`, and so on, from its durable window slot - so two side-by-side terminals are tellable apart, and the number stays put when a sibling opens or closes. The same title identifies that terminal on its Agent Monitor row. Once you send a first prompt, the title becomes a short auto-derived name for what you asked instead.
+- **Layout controls (same as task windows).** When a terminal is tiled, a **pop-out** button floats it back out of the tile group. The title always wins the header's space: the quick-action pills (Commands, Project, Changes, shortcuts) fold into the `...` menu as the window narrows.
 - The **branch picker** in the header lets you switch branches - selecting a new branch kills that terminal's session and respawns it on the selected branch
 - A shimmer overlay shows while Claude Code initializes, then lifts to reveal the clean TUI
 - Transient sessions are fully independent of task sessions - they don't appear in the terminal panel tabs, don't count toward session limits, and produce no toasts on exit
@@ -706,14 +733,42 @@ Open the usage dashboard from the chart icon in the title bar or with `Mod+Shift
 
 Totals are read from the durable usage ledgers, so they survive task and session deletion. The selected range and scope persist across app restarts (one global value shared across all projects).
 
+## Agent Monitor
+
+Open the monitor from the activity icon in the title bar or with `Mod+Shift+M`. It answers "what are all my agents doing right now?" in one place, across **every** registered project rather than just the one whose board is open. The title-bar icon itself is the ambient signal: green while any agent anywhere is working, amber the moment one starts waiting on you.
+
+Each session shows its owning project and column, the task title and ticket number, live activity state, agent, model, effort and permission mode, how long it has been running, and what the agent is doing right now. Four tiles across the top count what needs you, what is active, what is paused, and how many projects have something live.
+
+Every card also carries a **live output peek**: the last few rendered lines of that session's terminal, in a shaded panel where a task description would otherwise sit. It updates in place as the agent works (at most twice a second, and only when the visible text actually changes), so you can see what a session is saying without opening it. The panel is a fixed height, so a card never resizes as messages land.
+
+Command Terminals (`Mod+Shift+P`) appear here too. They are the one thing the board cannot show you - they belong to no task, so before now a Command Terminal left running in another project was invisible. Each is titled `Command Terminal N` (matching the number on its own window), draws a terminal-shaped activity glyph rather than the agent one, and names the **branch** it is working on where a task card names its column.
+
+You choose how it looks, and the choice is remembered (including across a restart):
+
+- **Layout** - cards (which reflow into 2 or 3 columns as the window widens), a dense sortable table, or a one-line-per-session list.
+- **Grouping** - by status (Idle / Active / Paused / Recently finished) or by project. Rows are always sectioned, which is what keeps anything waiting on you at the top without you having to sort for it.
+- **Sort** - Oldest or Newest, applied within each section. The table layout sorts by its own column headers instead.
+- **Filters** - a text filter across title, project, column, agent, model, ticket number and labels, plus a "Live only" toggle that drops paused and recently finished sessions.
+
+Clicking a row opens that task's full detail - terminal included - **in the monitor**, so several agents across several projects can be watched and driven from one surface without leaving for another project's board. Right-click a row and choose **Open on board** for the old behavior. A task's detail is only ever open in one place: opening it somewhere else moves it rather than making a second copy, and its tab leaves the bottom panel while it is open.
+
+Clicking empty space anywhere in the monitor - its list, header, summary cards, or filter bar - closes a detail open there, following your [Close on Outside Click](#behavior-settings) setting. It is scoped to the monitor, so it never reaches through to a task window open on the board underneath.
+
+The pop-out button detaches the monitor into its own window, which is the intended way to keep it on a second monitor. The detached window lays out by its own width, so it stays readable narrow while the in-app view fills a wide screen.
+
+Whatever you have open in the monitor follows it. Detaching carries your open details into the pop-out, closing the pop-out hands them back to the in-app monitor, and the arrangement survives a restart - the same way board and Command Terminal layouts do. Nothing stays running in the background: closing the monitor unmounts its terminals (the agents keep working, and their tabs return to the bottom panel), and reopening it restores what you had.
+
+Two things are deliberately left out of that restore, because the monitor is for watching agents that are still working: a task you have since opened on the board stays where it is rather than being pulled back in, and a detail whose agent has finished is not reopened. You can still click a finished session's row to look at it; it just will not come back on its own.
+
 ## Keyboard Shortcuts
 
-Every shortcut is declared in a central registry and is **rebindable** under Settings > Hotkeys, where it can be bound to a key chord or a mouse button (middle or side buttons). Hotkeys also flags conflicts and combos already claimed by the OS or another app. `Mod` below is Cmd on macOS and Ctrl on every other platform.
+Every shortcut is declared in a central registry, and nearly all are **rebindable** under Settings > Hotkeys, where each can be bound to a key chord or a mouse button (middle or side buttons). Hotkeys also flags conflicts and combos already claimed by the OS or another app. The description-editor keys below are the exception: they are **fixed**, because they are the platform conventions for text formatting. Fixed keys are still listed in Hotkeys for reference, just not editable. `Mod` below is Cmd on macOS and Ctrl on every other platform.
 
 General:
 
 - **Mod+Shift+S** - Toggle the settings panel
 - **Mod+Shift+U** - Toggle the Usage Stats dashboard
+- **Mod+Shift+M** - Toggle the Agent Monitor (every running agent, across all projects)
 - **Mod+Shift+B** - Switch between Board and Backlog view
 - **Mod+Shift+E** - Toggle the project sidebar
 - **Mod+Shift+J** - Toggle the bottom terminal panel
@@ -732,10 +787,19 @@ Task detail (whichever panel is open):
 - **Mod+Shift+K** - Toggle the description panel inside the task detail dialog
 - **Middle-click the window header** - Close a modeless task-detail window (default `Mouse:Middle`; routes through the same unsaved-edits guard as the close button)
 
+Description editor (mounts in task detail and in the New Task / New Backlog Task dialogs). All four are fixed, not rebindable:
+
+- **Mod+B** - Wrap the selected text in bold markdown
+- **Mod+I** - Wrap the selected text in italic markdown
+- **Mod+K** - Wrap the selected text in a markdown link
+- **Mod+Shift+V** - Paste without converting pasted HTML to markdown. Not listed in Settings > Hotkeys, since no app lets you rebind it
+
 Windows (modeless task-detail windows):
 
 - **Mod+Shift+Left** / **Mod+Shift+Right** - Snap the focused window to the left / right half of the board area
-- **Mod+Shift+Up** / **Mod+Shift+Down** - Snap the focused window to the top / bottom half
+- **Mod+Shift+Up** / **Mod+Shift+Down** - Stateful snap: Up maximizes a floating window and moves a half-snapped one to its top corner; Down restores a maximized window and moves a half-snapped one to its bottom corner
+- **Drag by the header** - Wherever your cursor goes decides what happens: run it into the left, right or bottom edge of the board area to snap that half, into the top edge to maximize, or over another window to tile beside it. Over a window, the left and right thirds dock to that side at any height, and the middle third docks above or below depending on which half of the window you point at. Dragging onto another window only tiles once you have moved a fair distance, so a nudge just repositions; the screen edges arm as soon as the cursor reaches them.
+- **Escape while dragging** - Abandon the drag: the window returns to where it started and nothing docks
 
 Terminal:
 

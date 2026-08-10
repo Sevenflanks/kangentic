@@ -7,11 +7,72 @@
  * collapse to a single key.
  */
 import { describe, it, expect } from 'vitest';
-import { popOutInstanceKey, isPopOutKind } from '../../src/shared/pop-out';
+import { popOutInstanceKey, isPopOutKind, POP_OUT_SURFACES, POPOUT_KINDS } from '../../src/shared/pop-out';
+import { IPC } from '../../src/shared/ipc-channels';
 
 describe('popOutInstanceKey', () => {
   it('collapses the global "stats" surface to its bare kind, ignoring any params', () => {
     expect(popOutInstanceKey('stats', {})).toBe('stats');
+  });
+
+  it('collapses the global "monitor" surface to its bare kind', () => {
+    expect(popOutInstanceKey('monitor', {})).toBe('monitor');
+  });
+
+  /**
+   * The specific regression this guards: the global branch used to be a hardcoded
+   * `kind === 'stats'` check, so a SECOND global surface fell through to the
+   * task-params branch and keyed as `monitor:undefined:undefined`. That key still
+   * looks plausible and is stable, so the window would open and track - it would
+   * simply never match the renderer's own lookup. Assert every declared global
+   * surface collapses, rather than spot-checking the two that exist today.
+   */
+  it('every global-scope surface collapses to its bare kind', () => {
+    const globalKinds = POPOUT_KINDS.filter((kind) => POP_OUT_SURFACES[kind].scope === 'global');
+    expect(globalKinds.length).toBeGreaterThan(1);
+    for (const kind of globalKinds) {
+      expect(popOutInstanceKey(kind, {} as never)).toBe(kind);
+    }
+  });
+});
+
+describe('POP_OUT_SURFACES fan-out declarations', () => {
+  /**
+   * A channel a surface subscribes to but does not declare here is dropped
+   * SILENTLY for pop-out windows (windowsForChannel filters on this list), so the
+   * detached surface just never updates. These pin the monitor's live
+   * wires - MONITOR_PEEK included, even though (unlike the others) it is
+   * subscribe-gated rather than an unconditional push: the detached window
+   * subscribes on its own behalf, so main is already fanning to it by the time
+   * rows exist, and dropping this line would silently freeze every card's
+   * output peek in a detached monitor.
+   */
+  it('the monitor declares the channels its surface subscribes to', () => {
+    const channels = POP_OUT_SURFACES.monitor.channels;
+    expect(channels).toContain(IPC.MONITOR_CHANGED);
+    expect(channels).toContain(IPC.SESSION_ACTIVITY);
+    expect(channels).toContain(IPC.MONITOR_PEEK);
+    expect(channels).toContain(IPC.CONFIG_CHANGED);
+  });
+
+  /**
+   * The monitor is currently the ONLY pop-out surface that can host a task
+   * detail (and therefore a live terminal) for a project the board is not on
+   * (see the channels comment in src/shared/pop-out.ts). Without this channel
+   * declared, a PTY reshaped under that detached terminal would never receive
+   * the width-drift self-heal's echo (windowsForChannel filters the broadcast
+   * on this list) and the divergence would never recover in that window -
+   * silently, since nothing else observes the drop. If a future surface also
+   * hosts a terminal, extend this assertion to it too.
+   */
+  it('the monitor declares the PTY-dims echo so a hosted terminal can self-heal a width divergence', () => {
+    const channels = POP_OUT_SURFACES.monitor.channels;
+    expect(channels).toContain(IPC.SESSION_PTY_RESIZED);
+  });
+
+  it('the monitor is a global surface with no task params', () => {
+    expect(POP_OUT_SURFACES.monitor.scope).toBe('global');
+    expect(POP_OUT_SURFACES.monitor.needsWebview).toBe(false);
   });
 
   it('keys a task-scoped "changes" surface by kind:projectId:taskId', () => {

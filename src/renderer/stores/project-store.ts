@@ -289,17 +289,14 @@ const createProjectStore = () => create<ProjectStore>(projectStoreInitializer);
 // not a React Fast Refresh boundary. Pin the instance in `import.meta.hot.data`
 // so a Fast Refresh that re-evaluates this module cannot strand a second store
 // instance while the mounted sidebar stays subscribed to the first.
-// @ts-expect-error -- Vite handles import.meta.hot; tsc's "module": "commonjs" doesn't support it
 const preservedProjectStore: ReturnType<typeof createProjectStore> | undefined = import.meta.hot?.data?.projectStore;
 
 export const useProjectStore = preservedProjectStore ?? createProjectStore();
 
-// @ts-expect-error -- Vite handles import.meta.hot; tsc's "module": "commonjs" doesn't support it
 if (import.meta.hot) {
-  // @ts-expect-error -- Vite handles import.meta.hot
   import.meta.hot.data.projectStore = useProjectStore;
   // Editing this module's OWN code would leave the pinned instance running stale
   // closures; force a clean full reload instead (rare; prod drops this block).
-  // @ts-expect-error -- Vite handles import.meta.hot
-  import.meta.hot.accept(() => import.meta.hot.invalidate());
+  const hot = import.meta.hot;
+  import.meta.hot.accept(() => hot.invalidate());
 }

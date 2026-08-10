@@ -8,7 +8,7 @@
  * bar drags it; geometry is fractional, projected to pixels against the overlay.
  */
 
-import { useEffect, useLayoutEffect, useRef } from 'react';
+import { memo, useEffect, useLayoutEffect, useRef } from 'react';
 import type { RefObject } from 'react';
 import { useOverlayPhase } from '../../hooks/useOverlayPhase';
 import type { ContainerSize, PixelRect } from '../store/geometry';
@@ -32,7 +32,7 @@ interface WindowFrameProps {
 
 const MAXIMIZED_GEOMETRY = { x: 0, y: 0, w: 1, h: 1 };
 
-export function WindowFrame({ managedWindow, containerSize, overlayRef, tiledRect }: WindowFrameProps) {
+function WindowFrameInner({ managedWindow, containerSize, overlayRef, tiledRect }: WindowFrameProps) {
   const frameRef = useRef<HTMLDivElement>(null);
   const useStore = useLayerStore();
   const focusWindow = useStore((state) => state.focusWindow);
@@ -78,6 +78,7 @@ export function WindowFrame({ managedWindow, containerSize, overlayRef, tiledRec
 
   const isMaximized = managedWindow.state === 'maximized';
   const isTiled = managedWindow.state === 'tiled';
+  const isRetained = managedWindow.retainedProjectId !== undefined;
   // A tiled window's rect comes from the tile tree (resolved by WindowLayer), not
   // its own geometry. Falls back to geometry if the resolved rect is missing.
   const pixelRect =
@@ -120,12 +121,20 @@ export function WindowFrame({ managedWindow, containerSize, overlayRef, tiledRec
         if (target.closest('.xterm')) return;
         if (target.closest('[data-testid="conversation-view"]')) return;
         event.preventDefault();
+        // arrival-focus-ok: a literal pointer-down on THIS window's chrome.
         frameRef.current?.querySelector<HTMLElement>('.xterm-helper-textarea')?.focus();
       }}
       onPointerMove={handleFramePointerMove}
       onPointerUp={handleFramePointerUp}
       onPointerCancel={handleFramePointerCancel}
       onAnimationEnd={onAnimationEnd}
+      // A retained window belongs to a backgrounded project and exists only to
+      // keep its Browser pane's <webview> guest alive. It is hidden with
+      // `opacity: 0`, NOT `visibility: hidden` and NOT by moving it offscreen:
+      // both of those stop the guest compositing, which makes CDP
+      // Page.captureScreenshot never resolve and wedges every later command for
+      // that guest (measured on Electron 41). An opacity-0 subtree keeps
+      // compositing, so the agent can still screenshot its own pane.
       style={{
         position: 'absolute',
         left: pixelRect.left,
@@ -133,7 +142,12 @@ export function WindowFrame({ managedWindow, containerSize, overlayRef, tiledRec
         width: pixelRect.width,
         height: pixelRect.height,
         zIndex: managedWindow.zIndex,
+        ...(isRetained
+          ? { opacity: 0, pointerEvents: 'none' as const }
+          : {}),
       }}
+      aria-hidden={isRetained || undefined}
+      inert={isRetained || undefined}
       className={`pointer-events-auto group bg-surface-raised border border-edge focus-within:border-accent/40 ${
         isMaximized || isTiled ? 'rounded-none' : 'rounded-lg'
       } ${isTiled ? '' : 'shadow-2xl'} flex flex-col overflow-hidden ${contentClassName}`}
@@ -162,3 +176,15 @@ export function WindowFrame({ managedWindow, containerSize, overlayRef, tiledRec
     </div>
   );
 }
+
+/**
+ * Memoized: `WindowLayer` maps over the whole `windows` record, and every store
+ * write replaces that record identity - opening or closing one window, focusing
+ * one, or committing a single frame of a drag. `openWindow` / `closeWindow` spread
+ * the record rather than rebuilding its members, so an untouched window keeps its
+ * object identity and its frame can skip the render entirely. Without this, one
+ * open re-ran this whole subtree (WindowContent -> TaskDetailWindow ->
+ * TaskDetailBody -> TerminalTab, each with its own store selectors) for EVERY open
+ * window, so the cost of opening a detail grew with how many were already open.
+ */
+export const WindowFrame = memo(WindowFrameInner);

@@ -37,6 +37,9 @@ Priority 3 has five sub-cases, checked in order:
 **c) Same agent + effort change:** The adapter decides whether it can apply a concrete effort change live. A live-swap plan is scheduled through `TerminalSubmitScheduler.scheduleKeystrokes`, then its applied settings are persisted on the session record. Without a live-swap capability, a concrete effort delta suspends and respawns so the new setting reaches the adapter command. Deltas compare the session record's `applied_effort`, not the source lane. Entering a default-effort lane does not respawn because resume preserves the existing agent setting.
 
 **d) Same agent + permission-only delta:** The live session remains running. A changed lane permission does not restart it, including the Planning to Executing path where the user already approved the plan in the same session. The spawn-time permission record is not a restart signal.
+**c) Same agent + live injection plan:** If the destination adapter returns a non-null plan from `prepareInjectionPlan` (model/effort slash commands like `/model X` + optional auto_command), the writes are scheduled directly into the running session via `TerminalSubmitScheduler.scheduleKeystrokes`. No suspend/resume cycle occurs. The delta is computed against what the session is *actually running at*, not the leaving column, so a column whose value the session already has injects nothing. The two fields resolve that differently: **model** uses the session record's `applied_model`, while **effort** prefers the level the agent itself reports (`task.effort_override ?? <agent-reported effort> ?? record.applied_effort`), because `applied_effort` records only what Kangentic last asked for and an `/effort` typed straight into the terminal never reaches it. Model deliberately stays record-only - telemetry reports canonical ids while the configured values are flag strings, so comparing them would read a false change and restart the PTY. See [Command Injection](command-injection.md) for the full precedence. After scheduling, when `plan.appliedSettings` is present the handler persists it via `sessionRepo.updateAppliedSettings`, keeping the recorded value current so the next move diffs against the truth.
+
+**d) Same agent + concrete model/effort delta (no live-swap):** If the adapter has no live-swap slash for the target value AND the destination column overrides model or effort to a non-null value the session is not already running at (the delta is computed against what the session is actually running at, not the source lane: `applied_model` for model, and `task.effort_override ?? <agent-reported effort> ?? record.applied_effort` for effort, matching case (c) above), the session is suspended and respawned so the new flags land on the command line. The respawn is skipped when the target value is null (entering a "Default" column) because adapters have no `/model <agent-default>` slash and `--resume <id>` preserves the saved model regardless - the suspend/resume would just churn the PTY without changing anything. Matches the recovery contract in `task-runtime-override.ts`.
 
 **e) Same agent, no restart condition:** The session stays alive. An adapter may still schedule a configured `auto_command` through its injection plan.
 
@@ -147,8 +150,10 @@ Content-Type defaults to `application/json`. Failures are logged but don't block
 
 One declaration (`src/shared/task-template-vars.ts`) drives every consumer: the
 `auto_command` field (column and per-task), the `spawn_agent` action's
-`promptTemplate`, the Automation tab's chip list, and this table - see
-`tests/unit/task-template-vars-parity.test.ts`. All 10 keywords resolve
+`promptTemplate`, the Automation section's "Template variable" picker, and this
+table - see `tests/unit/task-template-vars-parity.test.ts`. Because the picker
+shows each entry's `description`, that field is user-facing copy and should stay
+to one line. All 10 keywords resolve
 identically in both `auto_command` and `promptTemplate`; `send_command` /
 `run_script` / `webhook` use the same values but keep literal, non-collapsing
 substitution (an unknown or empty `{{key}}` is left as-is, matching
@@ -205,6 +210,14 @@ fresh 與 resume 使用不同 payload-path env，避免分離的 TUI/server plug
 後續 OpenCode live lane command 維持既有 delivery invariant：只有 already-running active writable compatible Main Session，且稍後取得相符的 root-native clean idle 私有同 process evidence，才能授權交付。generic public idle、child idle 與 timer 完成都不能授權。使用者輸入優先並取消等待中的交付，既有 cancellation 不變，交付不送 `Ctrl+C`，也不 respawn session。PTY 是這些 later live command 唯一允許的 transport，無須 native API transport。
 
 OpenCode 的 fresh、resume、handoff、restart、isolated、no-active lifecycle cases finalizes a skip for Auto-command。這個 disposition 不改變正常的 resume、fresh spawn、worktree 或 action chain，也不改 ordinary Task prompt、continuation prompt 或 action prompt。Non-OpenCode existing legacy delivery remains intact.
+**Fresh spawns** (priority 4, no suspended session to resume):
+- `TerminalSubmitScheduler.scheduleKeystrokes` schedules the command for deferred PTY injection
+- Interpolates the `auto_command` template with task variables
+- Waits for the CLI's first `'thinking'` activity event, then delivers via `TerminalSubmit.submitKeystrokes` as a handshake chain (drain + output-settle between keystrokes) rather than fixed sleeps
+
+If keystroke delivery cannot be confirmed in the agent's transcript, it escalates to a session restart that passes the command as the CLI's prompt argument - the same guarantee the resumed path has. Every injection ends in a recorded outcome on the task, and a failure raises a notice instead of a console warning. The full contract, including the delivery ladder, the prompt-state policy, and the measured before/after delivery rate, is in [Command Injection](command-injection.md).
+
+A column also declares WHEN its command fires, via `auto_command_mode`: `immediate` (the default; interrupts the agent's current turn if there is one) or `deferred` (holds until that turn genuinely finishes). "Finishes" requires activity `idle` AND a quiet PTY, because a bare idle is reported for minutes during an API retry backoff or a `Monitor` wait.
 
 This enables workflows like moving a task from "Running" to "Code Review" to automatically send a review prompt to the agent.
 
@@ -230,6 +243,45 @@ Each swimlane has an `auto_spawn` boolean (default: `true`):
 - `false` -- tasks in this column should NOT have active sessions. Moving a task here suspends its session.
 
 To Do and Done columns have `auto_spawn=false` by default.
+
+### Changing the flag applies immediately
+
+Editing `auto_spawn` reconciles the tasks ALREADY in the column, with no restart
+and no move: switching it on spawns for each task that has no session, and
+switching it off suspends the live sessions there. This runs through
+`reconcileAutoSpawnChange` (`src/main/ipc/handlers/auto-spawn-reconcile.ts`),
+dispatched from `propagateStrategyToLiveSessions`, so all four authoring surfaces
+behave identically on the ACTIVE project:
+
+- the Board Manager's column edit (`SWIMLANE_UPDATE`),
+- the Board Manager's Board Profile edit (`BOARD_CONFIG_SET_BOARD_PROFILES`) -
+  `auto_spawn` is profile-scoped, so a profile can flip it for a task without the
+  column changing,
+- the MCP `kangentic_update_column` tool,
+- the MCP profile tools (`kangentic_update_board_profile`,
+  `kangentic_delete_board_profile`, `kangentic_create_board_profile`), which
+  reach the same reconcile through `setBoardProfiles`.
+
+An MCP tool can also target a background project via its `project` argument; that
+writes the setting without reconciling. The reason is BLAST RADIUS, not an absent
+session: a background project can have live sessions (the Agent Monitor and the
+sidebar's per-project agent counts are built on exactly that). The reconcile
+SPAWNS, and a spawn creates a worktree and checks out a branch in a checkout the
+user is not looking at. Its tasks pick the new setting up when they next spawn.
+The cost is that turning `auto_spawn` off on a non-focused project leaves that
+project's agents running until it is next opened.
+
+Three things it deliberately does not do. A task the user explicitly paused is
+never started by a column edit; only an explicit Resume clears that. A To Do or
+Done column never spawns, whatever the flag says: the Board Manager and
+`apply-config.ts` both force `auto_spawn` false for a role column, but the MCP
+`update_column` tool writes the field with no role validation, so the reconcile
+guards the ON direction itself. Only the ON direction is guarded, since
+suspending a session that should not have been there is always safe. And the
+`kangentic.json` file watcher (`BOARD_CONFIG_APPLY`) does NOT reconcile, so a
+`git pull` that flips `autoSpawn` still takes effect on the next project open -
+that path fires for whichever project changed on disk, which is often not the
+focused one.
 
 ## plan_exit_target_id
 

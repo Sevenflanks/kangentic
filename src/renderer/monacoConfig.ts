@@ -42,9 +42,7 @@ errorHandler.unexpectedErrorHandler = (error: unknown) => {
 // edit to monacoConfig.ts, or to benign-renderer-errors.ts which it imports)
 // rewraps the real default rather than stacking another layer on the already-
 // wrapped handler. Pattern D cleanup; see .claude/rules/hmr-patterns.md.
-// @ts-expect-error -- Vite handles import.meta.hot; tsc's "module": "commonjs" doesn't support it
 if (import.meta.hot) {
-  // @ts-expect-error -- Vite handles import.meta.hot
   import.meta.hot.dispose(() => {
     errorHandler.unexpectedErrorHandler = defaultUnexpectedErrorHandler;
   });
@@ -56,7 +54,6 @@ if (import.meta.hot) {
 // dead-code elimination (import.meta.env.DEV is false). Mirrors the
 // __zustandStores handle in App.tsx. This is a read-only debug handle, not a
 // behavior change.
-// @ts-expect-error - Vite defines import.meta.env; tsc doesn't support it
 if (import.meta.env.DEV) {
   (window as unknown as Record<string, unknown>).__monaco = monaco;
 }

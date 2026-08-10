@@ -82,6 +82,8 @@ export function registerTranscriptionHandlers(context: IpcContext): void {
   // Live experience: classify raw bytes (text and/or \x7f backspaces) at the
   // same user-input boundary as SESSION_WRITE before they join the ordered FIFO.
   ipcMain.on(IPC.TRANSCRIBE_LIVE_WRITE, (_event, sessionId: string, payload: string) => {
+    // Dictation is the user speaking into the prompt, so it counts as a draft
+    // that an injected auto_command must not concatenate onto.
     if (sessionId && payload) context.sessionManager.writeUserInput(sessionId, payload);
   });
 

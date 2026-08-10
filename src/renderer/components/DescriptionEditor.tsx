@@ -234,7 +234,7 @@ export function DescriptionEditor({
           at 280 a To Do task with attachments had to be scrolled to reach its
           own run-mode controls. */}
       <div
-        className="relative w-full bg-surface flex-1 min-h-[160px] overflow-hidden"
+        className="relative w-full bg-surface-control flex-1 min-h-[160px] overflow-hidden"
         data-testid="description-editor-body"
       >
         <textarea
@@ -257,7 +257,7 @@ export function DescriptionEditor({
           onSelect={mentions.handleTextareaSelect}
           onClick={mentions.handleTextareaClick}
           inert={showPreview}
-          className="absolute inset-0 w-full h-full bg-transparent pl-3 pr-28 py-2 text-sm text-fg focus:outline-none resize-none overflow-y-auto"
+          className="absolute inset-0 w-full h-full bg-transparent pl-3 pr-28 py-2 text-sm text-fg-tertiary focus:outline-none resize-none overflow-y-auto"
         />
         {mentions.menuOpen && (
           <DescriptionMentionMenu
@@ -273,29 +273,30 @@ export function DescriptionEditor({
             40% opacity until the textarea was focused, which faded it exactly
             when it is most needed: an unfocused empty box is the moment someone
             is deciding what to type, and on a fresh dialog focus starts in the
-            title field, so the placeholder and the markdown hint were barely
-            legible. The muted tokens already carry the "this is placeholder,
-            not content" signal without a second multiplier. */}
+            title field, so the placeholder was barely legible. The muted tokens
+            already carry the "this is placeholder, not content" signal without a
+            second multiplier. */}
         {!value && !showPreview && (
           <div className="absolute inset-0 pointer-events-none">
             {/* Two independent layers rather than one column. Stacking them made
                 the drop hint centre itself in the space LEFT OVER under the
                 text, which reads as sitting too low; centring it on the whole
                 box instead puts it where the eye expects. */}
+            {/* Placeholder only. A "Markdown supported" line used to sit under
+                it and was cut: this dialog is opened constantly, and a standing
+                label restating what the Preview pill already implies reads as
+                overbearing. Do not restore it. */}
             <div className="absolute inset-x-0 top-0 pl-3 pr-28 py-2">
               <span className="block text-sm text-fg-faint">{placeholder}</span>
-              {/* The toggle says what the button does; this says what the box
-                  accepts. Same split GitHub uses ("Styling with Markdown is
-                  supported" sits outside the Write/Preview tabs), and folding it
-                  into the existing empty state costs no extra chrome while
-                  surfacing it exactly when someone is deciding how to type. */}
-              <span className="mt-0.5 block text-xs text-fg-disabled">Markdown supported</span>
             </div>
             {/* A single compact row, not a stacked panel: the editor rests at
                 160px, so the old 20px icon over its own line of text took up
                 roughly half the box for a secondary hint. */}
             <div className="absolute inset-0 flex items-center justify-center">
-              <span className="inline-flex items-center gap-2 rounded-md border border-dashed border-edge px-3 py-1.5 text-xs text-fg-disabled">
+              {/* `fg-muted`, not `fg-disabled`: this is an instruction, and at
+                  `fg-disabled` it sat at 1.48:1 on the control fill - the
+                  weakest text in the app. Nothing here is disabled. */}
+              <span className="inline-flex items-center gap-2 rounded-md border border-dashed border-edge px-3 py-1.5 text-xs text-fg-muted">
                 <Paperclip size={14} />
                 Paste or drop files here
               </span>
@@ -304,7 +305,7 @@ export function DescriptionEditor({
         )}
         {showPreview && (
           <div
-            className="absolute inset-0 bg-surface pl-3 pr-28 py-2 overflow-y-auto"
+            className="markdown-on-control absolute inset-0 bg-surface-control pl-3 pr-28 py-2 overflow-y-auto"
             data-testid="description-preview"
           >
             {value ? (

@@ -1,7 +1,7 @@
 {
   "name": "kangentic",
   "productName": "Kangentic",
-  "version": "0.31.0",
+  "version": "0.34.0",
   "description": "Cross-platform desktop Kanban for Claude Code agents",
   "main": ".vite/build/index.js",
   "repository": {
@@ -56,7 +56,7 @@
     "@electron/fuses": "^2.1.1",
     "@electron/notarize": "^3.1.1",
     "@eslint/js": "^9.39.4",
-    "@kangentic/branding": "^2.6.0",
+    "@kangentic/branding": "^2.8.1",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@playwright/test": "^1.60.0",
     "@tailwindcss/postcss": "^4.3.0",

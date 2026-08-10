@@ -37,6 +37,11 @@ export function registerMobileBridgeHandlers(context: IpcContext): void {
 
   ipcMain.handle(IPC.MOBILE_LIST_DEVICES, (): MobilePairedDevice[] => service.listDevices());
 
+  // The set the bottom panel suspends its terminals for. The push below keeps
+  // it current; this invoke seeds a renderer that mounts after the phone
+  // already subscribed (app start with a connected phone, window reload).
+  ipcMain.handle(IPC.MOBILE_GET_TERMINAL_STREAMS, (): string[] => service.terminalStreamedSessionIds());
+
   ipcMain.handle(IPC.MOBILE_REVOKE_DEVICE, (_event, deviceId: string) => {
     service.revokeDevice(deviceId);
   });
@@ -60,16 +65,22 @@ export function registerMobileBridgeHandlers(context: IpcContext): void {
     const validation = validateRelayUrl(relayUrl);
     if (!validation.ok) return { reachable: false, reason: validation.reason };
     try {
+      const startedAt = performance.now();
       const response = await fetch(relayHealthUrl(validation.normalized), {
         method: 'GET',
         signal: AbortSignal.timeout(RELAY_TEST_TIMEOUT_MS),
       });
+      // Read the clock the moment the headers land, before the body is
+      // consumed, so the number is the relay's time-to-respond. It is the FULL
+      // cost of a cold request (DNS + TLS + response), not a warm round trip,
+      // which is the honest figure for "what does dialing this relay cost".
+      const latencyMs = Math.round(performance.now() - startedAt);
       if (!response.ok) return { reachable: false, reason: `Relay responded with HTTP ${response.status}` };
-      // Any 2xx counts as reachable: the relay's documented /healthz contract
-      // is `{"status":"ok"}` with no version field, so requiring one would
-      // report a working relay as unreachable.
+      // Any 2xx counts as reachable, and `version` is optional in the body:
+      // a relay that reports none (self-hosted, or older than the field) is
+      // still working, so requiring it would report it as unreachable.
       const body = (await response.json().catch(() => null)) as { version?: string } | null;
-      return { reachable: true, version: body?.version ?? null };
+      return { reachable: true, version: body?.version ?? null, latencyMs };
     } catch (error) {
       return { reachable: false, reason: error instanceof Error ? error.message : 'Unknown error' };
     }
@@ -97,5 +108,9 @@ export function registerMobileBridgeHandlers(context: IpcContext): void {
 
   service.on('stateChanged', () => {
     sendIfWindowAlive(IPC.MOBILE_STATE_CHANGED);
+  });
+
+  service.on('terminalStreamsChanged', (sessionIds: string[]) => {
+    sendIfWindowAlive(IPC.MOBILE_TERMINAL_STREAMS_CHANGED, sessionIds);
   });
 }

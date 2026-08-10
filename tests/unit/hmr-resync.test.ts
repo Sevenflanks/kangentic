@@ -119,6 +119,17 @@ describe('HMR store re-sync', () => {
     // nothing to preserve until the first reassignment, and that reassignment
     // path is responsible for triggering its own preservation if needed.
     const letPattern = /^let\s+(\w+)\b[^=]*=\s*(.+?);?\s*$/gm;
+    // A `const` binding can still hold MUTABLE module state: a Map/Set seeded
+    // from hot.data is mutated in place for the module's whole life, so it needs
+    // preservation exactly as a `let` does. A `let`-only scan silently loses the
+    // declaration the moment someone converts a scalar counter into a keyed Map
+    // (which is how task-slice.ts's per-task `moveGenerations` dropped out).
+    // Deliberately narrow: it requires BOTH `import.meta.hot` and a collection
+    // constructor, so the many Pattern-E `const preservedXStore = hot.data.x`
+    // bindings (pinned by direct assignment, not a dispose stash) are not swept
+    // in, and plain `const` constants are untouched.
+    const hotCollectionPattern =
+      /^const\s+(\w+)\b[^=]*=\s*(import\.meta\.hot[^;]*new (?:Map|Set|WeakMap)[^;]*);?\s*$/gm;
     const TRIVIAL_INITIALIZERS = new Set(['null', 'undefined', 'false', 'true']);
 
     // Extract all dispose callback bodies from the source. A file may have
@@ -145,8 +156,9 @@ describe('HMR store re-sync', () => {
       const disposeBodies = extractDisposeBodies(source);
 
       let match;
-      letPattern.lastIndex = 0;
-      while ((match = letPattern.exec(source)) !== null) {
+      for (const declarationPattern of [letPattern, hotCollectionPattern]) {
+      declarationPattern.lastIndex = 0;
+      while ((match = declarationPattern.exec(source)) !== null) {
         const name = match[1];
         const initializer = match[2].trim();
         if (TRIVIAL_INITIALIZERS.has(initializer)) continue;
@@ -176,6 +188,7 @@ describe('HMR store re-sync', () => {
           const relativePath = path.relative(path.resolve(__dirname, '../..'), file).replace(/\\/g, '/');
           violations.push(`${relativePath}:${lineNumber} -> let ${name} = ${initializer} (not stashed in dispose)`);
         }
+      }
       }
     }
 
@@ -255,7 +268,7 @@ describe('HMR store re-sync', () => {
   // back, and self-accept so editing the store's own code forces a clean reload
   // instead of running stale closures. See .claude/rules/hmr-patterns.md.
   it('instance-pinned stores read, write, and self-accept across HMR (Pattern E)', () => {
-    const PATTERN_E_STORES = ['board-store.ts', 'backlog-store.ts', 'project-store.ts', 'dictation-store.ts', 'usage-dashboard-store.ts', 'pop-out-store.ts'];
+    const PATTERN_E_STORES = ['board-store.ts', 'backlog-store.ts', 'project-store.ts', 'dictation-store.ts', 'usage-dashboard-store.ts', 'pop-out-store.ts', 'updater-store.ts', 'monitor-store.ts', 'announcements-store.ts'];
     const violations: string[] = [];
     for (const fileName of PATTERN_E_STORES) {
       const source = fs.readFileSync(path.join(STORES_DIR, fileName), 'utf-8');
@@ -270,11 +283,11 @@ describe('HMR store re-sync', () => {
     }
 
     // window-store.ts (under window-manager/store/, not the Zustand stores/ dir) is
-    // also a Pattern E boundary: it builds two layer instances and pins BOTH
-    // (boardWindowManager + commandWindowManager) in import.meta.hot.data, then
-    // self-accepts. Guard it here so a later edit that drops a pin is caught
-    // mechanically, not only at runtime (a split-brain second store makes the
-    // command-terminal / board windows vanish on every save while dogfooding). It
+    // also a Pattern E boundary: it builds THREE layer instances and pins ALL of
+    // them (boardWindowManager + commandWindowManager + monitorWindowManager) in
+    // import.meta.hot.data, then self-accepts. Guard them here so a later edit that
+    // drops a pin is caught mechanically, not only at runtime (a split-brain second
+    // store makes that layer's windows vanish on every save while dogfooding). It
     // reads via `const HMR_DATA = import.meta.hot?.data`, so the read check is
     // looser than the stores/ ones above.
     const WINDOW_MANAGER_STORE = path.resolve(
@@ -285,10 +298,17 @@ describe('HMR store re-sync', () => {
     const windowStoreReads = /import\.meta\.hot\?\.data/.test(windowStoreSource);
     const windowStoreWritesBoard = /import\.meta\.hot\.data\.boardWindowManager\s*=/.test(windowStoreSource);
     const windowStoreWritesCommand = /import\.meta\.hot\.data\.commandWindowManager\s*=/.test(windowStoreSource);
+    const windowStoreWritesMonitor = /import\.meta\.hot\.data\.monitorWindowManager\s*=/.test(windowStoreSource);
     const windowStoreAccepts = /import\.meta\.hot\.accept\s*\(/.test(windowStoreSource);
-    if (!windowStoreReads || !windowStoreWritesBoard || !windowStoreWritesCommand || !windowStoreAccepts) {
+    if (
+      !windowStoreReads
+      || !windowStoreWritesBoard
+      || !windowStoreWritesCommand
+      || !windowStoreWritesMonitor
+      || !windowStoreAccepts
+    ) {
       violations.push(
-        `window-manager/store/window-store.ts -> reads:${windowStoreReads} writesBoard:${windowStoreWritesBoard} writesCommand:${windowStoreWritesCommand} accepts:${windowStoreAccepts}`,
+        `window-manager/store/window-store.ts -> reads:${windowStoreReads} writesBoard:${windowStoreWritesBoard} writesCommand:${windowStoreWritesCommand} writesMonitor:${windowStoreWritesMonitor} accepts:${windowStoreAccepts}`,
       );
     }
 

@@ -62,6 +62,7 @@ function makeContext(db: InstanceType<typeof DatabaseType>, projectPath: string)
   onTaskCreated: ReturnType<typeof vi.fn>;
   onTaskMove: ReturnType<typeof vi.fn>;
   onTaskAutoSpawn: ReturnType<typeof vi.fn>;
+  onTasksReordered: ReturnType<typeof vi.fn>;
 } {
   return {
     getProjectDb: () => db as unknown as ReturnType<CommandContext['getProjectDb']>,
@@ -74,7 +75,9 @@ function makeContext(db: InstanceType<typeof DatabaseType>, projectPath: string)
       autoCommand: { kind: 'not-applicable' },
     })),
     onTaskAutoSpawn: vi.fn(async (): Promise<AutoCommandImmediateOutcome> => ({ kind: 'not-applicable' })),
+    onTasksReordered: vi.fn(),
     onSwimlaneUpdated: vi.fn(),
+    onSwimlaneDeleted: vi.fn(),
     onBacklogChanged: vi.fn(),
     onLabelColorsChanged: vi.fn(),
   };

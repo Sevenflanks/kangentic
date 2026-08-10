@@ -19,7 +19,9 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { EventEmitter } from 'node:events';
 import {
   CAPABILITY_VERBS,
+  bytesToHex,
   createPairingInitiatorHandshake,
+  derivePairingSlotId,
   generateX25519KeyPair,
   sealPairingConfirm,
   type CapabilityVerb,
@@ -294,6 +296,32 @@ describe('MobileBridgeService.startPairing() is the deliberate identity-creation
   });
 });
 
+describe('MobileBridgeService.startPairing() derives the relay slot id from the pairing token', () => {
+  it('passes createTransport a slotId derived from the minted token, never the token bytes verbatim', async () => {
+    const service = new MobileBridgeService({ enabled: true, relayUrl: 'wss://relay.example.com' });
+    const { qrPayload } = await service.startPairing();
+    const mintedPairingToken = qrPayload.pairingToken;
+
+    // .at(-1), not [0]: createTransport's call history is not cleared between
+    // tests in this file, so an earlier test's startPairing() call is still
+    // in there. The most recent call is the one this test's startPairing()
+    // just made.
+    const transportOptions = vi.mocked(createTransport).mock.calls.at(-1)?.[0];
+    if (!transportOptions) throw new Error('test setup: createTransport was not called');
+
+    expect(transportOptions.slotId).toBe(derivePairingSlotId(mintedPairingToken));
+    // The regression this guards: the slot travels in cleartext in the relay
+    // URL's query string while the pairing token is the Noise IKpsk0
+    // pre-shared key, so dialing the raw token as the slot id would publish
+    // the PSK to every hop that can read a request URI. Asserting the
+    // positive derivation above is not enough by itself, since a broken
+    // derivation that happened to still differ from the raw hex would slip
+    // through it - this assertion is the one that actually catches a revert
+    // back to `bytesToHex(token.token)`.
+    expect(transportOptions.slotId).not.toBe(bytesToHex(mintedPairingToken));
+  });
+});
+
 describe('MobileBridgeService.reconcile()', () => {
   it('cancels an in-progress pairing when the bridge is disabled', async () => {
     const service = new MobileBridgeService({ enabled: true, relayUrl: 'wss://relay.example.com' });
@@ -465,7 +493,7 @@ describe('MobileBridgeService.attachContext() migrates pre-existing devices to t
     existsSyncSpy.mockImplementation((filePath: string) => filePath.includes('mobile-bridge-identity.json') || filePath.includes('mobile-bridge-roster.json'));
     readFileSyncSpy.mockImplementation((filePath: string) => (filePath.includes('mobile-bridge-roster.json') ? rosterJson : identityJson));
 
-    service.attachContext({ sessionManager: new EventEmitter(), boardEvents: { emitBoardChanged: vi.fn() } } as never);
+    service.attachContext({ sessionManager: Object.assign(new EventEmitter(), { setMobileTerminalProbe: vi.fn() }), boardEvents: { emitBoardChanged: vi.fn() } } as never);
 
     // Re-point the mock at whatever the migration itself just wrote -
     // otherwise listDevices() below would read back the STALE pre-migration
@@ -494,7 +522,7 @@ describe('MobileBridgeService.attachContext() migrates pre-existing devices to t
     });
 
     writeFileSyncSpy.mockClear();
-    service.attachContext({ sessionManager: new EventEmitter(), boardEvents: { emitBoardChanged: vi.fn() } } as never);
+    service.attachContext({ sessionManager: Object.assign(new EventEmitter(), { setMobileTerminalProbe: vi.fn() }), boardEvents: { emitBoardChanged: vi.fn() } } as never);
 
     // No roster write at all means migrateDevicesToFullCapabilityGrant()
     // correctly skipped this device instead of re-signing an entry that was

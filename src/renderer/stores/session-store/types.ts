@@ -53,6 +53,26 @@ export interface CoreSessionSlice {
    *  owners). Was a single scalar (`dialogSessionId`) when only one modal could
    *  be open; an array now that windows are modeless and stack. */
   dialogSessionIds: string[];
+  /** Task ids whose detail is open in ANOTHER renderer (the detached Agent Monitor,
+   *  or the main window as seen from a pop-out). Pushed by main, which is the only
+   *  side that can see across renderers; already filtered to exclude our own.
+   *
+   *  `dialogSessionIds` answers "does a window in THIS renderer own the terminal",
+   *  which is the right question for the focused set (we are the ones who would
+   *  render the bytes). This answers the different question the bottom panel asks:
+   *  "does a terminal exist for this session anywhere at all". Conflating them
+   *  either let the panel mount a second xterm on a live PTY, or made main stream
+   *  bytes to a renderer with nothing to paint them into. */
+  remoteDetailTaskIds: string[];
+  /** Sessions a paired phone holds a terminal-WANTING stream subscription for
+   *  (not the list-only feed it keeps for every live session). Pushed by main's
+   *  mobile bridge. The bottom panel renders a placeholder instead of an xterm
+   *  for these: the resting park owns their grid (a phone mirrors it 1:1 and
+   *  cannot escape a strip fit), so a panel xterm fitting them to its strip
+   *  produced both the phone's sliver view and the panel's own mis-wrapped
+   *  frames. A task-detail window still mounts a real terminal for them - the
+   *  detail is the primary surface and its grid wins while it is open. */
+  mobileTerminalStreamedSessionIds: string[];
   /** Destination project id captured at the FIRST frame of a project switch when that
    *  project has persisted detail windows (read synchronously from
    *  `config.workspaceByProject` before the deferred cold-path workspace restore runs). The
@@ -156,11 +176,13 @@ export interface CoreSessionSlice {
    */
   reconcileSession: (taskId: string) => Promise<Session | null>;
   setActiveSession: (id: string | null) => void;
-  /** User-gesture variant of setActiveSession. Updates state AND persists the
+  /** User-gesture variant of setActiveSession. Updates state, persists the
    *  selection to AppConfig.lastActiveTaskByProject so it survives app restart
-   *  and project switch. Used by tab-click handlers; the auto-select fallback
-   *  in TerminalPanel uses setActiveSession directly so default picks don't
-   *  overwrite the remembered value. */
+   *  and project switch, AND claims arrival focus for the chosen session (see
+   *  utils/terminal-arrival-focus.ts) so the tab the user just clicked is the
+   *  terminal that takes focus when it mounts. Used by tab-click handlers; the
+   *  auto-select fallback in TerminalPanel uses setActiveSession directly so
+   *  default picks neither overwrite the remembered value nor claim focus. */
   selectActiveSession: (id: string | null) => void;
   /** A task-detail window claims its session (one xterm per PTY: the panel drops
    *  it while a window owns it). Idempotent. */

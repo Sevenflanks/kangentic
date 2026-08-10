@@ -1,5 +1,12 @@
 import { EventEmitter } from 'node:events';
 import { v4 as uuidv4 } from 'uuid';
+
+/**
+ * Renderer key used when a caller does not identify itself (headless callers, and
+ * tests that drive `setFocusedSessions` directly). Real renderers key on their
+ * webContents id, which is never negative.
+ */
+export const SHARED_RENDERER_ID = -1;
 import { resolveDebugDumpDir } from '../diagnostics/debug-dump-resolver';
 import { ShellResolver } from './spawn/shell-resolver';
 import { SessionQueue } from './session-queue';
@@ -19,7 +26,7 @@ import { FirstOutputTracker } from './lifecycle/first-output-tracker';
 import { disposeAdapterAttachment, disposeSpawnCleanup, removeAdapterHooks } from './lifecycle/adapter-lifecycle';
 import { safeKillPty } from './lifecycle/pty-kill';
 import { DEFAULT_PTY_COLS, DEFAULT_PTY_ROWS, performSpawn } from './lifecycle/session-spawn-flow';
-import { SessionRegistry, toSession, filterCacheByProject, type ManagedSession } from './session-registry';
+import { SessionRegistry, toSession, filterCacheByProject, type ManagedSession, type ManagedSessionSummary } from './session-registry';
 import { createWriteQueue, type WriteQueue } from './write-queue';
 import {
   SessionWriteCoordinator,
@@ -27,7 +34,9 @@ import {
   type SubmissionLease,
   type UserSubmissionLease,
 } from './session-write-coordinator';
+import { PromptDraftLedger, type WriteOrigin } from './prompt-draft-ledger';
 import { BackpressureController } from './buffer/backpressure-controller';
+import { traceTerminal } from './terminal-trace';
 import { isShuttingDown } from '../shutdown-state';
 import type { TranscriptRepository } from '../db/repositories/transcript-repository';
 import type {
@@ -38,6 +47,7 @@ import type {
   SessionEvent,
   SpawnSessionInput,
   PerToolStat,
+  PtyResizeOrigin,
 } from '../../shared/types';
 import type { ActivityEngineOptions, ActivityStatsSnapshot } from '../activity-engine/engine';
 import type { TerminalFocusReport } from '../../shared/terminal-focus-report';
@@ -50,7 +60,64 @@ export interface SessionManagerOptions {
    * defaults.
    */
   activityEngineOptions?: ActivityEngineOptions;
+  /**
+   * How long a session must stay unwatched before its grid is parked back at
+   * the resting grid (see scheduleRestingGridRestore). Production uses the
+   * default; tests shrink it so they need neither fake timers nor a wall-clock
+   * wait.
+   */
+  restingGridDelayMs?: number;
 }
+
+/**
+ * The mobile bridge's answers to the two questions the resting-grid park
+ * must ask, injected via setMobileTerminalProbe because the dependency
+ * points the other way (the bridge listens to this manager, never vice
+ * versa). `isSizeHeld` is the armed terminal-size-guard entry - the actual
+ * hold, which no last-writer origin heuristic can stand in for: a desktop
+ * resize makes itself the last writer while the guard stays armed. And
+ * `hasStreamSubscriber` is the interest that makes a park worth a reflow at
+ * all: the park exists so a phone does not mirror whatever strip the last
+ * desktop surface left behind, so a desktop nobody paired (no probe) or a
+ * session no phone is streaming must never pay its SIGWINCH + repaint.
+ */
+export interface MobileTerminalProbe {
+  isSizeHeld(sessionId: string): boolean;
+  hasStreamSubscriber(sessionId: string): boolean;
+}
+
+/**
+ * Long enough that switching a session between surfaces (which unfocuses and
+ * refocuses within a frame or two) never reshapes the PTY in the gap, short
+ * enough that a phone watching a session the desktop just stopped showing gets
+ * a usable grid while the user is still looking at it.
+ */
+const RESTING_GRID_DELAY_MS = 1000;
+
+/**
+ * The grid an unwatched session rests at: DETAIL-shaped, deliberately not the
+ * 120x30 spawn default (user decision 2026-08-02, from a live A/B on the
+ * phone). The phone mirrors this grid 1:1, and a phone-fitted narrow grid was
+ * built, tested end to end, and judged LESS readable than the desktop's own
+ * layout - Claude Code draws its rules and boxes for a wide frame, and at
+ * ~49 cols they dominate every line while the text wraps. Resting at the
+ * size a task detail typically fits means the phone's view is identical
+ * whether the detail is open or closed, and pan/zoom spends the density.
+ */
+const RESTING_GRID_COLS = 210;
+const RESTING_GRID_ROWS = 48;
+
+/**
+ * The row floor for a session a phone is actively streaming. Below this, the
+ * phone's 1:1 mirror is a sliver of its screen with no recovery available
+ * away from the desk (user decision 2026-08-02: that view must never reach a
+ * phone). The bottom terminal panel's strip (~14 rows) sits well below the
+ * floor; any realistic task detail sits well above it, so detail-driven grids
+ * always win. Enforced in resize() (refuse desktop shrinks below the floor
+ * while a phone streams) and at subscribe time (park a session already stuck
+ * below the floor even though a desktop surface holds it).
+ */
+const MOBILE_USABLE_MIN_ROWS = 20;
 
 export class SessionManager extends EventEmitter {
   private registry = new SessionRegistry();
@@ -78,6 +145,13 @@ export class SessionManager extends EventEmitter {
    */
   private focusedSessionIds = new Set<string>();
   /**
+   * Per-renderer visible sets, unioned into `focusedSessionIds` above. The union
+   * is what gates emitting at all; the individual sets are the ROUTING TABLE for
+   * which renderer each session's bytes belong to (a session is hosted by exactly
+   * one renderer, because the task-detail owner registry says so).
+   */
+  private focusedByRenderer = new Map<number, Set<string>>();
+  /**
    * Per-session FIFO write queue. Every `write()` call appends to the same
    * buffer and is drained by a single loop that yields via setImmediate
    * between 4KB chunks. Guarantees byte order across concurrent callers
@@ -86,12 +160,17 @@ export class SessionManager extends EventEmitter {
    */
   private writeQueues = new Map<string, WriteQueue>();
   /**
+   * Per-session record of what the user has typed and not yet sent. Read by
+   * keystroke injection so an auto_command never concatenates onto a draft.
+   */
+  private promptDrafts = new PromptDraftLedger();
+  /**
    * Terminal dimensions from a resize that arrived before the session's PTY
    * existed (the renderer mounted and fit its container before the auto-resume
    * spawn landed, or while the session was queued/suspended awaiting spawn).
    * performSpawn consumes this so the PTY spawns at the real fitted size
    * instead of the 120x30 default, so no post-spawn corrective resize (and its
-   * stale-width repaint window) is needed. Keyed by session id, independent of
+   * stale-geometry repaint window) is needed. Keyed by session id, independent of
    * the registry so it survives the registry.delete during a respawn. Consumed
    * at spawn (takePendingResize) or dropped on kill.
    */
@@ -106,6 +185,23 @@ export class SessionManager extends EventEmitter {
    * phone-shaped grid. Cleared on kill/remove with pendingResizes.
    */
   private lastDesktopDimensions = new Map<string, { cols: number; rows: number }>();
+  /** See MobileTerminalProbe; null until the bridge attaches (or forever, unpaired). */
+  private mobileTerminalProbe: MobileTerminalProbe | null = null;
+  /**
+   * Pending resting-grid restores, keyed by session. See
+   * scheduleRestingGridRestore.
+   */
+  private restingGridTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /**
+   * Per-renderer sets of sessions with an xterm MOUNTED, unioned into
+   * mountedSessionIds below. Broader than focus on purpose: a PARKED terminal
+   * (Backlog view, occluded window) is unfocused but still mounted, holding a
+   * grid it will never re-send - xterm emits a resize only when its OWN size
+   * changes. Reshaping such a PTY leaves the two permanently disagreeing, so
+   * a mounted session's grid is never parked.
+   */
+  private mountedByRenderer = new Map<number, Set<string>>();
+  private mountedSessionIds = new Set<string>();
   /**
    * Per-session output backpressure: pauses a session's PTY when the renderer
    * falls behind on its emitted bytes, resuming as the renderer acks. Only
@@ -141,6 +237,7 @@ export class SessionManager extends EventEmitter {
   private sessionFiles: SessionFileManager;
   private sessionIdManager: SessionIdManager;
   private activityEngineOptions: ActivityEngineOptions | undefined;
+  private restingGridDelayMs: number;
 
   constructor(options: SessionManagerOptions = {}) {
     super();
@@ -152,6 +249,7 @@ export class SessionManager extends EventEmitter {
     // (a genuine leak still shows as an unbounded climb well past this).
     this.setMaxListeners(100);
     this.activityEngineOptions = options.activityEngineOptions;
+    this.restingGridDelayMs = options.restingGridDelayMs ?? RESTING_GRID_DELAY_MS;
 
     this.sessionQueue = new SessionQueue({
       spawner: (input) => this.doSpawn(input).then(() => {}),
@@ -221,11 +319,15 @@ export class SessionManager extends EventEmitter {
         this.emit('pr-candidate', sessionId, scrollback);
       },
       onAgentSessionId: (sessionId, agentReportedId) => {
-        // Agent session ID capture covers two cases:
+        // Agent session ID capture covers three cases:
         // 1. Fresh capture: agent_session_id was null (Codex/Gemini), now captured from hooks/PTY output.
         // 2. Stale recovery: agent_session_id was pre-specified (Claude --resume) but the agent
         //    created a different session (--resume failed silently). DB needs the correct ID.
-        // recoverStaleSessionId() handles both cases - emit unconditionally.
+        // 3. Mid-session fork: the agent moved the live conversation to a NEW id (Claude /clear)
+        //    and its status file re-reported it, so this callback fires AGAIN mid-session.
+        //    Everything below is repeat-safe: the mutation is value-guarded, and the history
+        //    re-attach is blocked by hasReceivedStatus (see the note further down).
+        // recoverStaleSessionId() handles all cases - emit unconditionally.
         const session = this.registry.get(sessionId);
         if (!session) return;
         // Reflect the captured ID on the live Session so the renderer (and
@@ -240,7 +342,7 @@ export class SessionManager extends EventEmitter {
         // failures and degrades gracefully to PtyActivityTracker.
         //
         // For Claude the transcript reader is a background-session FALLBACK,
-        // and processStatusUpdate's one-shot id capture routes back here. The
+        // and processStatusUpdate's id capture routes back here. The
         // guard skips a re-attach once status.json has been handed off. Note:
         // on the normal Claude path this callback fires synchronously nested
         // inside the FIRST onUsageParsed - before StatusFileReader sets
@@ -250,7 +352,13 @@ export class SessionManager extends EventEmitter {
         // spawn-time attach already holds the slot) plus the detach in
         // onFirstStatus (fired right after onUsageParsed) cancelling any
         // in-flight re-attach. The guard covers any path where an id capture
-        // could arrive after that handoff.
+        // could arrive after that handoff - including the mid-session fork
+        // (case 3 above): a status-reported id CHANGE implies a prior status
+        // write (no adapter reports session ids via both a hook/PTY channel
+        // and parseStatus), so by the time it fires here firstStatusDelivered
+        // is already true and the deliberately-detached transcript fallback
+        // stays detached. status.json remains the live telemetry source for
+        // the forked conversation.
         const historyHook = session.agentParser?.runtime?.sessionHistory;
         if (historyHook && !this.statusFileReader.hasReceivedStatus(sessionId)) {
           // No startAtEnd here: this attach only ever runs when the agent id was
@@ -364,8 +472,13 @@ export class SessionManager extends EventEmitter {
         writeQueue.dispose();
         this.writeQueues.delete(sessionId);
       }
+      // The prompt died with the PTY; a remembered draft would otherwise be
+      // reported as discarded by the next session to reuse this id.
+      this.promptDrafts.clear(sessionId);
       // The PTY is gone; drop any backpressure accounting (resume is moot).
       this.backpressure.release(sessionId);
+      // Nothing left to reshape either: a respawn spawns at the desktop grid.
+      this.cancelRestingGridRestore(sessionId);
     });
   }
 
@@ -398,19 +511,189 @@ export class SessionManager extends EventEmitter {
   dispose(): void {
     this.telemetry.dispose();
     this.transcriptWriter?.finalizeAll();
+    for (const sessionId of [...this.restingGridTimers.keys()]) this.cancelRestingGridRestore(sessionId);
   }
 
-  /** Set which sessions are currently visible (terminal panel + command bar overlay). */
-  setFocusedSessions(sessionIds: string[]): void {
-    this.focusedSessionIds = new Set(sessionIds);
-    // The emit set just changed, so prior in-flight accounting is stale (a
-    // session leaving the focused set would otherwise stay paused forever
-    // because the renderer no longer acks its data). Resume every paused PTY
-    // and clear the counters; backpressure rebuilds from zero as fresh data
-    // flows to the now-focused terminals (the scrollback replay catches them
-    // up). Focus changes are user-driven and infrequent, so a blanket reset is
-    // cheap and robust.
-    this.backpressure.reset();
+  /**
+   * Set which sessions a RENDERER currently has visible (terminal panel, command
+   * bar overlay, task-detail windows).
+   *
+   * Keyed by renderer, not global, because more than one renderer can host a
+   * terminal: the detached Agent Monitor is its own window with its own visible
+   * set. A single shared set meant last-writer-wins, so two renderers publishing
+   * focus would silently starve each other's terminals of PTY data.
+   *
+   * The emit gate stays the UNION (`isSessionFocused`), so nothing about when
+   * data is produced changes; what the per-renderer split buys is knowing WHERE
+   * to send it.
+   */
+  setFocusedSessions(sessionIds: string[], rendererId = SHARED_RENDERER_ID): void {
+    const previousForRenderer = this.focusedByRenderer.get(rendererId);
+    if (sessionIds.length === 0) this.focusedByRenderer.delete(rendererId);
+    else this.focusedByRenderer.set(rendererId, new Set(sessionIds));
+    this.recomputeFocusedUnion();
+    // Prior in-flight accounting is stale for the sessions THIS renderer just
+    // changed: one leaving its visible set would otherwise stay paused forever,
+    // because that renderer no longer acks its data. Resume those and clear
+    // their counters; backpressure rebuilds from zero as fresh data flows to the
+    // now-focused terminals (the scrollback replay catches them up).
+    //
+    // Scoped to the caller's own sessions on purpose. This used to be a blanket
+    // `backpressure.reset()`, which was safe only while a single renderer
+    // published focus. The detached Agent Monitor is a second publisher, and its
+    // effect re-runs on any session-list change, so a blanket reset would
+    // force-resume a PTY the OTHER window is still actively throttling and zero
+    // its unacked byte count, defeating backpressure for a session this renderer
+    // has no relationship to.
+    const affectedSessionIds = new Set(previousForRenderer);
+    for (const sessionId of sessionIds) affectedSessionIds.add(sessionId);
+    for (const sessionId of affectedSessionIds) {
+      this.backpressure.release(sessionId);
+      this.reconsiderRestingGrid(sessionId);
+    }
+  }
+
+  /**
+   * Set which sessions a RENDERER has an xterm mounted for. Same whole-set
+   * replace, keyed by renderer, as setFocusedSessions - and published by the
+   * terminals themselves rather than derived from view state, because "is a
+   * grid held" is a mount fact, not a visibility one.
+   */
+  setMountedSessions(sessionIds: string[], rendererId = SHARED_RENDERER_ID): void {
+    const previousForRenderer = this.mountedByRenderer.get(rendererId);
+    if (sessionIds.length === 0) this.mountedByRenderer.delete(rendererId);
+    else this.mountedByRenderer.set(rendererId, new Set(sessionIds));
+    this.recomputeMountedUnion();
+    const affectedSessionIds = new Set(previousForRenderer);
+    for (const sessionId of sessionIds) affectedSessionIds.add(sessionId);
+    for (const sessionId of affectedSessionIds) this.reconsiderRestingGrid(sessionId);
+  }
+
+  /** Sessions some renderer still has an xterm mounted for. */
+  getMountedSessions(): Set<string> {
+    return this.mountedSessionIds;
+  }
+
+  /** A session is HELD while any renderer shows it or holds a grid for it. */
+  private isSessionHeld(sessionId: string): boolean {
+    return this.focusedSessionIds.has(sessionId) || this.mountedSessionIds.has(sessionId);
+  }
+
+  private reconsiderRestingGrid(sessionId: string): void {
+    if (this.isSessionHeld(sessionId)) this.cancelRestingGridRestore(sessionId);
+    else this.scheduleRestingGridRestore(sessionId);
+  }
+
+  /**
+   * Park a session's grid at the resting grid once NO renderer is
+   * showing it.
+   *
+   * A PTY has exactly one grid, and every surface that displays a session fits
+   * that grid to its own box. The bottom panel is a wide, short strip, so a
+   * session last shown there is left at something like 306x14 - and nothing
+   * gave it back, so the agent kept working in a 14-row window and any other
+   * reader inherited one. That is worst on a phone, which mirrors the grid 1:1
+   * and cannot fill its screen from 14 rows, but a 14-row TUI is a poor frame
+   * for the agent itself too.
+   *
+   * Fires only when NOTHING holds the session: no renderer shows it and none
+   * has an xterm mounted for it (see mountedByRenderer - a parked terminal
+   * still holds its grid, and reshaping under one is unrecoverable).
+   *
+   * Deliberately debounced rather than fired on unfocus: switching surfaces
+   * unfocuses and refocuses within a frame or two, and a restore in that gap
+   * would add two reflows to every switch. Waiting means only a session that
+   * STAYS unwatched is reshaped.
+   *
+   * Cost when it does fire: the next open of that session pays a marker settle
+   * (~20-40ms, measured in the rows-only-settle work) because the grid changed
+   * while it was away. That is the same cost any surface switch already pays.
+   */
+  private scheduleRestingGridRestore(sessionId: string): void {
+    if (this.restingGridTimers.has(sessionId)) return;
+    const timer = setTimeout(() => {
+      this.restingGridTimers.delete(sessionId);
+      this.restoreRestingGrid(sessionId);
+    }, this.restingGridDelayMs);
+    // Never hold the process open for housekeeping.
+    if (typeof timer.unref === 'function') timer.unref();
+    this.restingGridTimers.set(sessionId, timer);
+  }
+
+  private cancelRestingGridRestore(sessionId: string): void {
+    const timer = this.restingGridTimers.get(sessionId);
+    if (timer === undefined) return;
+    clearTimeout(timer);
+    this.restingGridTimers.delete(sessionId);
+  }
+
+  private restoreRestingGrid(sessionId: string): void {
+    // The debounced path additionally requires a phone actually streaming
+    // this session: the park is a mobile feature, and a desktop with no
+    // watcher must never pay its reflow.
+    this.parkRestingGrid(sessionId, { requireStreamSubscriber: true });
+  }
+
+  private parkRestingGrid(
+    sessionId: string,
+    options: { requireStreamSubscriber: boolean; overrideHoldBelowFloor?: boolean },
+  ): void {
+    // Re-check everything at fire time: a session can be shown again, gone,
+    // or handed to a phone during the wait.
+    const session = this.registry.get(sessionId);
+    if (!session?.pty) return;
+    // A desktop surface holding the grid normally blocks the park outright.
+    // The subscribe-time caller overrides that for a grid below the phone
+    // floor: the only surface that holds a sub-floor grid is the bottom
+    // panel's strip, and a phone subscribing to it would otherwise be stuck
+    // in a sliver view it cannot escape from away from the desk. The panel
+    // then renders the resting grid clipped - the same state it is in
+    // whenever a task detail owns the grid.
+    if (this.isSessionHeld(sessionId)) {
+      const belowFloor = session.pty.rows < MOBILE_USABLE_MIN_ROWS;
+      if (!(options.overrideHoldBelowFloor === true && belowFloor)) return;
+    }
+    // No probe means no bridge attached, which means no paired phone exists:
+    // the park never fires and an unpaired desktop behaves exactly as it did
+    // before the park existed.
+    const probe = this.mobileTerminalProbe;
+    if (!probe) return;
+    // An armed size guard is a live phone hold. Asked of the guard registry,
+    // never a last-writer origin: a desktop resize makes itself the last
+    // writer while the guard stays armed, and parking then would reshape the
+    // PTY out from under the still-holding phone.
+    if (probe.isSizeHeld(sessionId)) return;
+    if (options.requireStreamSubscriber && !probe.hasStreamSubscriber(sessionId)) return;
+    if (session.pty.cols === RESTING_GRID_COLS && session.pty.rows === RESTING_GRID_ROWS) return;
+    this.resize(sessionId, RESTING_GRID_COLS, RESTING_GRID_ROWS, 'park');
+  }
+
+  /**
+   * Immediate park on behalf of a phone whose read-stream subscribe is being
+   * served RIGHT NOW: the subscription is not registered yet (the snapshot is
+   * built first), so the caller vouches for the interest the probe cannot see
+   * and skips the debounce so the one seed already carries the resting grid.
+   * Every other fire-time check still applies - held sessions and phone-held
+   * grids are never touched.
+   */
+  parkRestingGridForMobileSubscriber(sessionId: string): void {
+    this.cancelRestingGridRestore(sessionId);
+    this.parkRestingGrid(sessionId, { requireStreamSubscriber: false, overrideHoldBelowFloor: true });
+  }
+
+  /**
+   * Re-run the resting-grid decision after a mobile size-guard release: the
+   * guard restored the desktop grid, and if nothing else holds the session it
+   * should park again after the usual debounce (which is what lets the phone
+   * see park dims and re-request its grid on its next visit).
+   */
+  reconsiderRestingGridAfterMobileRelease(sessionId: string): void {
+    this.reconsiderRestingGrid(sessionId);
+  }
+
+  /** See MobileTerminalProbe. Called once by the mobile bridge when it attaches. */
+  setMobileTerminalProbe(probe: MobileTerminalProbe): void {
+    this.mobileTerminalProbe = probe;
   }
 
   /**
@@ -441,9 +724,94 @@ export class SessionManager extends EventEmitter {
     this.telemetry.notifyUserInterrupt(sessionId);
   }
 
-  /** Return the set of currently focused session IDs. */
+  /** Return the union of every renderer's focused session IDs. */
   getFocusedSessions(): Set<string> {
     return this.focusedSessionIds;
+  }
+
+  /**
+   * The renderers that currently have this session visible. The IPC layer sends
+   * that session's data to exactly these, instead of blanket-sending to the main
+   * window - which is both correct for a detached host and strictly less IPC
+   * than before for everyone else.
+   */
+  getRenderersFocusedOn(sessionId: string): number[] {
+    const renderers: number[] = [];
+    for (const [rendererId, sessionIds] of this.focusedByRenderer) {
+      if (sessionIds.has(sessionId)) renderers.push(rendererId);
+    }
+    return renderers;
+  }
+
+  /**
+   * Drop a renderer's claims when its window goes away - BOTH its focus set
+   * and its mounted set (kept under the original name because it is the one
+   * teardown call site, wired once per renderer in the session IPC handlers).
+   * Its terminals died with it, so neither claim can be renewed.
+   */
+  clearFocusedSessionsFor(rendererId: number): void {
+    const departingSessionIds = this.focusedByRenderer.get(rendererId);
+    const departingMountedIds = this.mountedByRenderer.get(rendererId);
+    const hadMounted = this.mountedByRenderer.delete(rendererId);
+    if (hadMounted) this.recomputeMountedUnion();
+    if (!this.focusedByRenderer.delete(rendererId)) {
+      // Nothing focused, but its terminals still died with it.
+      for (const sessionId of departingMountedIds ?? []) this.reconsiderRestingGrid(sessionId);
+      return;
+    }
+    this.recomputeFocusedUnion();
+    // A closed window leaves its sessions unwatched exactly as an unfocus
+    // does; park their grids on the same delay.
+    for (const sessionId of new Set([...(departingSessionIds ?? []), ...(departingMountedIds ?? [])])) {
+      this.reconsiderRestingGrid(sessionId);
+    }
+    // Rescue only the sessions this renderer was the LAST consumer of. Their
+    // in-flight bytes can never be acked (the window that was reading them is
+    // gone), so without this a session that crossed the high-water mark just as
+    // its sole renderer died would stay paused forever and the agent would
+    // stall. A session another renderer still has visible keeps its accounting,
+    // which the blanket reset this replaces would have wrongly zeroed.
+    for (const sessionId of departingSessionIds ?? []) {
+      if (!this.focusedSessionIds.has(sessionId)) this.backpressure.release(sessionId);
+    }
+  }
+
+  private recomputeFocusedUnion(): void {
+    const union = new Set<string>();
+    for (const sessionIds of this.focusedByRenderer.values()) {
+      for (const sessionId of sessionIds) union.add(sessionId);
+    }
+    // Trace the EDGES of the emit gate. This union is what decides whether a
+    // session's PTY data reaches any renderer at all, so a session silently
+    // leaving it is the difference between "the terminal is stale" and "the
+    // terminal is broken" - and until now it produced no trace on either side,
+    // which is why a gap in a session's byte stream was unattributable.
+    //
+    // Gated at the BLOCK, not left to traceTerminal's own early return: the
+    // detail objects are built by the caller, so an ungated block allocates one
+    // per changed session in production to hand to a no-op. Same reason the
+    // renderer's hot trace sites pass thunks.
+    if (__KANGENTIC_DEV__) {
+      for (const sessionId of union) {
+        if (!this.focusedSessionIds.has(sessionId)) {
+          traceTerminal(sessionId, 'focus-union-gained', { renderers: this.focusedByRenderer.size });
+        }
+      }
+      for (const sessionId of this.focusedSessionIds) {
+        if (!union.has(sessionId)) {
+          traceTerminal(sessionId, 'focus-union-lost', { renderers: this.focusedByRenderer.size });
+        }
+      }
+    }
+    this.focusedSessionIds = union;
+  }
+
+  private recomputeMountedUnion(): void {
+    const union = new Set<string>();
+    for (const sessionIds of this.mountedByRenderer.values()) {
+      for (const sessionId of sessionIds) union.add(sessionId);
+    }
+    this.mountedSessionIds = union;
   }
 
   setShell(shell: string | null): void {
@@ -502,6 +870,8 @@ export class SessionManager extends EventEmitter {
         exitCode: null,
         resuming: ownedInput.resuming ?? false,
         transient: ownedInput.transient ?? false,
+        commandTerminalSlot: ownedInput.commandTerminalSlot ?? null,
+        commandTerminalBranch: ownedInput.commandTerminalBranch ?? null,
         isolatedSwimlaneId: ownedInput.isolatedSwimlaneId,
         exitSequence: ownedInput.exitSequence ?? ['\x03'],
         agentParser: ownedInput.agentParser,
@@ -569,9 +939,20 @@ export class SessionManager extends EventEmitter {
     return !!this.registry.get(sessionId)?.pty;
   }
 
-  write(sessionId: string, data: string): void {
+  /**
+   * Enqueue system bytes, or route explicit user bytes through the ownership
+   * coordinator so native-idle admission observes the same input generation.
+   */
+  write(sessionId: string, data: string, origin: WriteOrigin = 'system'): void {
+    if (origin === 'user') {
+      this.writeUserInput(sessionId, data);
+      return;
+    }
     if (data.length === 0) return;
-    this.getOrCreateWriteQueue(sessionId)?.enqueue(data);
+    const queue = this.getOrCreateWriteQueue(sessionId);
+    if (!queue) return;
+    this.promptDrafts.record(sessionId, data, origin);
+    queue.enqueue(data);
   }
 
   getSessionGeneration(sessionId: string): number | null {
@@ -600,6 +981,7 @@ export class SessionManager extends EventEmitter {
 
   writeUserInput(sessionId: string, data: string, occurredAt = Date.now()): void {
     if (data.length === 0 || this.writeCoordinator.getSessionGeneration(sessionId) === null) return;
+    this.promptDrafts.record(sessionId, data, 'user');
     this.writeCoordinator.recordUserInput(sessionId, data, occurredAt);
   }
 
@@ -640,6 +1022,15 @@ export class SessionManager extends EventEmitter {
   }
 
   /**
+   * Text the user has typed into this session's prompt and not yet sent, or
+   * null when the prompt looks empty. Used by keystroke injection to decide
+   * whether a clear is needed and to report what it discarded.
+   */
+  getPendingDraft(sessionId: string): string | null {
+    return this.promptDrafts.get(sessionId);
+  }
+
+  /**
    * Write `data` to the session's PTY in a single, un-chunked `pty.write`
    * call. This BYPASSES the per-session FIFO write queue and the 4KB
    * chunking that the queue enforces.
@@ -666,52 +1057,159 @@ export class SessionManager extends EventEmitter {
     sessionId: string,
     cols: number,
     rows: number,
-    origin: 'desktop' | 'mobile' = 'desktop',
-  ): { colsChanged: boolean } {
+    // 'spawn' is excluded: the spawn grid is announced by performSpawn's own
+    // pty-resize emit, never passed through resize(). Deriving from the shared
+    // type keeps the two unions linked when PtyResizeOrigin grows.
+    origin: Exclude<PtyResizeOrigin, 'spawn'> = 'desktop',
+  ): { colsChanged: boolean; refused?: true } {
     const session = this.registry.get(sessionId);
 
     // Guard against NaN/Infinity from layout edge cases (e.g. getComputedStyle
     // returning "" during unmount, yielding parseInt -> NaN)
-    if (!Number.isFinite(cols) || !Number.isFinite(rows)) return { colsChanged: false };
+    if (!Number.isFinite(cols) || !Number.isFinite(rows)) {
+      traceTerminal(sessionId, 'resize-invalid', { origin, cols, rows });
+      return { colsChanged: false };
+    }
 
     // Clamp to valid dimensions (node-pty throws on 0 or negative)
     const clampedCols = Math.max(2, Math.floor(cols));
     const clampedRows = Math.max(1, Math.floor(rows));
 
-    if (!session?.pty) {
-      // The PTY does not exist yet. A resize can beat the auto-resume spawn (the
-      // renderer mounts and fits before the main-process spawn lands), or arrive
-      // while a session is queued/suspended awaiting (re)spawn. Stash the dims so
-      // performSpawn spawns the PTY at the real size instead of the default,
-      // closing the stale-width race at the source. Never stash for an
-      // exited/killed session - it is not coming back, and xterm never re-sends
-      // unchanged dims, so a resurrected 120x30 would stick forever.
-      if (session && (session.status === 'queued' || session.status === 'suspended')) {
+    // A queued or suspended session stashes the dims instead of reshaping. A
+    // resize can beat the auto-resume spawn (the renderer mounts and fits
+    // before the main-process spawn lands), arrive while a session awaits
+    // (re)spawn, or land in suspend's marked-but-alive window: suspend() sets
+    // status BEFORE gracefulPtyShutdown resolves, so `session.pty` can still be
+    // non-null for up to ~3s of teardown, and reshaping that dying PTY would
+    // SIGWINCH a mid-exit agent and re-broadcast an echo that arms further
+    // re-asserts on other mounted terminals. Stashing records the INTENT so
+    // performSpawn spawns the respawned PTY at the real size, closing the
+    // stale-geometry race at the source.
+    if (session && (session.status === 'queued' || session.status === 'suspended')) {
+      // The floor applies to the stash too: a sub-floor desktop fit landing
+      // in the suspended window (mid-suspend, pre-respawn) would otherwise
+      // respawn the PTY at the strip while a phone streams it, and pair the
+      // seed's ptyDimensions with a frame serialized at the old grid. The
+      // desktop's INTENT is still recorded below, exactly like the live
+      // refusal.
+      const subFloorForStreamingPhone =
+        origin === 'desktop' &&
+        clampedRows < MOBILE_USABLE_MIN_ROWS &&
+        this.mobileTerminalProbe?.hasStreamSubscriber(sessionId) === true;
+      if (!subFloorForStreamingPhone) {
         this.pendingResizes.set(sessionId, { cols: clampedCols, rows: clampedRows });
-        if (origin === 'desktop') {
-          this.lastDesktopDimensions.set(sessionId, { cols: clampedCols, rows: clampedRows });
-        }
       }
+      if (origin === 'desktop') {
+        this.lastDesktopDimensions.set(sessionId, { cols: clampedCols, rows: clampedRows });
+      }
+      traceTerminal(sessionId, 'resize-stash', {
+        origin,
+        cols: clampedCols,
+        rows: clampedRows,
+        status: session.status,
+        stashed: !subFloorForStreamingPhone,
+      });
       return { colsChanged: false };
     }
 
+    if (!session?.pty) {
+      // No session, or an exited/killed one. Never stash here - the session is
+      // not coming back, and xterm never re-sends unchanged dims, so a
+      // resurrected 120x30 would stick forever. Distinct trace event from
+      // 'resize-stash' so the merged trace separates "nothing to resize" from
+      // "deferred to the respawn".
+      traceTerminal(sessionId, 'resize-ignored', {
+        origin,
+        cols: clampedCols,
+        rows: clampedRows,
+        status: session?.status ?? 'unknown',
+      });
+      return { colsChanged: false };
+    }
+
+    // Someone is sizing this session again, so the pending park is moot -
+    // whatever fired the resize is either showing it or holding its grid.
+    this.cancelRestingGridRestore(sessionId);
+
     if (origin === 'desktop') {
+      // Only a REAL desktop resize may set the restore target. The park
+      // resizes through this same method (it must - the buffer settle, the
+      // activity suppression, and the pty-resize emit below all matter), and
+      // recording ITS 120x30 here is exactly the clobber that made a later
+      // release-size "restore" a phone to the park instead of the desktop.
       this.lastDesktopDimensions.set(sessionId, { cols: clampedCols, rows: clampedRows });
     } else if (!this.lastDesktopDimensions.has(sessionId)) {
-      // First mobile-origin resize for a session the desktop never resized:
-      // snapshot the current grid as the restore target before changing it.
+      // First mobile- or park-origin resize for a session the desktop never
+      // resized: snapshot the current grid as the restore target before
+      // changing it.
       this.lastDesktopDimensions.set(sessionId, { cols: session.pty.cols, rows: session.pty.rows });
     }
 
+    if (
+      origin === 'desktop' &&
+      clampedRows < MOBILE_USABLE_MIN_ROWS &&
+      this.mobileTerminalProbe?.hasStreamSubscriber(sessionId) === true
+    ) {
+      // A phone mirrors this grid 1:1 and cannot make a strip taller, so a
+      // sub-floor grid renders a sliver of the phone screen with no way to
+      // recover away from the desktop. The bottom terminal panel is the case
+      // that hits this: its wide short strip (~306x14) grabs the grid
+      // whenever it becomes the surviving surface (user decision 2026-08-02:
+      // that view must never reach a phone). Refusing here leaves the panel
+      // rendering the taller grid clipped - exactly what it already does
+      // while a task detail owns the grid - and it self-heals: the next
+      // panel-layout fit after the phone unsubscribes goes through, and the
+      // restore target above already records what the desktop wanted. The
+      // refusal happens BEFORE bufferManager.onResize so the headless
+      // parser's grid never diverges from the real PTY. Desktops with no
+      // streaming phone never take this branch.
+      //
+      // The cancel above assumed the resize would be honored; a REFUSED
+      // resize must not eat a pending park, or a sub-floor session whose
+      // rescue was mid-debounce would strand on the sliver. Re-running the
+      // decision re-checks everything at fire time, so this is free when no
+      // park is actually due.
+      this.reconsiderRestingGrid(sessionId);
+      traceTerminal(sessionId, 'resize-refused', {
+        origin,
+        cols: clampedCols,
+        rows: clampedRows,
+        ptyCols: session.pty.cols,
+        ptyRows: session.pty.rows,
+        reason: 'sub-floor-mobile-hold',
+      });
+      // `refused` tells the echo re-assert (the width-drift self-heal) that
+      // main is deliberately holding this grid, so it stops immediately
+      // instead of burning its retry budget against the floor.
+      return { colsChanged: false, refused: true };
+    }
+
     const colsChanged = this.bufferManager.onResize(sessionId, clampedCols, clampedRows);
+    if (clampedCols === session.pty.cols && clampedRows === session.pty.rows) {
+      // The grid is not changing, so reshaping the PTY, suppressing activity
+      // transitions, and emitting pty-resize would all be pure churn - the
+      // emit especially: a task-detail remount re-sends its unchanged fit
+      // (xterm only skips re-sending within one instance's lifetime), and
+      // broadcasting it made every subscribed phone re-seed a byte-identical
+      // frame over the relay (measured live 2026-08-02). The bookkeeping
+      // above still ran: the park cancel and the desktop restore target
+      // record INTENT, and the buffer manager saw the call so its
+      // initial-resize-establishes-dimensions semantics hold.
+      traceTerminal(sessionId, 'resize-noop', { origin, cols: clampedCols, rows: clampedRows });
+      return { colsChanged };
+    }
     session.pty.resize(clampedCols, clampedRows);
+    traceTerminal(sessionId, 'resize-applied', { origin, cols: clampedCols, rows: clampedRows });
     // Mark resize time so the dispatch can suppress idle->thinking
     // transitions during the redraw burst that follows.
     this.resizeManager.notifyResize(sessionId);
     // The mobile bridge's seam onto grid changes, mirroring 'data-tap':
     // read-stream forwards this to subscribed phones as a terminal-resize
     // event so their renderer matches the grid before the repaint bytes land.
-    this.emit('pty-resize', sessionId, clampedCols, clampedRows);
+    // The IPC handler also forwards it to renderers (SESSION_PTY_RESIZED) so
+    // the mounted owner xterm can detect and heal a width divergence; the
+    // origin lets it leave phone- and park-held grids alone.
+    this.emit('pty-resize', sessionId, clampedCols, clampedRows, origin);
     return { colsChanged };
   }
 
@@ -804,6 +1302,7 @@ export class SessionManager extends EventEmitter {
     // desktop-dims restore target dies with the session for the same reason.
     this.pendingResizes.delete(sessionId);
     this.lastDesktopDimensions.delete(sessionId);
+    this.cancelRestingGridRestore(sessionId);
     // Release backpressure BEFORE nulling the PTY so a paused session is
     // resumed (lets any buffered output flush) and its accounting entry is
     // dropped immediately, rather than waiting for the async onExit handler.
@@ -961,28 +1460,74 @@ export class SessionManager extends EventEmitter {
   }
 
   async getScrollback(sessionId: string): Promise<string> {
-    // If a width-changing resize just fired, wait for the agent TUI's async
+    // If a geometry-changing resize just fired, wait for the agent TUI's async
     // repaint to land before sampling, so the replay shows the frame at the
-    // fitted width rather than the stale pre-resize one. No-op for sessions
-    // with no pending width change (see PtyBufferManager.waitForResizeRepaint).
-    await this.bufferManager.waitForResizeRepaint(sessionId);
-    return this.bufferManager.getScrollback(sessionId);
+    // fitted geometry rather than the stale pre-resize one. No-op for sessions
+    // with no pending geometry change (see PtyBufferManager.waitForResizeRepaint).
+    // Skipped entirely when the session has no live PTY (suspended/killed, or
+    // queued pre-spawn): no process means no SIGWINCH repaint can ever arrive,
+    // so a wait armed just before teardown would only burn its deadline against
+    // a repaint that cannot come.
+    if (this.registry.get(sessionId)?.pty) {
+      await this.bufferManager.waitForResizeRepaint(sessionId);
+    }
+    // Alt-screen sessions get the parsed-grid frame, everything else the raw
+    // byte replay - see PtyBufferManager.getReplaySnapshot for why a capped
+    // byte ring cannot reconstruct a fullscreen TUI's write-once cells.
+    return this.bufferManager.getReplaySnapshot(sessionId);
   }
 
   /**
    * The MOBILE seed frame: a snapshot of the PARSED grid from the per-session
    * headless xterm, serialized as a self-contained escape-sequence frame the
-   * phone cold-replays into a fresh terminal. Unlike getScrollback's raw 512KB
-   * byte replay, this never drops a fullscreen TUI's write-once static cells
-   * whose drawing bytes have aged out of the byte window.
+   * phone cold-replays into a fresh terminal. Unlike a raw 512KB byte replay,
+   * this never drops a fullscreen TUI's write-once static cells whose drawing
+   * bytes have aged out of the byte window (getScrollback serves the same
+   * frame to the desktop when the session is in the alt screen).
    *
    * Preserves the same repaint settle as getScrollback (awaits
-   * waitForResizeRepaint) so the grid is never serialized mid-repaint at a
-   * stale width. Desktop consumers keep using getScrollback unchanged.
+   * waitForResizeRepaint, and like getScrollback skips it when no live PTY can
+   * deliver a repaint) so the grid is never serialized mid-repaint at a stale
+   * geometry.
    */
   async getSerializedFrame(sessionId: string): Promise<string> {
-    await this.bufferManager.waitForResizeRepaint(sessionId);
+    if (this.registry.get(sessionId)?.pty) {
+      await this.bufferManager.waitForResizeRepaint(sessionId);
+    }
     return this.bufferManager.getSerializedFrame(sessionId);
+  }
+
+  /**
+   * The UNPROCESSED byte ring, exactly as it arrived from the PTY.
+   *
+   * The forensics read, and the only one that can answer "did these bytes ever
+   * exist?". Every other view is downstream of a parser: the transcript is
+   * ANSI-stripped, the serialized frame is a re-render of the parsed grid, and
+   * the renderer's xterm is a second parse of the same stream. When rows are
+   * missing from a frame, all of those agree with each other whether the agent
+   * omitted the rows or something here dropped them - the raw ring is what
+   * separates the two.
+   *
+   * No settle and no slicing: a diagnostic wants the bytes as they are, not a
+   * replay-shaped view of them.
+   */
+  getRawScrollback(sessionId: string): string {
+    return this.bufferManager.getRawScrollback(sessionId);
+  }
+
+  /**
+   * The Agent Monitor's output peek: the last few meaningful rendered lines.
+   *
+   * Deliberately does NOT await `waitForResizeRepaint`, unlike the two readers
+   * above. That settle exists so a REPLAY is never captured mid-repaint at a
+   * stale width, which matters when the captured frame becomes the terminal the
+   * user then looks at. The peek is a few lines of throwaway text resampled on a
+   * timer, so a mid-repaint sample self-corrects on the next tick, while awaiting
+   * the settle would make every sample cost up to REPAINT_MAX_WAIT_MS and force
+   * this synchronous read to become async for no benefit.
+   */
+  getOutputPeek(sessionId: string): string[] {
+    return this.bufferManager.getOutputPeek(sessionId);
   }
 
   /**
@@ -1029,12 +1574,76 @@ export class SessionManager extends EventEmitter {
     return stats;
   }
 
+  /**
+   * Dev diagnostics: every dimension MAIN knows for each session's terminal.
+   *
+   * The renderer can only see its own xterm's grid, so a PTY whose geometry has
+   * drifted from the grid showing it is invisible from there - and that
+   * divergence is exactly the failure where a terminal opens with its content
+   * wrapped or clipped and no refit ever corrects it (xterm only re-sends
+   * dimensions when ITS OWN size changes, so a mismatch has no path back).
+   *
+   * `ptyCols`/`ptyRows` is the live node-pty grid. `lastCols`/`lastRows` is the
+   * geometry the bytes now in the scrollback were drawn at.
+   * `lastDesktopDimensions` is the size the desktop last asked for, and
+   * `pendingResize` a size stashed for a session with no PTY yet. Comparing
+   * them against the renderer's grid (see the `dims` section of the
+   * terminal-state route) localizes a drift to a specific layer instead of
+   * leaving it to be inferred from pixels.
+   */
+  getTerminalDimensions(): Array<{
+    sessionId: string;
+    taskId: string;
+    status: string;
+    ptyCols: number | null;
+    ptyRows: number | null;
+    lastCols: number | null;
+    lastRows: number | null;
+    lastDesktopCols: number | null;
+    lastDesktopRows: number | null;
+    pendingResizeCols: number | null;
+    pendingResizeRows: number | null;
+    pendingRepaintAt: number | null;
+    pendingRepaintStacked: boolean;
+    inAltScreen: boolean;
+  }> {
+    const rows = [];
+    for (const session of this.registry.values()) {
+      const buffer = this.bufferManager.getDimensionState(session.id);
+      const desktop = this.lastDesktopDimensions.get(session.id) ?? null;
+      const pending = this.pendingResizes.get(session.id) ?? null;
+      rows.push({
+        sessionId: session.id,
+        taskId: session.taskId,
+        status: session.status,
+        ptyCols: session.pty?.cols ?? null,
+        ptyRows: session.pty?.rows ?? null,
+        lastCols: buffer?.lastCols ?? null,
+        lastRows: buffer?.lastRows ?? null,
+        lastDesktopCols: desktop?.cols ?? null,
+        lastDesktopRows: desktop?.rows ?? null,
+        pendingResizeCols: pending?.cols ?? null,
+        pendingResizeRows: pending?.rows ?? null,
+        pendingRepaintAt: buffer?.pendingRepaintAt ?? null,
+        pendingRepaintStacked: buffer?.pendingRepaintStacked ?? false,
+        inAltScreen: buffer?.inAltScreen ?? false,
+      });
+    }
+    return rows;
+  }
+
   getSession(sessionId: string): Session | undefined {
     return this.registry.getSession(sessionId);
   }
 
   listSessions(): Session[] {
     return this.registry.listSessions();
+  }
+
+  /** Registry rows carrying `agentName`, for the cross-project Agent Monitor.
+   *  See SessionRegistry.listManagedSummaries for why this is separate from listSessions. */
+  listManagedSummaries(): ManagedSessionSummary[] {
+    return this.registry.listManagedSummaries();
   }
 
   /** Return cached usage data for all sessions (survives renderer reloads). */
@@ -1058,6 +1667,17 @@ export class SessionManager extends EventEmitter {
   /** Return the latest ActivityReason for a session, or null if unknown. */
   getActivityReason(sessionId: string): ActivityReason | null {
     return this.telemetry.getActivityReason(sessionId);
+  }
+
+  /**
+   * Assert that this session's current idle is authoritative - the caller knows
+   * from outside the hook stream that the agent is parked and started no work.
+   * Used by the settings-change restart, whose resumed session sends no prompt
+   * but whose `--resume` context reload would otherwise trip the status
+   * heartbeat's force-thinking recovery. See `ActivityEngine.markIdleAuthoritative`.
+   */
+  markIdleAuthoritative(sessionId: string): void {
+    this.telemetry.markIdleAuthoritative(sessionId);
   }
 
   /** Return cached ActivityReason for all sessions (HMR/full-reload reconcile). */
@@ -1249,6 +1869,7 @@ export class SessionManager extends EventEmitter {
     // Coordinator 與 evidence 必須同時退場，避免舊 generation 留在任一邊而授權下一次 automation。
     this.writeCoordinator.disposeSession(sessionId);
     this.nativeIdleEvidence.removeSession(sessionId);
+    this.promptDrafts.clear(sessionId);
   }
 
   private shutdownContext() {

@@ -47,6 +47,7 @@ The in-memory `SessionStatus` does not include `orphaned` (that is a DB-only con
 | `queued` | `running` | Concurrency slot opens, `SessionQueue` promotes |
 | `queued` | `exited` | Session killed while still queued |
 | `running` | `suspended` | Task moved to Done or `auto_spawn=false` column |
+| `running` | `suspended` | A column or Board Profile edit flips `auto_spawn` to false while the task is already sitting there, with no move at all (`reconcileAutoSpawnChange`, `suspended_by='system'`) |
 | `running` | `exited` | Task moved to To Do (full cleanup via `cleanupTaskSession`) |
 | `running` | `exited` | Process exits naturally or is killed |
 | `running` | `orphaned` | App crashes, leftover `running` DB record found on next launch |
@@ -94,6 +95,7 @@ Deleting a task, including bulk delete, clears its pending requirement, placehol
 | Create into a spawn column | New Task dialog / `TASK_CREATE` | `spawnAgent`, `fromSwimlaneId: '*'` |
 | Backlog promote | promote from Backlog panel | `spawnAgent`, `fromSwimlaneId: '*'` |
 | MCP create (`kangentic_create_task`) | `autoSpawnForTask` | `spawnAgent` |
+| Column auto-spawn switched on | a column edit or a Board Profile edit, from either the Board Manager or the MCP `update_column` / profile tools, via `reconcileAutoSpawnChange` | `autoSpawnForTask` -> `spawnAgent` (sequential, skips user-paused, active project only) |
 | Unarchive (single + bulk) | Completed Tasks restore / `TASK_UNARCHIVE` | `spawnAgent`, `skipPromptTemplate` + `suppressAutoCommand` (recovery move) |
 | Startup crash recovery | project open, `resumeSuspendedSessions` | `prepareAgentSpawn` (`session-startup/prepare-spawn.ts`) |
 | Startup reconcile | project open, `autoSpawnTasks` | `prepareAgentSpawn` |
@@ -117,6 +119,9 @@ Transient Command Terminal sessions bypass all of this (not task agents).
    - If resuming: use existing `agent_session_id` with `--resume`, no prompt
     - If fresh: generate an adapter-native `agent_session_id` only when the adapter accepts caller-supplied IDs, then include the prompt
     - Generate a Kangentic PTY session ID and create `.kangentic/sessions/<ptySessionId>/`; this is also the `sessions.id` primary key and is distinct from `agent_session_id`
+   - If resuming: reconcile the stored `agent_session_id` against the record's own `status.json` (see [Resume](#resume)), then use it with `--resume`, no prompt
+   - If fresh: generate new UUID for `agent_session_id`, use `--session-id`, include prompt
+   - Create session directory at `.kangentic/sessions/<agentSessionId>/`
    - Build agent CLI command via `CommandBuilder`
    - Call `SessionManager.spawn()`
 3. `SessionManager.spawn()`:
@@ -144,6 +149,10 @@ Session teardown varies by target column:
 - **To Do** (role=`todo`) -- full cleanup via `cleanupTaskResources()`: kills the PTY, deletes session files and DB records, and removes the worktree. When `git.autoCleanup` is enabled, it also deletes the task branch. Moving back to an active column starts a fresh session and creates a new worktree and branch as needed.
 - **Done** (role=`done`) -- suspends session (preserves for resume via `SessionManager.suspend()`), archives task. The DB record is marked `suspended` so the session can be resumed if the task is later unarchived.
 - **Any column with `auto_spawn=false`** -- suspends session (same as Done, but without archiving).
+- **To Do** (role=`todo`), via `TASK_MOVE` - full cleanup via `cleanupTaskResources()`: kills the PTY (via `SessionManager.remove()`), deletes session files from disk, deletes all session DB records for the task, and then removes the worktree and (when `git.autoCleanup` is on) force-deletes the branch. Destructive, which is why the drop is gated behind a pending-changes confirmation. Moving back to an active column spawns a fresh session.
+- **To Do** (role=`todo`), via `TASK_UNARCHIVE` / `TASK_BULK_UNARCHIVE` (restore from Done) - the SESSION-only half, `cleanupTaskSession()`. The worktree and branch are left alone. Without this the task keeps the session Done deliberately suspended, and since `listSessions()` has no status filter the restored card renders "Paused" for the rest of the app session. It is not the full `cleanupTaskResources()` on purpose: `deleteTaskWorktree` nulls `worktree_path` only when the Done-time removal SUCCEEDED, so a task whose worktree was pinned at Done time (routine on Windows) still carries both fields, and the full helper would re-attempt the removal and force-delete the branch holding its committed work with no confirmation on this route.
+- **Done** (role=`done`) - suspends session (preserves for resume via `SessionManager.suspend()`), archives task, and deletes the worktree to reclaim disk while preserving `branch_name` and the session records. The DB record is marked `suspended` so the session can be resumed if the task is later unarchived into an auto-spawn column.
+- **Any column with `auto_spawn=false`** - suspends session (same as Done, but without archiving). A restore into such a column keeps the suspended session and its Resume affordance; only a `role=todo` target resets it.
 
 ### What is preserved on suspend (Done / auto_spawn=false)
 
@@ -175,6 +184,15 @@ Session teardown varies by target column:
 When a suspended task moves to an active column:
 
 - Command: `claude --settings <path> --resume <agentSessionId>` (no prompt)
+- The resumed id tracks mid-session forks. Running `/clear` inside a Claude session forks the
+  conversation to a brand-new session id; the statusline re-reports it and the change-sensitive
+  status-file capture (`SessionTelemetry.processStatusUpdate` -> `recoverStaleSessionId`)
+  rewrites `sessions.agent_session_id` live. At resume time,
+  `reconcileResumeAgentSessionId` (`src/main/transition-engine/resume-id-reconcile.ts`)
+  additionally checks the retiring record's own `status.json` and swaps the resumed id if a fork
+  landed in the final seconds before suspend (the status watcher detaches before the CLI exits).
+  Details and the empirical grounding: docs/adapter-session-history.md, "Mid-session fork
+  reconcile".
 - New PTY spawned with scrollback carried over from previous session
 - New session DB record inserted, old record marked `exited`
 - The destination column's settings are re-applied as CLI flags on the resume
@@ -190,6 +208,21 @@ When a suspended task moves to an active column:
   first message when the existing continuation flow qualifies. For OpenCode,
   a skipped Auto-command never replaces or erases that continuation prompt;
   non-OpenCode existing legacy behavior remains intact.
+  merely invokes it), passes a continuation prompt
+  ("Proceed with implementing the approved plan.") delivered as the resumed
+  session's first message when the destination column has no `auto_command`;
+  the `auto_command` wins when present.
+- The resume prompt is also how **auto_command escalation** lands. When a live
+  session's keystroke injection cannot be confirmed in the agent's transcript,
+  `restartSessionForSettingsChange` suspends and resumes with the command as the
+  prompt argument, which is guaranteed by the spawn rather than by TUI timing.
+  That restart is gated on the turn-completion predicate (activity idle AND a
+  quiet PTY) so it can never kill live work, is attempted at most once, and
+  carries only the user's `auto_command` - never an adapter-emitted settings
+  write, which would arrive as literal message text. Unlike the ordinary
+  settings-change restart it does NOT assert idle-authoritative afterwards,
+  because a resume with a prompt starts a real turn. See
+  [Command Injection](command-injection.md) for the full delivery ladder.
 - The **first move OUT of Done** (the recovery / restore move, whatever the
   destination column) resumes the session WITHOUT injecting the destination
   column's `auto_command`. Restoring a Done task is usually to inspect the
@@ -218,9 +251,9 @@ On project open (`src/main/transition-engine/session-startup/`):
 3. **Collect candidates** -- all `suspended` + `orphaned` agent records, plus OS-killed **interrupted-exited** records (any `session_type` except `run_script`). An interrupted-exited record is `status='exited'` with an *abnormal* code (`exit_code != 0`, cross-platform: Windows `1073807364`, Unix `137`/`143`/`130`), a captured `agent_session_id`, that is the latest record for its `(task, session_type, isolation)` group (`getInterruptedExited`). This catches a hard shutdown (OS restart, power loss, SIGKILL) where the PTY died and the onExit handler recorded `exited` before the clean-quit path could mark it `suspended`. Clean exit 0 is excluded so a deliberate `/exit` is never resurrected on startup.
 4. **Deduplicate per `(task_id, isolated_swimlane_id)`** -- keep only the latest record for each parallel session (see [Isolated Sessions](#isolated-sessions-per-column-session-model)), mark older same-session duplicates as `exited`. A task may hold multiple sessions; only same-session duplicates are retired.
 5. **Select the current session** -- per task, recover ONLY the session matching the task's current column strategy (`resolveIsolatedSwimlaneId`). Non-target sessions are preserved (an orphaned or interrupted-exited one is CAS-upgraded to `suspended`) so re-entering their column later continues their own conversation.
-6. **Filter** -- skip tasks in non-auto-spawn columns (an interrupted-exited record there is CAS-upgraded to `suspended` for future resume, mirroring move-to-Done), skip user-paused sessions (`suspended_by = 'user'`), skip missing CWD, skip deleted/archived tasks
+6. **Filter** -- skip tasks in non-auto-spawn columns (an interrupted-exited record there is CAS-upgraded to `suspended` for future resume, mirroring move-to-Done), skip user-paused sessions (`suspended_by = 'user'`), skip missing CWD, skip deleted/archived tasks. Skipped does NOT mean invisible: a record that ends up `suspended` in a non-auto-spawn **custom** column gets a `registerSuspendedPlaceholder` entry, because the renderer derives the Resume control and the card's click target from its in-memory session list, not the DB. Without one the task presents exactly like a To Do card (click opens the edit form, no Resume anywhere) even though `SESSION_RESUME` would happily resume it. To Do and Done are excluded by ROLE, not by the `auto_spawn` flag: both deliberately hide Resume, and a To Do card relies on having no session so it opens straight into the edit form.
 7. **Resume or respawn** (isolation-scoped via `getLatestForTaskByTypeAndIsolation`):
-   - Suspended/orphaned/interrupted-exited with `agent_session_id` -- use `--resume` (attempts to restore conversation)
+   - Suspended/orphaned/interrupted-exited with `agent_session_id` -- use `--resume` (attempts to restore conversation; the id is first reconciled against the record's own `status.json`, see [Resume](#resume))
    - No session ID -- fresh `--session-id` with prompt from matching `spawn_agent` action
 8. **Reconcile** -- spawn fresh agents for tasks in auto_spawn columns with no session at all (skips user-paused tasks); fresh rows are tagged with the column's `isolated_swimlane_id`
 
@@ -279,10 +312,36 @@ Sessions are resumable on next launch via `--resume <agent_session_id>` from the
 
 - Each PTY session spawns exactly one Claude Code CLI process.
 - The bottom panel and the modeless task-detail windows share that process, one xterm per session at a time.
-- `dialogSessionIds: string[]` in `SessionStore` lists every session owned by an open task-detail window. It replaced the scalar `dialogSessionId` once task detail became modeless and windows can stack.
-- When a window claims a session: the panel unmounts that session's xterm instance.
-- When the window releases it: the panel recreates xterm from the PTY scrollback buffer.
+- `dialogSessionIds: string[]` in `SessionStore` lists every session owned by an open task-detail window, in ANY window-manager layer (board, Command Terminal, Agent Monitor). It replaced the scalar `dialogSessionId` once task detail became modeless and windows can stack. It is one array per renderer, so `useWindowSessionClaims` reconciles it across all layers at once.
+- When a window claims a session: the panel unmounts that session's xterm instance AND drops its tab, so a detached task leaves no tab that would select an empty pane. The panel keeps every other tab live; it collapses only once no tab is left (`derivePanelSessions` + `shouldForceCollapseTerminal`).
+- When the window releases it: the tab returns, still selected, and the panel recreates xterm from the PTY scrollback buffer.
 - This prevents duplicate xterm instances from sending conflicting resize calls.
+- Both surfaces can therefore hold a live terminal at once, so `deriveFocusedSessionIds` focuses the window-owned sessions AND the panel's own session; anything with a mounted xterm must be in that set or the main process suppresses its PTY output.
+- **Which of those terminals takes KEYBOARD focus when it arrives is arbitrated, not raced**
+  (`src/renderer/utils/terminal-arrival-focus.ts`). The handoff above is exactly what creates the
+  race: opening a detail claims its session, so the panel drops that tab and mounts a terminal for a
+  DIFFERENT session at the same moment the window mounts its own. Both then fetch scrollback, which
+  main delays 150-400ms for the repaint settle, and every arrival path used to end in an
+  unconditional `xterm.focus()` - so whichever replay resolved LAST won, and a user who opened a
+  task and started typing could have the keystrokes land in whatever agent the panel fell back to.
+  `mayTakeArrivalFocus(sessionId)` decides from user-intent STATE instead, in three tiers:
+  a claim recorded by a gesture that named a terminal before it existed (a panel tab click, a panel
+  expand - the panel is not a window, so neither moves any layer's `focusedWindowId`); else the
+  terminal-hosting window holding window-layer focus, resolved by ANCHOR across all three layers
+  via `resolveFocusedWindowTerminal` in `dictation-target.ts`; else, when nothing owns the user's
+  attention, allow unless focus is in a typing surface. A claim is NOT consumed on grant, because
+  one arrival legitimately fires focus more than once (the deferred-init frame, then the mount
+  replay); a later window-focus change (the fingerprint) or the TTL is what ends it. Tiers 1 and 2
+  DENY a mismatch outright rather than falling through, which is what stops two terminals arriving
+  in one frame from both being permitted - including the case where the focused window has not
+  spawned a session yet, which still blocks everyone else. Tier 3 has no mismatch to deny, so its
+  own guard is a 500ms burst hold (`ARRIVAL_BURST_MS`): several terminals can reach it together on a
+  workspace restore that persisted no focused window, and only the first wins. Hosts own the policy
+  and pass it to `useTerminal` as an option, so the hook stays
+  surface-agnostic. Genuinely user-initiated focus (frame pointer-down, file drop, maximize
+  re-homing) is unconditional and marked `// arrival-focus-ok:`. See
+  `.claude/rules/terminal-arrival-focus.md`.
+- The converse also holds: anything with NO mounted xterm must be OUT of that set. A collapsed panel renders no `TerminalTab`, so `derivePanelSessionId` returns null for it (`panelShowsTerminal`, threaded from `useTerminalResize`'s `showContent`). Otherwise main streams bytes nothing can acknowledge, and a chatty agent eventually trips backpressure (`BACKPRESSURE_HIGH_WATER`) and has its PTY paused. Output produced while collapsed accumulates in main's scrollback ring and is replayed when the panel expands and the terminal remounts. A remount is not the only way back: a session that stays MOUNTED and merely leaves the focused union (a detail window a detached monitor owns, a hidden panel, a closed command bar over a transient) is repaired on the focus edge alone, without remounting. See the focus-edge catch-up bullet under Output Streaming.
 
 ## Project-Scoped Session State
 
@@ -317,34 +376,260 @@ The target agent is not required to read the reference. If lookup finds no path,
 - PTY `onData` accumulates into a per-session buffer.
 - A 16ms flush interval (~60fps) emits buffered data via IPC `session:data`.
 - A 512KB scrollback ring buffer per session supports terminal restoration.
+- **Alt-screen sessions replay the parsed grid, not the byte tail.** A raw byte replay is not a
+  frame snapshot: a fullscreen TUI leaves write-once static cells (box rules, mode labels)
+  undrawn after a clear, so once a session outgrows the 512KB ring their drawing bytes are gone
+  and a remount at unchanged geometry (no SIGWINCH, so no fresh repaint) paints a permanently
+  holed frame. `PtyBufferManager.getReplaySnapshot` therefore serves the headless PARSED grid
+  (the same serialized frame `getSerializedFrame` gives the mobile seed) when the session is in
+  the alt screen, and the raw byte replay otherwise - a plain shell's scrollback IS the bytes,
+  and truncation there only loses old history.
+- **Do not trim the byte replay to the last full-screen clear.** Tried and reverted: it cut a
+  512KB ring to ~1.5KB but produced a permanently black terminal on a fast open/close/reopen.
+  Slicing at the last clear discards write-once cells, and a sample landing at or just after a
+  clear replays a clear with nothing after it. The parsed-grid snapshot above is the safe shape,
+  not a byte-offset heuristic; and since the byte path now serves normal-buffer sessions, a trim
+  there would discard genuine user-scrollable history, not just a TUI's redraw bytes.
+- **One grid width per mount (deterministic fit).** `describeProposedDimensions`
+  (`src/renderer/addons/fit-addon.ts`, the single implementation that both `proposeDimensions` and
+  `fit` read) is a pure function of two inputs and no others: the container geometry, and the ACTIVE
+  renderer's cell metric. It must not read anything else that can change while a terminal is
+  mounting, because every distinct column count costs a PTY resize and a full agent
+  repaint the user watches land. Holding the second input still across a mount or a reveal is the
+  next bullet's subject. The rule exists because the fit used to reclaim the scrollbar
+  gutter whenever the alternate screen buffer was active: the scrollback replay writes the TUI's
+  alt-screen enter mid-mount, so the mount fit and the post-replay refit disagreed by two columns on
+  every open (always, under Claude Code's `/tui fullscreen`). That produced the "opens mis-sized,
+  then refits" flash, and its stacked-repaint race intermittently left the terminal black with
+  correct dimensions. xterm's own stylesheet sets `.xterm-viewport { overflow-y: scroll }`, so the
+  gutter is reserved in the alt buffer too; it is now MEASURED (`offsetWidth - clientWidth`) rather
+  than assumed, which is both correct and constant across buffer modes. The old hardcoded 14px
+  against the real 8px gutter was the actual cause of the empty right-hand strip that the
+  alt-buffer reclaim was mistakenly written to fix. Gated by
+  `tests/e2e/terminal-fit-invariant.spec.ts` (one distinct grid width per open, and the grid never
+  wider than its viewport) and `tests/unit/fit-addon.test.ts`.
+- **Fit only on the renderer the terminal keeps.** The container is not the fit's only input: the
+  cell metric is, and that comes from whichever renderer is attached
+  (`_renderService.dimensions.css.cell.width`). Parking a terminal disposes its WebGL addon for the
+  GPU budget, and the DOM renderer it falls back to measures a WIDER cell, so an unchanged container
+  proposes ~10% FEWER columns while suspended (measured: 210 attached, 191 suspended, at
+  hostWidth 1483). `useFocusedSessionsSync` therefore applies the WebGL attachment plan BEFORE it
+  publishes the parked set, because `syncParkedTerminals` fires reveal listeners synchronously and
+  each one fits itself on the spot; the mount path already had this order
+  (`attachWebglRenderer`, then the initial fit). With the order inverted, a Board -> Backlog ->
+  Board round trip wrote main's full-width frame into the narrow grid and the refit widened it back
+  WITHOUT reflowing - xterm reflows the normal buffer on resize and never the alternate one, so a
+  full-screen agent TUI stayed hard-wrapped until something forced a repaint. As a backstop for
+  the other ways the width can move across a REVEAL replay's async gap, `resolveReplayWidthAction`
+  (`useTerminal.ts`) compares the grid width at the write against the width after the post-write
+  refit and re-issues the replay once on a mismatch. It is wired into `reloadScrollback` only. The
+  mount replay has the same structural gap but is usually not exposed to it: its fit runs after the
+  WebGL attach, and it sends a real resize, so main serializes at the width it fitted to. The
+  exception is a mount taken while the page is already at `WEBGL_ATTACH_BUDGET` - that terminal
+  starts SUSPENDED, so its fit reads the DOM cell, and the coordinator's next plan can promote it to
+  WebGL mid-replay, which is the same uncovered corruption. Widening the backstop to the mount path
+  is left undone deliberately. `fit()` returns an applied/declined outcome so
+  a silent bail (a collapsed container, an unmeasured cell) is distinguishable from a real resize in
+  the `fit` trace. Gated by `tests/unit/replay-width-invariant.test.ts` and
+  `tests/ui/window-reveal-grid-width.spec.ts`, which deliberately keeps WebGL on and asserts on the
+  renderer trace ring, because the specs that read terminal CONTENT pass `--disable-webgl` and so
+  cannot reproduce a renderer swap at all.
+- **A session nobody is showing goes back to the spawn grid (the resting grid).** A PTY has ONE
+  grid and every surface fits it to its own box, so a session last shown in the bottom panel was
+  left at that panel's strip - measured live at 306x14 - with nothing to give it back. The agent
+  then kept working in a 14-row window, and a paired phone (which mirrors the desktop grid 1:1 and
+  cannot reshape a shared session) could not fill its screen from 14 rows no matter what it did
+  locally. `SessionManager.scheduleRestingGridRestore` parks such a session at the RESTING GRID
+  (`RESTING_GRID_COLS x RESTING_GRID_ROWS`, 210x48 - detail-shaped on purpose, not the 120x30
+  spawn default: the phone mirrors the resting grid 1:1, and a phone-fitted narrow grid was
+  built, live-tested, and judged LESS readable than the desktop's own layout, whose rules and
+  boxes are drawn for a wide frame) after `RESTING_GRID_DELAY_MS` (1s). The park is a MOBILE
+  feature and is gated on mobile interest: it fires only for a session a paired phone is actually
+  streaming (`MobileTerminalProbe.hasStreamSubscriber`, answered from the bridge's per-device
+  subscription registries), and a phone subscribing to a session that went unheld earlier gets an
+  immediate park instead (`parkRestingGridForMobileSubscriber`, called by the read-stream
+  subscribe handler BEFORE it serializes the seed, so the one snapshot already carries the
+  resting grid). A desktop that never pairs never parks at all - no probe, no bridge registries,
+  byte-for-byte the pre-park behavior. Three further guards make a firing park safe: it fires
+  only when NOTHING holds the session - unfocused AND no renderer has an xterm mounted for it
+  (`session:setMounted`, published by `terminal-mount-registry` from each terminal's own mount
+  effect); it never touches a grid a phone is holding (the armed size guard consulted through
+  `MobileTerminalProbe.isSizeHeld` - the guard registry, never a last-writer origin, which a
+  desktop resize overwrites while the hold stays armed); and it no-ops when the PTY is already at
+  the spawn grid. The park resizes with origin `'park'`, which deliberately does NOT update
+  `lastDesktopDimensions`: that map is the restore target for a phone's `release-size`, and a
+  park recording itself there made release "restore" the phone straight back to 120x30. After a
+  release the guard teardown asks for the park decision to re-run
+  (`reconsiderRestingGridAfterMobileRelease`), so an unheld session returns to the resting grid
+  and the phone's next visit finds park dims again. The mounted set is the load-bearing hold: a
+  PARKED terminal (Backlog view, occluded window) is unfocused but still mounted, and xterm
+  re-sends dimensions only when its OWN size changes, so a PTY reshaped underneath one would
+  disagree with it permanently - and the reveal deliberately skips its resize. Cost when it does
+  fire: the next open of that session pays the marker settle (~20-40ms) because the grid changed
+  while it was away, which is what any surface switch already pays. Gated by the `Resting grid
+  restore` block in `tests/unit/session-manager.test.ts`,
+  `tests/unit/terminal-mount-registry.test.ts`, and the park assertions in
+  `tests/unit/mobile-bridge/{interactive-terminal,read-stream}.test.ts`.
+- **A phone-streamed session is never rendered by the bottom panel, and never drops below the
+  mobile row floor.** Terminal ownership is one xterm per PTY, and a phone mirrors the grid 1:1
+  with no way to escape a strip-shaped fit: when the expanded bottom panel survived a
+  detail-close as the owning surface, its fit took the grid to the 306x14 strip and the phone
+  showed a sliver; and when the park reshaped a session under an unmounted-then-revealed panel
+  xterm, the reveal's `skipResize` replay left the panel permanently mis-wrapped (both observed
+  live 2026-08-02; user decision: the panel is a utility surface - the task detail is primary,
+  and the phone must never inherit the strip). Three layers enforce it:
+  1. **The gate is terminal-wanting subscriptions, not the bare stream key.** The phone holds a
+     list-only stream subscription for EVERY live session whenever it is connected, so
+     `MobileTerminalProbe.hasStreamSubscriber` answers from the `stream-terminal:<id>` marker
+     that `read-stream` registers only for `terminal: true` subscribes (and removes on every
+     release path). Gating on `stream:<id>` made the park fire for the entire board.
+  2. **The panel drops the tab of a phone-streamed session entirely.** Main pushes the
+     terminal-streamed set to the renderer (`MobileBridgeService.terminalStreamedSessionIds`,
+     `mobile:terminalStreamsChanged`, mirrored by `useMobileTerminalStreamsSync`), and
+     `derivePanelSessions` folds it into the `owned` exclusion - the same no-tab treatment a
+     detail-owned session gets, so no panel fit ever contends with the park, and the focused
+     set, the parked/reveal plan, and the WebGL budget all follow from the shared derivation.
+     No placeholder (user decision 2026-08-02): the user watching that session is on their
+     phone, not at the desk, and the tab returns the moment the phone lets go. A task-detail
+     window still mounts a real terminal: the detail is primary and its grid wins while open.
+  3. **`SessionManager` backstops the races** (`MOBILE_USABLE_MIN_ROWS`, 20): `resize()`
+     REFUSES a desktop-origin resize below the floor while a phone streams (before
+     `bufferManager.onResize`, so the headless parser never diverges from the real PTY; the
+     refused grid still records `lastDesktopDimensions` as the restore target), and
+     `parkRestingGridForMobileSubscriber` overrides a desktop HOLD below the floor, rescuing a
+     phone that subscribes to a session the strip captured before the phone arrived.
+  A desktop with no terminal-streaming phone never hits any layer: the panel renders and owns
+  grids exactly as before the park existed. Gated by the floor tests in the `Resting grid
+  restore` block of `tests/unit/session-manager.test.ts`, the terminal-marker tests in
+  `tests/unit/mobile-bridge/read-stream.test.ts`, the change-hook test in
+  `tests/unit/mobile-bridge/subscription-registry.test.ts`, and `panelTerminalSessionIdFor` in
+  `tests/unit/focused-sessions.test.ts`.
+- **The width-drift self-heal (PTY dims echo + owner re-assert).** xterm re-sends its dimensions
+  only when its OWN size changes, so a PTY reshaped under a mounted xterm (a lost or overridden
+  resize on a surface flip, a respawn at stashed dims, any last-writer-wins race - `resize()`
+  carries no surface identity) used to diverge with NO recovery path: with the Windows
+  full-repaint flag every frame is absolute-positioned at the PTY width, so the mounted grid
+  rendered a staircase (rows shifted progressively right, labels clipped) until the window was
+  resized by hand. Main now broadcasts `session:ptyResized` (`SESSION_PTY_RESIZED`) whenever the
+  PTY's grid ACTUALLY changes - the same-dims short-circuit runs first, so the echo of a
+  terminal's own resize always carries its own dims - with the resize's origin
+  (`PtyResizeOrigin`: `desktop`/`mobile`/`park`/`spawn`). It is a broadcast, not a focus-routed
+  push: a freshly mounted xterm can miss a routed echo during exactly the mount window where a
+  divergence is born, and echoes only fire on real grid changes. The mounted owner's listener
+  (`useTerminal`) compares the echoed dims to its own and, when they disagree, re-asserts its
+  fitted grid after a 150ms coalescing debounce and repairs the already-garbled frame with a
+  `reloadScrollback({ skipResize: true })` replay (the resize it just sent armed the repaint
+  settle, so the reload samples the frame drawn at the corrected width). The guard matrix is the
+  pure `resolvePtyEchoReassert` (exported from `useTerminal.ts`): in-sync self-filter first,
+  then foreign-hold (`mobile`/`park` origins - a phone or the park legitimately holds the grid;
+  `spawn` is healable), refused-hold (see below), parked, replay-in-flight, own-resize-pending,
+  and last a TIME-WINDOWED budget (2 re-asserts per divergence signature per 10s) - deliberately
+  not reset by an in-sync echo, because in a two-surface fight each side's successful re-assert
+  lands an in-sync echo at the other side, so a reset-on-heal budget never binds in exactly the
+  livelock it exists to bound. `resize()` also reports `refused: true` from the mobile sub-floor
+  branch (the one path where main deliberately holds the grid against the caller), which arms a
+  time-stamped refusal hold after a single refused IPC: no further re-asserts for the budget
+  window, whatever dims later echoes carry (time-stamped rather than signature-keyed, because
+  the pre-send fit can move the terminal's own dims and a burned signature would stop binding
+  exactly then). Every renderer resize sender now traces `resize-request` with an origin
+  tag (`mount`/`flush`/`reload`/`echo-reassert`/`debounced-onResize`) and main traces every
+  resize outcome (`resize-applied`/`resize-noop`/`resize-refused`/`resize-stash`/
+  `resize-ignored`/`resize-invalid`), so `kangentic_devtools_terminal_state`'s merged trace
+  names the trigger if a divergence ever recurs. A resize for a queued or suspended session
+  stashes (including suspend's marked-but-alive teardown window, where the PTY is still
+  non-null but must not be reshaped or re-echoed); one for a missing or exited session is
+  ignored. Gated by `tests/unit/pty-resize-echo-reassert.test.ts` (the guard
+  matrix), the emit/refusal pins in `tests/unit/session-manager.test.ts`,
+  `tests/ui/terminal-resize-echo-reassert.spec.ts` (real xterm wiring: re-assert, repair,
+  self-echo no-op, budget bound), and `tests/e2e/terminal-width-drift-selfheal.spec.ts` (a real
+  PTY driven to the incident by a rogue `sessions.resize`, healed back to the owner grid).
 - **Repaint-settled scrollback sampling.** A session spawns at a default 120x30; on a cold launch
   an auto-resumed PTY sits at that size until a card opens and the renderer fits it wider. When a
-  width-changing resize fires, a full-screen agent TUI repaints its frame asynchronously in
-  response to SIGWINCH. So `getScrollback` waits for that repaint to land and quiesce before
-  sampling (`PtyBufferManager.waitForResizeRepaint`), so a terminal restored right after a resize
-  replays the frame at the fitted width instead of a stale narrow one. The wait arms only when the
-  scrollback shows a TUI (a `\x1b[2J` clear) and is bounded by a max-wait ceiling, so a missing or
+  geometry-changing resize fires (cols OR rows), a full-screen agent TUI repaints its frame
+  asynchronously in response to SIGWINCH. So `getScrollback` waits for that repaint to land and
+  quiesce before sampling (`PtyBufferManager.waitForResizeRepaint`), so a terminal restored right
+  after a resize replays the frame at the fitted geometry instead of a stale one. Width armed the
+  settle first; rows-only changes (a bottom-panel height drag, a vertical-only window resize) arm
+  it too since a 2026-07-31 live measurement: 12/12 trials sampled the old-row-count frame before
+  the repaint, and the rows repaint always arrived 21-122ms later carrying a full `\x1b[2J` erase,
+  so the marker settles the wait early rather than riding the ceiling. (The resize IPC's
+  `colsChanged` report is unchanged - arming widened internally; nothing on the renderer or the
+  mobile wire consumes a rows flag.) A ring with NO `\x1b[2J` anywhere takes a
+  short wait of its own rather than the old instant sample: "no marker" at mount time also
+  describes a fullscreen TUI that has not drawn its first frame yet (observed live as a 237-byte
+  replay where a settled mount replays hundreds of KB), so the no-marker path samples on a
+  post-resize erase (the first frame just landed), on a marker-less quiesce, or - for a session
+  that answers SIGWINCH with silence, i.e. a plain shell - after a small grace
+  (`NO_MARKER_SILENT_GRACE_MS`), bounded by `NO_MARKER_MAX_WAIT_MS` far below the TUI ceiling so
+  Command Terminal opens stay fast. The wait is skipped entirely when the session has no live PTY
+  (a suspended, killed, or pre-spawn session can never receive a SIGWINCH repaint, so the wait
+  would only burn its deadline), and is bounded by a max-wait ceiling, so a missing or
   slow repaint can only delay a first paint, never hang the read. An actively streaming session
-  never quiesces, so the wait also settles EARLY the moment a full-frame repaint marker (`\x1b[2J`
-  or `\x1b[H`) lands in the bytes appended after the resize, outside any open synchronized-output
-  frame - instead of burning the whole ceiling and sampling mid-repaint. STACKED resizes (a second
-  width change while the previous repaint is still pending, e.g. rapidly closing and reopening a
-  task detail ping-pongs the PTY between the dialog and bottom-panel widths) disable the
-  marker-only settle - the first marker may be the previous width's late repaint - and require
-  marker AND quiesce, falling back to the ceiling while streaming. A resize that arrives before the
-  PTY exists (the renderer mounts before the auto-resume spawn lands) is stashed and applied at
-  spawn, so the PTY starts at the fitted size and no corrective resize is needed.
+  never quiesces, so the wait also settles EARLY the moment a full-frame repaint marker lands in
+  the bytes appended after the resize, outside any open synchronized-output frame - instead of
+  burning the whole ceiling and sampling mid-repaint. The marker is the `\x1b[2J` erase ONLY: a
+  bare `\x1b[H` cursor-home was tried and reverted, since TUIs emit it for ordinary partial
+  updates (a live session showed 169 cursor-homes to 56 erases). STACKED resizes (a second
+  geometry change while a RECENT previous repaint is still pending, e.g. rapidly closing and
+  reopening a task detail ping-pongs the PTY between the dialog and bottom-panel widths) disable
+  the marker-only settle - the first marker may be the previous geometry's late repaint - and
+  require marker AND quiesce, falling back to the ceiling while streaming. An arm older than the
+  400ms ceiling does not stack the next one: by then its repaint has landed or never will (the
+  settle itself stops waiting at that ceiling), so an unconsumed old arm - a height drag nothing
+  sampled after - cannot slow the next open. Concurrent samplers of the SAME
+  resize (a bottom-panel tab and a detail window overlapping during a handover; in dev, StrictMode's
+  double mount of a Command Terminal window - both terminal hosts defer their init off the mount
+  commit via the shared `useDeferredTerminalInit` hook, which lets StrictMode's
+  synchronous unmount cancel the first scheduled init, so each pair collapses to a single fetch
+  and no throwaway xterm races the survivor; what matters here is cancel-before-run, not which
+  frame the init lands on, since the shared queue in `terminal-init-queue.ts` can push a host
+  contending with others several frames out) share ONE wait: the second joins the first rather
+  than starting its own. Two
+  independent waits could not both work, because the first to settle clears the pending-repaint
+  state that the other's early-settle scan offset points at, so the loser could never settle early
+  and rode the full ceiling out - a deterministic ~415ms added to that open. A resize that arrives
+  before the PTY exists (the renderer mounts before the auto-resume spawn lands) is stashed and
+  applied at spawn, so the PTY starts at the fitted size and no corrective resize is needed.
+  One reader deliberately OPTS OUT of this settle: `SessionManager.getOutputPeek`, which backs the
+  Agent Monitor's live output peek. The settle exists so a captured frame becomes the terminal the
+  user then looks at; a peek is a few throwaway lines resampled twice a second, so a mid-repaint
+  sample self-corrects on the next tick, while awaiting the settle would cost up to the ceiling on
+  every sample and force a synchronous read to become async. It reads the parsed grid row by row
+  (`HeadlessFrameBuffer.cursorRow` / `lineAt`) rather than serializing a frame, and the line
+  selection lives in `src/main/pty/buffer/output-peek.ts`.
 - **DEC private mode and alt-screen re-assert on replay.** `xterm.reset()` on the renderer wipes
   every DEC private mode xterm is tracking, and the original mode-set bytes usually scroll out of
-  the 512KB scrollback window on a long-running session. `PtyBufferManager` tracks DEC private
-  input/reporting modes (DECCKM, mouse tracking, bracketed paste, ...) from the live stream and
-  re-asserts them as a prefix on `getScrollback` (#313). Alt-screen (mode 1049/47/1047) is tracked
-  separately as `inAltScreen` and re-asserted with its own `\x1b[?1049h` prefix, gated on the
-  session currently being in the alt buffer - a classic (normal-buffer) session's replay is
-  unaffected, but a fullscreen-TUI session's replay now paints into the alt buffer instead of the
-  normal buffer (previously the cause of a cursor left visually disconnected from the TUI frame). A
-  synchronized-output frame (mode 2026) left open by a mid-frame sample is closed with a trailing
-  `\x1b[?2026l` so it cannot stall the renderer's ~1s safety timeout.
+  the 512KB scrollback window on a long-running session. On the byte-replay path,
+  `PtyBufferManager` tracks DEC private input/reporting modes (DECCKM, mouse tracking, bracketed
+  paste, ...) from the live stream and re-asserts them as a prefix on `getScrollback` (#313), and
+  a synchronized-output frame (mode 2026) left open by a mid-frame sample is closed with a
+  trailing `\x1b[?2026l` so it cannot stall the renderer's ~1s safety timeout. Alt-screen (mode
+  1049/47/1047) is tracked separately as `inAltScreen`; it routes the replay (see
+  `getReplaySnapshot` above), and a session in the alt screen gets a serialized frame that carries
+  its own addon-emitted alt-screen switch and mode re-asserts (mid-stream, after the serialized
+  normal buffer - not a leading prefix, so nothing may `startsWith` on it), so the replay paints
+  into the alt buffer with the right input modes (a replay landing in the normal buffer was
+  previously the cause of a cursor left visually disconnected from the TUI frame). One mode class
+  the addon cannot emit is the mouse ENCODING modes (1005/1006/1015/1016 - it re-asserts mouse
+  TRACKING only), so `getReplaySnapshot` folds the tracked DEC-mode prefix onto the frame; without
+  it, a same-grid remount left xterm reporting legacy X10 mouse bytes that an SGR-expecting TUI
+  ignores, and wheel scroll went dead until the TUI happened to re-assert its own modes.
+  A SECOND thing the addon cannot emit is the DECSTBM scroll region: it builds its prefix from
+  `terminal.modes`, and a region is two integers of buffer state rather than a mode flag, so
+  `IModes` has no member for it. `HeadlessFrameBuffer.serialize` therefore appends the region
+  itself plus an absolute cursor restore. Order is load-bearing twice over: the region must FOLLOW
+  the frame (set before it, the frame's own row writes would scroll against it), and it must be
+  followed by the CUP, because DECSTBM homes the cursor and would otherwise discard the position
+  the addon's relative moves just rebuilt. The suffix is empty only when the region already spans
+  the grid AND origin mode is off, which is the common case: with DECOM on it still emits a bare
+  CUP, because the addon appends its own `\x1b[?6h` after its cursor restore and DECSET 6 homes
+  the cursor too. Claude Code gates its own DECSTBM use on a terminal-capability probe and
+  currently leaves it off under xterm.js (measured with `claude --debug`: `XTVERSION: no reply`
+  then `DECSTBM: gated`, because xterm registers `CSI > c` but no `CSI > q`), so the REGION half
+  guards against that gate reopening rather than repairing a live break. The origin-mode half
+  repairs a live one.
+  `getScrollback` itself retains the `\x1b[?1049h` prefix gate, reachable now only via direct
+  byte-path reads and `getReplaySnapshot`'s serialize-deadline fallback.
 - **Hold, not drop, live output across a renderer-side replay.** While a scrollback replay is in
   flight (`scrollbackPendingRef`), the renderer's incoming-write queue HOLDS (retains, does not
   ack) rather than drops live PTY bytes, and flushes them in order once the replay's `afterWrite`
@@ -353,6 +638,71 @@ The target agent is not required to read the reference. If lookup finds no path,
   drop-and-ack (its window can span the whole agent startup). A generation-aware `afterWrite` and a
   bounded watchdog timer additionally guard against a stale or stuck replay leaving
   `scrollbackPendingRef` true indefinitely, which would otherwise drop all live output forever.
+- **But the held bytes that PREDATE the sample are dropped, not flushed.** The hold above must not
+  be read as "every held byte is flushed after the replay": bytes main flushed BEFORE the
+  `getScrollback` reply are, by construction, already inside the replay whichever shape it takes
+  (a byte replay: main appends to its ring and its pending buffer from the same bytes and clears
+  the pending buffer when it samples; a parsed-grid frame: the serialize is atomic with the
+  parser's flush barrier so every pre-sample byte is baked in, bytes racing the sample ride the
+  reply as an appended tail, and main holds the session's flush ticks for the sample's duration
+  so nothing can be flushed ahead of the reply), so
+  flushing them afterwards repaints a pre-sample frame ON TOP of the fresh one. Because a TUI then
+  sends only differential updates, nothing repairs it and the terminal shows the previous geometry's
+  frame until the next SIGWINCH - a task detail opening on a session at the bottom panel's 14 rows
+  showed that 14-row frame in a 48-row grid until the window was resized by hand. Both replay paths
+  therefore reset the queue the moment the sample resolves, before writing it, and trace what they
+  discarded (`replay-drop-held`, with a byte count). Bytes flushed AFTER the reply are post-sample
+  and still held, then flushed, exactly as above. This was latent until the deferred terminal init
+  collapsed `TerminalTab`'s StrictMode double mount to one terminal: the second mount's replay had
+  been overwriting the stale paint.
+- **A replay never leaves the terminal both blank and held.** Two rules keep an aborted replay from
+  becoming a permanently black terminal. First, `reloadScrollback` clears the terminal immediately
+  before writing the new frame, not before fetching it: clearing first opened a window in which only
+  a SUCCESSFUL replay ever repainted, so any abort (a newer generation, a rejected read) left the
+  grid empty with every byte still sitting in the main-process ring and an idle agent with no reason
+  to send more. The last good frame now stays on screen until the new one replaces it. Second, the
+  stuck-replay watchdog RECOVERS (re-issues the replay once, at the already-synced width) rather
+  than only unblocking the queue, since unblocking a queue does not repaint a cleared grid. The
+  replay lifecycle is traced (`replay-start` / `-write` / `-abort` / `-done` / `-error` /
+  `-watchdog`, each with its generation) and surfaces in `kangentic_devtools_terminal_state`, so an
+  abandoned replay is readable directly instead of inferred from a missing later event.
+- **Focus-edge catch-up, the wider sibling of park/reveal.** Main gates PTY emission on its focused
+  union, but the only catch-up repaint used to be `onTerminalReveal`, which fires on the PARKED
+  edge. Parking implies unfocus, not the reverse, so every session that left the union WITHOUT
+  being parked had no path back to a correct grid: a detail window a detached monitor owns
+  (`remotelyOwnedSessionIds`), a hidden bottom panel, a closed command bar over a transient.
+  `src/renderer/utils/focused-terminals.ts` adds the missing edge (`syncFocusedTerminals` /
+  `onTerminalRefocus`, edge-triggered exactly like the parked registry), and `useTerminal`
+  subscribes it to the same `reloadScrollback({ skipResize: true, skipFocus: true })` the reveal
+  path uses, skipping when a replay is already in flight so a mount-time replay is never aborted
+  and re-issued for the same frame. Both registries are kept: only parking additionally makes the
+  incoming queue ack-and-discard, so neither subsumes the other.
+- **Post-interaction repaint nudge.** A fullscreen TUI intermittently emits a frame that erases
+  the grid and then redraws only some of it, leaving either the whole transcript blank or a
+  contiguous band of rows missing mid-frame. Its renderer is differential, so it never revisits
+  those rows and only a full repaint heals them, which is why a click or a resize fixes it and
+  waiting does not. `src/renderer/utils/repaint-nudge.ts` asks for that repaint automatically:
+  after real user input reaches a focused alt-screen terminal and the output it provoked goes
+  quiet (250ms), it writes a FocusOut+FocusIn pair, which is the same report a real terminal sends
+  on alt-tab and the same one the user's click was already sending. It fires on the TRIGGER rather
+  than on a detected symptom, so there is no threshold to false-positive on a legitimately sparse
+  frame and it covers every shape of the defect. Gated on alt-screen plus DECSET 1004 plus
+  not-parked plus no-replay-pending, floored at one per 750ms per session. `isUserInputData`
+  filters out xterm's OWN focus and motion reports, which arrive through the same `onData` channel
+  and would otherwise self-arm a nudge on every mount replay. The before/after grid comparison is
+  reporting only and never gates the nudge. Upstream: anthropics/claude-code#83714.
+- **Trace vocabulary for the two mechanisms above.** `focus-union-gained` / `focus-union-lost`
+  (main, `recomputeFocusedUnion`), `terminal-unfocus` / `terminal-refocus` (renderer,
+  `focused-terminals.ts`), and `repaint-repaired` / `repaint-verified` (renderer,
+  `repaint-nudge.ts`, the latter meaning the frame was already correct and the nudge cost one
+  render). `arrival-focus` (renderer, `terminal-arrival-focus.ts`) joins them, carrying the
+  allow/deny plus the tier that decided it (`claim` / `claim-mismatch` / `window` /
+  `window-mismatch` / `occupied` / `burst-taken` / `unclaimed`) - the only record of WHY a terminal
+  did or did not take focus, which a "typed into the wrong terminal" report otherwise leaves to
+  guesswork. All seven merge into `kangentic_devtools_terminal_state`'s timeline alongside the
+  resize and replay events above. `kangentic_devtools_terminal_forensics` is the session-scoped
+  companion: renderer viewport rows, main's re-parsed grid, and the raw byte ring side by side,
+  which is what separates "the agent never sent these rows" from "we lost them".
 - **Replay veil for a warm mount.** For an already-running session, `TerminalTab`'s launch overlay
   never shows (`terminalReady` starts true), so the whole mount-time fit -> replay -> refit ->
   held-byte-flush sequence used to paint live, occasionally as a visible flash. `TerminalTab` now

@@ -1,8 +1,19 @@
 import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { EventEmitter } from 'node:events';
 
 const handlers = new Map<string, (...args: readonly unknown[]) => unknown>();
 const scheduler = { cancel: vi.fn(), scheduleKeystrokes: vi.fn() };
+const getUsageCache = vi.fn(() => ({}));
+const listSessions = vi.fn(() => []);
+const boardEventEmitter = new EventEmitter();
+const onBoardChanged = vi.fn((listener: (event: unknown) => void) => {
+  boardEventEmitter.on('board-changed', listener);
+  return () => {
+    boardEventEmitter.off('board-changed', listener);
+  };
+});
 const prepareInjectionPlan = vi.fn(() => null);
+const resolveLiveEffort = vi.fn(() => null);
 
 vi.mock('electron', () => ({
   ipcMain: { handle: vi.fn((channel: string, handler: (...args: readonly unknown[]) => unknown) => handlers.set(channel, handler)) },
@@ -11,9 +22,14 @@ vi.mock('electron', () => ({
 vi.mock('node:fs', () => ({ default: { mkdirSync: vi.fn(), copyFileSync: vi.fn() } }));
 vi.mock('node:os', () => ({ default: { tmpdir: vi.fn(() => '/tmp') } }));
 vi.mock('../../src/main/db/database', () => ({ getProjectDb: vi.fn(() => ({})) }));
-vi.mock('../../src/main/db/repositories/session-repository', () => ({ SessionRepository: class { updateAppliedSettings = vi.fn(); } }));
+vi.mock('../../src/main/db/repositories/session-repository', () => ({
+  SessionRepository: class {
+    updateAppliedSettings = vi.fn();
+    getUserPausedTaskIds(): Set<string> { return new Set(); }
+  },
+}));
 vi.mock('../../src/main/agent/agent-registry', () => ({ agentRegistry: { get: vi.fn() } }));
-vi.mock('../../src/main/transition-engine/injection-plan', () => ({ prepareInjectionPlan }));
+vi.mock('../../src/main/transition-engine/injection-plan', () => ({ prepareInjectionPlan, resolveLiveEffort }));
 vi.mock('../../src/main/ipc/handlers/session-reconcile', () => ({ restartSessionForSettingsChange: vi.fn() }));
 vi.mock('../../src/main/diagnostics/project-log-context', () => ({ runWithProjectLogContext: vi.fn((_name: string, operation: () => unknown) => operation()) }));
 
@@ -40,11 +56,16 @@ let IPC: typeof import('../../src/shared/ipc-channels').IPC;
 
 const context = {
   currentProjectId: 'project-board', currentProjectPath: '/project-board',
-  sessionManager: { getSession: vi.fn(() => ({ status: 'running' })) },
+  sessionManager: {
+    getSession: vi.fn(() => ({ status: 'running' })),
+    getUsageCache,
+    listSessions,
+  },
   terminalSubmitScheduler: scheduler,
   boardConfigManager: { writeBack: vi.fn(), exists: vi.fn(), exportFromDb: vi.fn(), applyFileChange: vi.fn(), getShortcuts: vi.fn(), setShortcuts: vi.fn(), setDefaultBaseBranch: vi.fn(), getBoardProfiles: vi.fn(() => []) },
   projectRepo: { getById: vi.fn(() => ({ id: 'project-board' })) },
   mainWindow: { isDestroyed: vi.fn(() => false), webContents: { send: vi.fn() } },
+  boardEvents: { onBoardChanged },
 };
 
 async function updateLane(input: Record<string, unknown>): Promise<void> {
@@ -62,6 +83,7 @@ describe('SWIMLANE_UPDATE live submission invalidation', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     handlers.clear();
+    boardEventEmitter.removeAllListeners();
     registerBoardHandlers(context as never);
   });
 

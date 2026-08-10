@@ -1,12 +1,11 @@
 import fs from 'node:fs';
-import path from 'node:path';
 import { ipcMain } from 'electron';
 import { IPC } from '../../../shared/ipc-channels';
 import { SessionRepository } from '../../db/repositories/session-repository';
 import { UsageHistoryRepository } from '../../db/repositories/usage-history-repository';
 import { captureGitChurn, resolveDefaultBaseBranch } from './git-stats-capture';
 import { WorktreeManager, type GitWaitProgress } from '../../git/worktree-manager';
-import { slugify } from '../../../shared/slugify';
+import { candidateWorktreePathsFor, legacyAutoBranchNameFor } from '../../git/task-worktree-folder';
 import { getProjectDb } from '../../db/database';
 import {
   getProjectRepos,
@@ -38,41 +37,15 @@ import {
   finalizeAutoCommandGate,
   type AutoCommandLifecycle,
 } from '../../agent/auto-command-disposition';
-import { prepareInjectionPlan } from '../../transition-engine/injection-plan';
+import { prepareInjectionPlan, resolveLiveEffort } from '../../transition-engine/injection-plan';
 import { prepareLiveSubmission } from '../../transition-engine/live-submission-eligibility';
 import { resolveIsolatedSwimlaneId, resolveForceFresh } from '../../transition-engine/session-isolation';
 import { resolveEffectiveAutoCommand, applyProfileToLane } from '../../transition-engine/column-strategy';
 import { loadTaskProfile } from '../helpers/task-profile';
 import type { AutoCommandImmediateOutcome, TaskMoveResult } from '../../../shared/auto-command-outcome';
 import type { Task, Swimlane, SessionRecord, TaskMoveInput } from '../../../shared/types';
-
-/**
- * Guard: before checking out a branch in the main repo, verify no other
- * non-worktree task has an active PTY session. Checking out would change
- * the filesystem under a running agent.
- */
-export function guardActiveNonWorktreeSessions(
-  context: IpcContext,
-  task: Task,
-  tasks: ReturnType<typeof getProjectRepos>['tasks'],
-): void {
-  if (!task.base_branch || task.worktree_path) return;
-
-  const activeSessions = context.sessionManager.listSessions()
-    .filter(session => session.taskId !== task.id && (session.status === 'running' || session.status === 'queued'));
-
-  const otherNonWorktreeSessions = activeSessions.filter(session => {
-    const otherTask = tasks.getById(session.taskId);
-    return otherTask && !otherTask.worktree_path;
-  });
-
-  if (otherNonWorktreeSessions.length > 0) {
-    throw new Error(
-      `Cannot switch to branch '${task.base_branch}': another task is running in the main repo. `
-      + `Enable worktree mode for branch isolation.`
-    );
-  }
-}
+import { reportAutoCommandOutcome } from '../helpers/auto-command-outcome';
+import { restartSessionForSettingsChange } from './session-reconcile';
 
 /**
  * Per-task AbortController to cancel in-flight moves when a newer move
@@ -680,6 +653,10 @@ export async function handleTaskMove(
               }))
             : '';
           const capturedTaskAutoCommand = task.auto_command;
+          // Read ONCE and share with the 2b fallback below, so the plan and the
+          // respawn decision cannot straddle a status update and disagree about
+          // what the session is running at.
+          const liveEffort = resolveLiveEffort(context.sessionManager, task.session_id);
           const plan = prepareInjectionPlan({
             adapter,
             sessionRepo,
@@ -688,12 +665,13 @@ export async function handleTaskMove(
             toLane: toLane ?? null,
             project,
             autoCommand: interpolatedAuto,
+            liveEffort,
           });
-          const sourceEffort = task.effort_override ?? activeRecord?.applied_effort ?? null;
+          const sourceEffort = task.effort_override ?? liveEffort ?? activeRecord?.applied_effort ?? null;
           const targetEffort = task.effort_override ?? toLane?.effort_override ?? project?.default_effort ?? null;
           const restartNeededForEffort = targetEffort !== sourceEffort
             && targetEffort !== null
-            && (plan?.verifiedPrefixLength ?? 0) === 0;
+            && !plan?.sequence.some((command) => command.verify === 'command-match');
 
           // 1. Model change -> suspend + respawn. Checked BEFORE live injection
           // so a model change never live-swaps. Phase 3 re-applies the flags and
@@ -767,6 +745,19 @@ export async function handleTaskMove(
           // wait-for-native-idle 只接手 trailing Auto-command；deterministic
           // settings prefix 仍先走既有 verifier，兩者共用 task FIFO。
           if (plan) {
+            const escalateAutoCommand = async (commands: string[]): Promise<boolean> => {
+              if (!resolvedProjectPath) return false;
+              return withTaskLock(task.id, async () => {
+                const restarted = await restartSessionForSettingsChange(
+                  context,
+                  resolvedProjectId,
+                  resolvedProjectPath,
+                  task.id,
+                  { resumePrompt: commands.join('\n') },
+                );
+                return restarted.ok;
+              });
+            };
             let scheduledLaneCommand = false;
 
             const capturedSessionId = task.session_id;
@@ -800,7 +791,7 @@ export async function handleTaskMove(
               sessionGeneration: nativeSnapshot?.sessionGeneration ?? null,
               inputGeneration: nativeSnapshot?.inputGeneration ?? null,
               destinationLaneId: toLane?.id ?? '',
-              sequence: plan.sequence,
+              sequence: plan.sequence.map((command) => command.text),
             });
             const liveSubmission = prepareLiveSubmission(autoCommandDisposition);
             let autoCommandGateResult = finalizeAutoCommandGate({
@@ -882,7 +873,7 @@ export async function handleTaskMove(
                     sessionGeneration: currentSnapshot?.sessionGeneration ?? null,
                     inputGeneration: currentSnapshot?.inputGeneration ?? null,
                     destinationLaneId: currentLane.id,
-                    sequence: currentPlan?.sequence ?? [],
+                    sequence: currentPlan?.sequence.map((command) => command.text) ?? [],
                   },
                 );
                 const currentPrepared = prepareLiveSubmission(currentDisposition);
@@ -919,7 +910,7 @@ export async function handleTaskMove(
                     sessionGeneration: currentSnapshot?.sessionGeneration ?? null,
                     inputGeneration: currentSnapshot?.inputGeneration ?? null,
                     destinationLaneId: currentLane.id,
-                    sequence: persistedPlan?.sequence ?? [],
+                    sequence: persistedPlan?.sequence.map((command) => command.text) ?? [],
                   },
                 );
                 const persistedLiveSubmission = prepareLiveSubmission(persistedDisposition);
@@ -1020,7 +1011,7 @@ export async function handleTaskMove(
                         sessionGeneration: currentSnapshot?.sessionGeneration ?? null,
                         inputGeneration: currentSnapshot?.inputGeneration ?? null,
                         destinationLaneId: currentLane.id,
-                        sequence: currentPlan.sequence,
+                        sequence: currentPlan.sequence.map((command) => command.text),
                       },
                     );
                     const currentPrepared = prepareLiveSubmission(currentDisposition);
@@ -1039,6 +1030,9 @@ export async function handleTaskMove(
               context.terminalSubmitScheduler.scheduleKeystrokes(task.id, task.session_id, plan.sequence, {
                 verifier: plan.verifier,
                 verifiedPrefixLength: plan.verifiedPrefixLength,
+                mode: toLane?.auto_command_mode ?? 'immediate',
+                escalate: escalateAutoCommand,
+                onOutcome: (report) => reportAutoCommandOutcome(context, tasks, task, report, resolvedProjectId),
               });
               autoCommandGateResult = interpolatedAuto === ''
                 ? finalizeAutoCommandGate({ kind: 'not-dispatched', disposition: null })
@@ -1183,15 +1177,34 @@ export async function handleTaskMove(
         if (resolvedProjectPath) {
           try {
             const worktreeManager = new WorktreeManager(resolvedProjectPath);
-            const expectedSlug = slugify(task.title) || 'task';
-            const expectedFolder = `${expectedSlug}-${task.id.slice(0, 8)}`;
-            const expectedPath = path.join(resolvedProjectPath, '.kangentic', 'worktrees', expectedFolder);
-            const expectedBranch = task.branch_name || expectedFolder;
+            // Creation just failed, possibly before the DB write landed, so no
+            // single field is trustworthy here. Probe every directory this task
+            // could plausibly own: the stored path, the folder it is pinned to,
+            // the numeric name a fresh creation would pick, and the legacy
+            // title-derived name from before the numeric scheme.
+            const candidateWorktreePaths = candidateWorktreePathsFor(task, resolvedProjectPath);
+            // The BRANCH is derived independently of the folder. Folders are
+            // numeric now, so falling back to the folder name here would try to
+            // delete a branch literally called "460".
+            const expectedBranch = task.branch_name || legacyAutoBranchNameFor(task);
 
             await worktreeManager.withLock(async () => {
-              if (fs.existsSync(expectedPath)) {
-                await worktreeManager.removeWorktree(expectedPath);
-                // removeWorktree doesn't throw on failure - verify it actually worked
+              for (const expectedPath of candidateWorktreePaths) {
+                if (!fs.existsSync(expectedPath)) continue;
+                // Per candidate, because removeWorktree THROWS for a path
+                // outside this project's worktrees root (the raw stored
+                // worktree_path is one candidate, and it is probed first). A
+                // throw that escaped this loop would skip the remaining
+                // candidates AND the prune / removeBranch below, leaving exactly
+                // the stale state this block exists to clear.
+                try {
+                  await worktreeManager.removeWorktree(expectedPath);
+                } catch (removalError) {
+                  console.warn(`[TASK_MOVE] Skipped stale worktree candidate ${expectedPath}:`, removalError);
+                  continue;
+                }
+                // A removal that merely FAILS returns false rather than throwing,
+                // so verify on disk.
                 if (fs.existsSync(expectedPath)) {
                   console.warn(`[TASK_MOVE] Could not remove stale worktree directory (file handles may still be held): ${expectedPath}`);
                 } else {
@@ -1217,10 +1230,10 @@ export async function handleTaskMove(
 
       // Checkout the task's branch in the main repo (non-worktree tasks only).
       // Intentionally unguarded: if checkout fails, the error propagates to
-      // the outer catch which also handles AbortError cleanup.
-      const { tasks: tasksCheckout } = getProjectRepos(context, resolvedProjectId);
-      guardActiveNonWorktreeSessions(context, task, tasksCheckout);
-      await ensureTaskBranchCheckout(task, resolvedProjectPath, { signal, onProgress, onWaitProgress });
+      // the outer catch which also handles AbortError cleanup. That includes
+      // BranchCheckoutBlockedError, which reaches the user as a toast here, so
+      // this is the one call site that needs no notifyBranchCheckoutBlocked.
+      await ensureTaskBranchCheckout(context, task, resolvedProjectPath, { signal, onProgress, onWaitProgress });
 
       // === Phase 3 (locked, short) ===
       // CAS-check invariants before spawning. If a newer move ran during our

@@ -3,7 +3,7 @@
     "ignoreDeprecations": "6.0",
     "noUncheckedSideEffectImports": false,
     "target": "ESNext",
-    "module": "commonjs",
+    "module": "ESNext",
     "allowJs": true,
     "skipLibCheck": true,
     "esModuleInterop": true,

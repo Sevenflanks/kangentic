@@ -323,11 +323,18 @@ describe('resumeSuspendedSessions: OS-killed (interrupted-exited) recovery', () 
         makeConfigManager(true) as never,
       );
 
-      // Resume was requested with the ORIGINAL conversation id.
+      // Resume was requested with the ORIGINAL conversation id, threading the
+      // matched record's id + cwd and the live repo that power the resume-time
+      // /clear-fork reconcile inside prepareAgentSpawn.
       expect(prepareAgentSpawn).toHaveBeenCalledTimes(1);
       expect(prepareAgentSpawn).toHaveBeenCalledWith(
         expect.objectContaining({
-          resume: { agentSessionId: INCIDENT_172_AGENT_SESSION_ID },
+          resume: {
+            agentSessionId: INCIDENT_172_AGENT_SESSION_ID,
+            recordId: 'rec-172',
+            recordCwd: '/project/cwd',
+          },
+          sessionRepo: expect.anything(),
         }),
       );
 

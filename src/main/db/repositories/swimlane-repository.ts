@@ -27,6 +27,37 @@ interface SwimlaneRow {
   created_at: string;
   // Added via ALTER TABLE, so physically last in the row.
   description: string | null;
+  // NOT NULL DEFAULT in the schema; mapRow keeps a defensive `?? default` for
+  // rows read mid-migration.
+  auto_command_mode: string;
+}
+
+/**
+ * Delete a swimlane row and every DB reference that points at it, atomically.
+ *
+ * Three call sites need exactly this trio and used to each carry their own copy:
+ * `SwimlaneRepository.delete`, `SwimlaneRepository.deleteEmptyGhosts`, and the
+ * board-config reconciler (`apply-config.ts`), which deliberately bypasses
+ * `delete()`'s guards so it can drop role-bearing lanes. Any fourth caller (the
+ * MCP `delete_column` handler) would have forked it again, which is how a
+ * reference gets missed.
+ *
+ * Deliberately NOT cleaned: `sessions.isolated_swimlane_id`. Null there MEANS
+ * "main session" (see `SessionRepository.getLatestForTaskByTypeAndIsolation`), so
+ * nulling a stale value would promote an isolated record into the main slot and
+ * collide in the resume dedup key; deleting the rows would lose transcript
+ * history. A stale id is inert - nothing ever matches a swimlane that is gone.
+ *
+ * Guards (role column, non-empty) belong to the CALLER, not here.
+ */
+export function deleteSwimlaneRowWithReferences(db: Database.Database, id: string): void {
+  const tx = db.transaction(() => {
+    db.prepare('DELETE FROM swimlane_transitions WHERE from_swimlane_id = ? OR to_swimlane_id = ?').run(id, id);
+    // Clear dangling plan_exit_target_id references
+    db.prepare('UPDATE swimlanes SET plan_exit_target_id = NULL WHERE plan_exit_target_id = ?').run(id);
+    db.prepare('DELETE FROM swimlanes WHERE id = ?').run(id);
+  });
+  tx();
 }
 
 export class SwimlaneRepository {
@@ -78,6 +109,7 @@ export class SwimlaneRepository {
       permission_mode: input.permission_mode ?? null,
       auto_spawn: input.auto_spawn ?? true,
       auto_command: input.auto_command ?? null,
+      auto_command_mode: input.auto_command_mode ?? 'immediate',
       plan_exit_target_id: input.plan_exit_target_id ?? null,
       agent_override: input.agent_override ?? null,
       model_override: input.model_override ?? null,
@@ -89,8 +121,8 @@ export class SwimlaneRepository {
     };
 
     this.db.prepare(
-      'INSERT INTO swimlanes (id, name, description, role, position, color, icon, is_archived, is_ghost, permission_mode, auto_spawn, auto_command, plan_exit_target_id, agent_override, model_override, effort_override, handoff_context, session_target, session_spawn_strategy, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
-    ).run(swimlane.id, swimlane.name, swimlane.description, swimlane.role, swimlane.position, swimlane.color, swimlane.icon, swimlane.is_archived ? 1 : 0, swimlane.is_ghost ? 1 : 0, swimlane.permission_mode, swimlane.auto_spawn ? 1 : 0, swimlane.auto_command, swimlane.plan_exit_target_id, swimlane.agent_override, swimlane.model_override, swimlane.effort_override, swimlane.handoff_context ? 1 : 0, swimlane.session_target, swimlane.session_spawn_strategy, swimlane.created_at);
+      'INSERT INTO swimlanes (id, name, description, role, position, color, icon, is_archived, is_ghost, permission_mode, auto_spawn, auto_command, auto_command_mode, plan_exit_target_id, agent_override, model_override, effort_override, handoff_context, session_target, session_spawn_strategy, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+    ).run(swimlane.id, swimlane.name, swimlane.description, swimlane.role, swimlane.position, swimlane.color, swimlane.icon, swimlane.is_archived ? 1 : 0, swimlane.is_ghost ? 1 : 0, swimlane.permission_mode, swimlane.auto_spawn ? 1 : 0, swimlane.auto_command, swimlane.auto_command_mode, swimlane.plan_exit_target_id, swimlane.agent_override, swimlane.model_override, swimlane.effort_override, swimlane.handoff_context ? 1 : 0, swimlane.session_target, swimlane.session_spawn_strategy, swimlane.created_at);
 
     return swimlane;
   }
@@ -110,6 +142,7 @@ export class SwimlaneRepository {
     if (input.permission_mode !== undefined) updated.permission_mode = input.permission_mode;
     if (input.auto_spawn !== undefined) updated.auto_spawn = input.auto_spawn;
     if (input.auto_command !== undefined) updated.auto_command = input.auto_command;
+    if (input.auto_command_mode !== undefined) updated.auto_command_mode = input.auto_command_mode;
     if (input.plan_exit_target_id !== undefined) updated.plan_exit_target_id = input.plan_exit_target_id;
     if (input.agent_override !== undefined) updated.agent_override = input.agent_override;
     if (input.model_override !== undefined) updated.model_override = input.model_override;
@@ -119,8 +152,8 @@ export class SwimlaneRepository {
     if (input.session_spawn_strategy !== undefined) updated.session_spawn_strategy = input.session_spawn_strategy;
 
     this.db.prepare(
-      'UPDATE swimlanes SET name = ?, description = ?, color = ?, icon = ?, position = ?, is_archived = ?, is_ghost = ?, permission_mode = ?, auto_spawn = ?, auto_command = ?, plan_exit_target_id = ?, agent_override = ?, model_override = ?, effort_override = ?, handoff_context = ?, session_target = ?, session_spawn_strategy = ? WHERE id = ?'
-    ).run(updated.name, updated.description, updated.color, updated.icon, updated.position, updated.is_archived ? 1 : 0, updated.is_ghost ? 1 : 0, updated.permission_mode, updated.auto_spawn ? 1 : 0, updated.auto_command, updated.plan_exit_target_id, updated.agent_override, updated.model_override, updated.effort_override, updated.handoff_context ? 1 : 0, updated.session_target, updated.session_spawn_strategy, updated.id);
+      'UPDATE swimlanes SET name = ?, description = ?, color = ?, icon = ?, position = ?, is_archived = ?, is_ghost = ?, permission_mode = ?, auto_spawn = ?, auto_command = ?, auto_command_mode = ?, plan_exit_target_id = ?, agent_override = ?, model_override = ?, effort_override = ?, handoff_context = ?, session_target = ?, session_spawn_strategy = ? WHERE id = ?'
+    ).run(updated.name, updated.description, updated.color, updated.icon, updated.position, updated.is_archived ? 1 : 0, updated.is_ghost ? 1 : 0, updated.permission_mode, updated.auto_spawn ? 1 : 0, updated.auto_command, updated.auto_command_mode, updated.plan_exit_target_id, updated.agent_override, updated.model_override, updated.effort_override, updated.handoff_context ? 1 : 0, updated.session_target, updated.session_spawn_strategy, updated.id);
 
     return updated;
   }
@@ -162,10 +195,7 @@ export class SwimlaneRepository {
     if (taskCount.c > 0) {
       throw new Error('Cannot delete swimlane with tasks. Move or delete tasks first.');
     }
-    this.db.prepare('DELETE FROM swimlane_transitions WHERE from_swimlane_id = ? OR to_swimlane_id = ?').run(id, id);
-    // Clear dangling plan_exit_target_id references
-    this.db.prepare('UPDATE swimlanes SET plan_exit_target_id = NULL WHERE plan_exit_target_id = ?').run(id);
-    this.db.prepare('DELETE FROM swimlanes WHERE id = ?').run(id);
+    deleteSwimlaneRowWithReferences(this.db, id);
   }
 
   /** Mark a swimlane as a ghost column (removed from team config but has tasks). */
@@ -180,9 +210,7 @@ export class SwimlaneRepository {
     for (const ghost of ghosts) {
       const taskCount = this.db.prepare('SELECT COUNT(*) as c FROM tasks WHERE swimlane_id = ?').get(ghost.id) as { c: number };
       if (taskCount.c === 0) {
-        this.db.prepare('DELETE FROM swimlane_transitions WHERE from_swimlane_id = ? OR to_swimlane_id = ?').run(ghost.id, ghost.id);
-        this.db.prepare('UPDATE swimlanes SET plan_exit_target_id = NULL WHERE plan_exit_target_id = ?').run(ghost.id);
-        this.db.prepare('DELETE FROM swimlanes WHERE id = ?').run(ghost.id);
+        deleteSwimlaneRowWithReferences(this.db, ghost.id);
         removed++;
       }
     }
@@ -203,6 +231,12 @@ export class SwimlaneRepository {
       permission_mode: (row.permission_mode as PermissionMode) ?? null,
       auto_spawn: Boolean(row.auto_spawn),
       auto_command: row.auto_command || null,
+      // Narrowed, not asserted. `as AutoCommandMode` would let any string the
+      // column happens to hold (raw SQL, a hand-edited row) through as a valid
+      // mode, and since every consumer tests `=== 'deferred'` it would then act
+      // as 'immediate' anyway - just without saying so. This makes that the
+      // defined behavior rather than an accident of the comparison operator.
+      auto_command_mode: row.auto_command_mode === 'deferred' ? 'deferred' : 'immediate',
       plan_exit_target_id: row.plan_exit_target_id || null,
       agent_override: row.agent_override || null,
       model_override: row.model_override || null,

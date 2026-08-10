@@ -1,12 +1,18 @@
-import { Network, Code2 } from 'lucide-react';
+import { Network, Code2, Sparkles, Rocket } from 'lucide-react';
 import type { AppConfig } from '../../shared/types';
 import { useScopedUpdate } from '../../renderer/components/settings/shared';
+import { useUpdaterStore } from '../../renderer/stores/updater-store';
 import {
   Code,
   Description,
   GroupHeading,
   ToggleRow,
 } from '../../renderer/components/settings/tabs/dev-tab-primitives';
+
+const FIXTURE_RELEASE_NOTES = `## What's New
+
+- Fixture release notes for the development updater modal.
+`;
 
 /**
  * Dev-only sections appended to the bottom of the product Developer
@@ -65,7 +71,9 @@ export function DevToolsSections({ globalConfig }: { globalConfig: AppConfig }) 
         />
         <Description>
           Off by default. Three high-risk endpoints are gated behind this toggle:{' '}
-          <strong>eval</strong> (run any JavaScript in the renderer process),{' '}
+          <strong>devtools eval</strong> (<Code>kangentic_devtools_eval</Code>, which runs any
+          JavaScript in Kangentic&apos;s own renderer process; the agent browser&apos;s eval is a
+          separate setting under Agent Browser),{' '}
           <strong>inject session event</strong> (synthesize fake activity-engine events to test
           watchdogs and predicates without spawning a real CLI), and{' '}
           <strong>raw PTY input</strong> (write any byte sequence directly to a session's terminal,
@@ -74,6 +82,61 @@ export function DevToolsSections({ globalConfig }: { globalConfig: AppConfig }) 
         </Description>
       </section>
 
+      {/* initUpdater() early-returns on !app.isPackaged and on Linux (see
+          src/main/updater.ts), so the release-notes modal is unreachable while
+          dogfooding from `npm start`. This trigger fires it directly with
+          fixture notes so the modal stays visible to whoever is working on it. */}
+      <section className="space-y-2">
+        <div className="flex items-center justify-between gap-3 rounded-lg bg-surface-hover px-4 py-3">
+          <div className="min-w-0">
+            <div className="text-sm font-medium text-fg-primary">Release Notes Modal</div>
+            <div className="text-xs text-fg-muted">
+              Fire an update-downloaded push with fixture markdown notes. The real trigger is
+              unreachable in dev (the updater only runs on a packaged Windows/macOS build).
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={() => {
+              useUpdaterStore.getState().receiveUpdate({
+                version: '99.0.0',
+                releaseNotes: FIXTURE_RELEASE_NOTES,
+              });
+            }}
+            data-testid="dev-trigger-release-notes-modal"
+            className="inline-flex flex-shrink-0 items-center gap-1.5 rounded-md border border-edge/60 bg-surface-inset/40 px-2.5 py-1 text-xs font-medium text-fg-secondary transition-colors hover:border-accent/50 hover:bg-accent/10 hover:text-fg"
+          >
+            <Sparkles size={13} />
+            Show modal
+          </button>
+        </div>
+      </section>
+
+      {/* The post-restart counterpart. Its real trigger is a version change on
+          launch, which a dev session never produces, so open it directly. The
+          notes are the build's own baked RELEASE_NOTES.md, not a fixture. */}
+      <section className="space-y-2">
+        <div className="flex items-center justify-between gap-3 rounded-lg bg-surface-hover px-4 py-3">
+          <div className="min-w-0">
+            <div className="text-sm font-medium text-fg-primary">What&apos;s New Dialog</div>
+            <div className="text-xs text-fg-muted">
+              Open the post-update notes for the running version. Normally shown once on the first
+              launch after the version changes; the status-bar version pill is the way back in.
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={() => {
+              useUpdaterStore.getState().openWhatsNew({ autoOpened: false });
+            }}
+            data-testid="dev-trigger-whats-new-dialog"
+            className="inline-flex flex-shrink-0 items-center gap-1.5 rounded-md border border-edge/60 bg-surface-inset/40 px-2.5 py-1 text-xs font-medium text-fg-secondary transition-colors hover:border-accent/50 hover:bg-accent/10 hover:text-fg"
+          >
+            <Rocket size={13} />
+            Show dialog
+          </button>
+        </div>
+      </section>
     </div>
   );
 }

@@ -11,14 +11,15 @@ import {
   getProjectRepos,
   ensureTaskWorktree,
   ensureTaskBranchCheckout,
+  notifyBranchCheckoutBlocked,
   createTransitionEngine,
   cleanupTaskResources,
   spawnAgent,
 } from '../helpers';
 import { resolveProjectContext } from '../helpers/project-repos';
+import { linkPR } from '../../pr/pr-linking';
 import { applyProfileToLane } from '../../transition-engine/column-strategy';
 import { loadTaskProfile } from '../helpers/task-profile';
-import { guardActiveNonWorktreeSessions } from './task-move';
 import { withTaskLock } from '../task-lifecycle-lock';
 import type { IpcContext } from '../ipc-context';
 import type { TaskBulkDeleteFailure, TaskBulkDeleteResult, TaskBulkDeleteProgress, TaskDetailViewState } from '../../../shared/types';
@@ -127,10 +128,10 @@ export function registerTaskCrudHandlers(context: IpcContext): void {
         // Checkout the task's branch in the main repo (non-worktree tasks only).
         // If checkout fails, the task is still created but no agent is spawned.
         try {
-          guardActiveNonWorktreeSessions(context, task, tasks);
-          await ensureTaskBranchCheckout(task, projectPath);
+          await ensureTaskBranchCheckout(context, task, projectPath);
         } catch (checkoutError) {
           console.error('[TASK_CREATE] Branch checkout failed:', checkoutError);
+          notifyBranchCheckoutBlocked(context, task, checkoutError, projectId);
           return;
         }
 
@@ -197,7 +198,34 @@ export function registerTaskCrudHandlers(context: IpcContext): void {
       }
     }
 
-    return tasks.update(input);
+    const updated = tasks.update(input);
+
+    // The task-detail edit form writes pr_url/pr_number with pr_state null on
+    // purpose (`buildPrFields`), so a stale terminal state can't freeze a
+    // re-pointed link. Nothing else resolves promptly, which left the card
+    // showing a bare PR pill with no state chip until the background sweep or
+    // the next auto-link trigger. Resolve now so the chip lands on save.
+    //
+    // Forced: a non-force resolve inside the 60s per-task throttle is coalesced
+    // away, which is exactly the situation right after a PR-creating flow.
+    // Fire-and-forget outside any lock: `linkPRForTask` takes the task lock
+    // itself, and its `onLinked` pushes TASK_UPDATED_BY_AGENT, so awaiting would
+    // only add a `gh` round-trip to every save. Gated on SETTING a link, never
+    // on clearing one - the ladder's branch/commit tiers would re-resolve a
+    // just-cleared task and bounce the clear straight back.
+    const linksPR = (typeof input.pr_url === 'string' && input.pr_url.trim() !== '')
+      || Number.isFinite(input.pr_number);
+    if (linksPR) {
+      void linkPR(context, {
+        projectId: resolvedProjectId,
+        taskId: input.id,
+        force: true,
+        preserveLinkOnNotFound: true,
+      }).catch((error) => {
+        console.error(`[pr-linking] link-time resolve failed for task ${String(input.id).slice(0, 8)}:`, error);
+      });
+    }
+    return updated;
   });
 
   // Persist the task-detail dialog's layout blob (debounced from the renderer).

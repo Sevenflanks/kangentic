@@ -78,6 +78,8 @@ describe('handleAnswerPermissionPrompt', () => {
     );
     expect(response.ok).toBe(true);
     expect(response.payload).toEqual({ answered: true });
+    // A phone answering a permission prompt is human input, and the
+    // prompt-draft ledger must see it the same way it sees the keyboard.
     expect(write).toHaveBeenCalledWith('sess-1', '1\r');
   });
 

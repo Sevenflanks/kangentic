@@ -109,12 +109,19 @@ vi.mock('node:fs', () => ({
   },
 }));
 
-vi.mock('node:path', () => ({
-  default: {
-    join: (...segments: string[]) => segments.join('/'),
-    dirname: (p: string) => p.split('/').slice(0, -1).join('/'),
-  },
-}));
+// Keep the real path module underneath, so `resolve` / `relative` / `parse`
+// (used by the removal-root invariant) behave correctly, while still forcing
+// join and dirname to forward slashes for these fixtures.
+vi.mock('node:path', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:path')>();
+  return {
+    default: {
+      ...actual.default,
+      join: (...segments: string[]) => segments.join('/'),
+      dirname: (p: string) => p.split('/').slice(0, -1).join('/'),
+    },
+  };
+});
 
 vi.mock('../../src/main/git/node-modules-link', () => ({
   linkNodeModules: vi.fn(),
@@ -135,7 +142,6 @@ vi.mock('../../src/main/git/fetch-throttle', () => ({
 
 vi.mock('../../src/shared/slugify', () => ({
   slugify: vi.fn((s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 20)),
-  computeSlugBudget: vi.fn(() => 20),
   computeAutoBranchName: vi.fn(
     (_base: string, _default: string, slug: string, shortId: string) => `${slug}-${shortId}`,
   ),
@@ -352,6 +358,33 @@ describe('WorktreeManager.removeWorktree', () => {
 
     expect(result).toBe(true);
     expect(mockReapProcessesForWorktree).not.toHaveBeenCalled();
+  });
+
+  // Wired-guard test: `assertRemovableWorktreePath` is `removeWorktree`'s FIRST
+  // statement, before the retried, Windows-lock-aggressive recursive delete
+  // ever starts. Every other test in this file always passes WORKTREE_PATH, a
+  // valid direct child of the worktrees root, so none of them would notice if
+  // the guard call were ever deleted from `removeWorktree`. This is the only
+  // one that would.
+  //
+  // The bad path is a GRANDCHILD of the worktrees root (two segments below
+  // it), which fails the direct-child check on both Windows and POSIX: after
+  // the real (unmocked) `path.resolve`/`path.relative`, the relative route
+  // between the root and this candidate contains a separator either way, so
+  // this does not depend on which platform's `path` semantics are bound at
+  // import time.
+  it('rejects a path that is not a direct child of the worktrees root, before attempting any removal', async () => {
+    const grandchildWorktreePath = `${PROJECT_PATH}/.kangentic/worktrees/460/src`;
+
+    await expect(manager.removeWorktree(grandchildWorktreePath)).rejects.toThrow(/direct child/);
+
+    // The dangerous machinery must never start - not even the existence check
+    // that gates the happy-path short-circuit.
+    expect(mockExistsSync).not.toHaveBeenCalled();
+    expect(mockSpawn).not.toHaveBeenCalled();
+    expect(mockFsRm).not.toHaveBeenCalled();
+    expect(mockRemoveWithRetry).not.toHaveBeenCalled();
+    expect(mockRemoveNodeModulesPath).not.toHaveBeenCalled();
   });
 });
 

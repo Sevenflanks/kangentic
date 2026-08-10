@@ -114,7 +114,9 @@ function createMockContext(db: ReturnType<typeof createMockDb>): CommandContext 
     onTaskDeleted: vi.fn(),
     onTaskMove: vi.fn(async () => ({ ok: true, autoCommand: { kind: 'not-applicable' } })),
     onTaskAutoSpawn: vi.fn(async () => ({ kind: 'not-applicable' })),
+    onTasksReordered: vi.fn(),
     onSwimlaneUpdated: vi.fn(),
+    onSwimlaneDeleted: vi.fn(),
     onBacklogChanged: vi.fn(),
     onLabelColorsChanged: vi.fn(),
   };
@@ -208,6 +210,25 @@ describe('handleUpdateColumn - description field', () => {
     expect(updatedSwimlane.description).toBe('new description text');
   });
 
+  it('hands onSwimlaneUpdated the PRE-edit row as well, so the host can tell what changed', () => {
+    // The MCP writer used to notify with the updated row alone, which is why it
+    // propagated nothing to live sessions - not the auto_spawn reconcile, and
+    // not even the model/effort injection the UI's SWIMLANE_UPDATE has had all
+    // along. Without a before-row the host cannot compute a delta at all.
+    const swimlaneRow = makeSwimlaneRow({ name: 'Planning', role: null, auto_spawn: 0 });
+    const db = createMockDb([swimlaneRow]);
+    const context = createMockContext(db);
+
+    handleUpdateColumn({ column: 'Planning', autoSpawn: true }, context);
+
+    const onSwimlaneUpdated = context.onSwimlaneUpdated as ReturnType<typeof vi.fn>;
+    expect(onSwimlaneUpdated).toHaveBeenCalledOnce();
+    const [updatedSwimlane, previousSwimlane] = onSwimlaneUpdated.mock.calls[0] as Array<Record<string, unknown>>;
+    expect(updatedSwimlane.auto_spawn).toBe(true);
+    expect(previousSwimlane).toBeTruthy();
+    expect(previousSwimlane.auto_spawn).toBe(false);
+  });
+
   it('does not include description in data when the field is not passed', () => {
     // Even though the stored row has a description, a name-only update must NOT
     // alter description. The returned data reflects whatever SwimlaneRepository.update
@@ -298,5 +319,74 @@ describe('handleGetColumnDetail - description field', () => {
 
     expect(result.success).toBe(true);
     expect((result.data as Record<string, unknown>).description).toBe('case test');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// handleGetColumnDetail - taskOrder
+//
+// This handler is the "read-before-reorder" call for kangentic_reorder_tasks
+// and kangentic_move_task's `position`, so its taskOrder must speak the same
+// ordinal vocabulary those tools consume, and the message's rendered lines
+// must stay bounded even though data.taskOrder carries the whole column. Every
+// other test in this file above passes an empty task list, which is why this
+// never got covered.
+// ---------------------------------------------------------------------------
+
+describe('handleGetColumnDetail - taskOrder', () => {
+  function makeTaskRow(index: number) {
+    return {
+      id: `task-${index}`,
+      display_id: 100 + index,
+      title: `Task ${index}`,
+      labels: '[]',
+    };
+  }
+
+  it('reports taskOrder as ordinal slots and renders a "Task order" line per task', () => {
+    const swimlaneRow = makeSwimlaneRow();
+    const taskRows = [makeTaskRow(0), makeTaskRow(1), makeTaskRow(2)];
+    const db = createMockDb([swimlaneRow], taskRows);
+    const context = createMockContext(db);
+
+    const result = handleGetColumnDetail({ column: 'To Do' }, context);
+
+    expect(result.success).toBe(true);
+    expect((result.data as Record<string, unknown>).taskOrder).toEqual([
+      { id: 'task-0', displayId: 100, title: 'Task 0', position: 0 },
+      { id: 'task-1', displayId: 101, title: 'Task 1', position: 1 },
+      { id: 'task-2', displayId: 102, title: 'Task 2', position: 2 },
+    ]);
+    expect(result.message).toContain('Task order (top to bottom):');
+    expect(result.message).toContain('0. #100 Task 0');
+    expect(result.message).toContain('2. #102 Task 2');
+  });
+
+  it('omits the "Task order" section entirely for an empty column', () => {
+    const swimlaneRow = makeSwimlaneRow();
+    const db = createMockDb([swimlaneRow], []);
+    const context = createMockContext(db);
+
+    const result = handleGetColumnDetail({ column: 'To Do' }, context);
+
+    expect(result.success).toBe(true);
+    expect((result.data as Record<string, unknown>).taskOrder).toEqual([]);
+    expect(result.message).not.toContain('Task order');
+  });
+
+  it('caps the rendered lines at COLUMN_DETAIL_TASK_LIMIT (50) but keeps the FULL order in data.taskOrder', () => {
+    const swimlaneRow = makeSwimlaneRow();
+    const taskRows = Array.from({ length: 52 }, (_unused, index) => makeTaskRow(index));
+    const db = createMockDb([swimlaneRow], taskRows);
+    const context = createMockContext(db);
+
+    const result = handleGetColumnDetail({ column: 'To Do' }, context);
+
+    expect(result.success).toBe(true);
+    const taskOrder = (result.data as Record<string, unknown>).taskOrder as unknown[];
+    expect(taskOrder).toHaveLength(52);
+    expect(result.message).toContain('49. #149 Task 49');
+    expect(result.message).not.toContain('50. #150 Task 50');
+    expect(result.message).toContain('... and 2 more (use kangentic_list_tasks for the full column)');
   });
 });

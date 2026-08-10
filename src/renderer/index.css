@@ -29,6 +29,7 @@
   --kng-surface: #18181b;          /* zinc-900 */
   --kng-surface-raised: #27272a;   /* zinc-800 */
   --kng-surface-hover: #3f3f46;    /* zinc-700 */
+  --kng-surface-control: #393940;
   --kng-surface-inset: #18181b;    /* zinc-900 */
 
   /* Foreground (text) */
@@ -81,6 +82,7 @@
   --kng-surface: #f5f5f4;          /* stone-100 */
   --kng-surface-raised: #fafaf9;   /* stone-50 */
   --kng-surface-hover: #e7e5e4;    /* stone-200 */
+  --kng-surface-control: #e1dedd;
   --kng-surface-inset: #ffffff;
 
   /* Foreground (text) */
@@ -109,6 +111,7 @@
   --kng-surface: #1a1d2e;
   --kng-surface-raised: #232740;
   --kng-surface-hover: #2e3350;
+  --kng-surface-control: #333958;
   --kng-surface-inset: #141623;
   --kng-fg: #e0e2e8;
   --kng-fg-secondary: #c6c8d0;
@@ -129,6 +132,7 @@
   --kng-surface: #1a2318;
   --kng-surface-raised: #222e1f;
   --kng-surface-hover: #2e3e2a;
+  --kng-surface-control: #31412c;
   --kng-surface-inset: #151c13;
   --kng-fg: #e0e4de;
   --kng-fg-secondary: #c6cac4;
@@ -149,6 +153,7 @@
   --kng-surface: #0f1923;
   --kng-surface-raised: #162231;
   --kng-surface-hover: #1e2e42;
+  --kng-surface-control: #23364d;
   --kng-surface-inset: #0b1318;
   --kng-fg: #dae0e6;
   --kng-fg-secondary: #c0c6ce;
@@ -169,6 +174,7 @@
   --kng-surface: #1f1a17;
   --kng-surface-raised: #2a2320;
   --kng-surface-hover: #38302a;
+  --kng-surface-control: #3e362e;
   --kng-surface-inset: #181412;
   --kng-fg: #e6e2de;
   --kng-fg-secondary: #ccc8c4;
@@ -191,6 +197,7 @@
   --kng-surface: #f5f0e8;
   --kng-surface-raised: #faf8f3;
   --kng-surface-hover: #e8e0d4;
+  --kng-surface-control: #e5dbce;
   --kng-surface-inset: #ffffff;
   --kng-fg: #2a2218;
   --kng-fg-secondary: #3d3228;
@@ -211,6 +218,7 @@
   --kng-surface: #eef5f0;
   --kng-surface-raised: #f7faf8;
   --kng-surface-hover: #d8e8dd;
+  --kng-surface-control: #cfe3d6;
   --kng-surface-inset: #ffffff;
   --kng-fg: #142820;
   --kng-fg-secondary: #1e3028;
@@ -231,6 +239,7 @@
   --kng-surface: #edf3f8;
   --kng-surface-raised: #f6f9fc;
   --kng-surface-hover: #d6e4f0;
+  --kng-surface-control: #cfdfed;
   --kng-surface-inset: #ffffff;
   --kng-fg: #121e2e;
   --kng-fg-secondary: #1a2a3a;
@@ -251,6 +260,7 @@
   --kng-surface: #f8f0ec;
   --kng-surface-raised: #fcf8f6;
   --kng-surface-hover: #ecd8d0;
+  --kng-surface-control: #edd9d2;
   --kng-surface-inset: #ffffff;
   --kng-fg: #2a1c18;
   --kng-fg-secondary: #3a2520;
@@ -287,6 +297,7 @@
   --color-surface: var(--kng-surface);
   --color-surface-raised: var(--kng-surface-raised);
   --color-surface-hover: var(--kng-surface-hover);
+  --color-surface-control: var(--kng-surface-control);
   --color-surface-inset: var(--kng-surface-inset);
 
   --color-fg: var(--kng-fg);
@@ -393,11 +404,14 @@
   z-index: 0;
 }
 
-/* The activity marks' marching-border animation used to live here as
-   `@keyframes march-border` / `.animate-march-border`. It now ships with the marks themselves,
-   in `@kangentic/branding/assets/activity/activity.css` (`kng-activity-march` / `.kng-march`,
-   same 1.4s linear dashoffset), imported by `components/ActivityMark.tsx` - so the keyframe
-   and the geometry it animates can no longer drift apart. */
+/* The activity marks' motion used to live here as `@keyframes march-border` /
+   `.animate-march-border`. It now ships with the marks themselves, in
+   `@kangentic/branding/assets/activity/activity.css`, imported by `components/ActivityMark.tsx` -
+   so the keyframes and the geometry they animate can no longer drift apart. Every shipped
+   primitive is now on a composited property, all 1.4s linear so they stay in lockstep:
+   `.kng-spin` (a `transform`, on the round working marks) and `.kng-blink` (an `opacity`, on the
+   terminal chip's prompt, since a rounded rect cannot carry a travelling dash under any
+   transform). `.kng-march` still ships in the packaged CSS but no mark uses it. */
 
 /* xterm: fill parent height so scrollbar is flush with bottom edge.
    xterm.js creates a .xterm child div that is content-sized (rows * cellHeight)
@@ -420,8 +434,10 @@
 /* Terminal scrollbar visibility: the global thumb color (--kng-edge, #3f3f46) is
    nearly invisible against the terminal's near-black default background, so the
    scrollbar reads as missing. Use a brighter translucent thumb so it is
-   discoverable. Width is left at the global 8px so the fit-addon's
-   DEFAULT_SCROLLBAR_WIDTH assumption holds. */
+   discoverable. Width is left at the global 8px: the fit addon MEASURES the
+   reserved gutter off the viewport rather than assuming it, and only falls back
+   to a constant (FALLBACK_SCROLLBAR_WIDTH, pinned to the 8px above by
+   tests/unit/fit-addon.test.ts) before the viewport has been laid out. */
 .xterm .xterm-viewport::-webkit-scrollbar-thumb {
   background: rgba(228, 228, 231, 0.28);
   border-radius: 4px;
@@ -595,11 +611,12 @@
 }
 
 /* Honor the OS-level reduced-motion preference (distinct from the in-app
-   Appearance toggle above). Stop the infinite Done-hover spin and the idle
-   pulse, and collapse the completed-card grow-in to a near-instant fade.
-   grow-in keeps a 1ms duration (not `animation: none`) so its `animationend`
-   still fires and DoneSwimlane clears recentlyArchivedId. The drag-to-Done fly
-   is inline-styled, so it reads this preference in JS (see FlyingCard). */
+   Appearance toggle above). Stop the infinite Done-hover spin and every ambient
+   pulse (the card idle pulse and Tailwind's stock one alike), and collapse the
+   completed-card grow-in to a near-instant fade. grow-in keeps a 1ms duration
+   (not `animation: none`) so its `animationend` still fires and DoneSwimlane
+   clears recentlyArchivedId. The drag-to-Done fly is inline-styled, so it reads
+   this preference in JS (see FlyingCard). */
 @media (prefers-reduced-motion: reduce) {
   .drop-zone-active::before {
     animation: none;
@@ -609,8 +626,25 @@
     animation: none;
   }
 
+  /* Tailwind's stock pulse. Every consumer is an ambient status indicator: the
+     dictation recording dot, TerminalPanel's unseen-attention dot, WindowFrame's
+     focus hairline, QueuedPlaceholder's waiting clock, and the loading skeletons.
+     All of it is infinite, so nothing can be listening for an `animationend` (an
+     infinite animation never fires one) and it is safe to stop dead rather than
+     shrink the way the overlay phases below must. */
+  .animate-pulse {
+    animation: none;
+  }
+
   .grow-in {
     animation-duration: 1ms;
+  }
+
+  /* SegmentedControl's sliding thumb. A transition, not an animation, and
+     nothing waits on its `transitionend`, so it is safe to drop outright: the
+     thumb still lands on the selected option, it just gets there instantly. */
+  .kng-segmented-thumb {
+    transition: none;
   }
 
   /* Overlay open/close: collapse to instant but keep the animation so the
@@ -663,6 +697,22 @@
   font-size: 0.875rem;
   line-height: 1.625;
   overflow-wrap: anywhere;
+}
+
+/* Markdown rendered ON the control fill (the description preview) steps its body
+   text up from `fg-muted` to `fg-tertiary`. `fg-muted` is the hint/decoration
+   tier: on this fill it reads 4.47:1 in the default theme, under AA, and 3.19:1
+   at worst, while a rendered description is content a user must read.
+   `fg-tertiary` clears AA on this fill in every theme (worst 4.63:1) and is what
+   the edit-mode textarea already uses, so Preview and Edit read at one tier.
+   Scoped rather than applied to `.markdown-body` itself because the other
+   markdown surfaces sit on grounds the control fill does not affect.
+
+   Unlayered on purpose, like `.markdown-body` above: a Tailwind utility compiles
+   into `@layer utilities`, which loses to an unlayered rule outright no matter
+   how specific the selector looks. */
+.markdown-on-control .markdown-body {
+  color: var(--kng-fg-tertiary);
 }
 
 .markdown-body > :first-child {

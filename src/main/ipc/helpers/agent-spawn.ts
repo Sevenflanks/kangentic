@@ -31,8 +31,11 @@ import { isResumeEligible } from '../../transition-engine/spawn-intent';
 import { resolveIsolatedSwimlaneId, resolveForceFresh } from '../../transition-engine/session-isolation';
 import { resolveEffectiveAutoCommand, applyProfileToLane } from '../../transition-engine/column-strategy';
 import { loadTaskProfile } from './task-profile';
+import { buildCommandInjectionVerifier } from '../../transition-engine/injection-plan';
+import type { CommandVerifier } from '../../transition-engine/terminal-submit-scheduler';
+import { reportAutoCommandOutcome } from './auto-command-outcome';
 import { emitSpawnProgress, createProgressCallback } from '../../transition-engine/spawn-progress';
-import { ensureTaskWorktree, ensureTaskBranchCheckout } from './task-git';
+import { ensureTaskWorktree, ensureTaskBranchCheckout, notifyBranchCheckoutBlocked } from './task-git';
 import { getProjectRepos } from './project-repos';
 import { withTaskLock } from '../task-lifecycle-lock';
 import { runWithProjectLogContext } from '../../diagnostics/project-log-context';
@@ -577,7 +580,17 @@ export async function spawnAgent(options: AgentSpawnOptions): Promise<AutoComman
       });
       if (interpolatedAutoCommand !== undefined
         && isLegacyAutoCommandFallback(autoCommandDisposition)) {
-        context.terminalSubmitScheduler.scheduleKeystrokes(currentTask.id, currentTask.session_id, [interpolatedAutoCommand], { freshlySpawned: true });
+        context.terminalSubmitScheduler.scheduleKeystrokes(
+          currentTask.id,
+          currentTask.session_id,
+          [{ text: interpolatedAutoCommand, verify: 'submitted' }],
+          {
+            freshlySpawned: true,
+            verifier: resolveInjectionVerifier(targetAgent, sessionRepo, currentTask.id),
+            mode: toLane.auto_command_mode ?? 'immediate',
+            onOutcome: (report) => reportAutoCommandOutcome(context, tasks, currentTask, report, options.projectId),
+          },
+        );
         return toImmediateAutoCommandOutcome(finalizeAutoCommandGate({ kind: 'legacy' }));
       }
       return toImmediateAutoCommandOutcome(finalizeAutoCommandGate({
@@ -714,7 +727,17 @@ export async function spawnAgent(options: AgentSpawnOptions): Promise<AutoComman
   currentTask = tasks.getById(task.id);
 
   if (currentTask?.session_id && deliveredAutoCommand !== undefined && !deliverAutoCommandAsPrompt) {
-    context.terminalSubmitScheduler.scheduleKeystrokes(currentTask.id, currentTask.session_id, [deliveredAutoCommand], { freshlySpawned: true });
+    context.terminalSubmitScheduler.scheduleKeystrokes(
+      currentTask.id,
+      currentTask.session_id,
+      [{ text: deliveredAutoCommand, verify: 'submitted' }],
+      {
+        freshlySpawned: true,
+        verifier: resolveInjectionVerifier(targetAgent, sessionRepo, currentTask.id),
+        mode: toLane?.auto_command_mode ?? 'immediate',
+        onOutcome: (report) => reportAutoCommandOutcome(context, tasks, currentTask, report, options.projectId),
+      },
+    );
   }
   if (deliveredAutoCommand !== undefined && currentTask?.session_id) {
     return toImmediateAutoCommandOutcome(finalizeAutoCommandGate({ kind: 'legacy' }));
@@ -730,6 +753,25 @@ export async function spawnAgent(options: AgentSpawnOptions): Promise<AutoComman
   // accepted one-shot decision adjacent to the immediate outcome without re-entry.
   consumeFinalizedTaskAutoCommand(tasks, task, outcome);
   return outcome;
+}
+
+/**
+ * Verifier for a fresh-spawn auto_command, or null when the agent exposes none.
+ *
+ * Built at SCHEDULE time but resolved at POLL time. That distinction is what
+ * makes fresh-spawn injection verifiable at all: the agent's session id is
+ * usually not captured yet when the spawn returns, but delivery is deferred
+ * until the CLI comes alive, by which point it is. Building eagerly against
+ * the id would give up on the exact path that most needed the check.
+ */
+function resolveInjectionVerifier(
+  agentName: string,
+  sessionRepo: SessionRepository,
+  taskId: string,
+): CommandVerifier | null {
+  const adapter = agentRegistry.get(agentName);
+  if (!adapter) return null;
+  return buildCommandInjectionVerifier(adapter, sessionRepo, taskId);
 }
 
 /**
@@ -758,9 +800,8 @@ export async function autoSpawnForTask(
     const run = async (): Promise<AutoCommandImmediateOutcome> => {
       const db = getProjectDb(projectId);
       const swimlaneRepo = new SwimlaneRepository(db);
-      const toLane = swimlaneRepo.getById(swimlaneId);
-      if (!toLane) throw new Error(`Swimlane ${swimlaneId} not found`);
-      if (!toLane.auto_spawn) return { kind: 'not-applicable' };
+      const rawLane = swimlaneRepo.getById(swimlaneId);
+      if (!rawLane) return { kind: 'not-applicable' };
 
       const project = context.projectRepo.getById(projectId);
       if (!project) throw new Error(`Project ${projectId} not found`);
@@ -771,24 +812,51 @@ export async function autoSpawnForTask(
       const fullTask = tasks.getById(task.id);
       if (!fullTask) throw new Error(`Task ${task.id} not found`);
 
-      await ensureTaskWorktree(context, fullTask, tasks, projectPath);
+      // The caller's `swimlaneId` is a snapshot. Callers that batch (the
+      // auto_spawn reconcile walks a whole column, awaiting a worktree and a
+      // branch checkout per task) can reach this many seconds later, by which
+      // time a drag may have moved the task elsewhere. Spawning would then
+      // apply the ORIGINAL column's agent, model, and permission mode to a task
+      // that has left it. Same re-check task-move makes before its own spawn.
+      if (fullTask.swimlane_id !== swimlaneId) {
+        console.log(
+          `[auto-spawn] Task ${fullTask.id.slice(0, 8)} left the column before its spawn - skipping`,
+        );
+        return { kind: 'not-applicable' };
+      }
 
-      // Checkout branch for non-worktree tasks (may fail if another session is active)
-      if (fullTask.base_branch && !fullTask.worktree_path) {
-        // Inlined from guardActiveNonWorktreeSessions to avoid circular import with task-move.ts
-        const activeSessions = context.sessionManager.listSessions()
-          .filter(session => session.taskId !== fullTask.id && (session.status === 'running' || session.status === 'queued'));
-        const otherNonWorktreeSessions = activeSessions.filter(session => {
-          const otherTask = tasks.getById(session.taskId);
-          return otherTask && !otherTask.worktree_path;
-        });
-        if (otherNonWorktreeSessions.length > 0) {
-          throw new Error(
-            `Cannot switch to branch '${fullTask.base_branch}': another task is running in the main repo. `
-            + `Enable worktree mode for branch isolation.`
-          );
-        }
-        await ensureTaskBranchCheckout(fullTask, projectPath);
+      // Fold the task's Board Profile BEFORE the auto_spawn guard. `auto_spawn`
+      // is profile-scoped (see the `auto_spawn` case in `applyProfileToLane`),
+      // so a profile can turn it on for a column whose base has it off.
+      // Guarding on the raw lane rejected exactly those tasks here, before
+      // spawnAgent's own fold could ever see them. spawnAgent folds again
+      // internally, which is idempotent.
+      const toLane = applyProfileToLane(rawLane, loadTaskProfile(context, fullTask, projectPath)) ?? rawLane;
+      if (!toLane.auto_spawn) return { kind: 'not-applicable' };
+
+      try {
+        await ensureTaskWorktree(context, fullTask, tasks, projectPath);
+      } catch (worktreeError) {
+        console.error('[MCP auto-spawn] Worktree creation failed:', worktreeError);
+        return { kind: 'not-applicable' };
+      }
+
+      // Checkout the task's branch for non-worktree tasks. ensureTaskBranchCheckout
+      // decides for itself whether there is anything to check out, and refuses to
+      // touch a directory another task's agent is live in. The occupancy check
+      // used to be inlined here "to avoid circular import with task-move.ts";
+      // that cycle never existed from task-git.ts, and the copy had drifted from
+      // the original in exactly the way that let a custom-branch task through.
+      try {
+        await ensureTaskBranchCheckout(context, fullTask, projectPath);
+      } catch (checkoutError) {
+        console.error('[MCP auto-spawn] Branch checkout failed:', checkoutError);
+        // The explicit projectId, never the ambient current one: MCP auto-spawn
+        // targets whichever project the tool named, which is often not the
+        // focused one. Falling back to `context.currentProjectId` would stamp
+        // the notice with the wrong project, and the renderer filters on it.
+        notifyBranchCheckoutBlocked(context, fullTask, checkoutError, projectId);
+        return { kind: 'not-applicable' };
       }
 
       const sessionRepo = new SessionRepository(db);

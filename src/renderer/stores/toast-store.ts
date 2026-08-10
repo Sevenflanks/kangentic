@@ -33,7 +33,6 @@ interface ToastStore {
  *  a toast's display window doesn't vanish it mid-display. Production has no
  *  `import.meta.hot`, so this is a no-op there. Mirrors the pattern in
  *  src/renderer/stores/board-store/task-slice.ts. */
-// @ts-expect-error -- Vite handles import.meta.hot; tsc's "module": "commonjs" doesn't support it
 const initialToasts: Toast[] = import.meta.hot?.data?.toasts ?? [];
 
 export const useToastStore = create<ToastStore>((set) => ({
@@ -64,9 +63,7 @@ export const useToastStore = create<ToastStore>((set) => ({
   },
 }));
 
-// @ts-expect-error -- Vite handles import.meta.hot
 if (import.meta.hot) {
-  // @ts-expect-error -- Vite handles import.meta.hot
   import.meta.hot.dispose((data: Record<string, unknown>) => {
     data.toasts = useToastStore.getState().toasts;
   });

@@ -259,6 +259,12 @@ export function KanbanBoard() {
   // from every lane below so a loadBoard() racing the ~700ms fly can't re-inject
   // the task into its source column for a frame. See tasksPerLane.
   const completingTaskIds = useBoardStore((s) => s.completingTaskIds);
+  // Tasks with an optimistic cross-lane move still in flight. The SECOND guard
+  // read by tasksPerLane below: completingTaskIds excludes a task from every
+  // lane, lanePins redirects one to a different lane. Both exist because
+  // loadBoard() has no staleness guard and the server row otherwise wins over
+  // an optimistic move. See tasksPerLane and stores/board-store/lane-pins.ts.
+  const lanePins = useBoardStore((s) => s.lanePins);
   // Board filter values live in the board store (board-filter-slice) so the
   // toolbar controls in ViewToggle and this filtering chokepoint share one
   // instance. The popover/search UI itself lives in ViewToggle.
@@ -331,7 +337,17 @@ export function KanbanBoard() {
         const description = (task.description ?? '').toLowerCase();
         if (!title.includes(normalizedSearch) && !description.includes(normalizedSearch)) continue;
       }
-      const arr = fresh.get(task.swimlane_id);
+      // A task whose optimistic move is still in flight renders at its pinned
+      // destination, not the lane the server last reported. Without this, a
+      // reload issued before the move's DB write (endBoardDrag flushes parked
+      // reloads at the top of handleDragEnd, well before moveTask runs) puts
+      // the card back in its source column until the move's own reload lands.
+      // Falling back to swimlane_id is not cosmetic: if the pinned column was
+      // deleted mid-move, `fresh.get(pinnedLaneId)` is undefined and the card
+      // would vanish from the board entirely rather than degrade gracefully.
+      const pinnedLaneId = lanePins.get(task.id)?.laneId;
+      const arr = (pinnedLaneId !== undefined ? fresh.get(pinnedLaneId) : undefined)
+        ?? fresh.get(task.swimlane_id);
       if (arr) arr.push(task);
     }
     for (const arr of fresh.values()) arr.sort((a, b) => a.position - b.position);
@@ -352,19 +368,14 @@ export function KanbanBoard() {
     }
     stableLanesRef.current = stable;
     return stable;
-  }, [swimlanes, tasks, priorityFilters, labelFilters, normalizedSearch, completingTaskIds]);
+  }, [swimlanes, tasks, priorityFilters, labelFilters, normalizedSearch, completingTaskIds, lanePins]);
 
   if (!hydrated) return null;
 
   return (
     <div className="relative h-full overflow-x-auto overflow-y-hidden flex flex-col">
       <ConfigWarningBanner />
-      {/* `data-dismiss-surface`: dead space in the board columns light-dismisses an
-          open task window. Overlays (dialogs, palettes) render elsewhere, not inside
-          this element, so they are never treated as a dismiss surface. Any clickable
-          child added here must carry `cursor-pointer` or `data-no-dismiss`, or a
-          click on it will also dismiss a window. */}
-      <div className="flex-1 overflow-x-auto overflow-y-hidden p-4" data-dismiss-surface>
+      <div className="flex-1 overflow-x-auto overflow-y-hidden p-4">
       <DndContext
         key={hmrGeneration}
         sensors={sensors}

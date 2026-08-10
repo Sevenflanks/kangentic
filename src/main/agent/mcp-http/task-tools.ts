@@ -215,7 +215,7 @@ export function registerTaskTools(
   server.registerTool(
     'kangentic_list_tasks',
     {
-      description: 'List tasks on the Kangentic board. Optionally filter by column name. Pass `project` to list tasks from a different project.',
+      description: 'List tasks on the Kangentic board, in board order (top to bottom within each column). Optionally filter by column name. Each task reports `position`, its zero-based ordinal slot within its own column - the same slot kangentic_move_task and kangentic_reorder_tasks accept, so a listing can be read and handed straight back. Pass `project` to list tasks from a different project.',
       inputSchema: z.object({
         column: z.string().optional().describe('Filter by column name. If omitted, returns all tasks.'),
         project: z.string().optional().describe(PROJECT_SELECTOR_DESCRIPTION),
@@ -227,7 +227,7 @@ export function registerTaskTools(
       if (!response.success) {
         return { content: [{ type: 'text' as const, text: `Failed to list tasks: ${response.error}` }], isError: true };
       }
-      const tasks = response.data as Array<{ id: string; displayId: number; title: string; description: string; column: string }>;
+      const tasks = response.data as Array<{ id: string; displayId: number; title: string; description: string; column: string; position: number }>;
       if (tasks.length === 0) {
         const filterNote = column ? ` in "${column}"` : '';
         return { content: [{ type: 'text' as const, text: `No tasks found${filterNote}.` }] };
@@ -236,7 +236,7 @@ export function registerTaskTools(
         const descriptionPreview = task.description
           ? ` - ${task.description.slice(0, 100)}${task.description.length > 100 ? '...' : ''}`
           : '';
-        return `- [${task.column}] ${task.title}${descriptionPreview} (#${task.displayId}, id: ${task.id})`;
+        return `- [${task.column}] ${task.title}${descriptionPreview} (#${task.displayId}, id: ${task.id}, position: ${task.position})`;
       });
       return { content: [{ type: 'text' as const, text: lines.join('\n') }] };
     }),
@@ -377,9 +377,9 @@ export function registerTaskTools(
   server.registerTool(
     'kangentic_get_current_task',
     {
-      description: 'Resolve the Kangentic task that corresponds to the current working directory and/or git branch. Use this at the start of work in a worktree to confirm which task you are operating on (e.g. before commits, PRs, or merge-back). Pass the agent\'s CWD and/or current branch name. Matches against tasks.worktree_path (full path or .kangentic/worktrees/<slug> segment) and tasks.branch_name. Returns the same shape as kangentic_find_task.',
+      description: 'Resolve the Kangentic task that corresponds to the current working directory and/or git branch. Use this at the start of work in a worktree to confirm which task you are operating on (e.g. before commits, PRs, or merge-back). Pass the agent\'s CWD and/or current branch name. Matches against tasks.worktree_path (full path or .kangentic/worktrees/<folder> segment) and tasks.branch_name. Returns the same shape as kangentic_find_task.',
       inputSchema: z.object({
-        cwd: z.string().optional().describe('Absolute working directory path. The tool extracts the worktree slug from .kangentic/worktrees/<slug> and matches against tasks.worktree_path.'),
+        cwd: z.string().optional().describe('Absolute working directory path. The tool extracts the worktree folder name from .kangentic/worktrees/<folder> and matches against tasks.worktree_path.'),
         branch: z.string().optional().describe('Current git branch name. Exact (case-insensitive) match against tasks.branch_name.'),
       }),
       annotations: READ_ONLY_ANNOTATIONS,
@@ -413,7 +413,7 @@ export function registerTaskTools(
   server.registerTool(
     'kangentic_get_column_detail',
     {
-      description: 'Get detailed configuration for a board column: automation settings (auto-spawn, auto-command, permission mode), plan exit target, role, and visual settings. Pass `project` to inspect a column in a different project.',
+      description: 'Get detailed configuration for a board column: automation settings (auto-spawn, auto-command, permission mode), plan exit target, role, and visual settings. Also returns `taskOrder`, the column\'s tasks top to bottom with their zero-based ordinal `position`, which makes this a complete read-before-write call for kangentic_reorder_tasks. Pass `project` to inspect a column in a different project.',
       inputSchema: z.object({
         column: z.string().describe('Column name (case-insensitive).'),
         project: z.string().optional().describe(PROJECT_SELECTOR_DESCRIPTION),
@@ -527,18 +527,34 @@ export function registerTaskTools(
   server.registerTool(
     'kangentic_move_task',
     {
-      description: 'Move a task to a different column. Triggers the same lifecycle as a UI drag: spawning/suspending agents, creating/cleaning up worktrees, and running configured transition actions. Moving to the Done column auto-archives the task. Moving to To Do kills the session and removes the worktree. If the user\'s prompt names a different Kangentic project, pass that name as `project` to route the move to that project instead of the active default. The name counts however it is phrased: "move task #7 in X to Done", "on the X board", and "in X" all target project X.',
+      description: 'Move a task to a different column, optionally placing it at a chosen slot in that column. Triggers the same lifecycle as a UI drag: spawning/suspending agents, creating/cleaning up worktrees, and running configured transition actions. Moving to the Done column auto-archives the task. Moving to To Do kills the session and removes the worktree. Naming the task\'s CURRENT column together with `position` repositions it in place, which changes nothing but its order - no session, worktree, or lifecycle effects. To re-sequence several tasks at once, use kangentic_reorder_tasks. If the user\'s prompt names a different Kangentic project, pass that name as `project` to route the move to that project instead of the active default. The name counts however it is phrased: "move task #7 in X to Done", "on the X board", and "in X" all target project X.',
       inputSchema: z.object({
         taskId: z.string().describe('Task ID (numeric display ID like "42" or full UUID).'),
         column: z.string().describe('Target column name (case-insensitive, e.g. "Review", "In Progress", "Done").'),
+        position: z.number().int().min(0).optional().describe('Zero-based ordinal slot among the column\'s tasks (not a raw stored position); the tasks at and below it shift down. Clamped to the column, so a value past the end lands last. Repositioning within the task\'s current column counts slots among the OTHER tasks there, so 0 is the top. Omit to append to the end of the column, which is the default. Has no useful effect when moving into Done, which archives the task.'),
         project: z.string().optional().describe(PROJECT_SELECTOR_DESCRIPTION),
       }),
       annotations: MUTATING_ANNOTATIONS,
     },
-    async ({ taskId, column, project }) => withProject(resolver, project, async (ctx) => {
-      const response = await runHandler('move_task', { taskId, column }, ctx);
+    async ({ taskId, column, position, project }) => withProject(resolver, project, async (ctx) => {
+      const response = await runHandler('move_task', { taskId, column, position: position ?? null }, ctx);
       return toTaskMutationResult(response, 'Failed to move task');
     }),
+  );
+
+  // --- kangentic_reorder_tasks ---
+  server.registerTool(
+    'kangentic_reorder_tasks',
+    {
+      description: 'Set the order of tasks within one column, top to bottom, in a single call. Use this to sequence a column by priority or execution order ("order To Do so the auth work comes first"). The listed tasks take the top slots in the order given; any task in the column you do not list keeps its relative order below them, so you can pass every task to set the full order or just a few to pin them to the top. Read the current order first with kangentic_list_tasks or kangentic_get_column_detail. This never moves a task between columns and never spawns, suspends, or otherwise touches a session or worktree - use kangentic_move_task to change a task\'s column. Pass `project` to reorder a column in a different project.',
+      inputSchema: z.object({
+        column: z.string().describe('Column name whose tasks are being reordered (case-insensitive).'),
+        taskIds: z.array(z.string()).min(1).describe('Task IDs (numeric display IDs like "42" or full UUIDs), in the order they should appear from the top of the column. Every ID must already be in that column.'),
+        project: z.string().optional().describe(PROJECT_SELECTOR_DESCRIPTION),
+      }),
+      annotations: MUTATING_ANNOTATIONS,
+    },
+    async ({ column, taskIds, project }) => withProject(resolver, project, (ctx) => callHandler('reorder_tasks', { column, taskIds }, ctx, 'Failed to reorder tasks')),
   );
 
   // --- kangentic_move_task_to_project ---
@@ -618,6 +634,62 @@ export function registerTaskTools(
       handoffContext: handoffContext ?? undefined,
       planExitTargetColumn: planExitTargetColumn === undefined ? undefined : planExitTargetColumn,
     }, ctx, 'Failed to update column')),
+  );
+
+  // --- kangentic_create_column ---
+  server.registerTool(
+    'kangentic_create_column',
+    {
+      description: 'Add a new swimlane (column) to the Kangentic board. By default it lands just before Done, which is where a new workflow stage almost always belongs. Column names must be unique (case-insensitive). Roles are structural and cannot be set: To Do and Done already exist on every board. Pass `project` to add a column to a different project.',
+      inputSchema: z.object({
+        name: z.string().max(100).describe('Column name, unique on this board (case-insensitive).'),
+        description: z.string().max(1000).optional().describe('Free-form description of the column\'s purpose, shown as a header tooltip and shared with the team via kangentic.json.'),
+        color: z.string().optional().describe('Hex color (e.g. "#71717a"). Defaults to blue.'),
+        icon: z.string().optional().describe('Lucide icon name.'),
+        autoSpawn: z.boolean().optional().describe('Whether moving a task into this column auto-spawns an agent. Defaults to true.'),
+        autoCommand: z.string().max(4000).optional().describe('Slash command template injected when an agent spawns in this column (e.g. "/review --strict").'),
+        agentOverride: z.string().optional().describe('Force a specific agent for this column (e.g. "codex"). Omit to use the project default.'),
+        modelOverride: z.string().max(200).optional().describe('Adapter-specific model identifier passed at spawn time (e.g. Claude "opus", "sonnet"). Omit to inherit the agent default.'),
+        effortOverride: z.string().max(50).optional().describe('Adapter-specific effort/reasoning level passed at spawn time (e.g. Claude "low", "high", "xhigh"). Omit to inherit the agent default.'),
+        permissionMode: PERMISSION_MODE_SCHEMA.optional().describe('Permission mode for agents spawned in this column. Omit to use the project default.'),
+        handoffContext: z.boolean().optional().describe('Enable multi-agent handoff context preservation when entering this column.'),
+        planExitTargetColumn: z.string().optional().describe('Column to auto-move the task to when an agent in plan mode exits planning.'),
+        position: z.number().int().min(0).optional().describe('Zero-based ordinal slot among the board\'s columns (not a raw stored position); later columns shift right. Clamped between the role columns: a value below the lowest legal slot lands immediately after To Do, and a value at or past Done lands immediately before Done, never after it. Omit for the default placement just before Done.'),
+        project: z.string().optional().describe(PROJECT_SELECTOR_DESCRIPTION),
+      }),
+      annotations: MUTATING_ANNOTATIONS,
+    },
+    async ({ name, description, color, icon, autoSpawn, autoCommand, agentOverride, modelOverride, effortOverride, permissionMode, handoffContext, planExitTargetColumn, position, project }) => withProject(resolver, project, (ctx) => callHandler('create_column', {
+      name,
+      description,
+      color,
+      icon,
+      autoSpawn,
+      autoCommand,
+      agentOverride,
+      modelOverride,
+      effortOverride,
+      permissionMode,
+      handoffContext,
+      planExitTargetColumn,
+      position,
+    }, ctx, 'Failed to create column'), { alwaysAnnotate: true }),
+  );
+
+  // --- kangentic_delete_column ---
+  server.registerTool(
+    'kangentic_delete_column',
+    {
+      description: 'Delete a swimlane (column) from the Kangentic board. Refused in two cases, deliberately: a column that still holds tasks (move them with kangentic_move_task first - this tool never touches a task), and a role column (To Do / Done), which the board depends on. Everything pointing at the deleted column is cleaned up in the same operation: lane transitions, other columns\' plan-exit targets, and Board Profile entries. The response reports what was cleaned. Pass `project` to delete a column from a different project.',
+      inputSchema: z.object({
+        column: z.string().describe('Column name to delete (case-insensitive, e.g. "Brand Review").'),
+        project: z.string().optional().describe(PROJECT_SELECTOR_DESCRIPTION),
+      }),
+      annotations: MUTATING_ANNOTATIONS,
+    },
+    async ({ column, project }) => withProject(resolver, project, (ctx) => callHandler('delete_column', {
+      column,
+    }, ctx, 'Failed to delete column'), { alwaysAnnotate: true }),
   );
 
   // --- kangentic_delete_task ---

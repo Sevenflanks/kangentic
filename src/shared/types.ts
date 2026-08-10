@@ -3,6 +3,7 @@ import type { LiveDeliveryStatus } from './live-delivery-status';
 import type { TaskMoveResult } from './auto-command-outcome';
 import type { TerminalFocusReport } from './terminal-focus-report';
 import type { CompatibilityRequirement, CompatibilityResolveResult } from './compatibility-requirement';
+import type { Announcement } from './announcements';
 
 // === Database Models ===
 
@@ -190,7 +191,16 @@ export interface ResolvedExecutionTarget {
 
 /** Result of probing a remote execution server for reachability. */
 export type RemoteServerStatus =
-  | { reachable: true; version: string | null }
+  | {
+      reachable: true;
+      version: string | null;
+      /** Whole milliseconds from request start to response headers. Optional
+       *  rather than nullable like `version` because only probes that actually
+       *  time their request report it: the relay probe does, the agent
+       *  execution-server probe does not, and making it required would force a
+       *  value out of every adapter's `probeServer`. */
+      latencyMs?: number;
+    }
   | { reachable: false; reason: string };
 
 export interface AgentSummarizeInput {
@@ -301,6 +311,22 @@ export interface Task {
   agent: string | null;
   session_id: string | null;
   worktree_path: string | null;
+  /**
+   * The directory NAME (not path) of this task's worktree, chosen exactly once
+   * and never changed. New tasks get `String(display_id)`; tasks that predate
+   * that scheme keep their legacy `<slug>-<taskId8>` name, so nothing on disk is
+   * ever renamed or relocated.
+   *
+   * This exists because a Done move nulls `worktree_path`, which makes the move
+   * back out a fresh creation. Without a durable record, a pre-existing task
+   * would be recreated under the new scheme at a different path, orphaning its
+   * agent transcript (keyed by a slug of the cwd) and its browser cookie jar
+   * (keyed by a hash of the path). See `WorktreeManager.createWorktree`.
+   *
+   * Invariant: whenever `worktree_path` is non-null,
+   * `path.basename(worktree_path) === worktree_folder`.
+   */
+  worktree_folder: string | null;
   branch_name: string | null;
   pr_number: number | null;
   pr_url: string | null;
@@ -355,6 +381,24 @@ export interface Task {
    */
   run_mode: TaskRunMode;
   attachment_count: number;
+  /**
+   * Outcome of this task's most recent auto_command injection - the durable
+   * half of the two sinks in `auto-command-outcome.ts` (the other being the
+   * transient `task:autoCommandResult` notice). All four stay null until a
+   * first injection runs.
+   *
+   * Declared here because `SELECT t.*` already returns these columns on every
+   * task read, so omitting them made `Task` describe a narrower shape than it
+   * actually carries over IPC - present at runtime, unreachable to a typed
+   * consumer.
+   */
+  auto_command_state: AutoCommandState | null;
+  /** The command text that was attempted, joined with ' | ' when a burst carried several. */
+  auto_command_text: string | null;
+  /** User-facing failure prose, set only when `auto_command_state` is 'failed'. */
+  auto_command_error: string | null;
+  /** When that outcome was recorded (UTC ISO 8601). */
+  auto_command_at: string | null;
   /** Serialized `TaskDetailViewState` (JSON) persisting the task-detail dialog's layout across restarts. null until the user changes the layout once. */
   detail_view_state: string | null;
   archived_at: string | null;
@@ -458,6 +502,8 @@ export interface Swimlane {
   permission_mode: PermissionMode | null;
   auto_spawn: boolean;
   auto_command: string | null;
+  /** When this column's auto_command fires (see AutoCommandMode). Defaults to 'immediate'. */
+  auto_command_mode: AutoCommandMode;
   plan_exit_target_id: string | null;
   agent_override: string | null;
   /** Free-form model identifier (e.g. "opus", "sonnet", "claude-opus-4-7"). Adapter-specific; null inherits the agent default. */
@@ -470,6 +516,54 @@ export interface Swimlane {
   /** What to do with that track on entry (see SessionSpawnStrategy). Defaults to 'create_or_resume'. */
   session_spawn_strategy: SessionSpawnStrategy;
   created_at: string;
+}
+
+/**
+ * When a column's `auto_command` is delivered to the agent.
+ *
+ * - `immediate` (default) inject as soon as the task lands in the column,
+ *   interrupting the agent's current turn if there is one. The interruption is
+ *   reported to the user rather than being silent.
+ * - `deferred` hold until the agent's current turn genuinely finishes, then
+ *   inject. "Finished" is the two-signal turn-completion predicate (idle AND a
+ *   quiet PTY), not a timer and not a bare idle check - see
+ *   `src/main/transition-engine/turn-completion.ts` for why a bare idle is not
+ *   safe here.
+ */
+export type AutoCommandMode = 'immediate' | 'deferred';
+
+/**
+ * Terminal state of one auto_command delivery.
+ *
+ * `unconfirmed` is NOT a failure, and the distinction is load-bearing: only
+ * Claude currently implements `getSubmissionVerifier('command-injection')`, so
+ * on every other agent a delivery can only ever land here. Treating it as a
+ * failure would make the field meaningless off Claude and would turn a normal
+ * delivery into an error notice for most users.
+ *
+ * `escalated` means keystrokes could not be confirmed, so the session was
+ * restarted and the command handed to the CLI as its prompt argument. Delivery
+ * is guaranteed by the spawn, so it is not a failure - but no verifier saw it
+ * land, so it is deliberately not `confirmed` either.
+ */
+export type AutoCommandState = 'confirmed' | 'unconfirmed' | 'escalated' | 'failed' | 'cancelled';
+
+/** Payload of the `task:autoCommandResult` push event. */
+export interface AutoCommandResultNotice {
+  taskId: string;
+  taskTitle: string;
+  projectId?: string;
+  state: AutoCommandState;
+  /** The command text that was attempted. */
+  command: string;
+  /** Set when `state` is 'failed'; already user-facing prose. */
+  reason?: string;
+  /** Unsent text that was cleared off the prompt to make room, if any. */
+  discardedDraft?: string;
+  /** True when delivery interrupted a turn the agent was in the middle of. */
+  interruptedTurn: boolean;
+  /** True when delivery only succeeded by restarting the session. */
+  escalated: boolean;
 }
 
 export type ActionType =
@@ -525,6 +619,14 @@ export interface SwimlaneTransition {
 // === Session Management ===
 
 export type SessionStatus = 'running' | 'queued' | 'exited' | 'suspended';
+
+/**
+ * Who reshaped the PTY. 'spawn' is the grid the PTY spawned at; the rest
+ * mirror SessionManager.resize's origin parameter ('desktop' is any
+ * renderer-driven fit, 'mobile' a paired phone's grid request, 'park' the
+ * resting-grid park for unwatched sessions).
+ */
+export type PtyResizeOrigin = 'desktop' | 'mobile' | 'park' | 'spawn';
 
 export interface Session {
   id: string;
@@ -794,6 +896,11 @@ export interface ActivityStatsSnapshot {
   subagentDepth: number;
   backgroundShellIds: readonly string[];
   anonymousBackgroundShellCount: number;
+  /** Named bg shells that opted out of holding the session active by carrying
+   *  `NO_ACTIVITY_HOLD_FLAG` in their launching command (today: `/preview`'s
+   *  watcher). Tracked for liveness by the process-tree watcher, but excluded
+   *  from the predicate's background-shell term. */
+  exemptBackgroundShellIds: readonly string[];
   turnActive: boolean;
   permissionPending: boolean;
   /** The tool_use_id awaiting a permission decision when `permissionPending` is true, else null. */
@@ -1142,6 +1249,22 @@ export type SubmissionContext =
        * `sentAt - tolerance`.
        */
       sentAt?: number;
+      /**
+       * How strongly this command's delivery may be confirmed.
+       *
+       * - `command-match` the adapter emitted this itself (`/effort xhigh`),
+       *   so the transcript must show a discrete invocation with exactly
+       *   these args. Rejecting a combined-args entry is the point: that is
+       *   how a swallowed Enter is detected.
+       * - `submitted` a user-supplied auto_command. It may be plain prose or
+       *   an unregistered `/foo`, so it cannot be required to parse as a
+       *   registered slash command - only that EXACTLY this text became a
+       *   user turn. Strictly weaker, therefore always available.
+       *
+       * Defaults to `command-match` when absent, preserving the behavior of
+       * callers written before per-command modes existed.
+       */
+      mode?: 'command-match' | 'submitted';
     };
 
 /** Context type for `getSubmissionVerifier()` parameter. */
@@ -1202,8 +1325,33 @@ export interface SessionUsage {
   model: {
     id: string;
     displayName: string;
-    /** Claude effort level from status.json (`low` | `medium` | `high` | `xhigh`). Absent for older Claude Code versions and non-Claude adapters. */
+    /**
+     * Effort level the agent reports it is RUNNING AT, from its live telemetry
+     * (Claude's status.json `effort.level`). Claude Code documents this as the
+     * level "after any silent downgrade for the selected model", so it is the
+     * running value, not the requested one.
+     *
+     * Absent for older Claude Code versions, for non-Claude adapters, and - the
+     * case that matters - for any model with no effort levels at all. Claude
+     * Code gates the field on a per-model capability check, so the key is simply
+     * omitted for an unsupported model. The exclusion is per model, not per
+     * generation or family: `claude-haiku-4-5` and `claude-sonnet-4-5` have no
+     * effort while `claude-opus-4-8` does. Never mirror that list here; read the
+     * telemetry. Pair with `reportedByAgent` to tell "this model has no effort
+     * level" apart from "no telemetry has arrived yet".
+     */
     effort?: string;
+    /**
+     * True when this model block came from a live agent telemetry snapshot. Set
+     * by the adapter that parsed the snapshot and never inferred downstream.
+     *
+     * Needed because `displayName` alone does not imply telemetry: a spawn seeds
+     * it from the `--model` flag so a never-yet-reported session still shows its
+     * model (`session-spawn-flow.ts`). Without this flag the renderer cannot
+     * tell a configured value from a confirmed one, and presents both with the
+     * same visual weight.
+     */
+    reportedByAgent?: boolean;
   };
   /** Agent-reported session ID (from status.json). Used for stale ID recovery. */
   sessionId?: string;
@@ -1850,8 +1998,10 @@ export interface NotificationConfig {
 }
 
 /** Click-outside (light-dismiss) policy for modeless task-detail windows. `off`
- *  disables it; `single` closes only a lone floating window (the peek case);
- *  `focused` closes the focused window in any state; `all` closes every window. */
+ *  disables it; `single` closes a lone window in any state (the peek case), and so
+ *  does nothing at all once a second window is open; `focused` closes the focused
+ *  window in any state, whether one or five are open (the default); `all` closes
+ *  every window. */
 export type WindowLightDismiss = 'off' | 'single' | 'focused' | 'all';
 
 // === Dictation (voice-to-text) ===
@@ -2021,6 +2171,232 @@ export interface OnboardingBaseline {
   swimlaneSignature: string;
 }
 
+// ============================================================================
+// Agent Monitor - the cross-project aggregate view.
+//
+// Machine-global by nature: it spans every registered project, so nothing here
+// is project-scoped. The rows are assembled in the main process
+// (src/main/monitor/monitor-aggregator.ts) by joining the process-global session
+// registry + activity/event caches against each owning project's DB.
+// ============================================================================
+
+/**
+ * The attention bucket a row falls into. Derived ONLY via `requiresUserInteraction()`
+ * / `isActive()` from `src/shared/activity-state.ts` - never by comparing an
+ * `ActivityState` to a literal (enforced by
+ * `tests/unit/activity-state-classification.test.ts`).
+ */
+export type MonitorStateBucket = 'needs-you' | 'working' | 'idle' | 'finished';
+
+/**
+ * How the monitor arranges its rows. `cards` reflows by container width.
+ *
+ * All three name a FORM, not a density - `list` was briefly "compact", which
+ * described how tight it was rather than what it is, and read oddly beside two
+ * options that name shapes.
+ */
+export type MonitorLayout = 'cards' | 'table' | 'list';
+/**
+ * How rows are sectioned. Always one or the other - there is no "ungrouped"
+ * choice, because a segmented control sitting with nothing selected reads as
+ * broken, and neither section scheme is expensive enough to want off.
+ *
+ * ('flat' still exists as an INTERNAL grouping mode for the table layout, which
+ * cannot interleave section headers into a <table>; it is simply not a value the
+ * user can select or that is ever persisted.)
+ */
+export type MonitorGroupBy = 'state' | 'project';
+/**
+ * Row order WITHIN a section. Just the two time directions.
+ *
+ * Attention-first ordering is not a sort option because it is structural: rows
+ * are always grouped, and the Status grouping emits Idle before Active before
+ * Paused. An "Idle first" sort on top of that ordered idle rows within the Idle
+ * section, which is no ordering at all. (Sorting BY project was dropped for the
+ * same reason - it duplicated grouping by project.)
+ */
+export type MonitorSort = 'longest-running' | 'recently-started';
+
+/** One live or recently-finished agent session, resolved across projects. */
+/**
+ * The subset of `SessionEvent` a monitor row carries.
+ *
+ * The row is re-sent on every snapshot push, and the renderer reads only the detail
+ * line, so the correlation ids and per-tool telemetry on the full event were pure
+ * payload. Kept as a named shape rather than a bare string so the "doing now" line
+ * can be formatted by event kind without widening the row again.
+ */
+export interface MonitorLastEvent {
+  type: EventType;
+  /** The rendered "doing now" line. See `SessionEvent.detail` for what it holds. */
+  detail: string | null;
+}
+
+export interface MonitorSessionRow {
+  sessionId: string;
+  projectId: string;
+  projectName: string;
+  taskId: string;
+  taskTitle: string;
+  /**
+   * The last few meaningful rendered lines of this session's terminal.
+   *
+   * This REPLACED the task-description excerpt the card used to show. A
+   * description is the same text every time you look at it and says nothing about
+   * what the agent is doing now, which is the one question this screen exists to
+   * answer; it also left a Command Terminal's card blank, since a terminal has no
+   * task. The peek is live, varies per session, and is the same for both kinds of
+   * row. `monitor.getTaskDetail` still serves the full description on demand for
+   * the detail view.
+   *
+   * Seeded here so a snapshot is self-consistent (and so an idle session that
+   * never emits still has one), then patched in place between snapshots by the
+   * MONITOR_PEEK push. Extraction rule: `src/main/pty/buffer/output-peek.ts`.
+   */
+  outputPeek: string[];
+  /** The task's #N ticket number; null when the task row could not be resolved. */
+  displayId: number | null;
+  /** Swimlane (column) name the task currently sits in. Empty for a Command
+   *  Terminal, which is not on the board at all. */
+  columnName: string;
+  /**
+   * Branch a Command Terminal is working on. Null for a task agent.
+   *
+   * The card's eyebrow is a breadcrumb answering "where is this session
+   * working". For a task that is its column; a terminal has none, which left the
+   * slot blank and the title sitting under a gap. The branch is the honest
+   * analogue: it is a location rather than a label, and it is what the Command
+   * Terminal's own window header shows via its branch picker.
+   *
+   * Deliberately NOT populated for task agents even though a worktree-backed task
+   * has a branch too. Its column is the more useful breadcrumb there, and the
+   * eyebrow only has room for one.
+   */
+  commandTerminalBranch: string | null;
+  labels: string[];
+  prUrl: string | null;
+  prNumber: number | null;
+  prState: PRState | null;
+  /** Adapter name captured at spawn (e.g. "claude"). Null for a pre-adapter session. */
+  agentName: string | null;
+  /** The agent-reported live model when available, else the model the session was
+   *  spawned/resumed/switched with. Null = agent default with no live report yet. */
+  modelDisplayName: string | null;
+  /** Reasoning effort the session was actually spawned/resumed/switched with
+   *  (`applied_effort`). Null = the agent's own default, or an agent with no
+   *  effort concept. */
+  effort: string | null;
+  /** Permission mode the session was spawned under. Null for agents that manage
+   *  autonomy in their own TUI rather than via a spawn flag. */
+  permissionMode: string | null;
+  startedAt: string;
+  /** UTC ISO exit time from the owning project's `sessions` row; null while live. */
+  exitedAt: string | null;
+  status: SessionStatus;
+  activity: ActivityState | null;
+  activityReason: ActivityReason | null;
+  /** Last telemetry event, rendered as the row's "doing now" line. */
+  lastEvent: MonitorLastEvent | null;
+  /** Context-window usage 0-100, or null when the window size is unknown. */
+  contextPercent: number | null;
+  isolated: boolean;
+  /**
+   * A Command Terminal (transient) session rather than a task agent.
+   *
+   * The monitor is the ONLY surface that can show these: they have no board card
+   * because they have no task, and the Command Terminal layer only shows the
+   * project you currently have open. Their `taskId` is a synthetic key, so they
+   * carry no title / ticket / column / labels.
+   */
+  isCommandTerminal: boolean;
+}
+
+export interface MonitorSnapshot {
+  rows: MonitorSessionRow[];
+  /** UTC ISO stamp of when main assembled this snapshot. */
+  generatedAt: string;
+}
+
+/**
+ * Everything the task-detail surface needs about the PROJECT a task belongs to,
+ * for a host that is not that project's board.
+ *
+ * Mirrors `TaskDetailHostValue`'s data half (the renderer adds the mutation
+ * callbacks). On the board these values come from the board / config / project
+ * stores; the Agent Monitor fetches this instead, because those stores hold the
+ * open project and its rows can belong to any of them.
+ */
+/**
+ * Where main decided a task detail should open. Mirrors `DetailDestination` in
+ * src/main/task-detail/detail-owner-registry.ts, which owns the rules.
+ */
+/** Which surface hosts a task detail. Both can live in the main window. */
+export type TaskDetailHost = 'board' | 'monitor';
+
+export interface TaskDetailOwner {
+  webContentsId: number;
+  host: TaskDetailHost;
+}
+
+export type TaskDetailDestination =
+  /** The requester already holds it; its window was focused, nothing remounts. */
+  | { kind: 'focused-existing'; owner: TaskDetailOwner }
+  /** The requester mounts it; `closedElsewhere` names the surface that gave it up. */
+  | { kind: 'open-here'; owner: TaskDetailOwner; closedElsewhere: TaskDetailOwner | null };
+
+/**
+ * A task detail open in a DIFFERENT renderer than the one receiving it.
+ *
+ * Carries no `webContentsId` on purpose: main has already filtered the list per
+ * recipient, so every entry means "not mine". Handing the renderer ids would only
+ * let a caller re-derive the comparison and get the direction backwards.
+ */
+export interface TaskDetailRemoteOwner {
+  projectId: string;
+  taskId: string;
+}
+
+export interface TaskDetailBundle {
+  task: Task;
+  projectId: string;
+  projectName: string;
+  projectPath: string;
+  defaultAgent: string | null;
+  swimlanes: Swimlane[];
+  shortcuts: (ShortcutConfig & { source: 'team' | 'local' })[];
+  config: {
+    labelColors: Record<string, string>;
+    defaultBaseBranch: string;
+    worktreesEnabled: boolean;
+    browserEnabled: boolean;
+  };
+}
+
+/**
+ * The user's persisted monitor view. Stored as one blob on the global AppConfig and
+ * shared by the in-app overlay and the detached pop-out, so "their preferred view"
+ * is a single preference rather than one per host.
+ */
+export interface MonitorView {
+  layout: MonitorLayout;
+  groupBy: MonitorGroupBy;
+  sort: MonitorSort;
+  /**
+   * Show only sessions with a live agent - the Idle and Active buckets - hiding
+   * Paused and Recently finished.
+   *
+   * Named `liveOnly`, not `hideIdle`: it never hid the Idle bucket (those are
+   * agents waiting on YOU, the last thing to hide), and "inactive" collided with
+   * the Active/Idle vocabulary the rest of the view speaks.
+   */
+  liveOnly: boolean;
+  /** Empty = every project. */
+  projectFilter: string[];
+  /** Empty = every state. */
+  stateFilter: MonitorStateBucket[];
+  textFilter: string;
+}
+
 export interface AppConfig {
   theme: ThemeMode;
   sidebarVisible: boolean;
@@ -2037,6 +2413,11 @@ export interface AppConfig {
   diffCollapseUnchanged: boolean; // fold away large unchanged regions, showing only changed hunks
   diffFileSort: 'name' | 'status' | 'size'; // Changes panel file ordering
   diffFlatList: boolean; // Changes panel file list: flat full-path list vs nested directory tree
+
+  /** Persisted Agent Monitor view. Global-only: the monitor spans every project, so a
+   *  per-project override would be meaningless. Written debounced on every change (not
+   *  on close) so the view survives a quit or crash, not just an orderly close. */
+  monitor: MonitorView;
 
   terminal: {
     shell: string | null; // null = auto-detect. Global-only: applies across every project.
@@ -2235,7 +2616,7 @@ export interface AppConfig {
    * by the `dictation.pushToTalk` keybinding-registry id.
    */
   dictation?: {
-    /** Master toggle: show the mic button and enable push-to-talk. Default false. */
+    /** Master toggle: enable push-to-talk dictation. Default false. */
     enabled?: boolean;
     /** Engine selection. `auto` tiers by detected hardware. Default `auto`. */
     engineMode?: DictationEngineMode;
@@ -2290,6 +2671,31 @@ export interface AppConfig {
   };
 
   hasCompletedFirstRun: boolean;
+  /** The version whose release-notes modal has already been auto-shown, so it does
+   *  not reopen on every relaunch. Empty string until the first update lands. */
+  lastSeenReleaseNotesVersion: string;
+  /** The version whose post-update "What's New" dialog has already been shown.
+   *
+   *  Deliberately NOT `lastSeenReleaseNotesVersion`, which records the PENDING
+   *  version when the pre-restart modal is dismissed. A user who clicks "Later"
+   *  and then quits normally has the update installed by
+   *  `autoUpdater.autoInstallOnAppQuit`, and would relaunch with the new version
+   *  already marked seen and the notes never read - exactly the case the
+   *  post-update surface exists to cover.
+   *
+   *  Seeded to the running version on a fresh install (src/main/index.ts) so a
+   *  first-time user is not shown notes for software they have never run, and so
+   *  it does not collide with the onboarding walkthrough on that same boot.
+   *  Empty string on an existing install that has not yet upgraded past the
+   *  release this key was added in. */
+  lastWhatsNewShownVersion: string;
+  /** Ids of in-app announcements the user has dismissed from the banner
+   *  (src/shared/announcements.ts). Auto-set on dismissal, not shown in the
+   *  settings UI. Pruned on write to ids still present in the active feed so
+   *  the array stays bounded (computeDismissedIdsAfterDismiss). Optional
+   *  because configs written before this key existed lack it until their next
+   *  save; readers guard with `?? []`. */
+  dismissedAnnouncementIds?: string[];
   /** Project ids whose onboarding checklist the user has dismissed. Global (per-machine)
    *  memory keyed by project id, like `lastActiveTaskByProject`. `undefined` means the
    *  one-time upgrade backfill (App.tsx, on first hydration) has not run yet; `[]` means
@@ -2321,8 +2727,30 @@ export interface AppConfig {
   skipDeleteConfirm: boolean;
   skipBoardConfigConfirm: boolean;
   autoFocusIdleSession: boolean;
-  /** Click-outside dismiss policy for modeless task-detail windows. Default `single`. */
+  /** Click-outside dismiss policy for modeless task-detail windows. Default `focused`. */
   windowLightDismiss: WindowLightDismiss;
+  /** One-shot marker for the `single` -> `focused` default flip on `windowLightDismiss`.
+   *
+   *  `ConfigManager.save()` writes the WHOLE merged blob, so every install that ran
+   *  while `single` was the default has it persisted as a literal key. A default change
+   *  alone therefore reaches fresh installs only: an upgrading user keeps `single`
+   *  forever, and `single` resolves to no target once a second window is open, so
+   *  click-outside close silently does nothing there with no visible cause.
+   *
+   *  A persisted `single` cannot be told apart from a deliberate choice - both serialize
+   *  identically - so the migration in `ConfigManager.load()` accepts overriding a real
+   *  `single` choice made before this shipped. This marker is what bounds that to exactly
+   *  one rewrite: a user who re-picks `single` afterwards keeps it.
+   *
+   *  The marker is persisted on every launch that can safely write, INCLUDING a fresh
+   *  install, so the block stops re-evaluating. The one exception is a config file that
+   *  exists but will not parse: writing there would replace it with bare defaults, so
+   *  the rewrite is deferred to a launch that can read the file.
+   *
+   *  Retirable (with its migration block) once no supported install can still predate
+   *  the release that introduced it - at which point every config on disk already
+   *  carries `true`. Until then it stays, like `hasCompletedFirstRun` below. */
+  hasMigratedWindowLightDismissDefault: boolean;
   /** Task IDs that have already been offered an auto-rename suggestion. Persisted so a
    *  dismissed suggestion does not reappear on the next app launch. Drained on task
    *  delete (TASK_DELETE / TASK_BULK_DELETE handlers in `task-crud.ts`) so the array
@@ -2367,6 +2795,19 @@ export interface AppConfig {
    *  Null until a layout is first saved. See
    *  src/renderer/components/command-bar/ + window-manager/persistence/. */
   commandTerminalWorkspace: SerializedWorkspace | null;
+  /** GLOBAL in-app layout for the Agent Monitor's task-detail window layer: which
+   *  details are open over the monitor and how they are arranged. One blob, not
+   *  keyed by project, because the monitor is cross-project by design (its windows
+   *  are anchored by `projectId:taskId`).
+   *
+   *  Unlike the other two layers this one has to cross a RENDERER boundary: the
+   *  monitor can be hosted in the main window or in its own pop-out, and each has
+   *  its own copy of the module-singleton window store, so the blob is the only
+   *  thing that can carry an open detail between them. Nothing is mounted while
+   *  the monitor is closed - the layout is restored on next open.
+   *
+   *  Null until a layout is first saved. See src/renderer/components/monitor/. */
+  monitorWorkspace: SerializedWorkspace | null;
   /** Persisted union of every model ID we've ever seen for each agent: the
    *  result of the static/JSONL `discoverCapabilities()` walk, plus any model
    *  that has appeared on a live session's usage stream (Claude reports model
@@ -2447,6 +2888,27 @@ export const DEFAULT_CONFIG: AppConfig = {
   diffCollapseUnchanged: false,
   diffFileSort: 'name',
   diffFlatList: false,
+  monitor: {
+    layout: 'cards',
+    // Grouped by PROJECT out of the box. This view exists because agents are
+    // spread across projects, so "whose agents are these" is the question a user
+    // arrives with, and project sections answer it before they touch a control.
+    // Grouping by state is the deliberate second choice, for when the question is
+    // "what needs me" instead.
+    //
+    // Either way the sections are LABELLED, which is what makes a card moving
+    // between them legible. Suppressing that movement was tried first and made
+    // the ordering dishonest (a working agent could sit above one that needed
+    // you); positions are still held stable for anything short of a section
+    // change. Note that attention-first ordering is a property of STATE grouping
+    // (BUCKET_ORDER), so it applies once the user picks Status.
+    groupBy: 'project',
+    sort: 'longest-running',
+    liveOnly: false,
+    projectFilter: [],
+    stateFilter: [],
+    textFilter: '',
+  },
   terminal: {
     shell: null,
     fontFamily: 'Menlo, Consolas, "Courier New", monospace',
@@ -2531,10 +2993,14 @@ export const DEFAULT_CONFIG: AppConfig = {
     enabled: true,
   },
   hasCompletedFirstRun: false,
+  lastSeenReleaseNotesVersion: '',
+  lastWhatsNewShownVersion: '',
+  dismissedAnnouncementIds: [],
   skipDeleteConfirm: false,
   skipBoardConfigConfirm: false,
   autoFocusIdleSession: false,
-  windowLightDismiss: 'single',
+  windowLightDismiss: 'focused',
+  hasMigratedWindowLightDismissDefault: false,
   autoNameAskedTaskIds: [],
   autoNameRateLimitPerHour: 60,
   restoreWindowPosition: true,
@@ -2547,6 +3013,7 @@ export const DEFAULT_CONFIG: AppConfig = {
   lastActiveTaskByProject: {},
   workspaceByProject: {},
   commandTerminalWorkspace: null,
+  monitorWorkspace: null,
   discoveredModelsByAgent: {},
   discoveredContextWindowsByAgent: {},
   hotkeyOverrides: {},
@@ -2598,6 +3065,7 @@ export interface AgentCommand {
 
 export interface UpdateDownloadedInfo {
   version: string;
+  releaseNotes: string;
 }
 
 // === Backlog ===
@@ -3062,6 +3530,7 @@ export interface SwimlaneCreateInput {
   permission_mode?: PermissionMode | null;
   auto_spawn?: boolean;
   auto_command?: string | null;
+  auto_command_mode?: AutoCommandMode;
   plan_exit_target_id?: string | null;
   agent_override?: string | null;
   model_override?: string | null;
@@ -3083,6 +3552,7 @@ export interface SwimlaneUpdateInput {
   permission_mode?: PermissionMode | null;
   auto_spawn?: boolean;
   auto_command?: string | null;
+  auto_command_mode?: AutoCommandMode;
   plan_exit_target_id?: string | null;
   agent_override?: string | null;
   model_override?: string | null;
@@ -3608,6 +4078,14 @@ export interface SpawnSessionInput {
    * adapter hook cleanup, and must retain its exact identity through queuing.
    */
   spawnCleanup?: SessionAttachment;
+  /** For a transient session, the renderer's durable Command Terminal window slot
+   *  (`slot-1`, ...). Recorded so the Agent Monitor names the terminal exactly as
+   *  its own window title bar does. See src/shared/command-terminal-name.ts. */
+  commandTerminalSlot?: string | null;
+  /** For a transient session, the branch it was actually spawned on (the RESOLVED
+   *  branch, after any checkout fallback). Recorded so the monitor can tell you
+   *  where a terminal is working, the way a task row names its column. */
+  commandTerminalBranch?: string | null;
   /** Agent-specific parser for status/event output. Falls back to ClaudeStatusParser if omitted. */
   agentParser?: AgentParser;
   /** Human-readable agent name for diagnostic logs (e.g. "claude", "gemini").
@@ -3643,6 +4121,11 @@ export interface SpawnSessionInput {
 
 export interface SpawnTransientSessionInput {
   projectId: string;
+  /** The window's durable slot id (`slot-1`, `slot-2`, ...). Slots are allocated by
+   *  the renderer's Command Terminal layer, so main cannot derive this; it is sent
+   *  purely so the Agent Monitor can name the terminal the same way its window
+   *  does. Optional so an older caller still spawns, just unnumbered. */
+  slot?: string;
   /** Branch to checkout before spawning. If omitted, uses the project's default base branch. */
   branch?: string;
   /** See `SpawnSessionInput.cols`/`rows` - the same seed-the-real-grid escape hatch. */
@@ -3672,6 +4155,8 @@ export interface BoardColumnConfig {
   planExitTarget?: string; // name of target column
   archived?: boolean;
   autoCommand?: string | null;
+  /** When the auto-command fires (see AutoCommandMode). Omitted means 'immediate'. */
+  autoCommandMode?: AutoCommandMode;
   agentOverride?: string | null;
   /** Adapter-specific model identifier passed at spawn time (e.g. Claude `--model`). Null inherits the agent default. */
   modelOverride?: string | null;
@@ -3732,6 +4217,7 @@ export interface BoardProfileEntry {
   effortOverride?: string | null;
   permissionMode?: PermissionMode | null;
   autoCommand?: string | null;
+  autoCommandMode?: AutoCommandMode;
   autoSpawn?: boolean;
   handoffContext?: boolean;
   sessionTarget?: SessionTarget;
@@ -3887,9 +4373,11 @@ export interface ElectronAPI {
     /** True only in dev-preview (`/preview`, `--ephemeral`); false in the regular dogfood. */
     isEphemeralPreview: boolean;
     /**
-     * The original task's title for a `/preview` window, so the title bar can identify
-     * which task the "Project 1" / "Project 2" clones belong to. Null outside preview, or
-     * when main could not resolve it from the parent project DB.
+     * The original task's label for a `/preview` window - `#<display_id> - <title>` - so
+     * the title bar can identify which task the "Project 1" / "Project 2" clones belong
+     * to. Main reuses the same string as the OS window title, so the taskbar thumbnail
+     * and the in-app pill always agree. Null outside preview, or when main could not
+     * resolve it from the parent project DB.
      */
     previewTaskTitle: string | null;
   };
@@ -3963,6 +4451,26 @@ export interface ElectronAPI {
     /** Persist the task-detail dialog's layout blob (debounced from the renderer) so it restores across restarts. Pass null to clear. */
     setDetailViewState: (taskId: string, state: TaskDetailViewState | null, projectId?: string | null) => Promise<void>;
     onAutoMoved: (callback: (taskId: string, targetSwimlaneId: string, taskTitle: string, projectId?: string) => void) => () => void;
+    /**
+     * A task was created, promoted, unarchived or MCP-auto-spawned successfully,
+     * but its agent could not start. Those four paths deliberately do not fail
+     * the whole operation, so without this the task simply sits there looking
+     * identical to a healthy one. `message` is already user-facing. A task MOVE
+     * does not use this channel: it rejects the in-flight invoke instead, which
+     * the renderer already toasts.
+     */
+    onSpawnBlocked: (callback: (taskId: string, taskTitle: string, message: string, projectId?: string) => void) => () => void;
+    /**
+     * A column's auto_command finished delivering, and the result is worth
+     * telling the user about.
+     *
+     * Only fires for outcomes a user should act on: a `failed` delivery, or a
+     * successful one that had to discard typed text or interrupt a live turn.
+     * A plain `confirmed` delivery is silent, and so is `unconfirmed` - most
+     * agents expose no transcript verifier at all, so every delivery on them
+     * lands there and toasting it would be constant noise that means nothing.
+     */
+    onAutoCommandResult: (callback: (result: AutoCommandResultNotice) => void) => () => void;
     onCreatedByAgent: (callback: (taskId: string, taskTitle: string, columnName: string, projectId?: string) => void) => () => void;
     onUpdatedByAgent: (callback: (taskId: string, taskTitle: string, projectId?: string) => void) => () => void;
     onDeletedByAgent: (callback: (taskId: string, taskTitle: string, projectId?: string) => void) => () => void;
@@ -4041,7 +4549,15 @@ export interface ElectronAPI {
     reset: (taskId: string, projectId?: string | null) => Promise<void>;
     write: (sessionId: string, data: string) => Promise<void>;
     writeFocusReport: (sessionId: string, report: TerminalFocusReport, projectId: string | null) => Promise<void>;
-    resize: (sessionId: string, cols: number, rows: number) => Promise<{ colsChanged: boolean }>;
+    /**
+     * `colsChanged` is intentionally unused by the renderer (main orders the
+     * geometry change ahead of any scrollback sample on its own - see the
+     * parallel-IPC note in useTerminal's mount path). `refused` is set only
+     * when main deliberately held the grid against this resize (the mobile
+     * sub-floor guard) and is consumed only by the echo re-assert, which uses
+     * it to stop healing attempts immediately instead of retrying to its cap.
+     */
+    resize: (sessionId: string, cols: number, rows: number) => Promise<{ colsChanged: boolean; refused?: true }>;
     list: () => Promise<Session[]>;
     getScrollback: (sessionId: string) => Promise<string>;
     /**
@@ -4060,6 +4576,19 @@ export interface ElectronAPI {
      * (fire-and-forget send), keyed by sessionId only - not project-scoped.
      */
     ackData: (sessionId: string, bytes: number) => void;
+    /**
+     * The PTY's dimensions actually changed, from any origin: a renderer fit,
+     * a phone's grid request, the resting-grid park, or the spawn itself.
+     * Exists because xterm re-sends dimensions only when its OWN size changes,
+     * so a PTY reshaped under a mounted xterm otherwise diverges with no
+     * recovery path. The mounted owner compares the echoed dims to its own and
+     * re-asserts its fit when they disagree. Broadcast to every window (echoes
+     * only fire on real dim changes); filtered by sessionId in the listener.
+     * Deliberately the one sessions push without a projectId parameter:
+     * session ids are globally-unique UUIDs, so the sessionId filter alone is
+     * unambiguous across projects.
+     */
+    onPtyResized: (callback: (sessionId: string, cols: number, rows: number, origin: PtyResizeOrigin) => void) => () => void;
     onFirstOutput: (callback: (sessionId: string, projectId?: string) => void) => () => void;
     onExit: (callback: (sessionId: string, exitCode: number, projectId?: string, intentional?: boolean) => void) => () => void;
     onStatus: (callback: (sessionId: string, session: Session, projectId?: string) => void) => () => void;
@@ -4081,6 +4610,13 @@ export interface ElectronAPI {
     spawnTransient: (input: SpawnTransientSessionInput) => Promise<{ session: Session; branch: string; checkoutError?: string }>;
     killTransient: (sessionId: string) => Promise<void>;
     setFocused: (sessionIds: string[]) => Promise<void>;
+    /**
+     * Which sessions this renderer has an xterm MOUNTED for - a superset of
+     * the focused set, because a parked terminal (Backlog view, occluded
+     * window) is unfocused but still holds a grid. Main leaves those PTYs
+     * alone; see SessionManager.scheduleRestingGridRestore.
+     */
+    setMounted: (sessionIds: string[]) => Promise<void>;
     /**
      * User pressed Ctrl+C in this session's terminal. The renderer
      * sends \x03 directly to the PTY (via `write`); this is a parallel
@@ -4303,6 +4839,12 @@ export interface ElectronAPI {
     onUpdateDownloaded: (callback: (info: UpdateDownloadedInfo) => void) => () => void;
   };
 
+  // Announcements (remote feed; active = filtered for this client in main)
+  announcements: {
+    getActive: () => Promise<Announcement[]>;
+    onChanged: (callback: (active: Announcement[]) => void) => () => void;
+  };
+
   // Backlog Attachments
   backlogAttachments: {
     list: (backlogTaskId: string) => Promise<BacklogAttachment[]>;
@@ -4341,6 +4883,96 @@ export interface ElectronAPI {
   };
 
   // Mobile Bridge -- machine-global (like config), not project-scoped.
+  /** Agent Monitor. Machine-global: no channel here takes a projectId, because the
+   *  snapshot deliberately spans every registered project. */
+  monitor: {
+    /** Full cross-project snapshot. Per-PROJECT setup (repos, swimlane names) is
+     *  resolved once and memoized, but the row build is O(sessions): each monitored
+     *  session costs a `tasks.getById` and a `sessions.findByAnyId`. Both are
+     *  indexed reads against an already-warm handle, and the push side is debounced
+     *  250ms, so this is cheap in practice - but it is not the O(projects) it was
+     *  once described as, and a project with many concurrent agents pays per agent. */
+    getSnapshot: () => Promise<MonitorSnapshot>;
+    /** Register this renderer as a live monitor consumer and get a fresh snapshot
+     *  back. Main only builds and pushes MONITOR_CHANGED snapshots while at least
+     *  one renderer is subscribed, so an unmounted monitor costs no per-event
+     *  snapshot builds. Main drops the subscription itself when the renderer
+     *  navigates or is destroyed. */
+    subscribe: () => Promise<MonitorSnapshot>;
+    /** Explicit counterpart of subscribe, called when the monitor closes. */
+    unsubscribe: () => Promise<void>;
+    /** Ask MAIN to reveal a task in the main window. Used by the detached monitor,
+     *  whose own stores cannot reach the board. */
+    revealTask: (projectId: string, taskId: string) => Promise<void>;
+    /** Everything the task-detail surface needs about a task's OWN project, so a
+     *  host that is not that project's board can render it. Null when the project
+     *  or task is gone (a race with a delete), so the caller closes rather than
+     *  renders a husk. */
+    getTaskDetail: (projectId: string, taskId: string) => Promise<TaskDetailBundle | null>;
+    /** Fired when the snapshot's DB-resident half changes (session spawned/exited, task
+     *  retitled or moved). Live activity does NOT come through here - it rides the
+     *  existing unbuffered SESSION_ACTIVITY push and is patched into rows in place. */
+    onChanged: (callback: (snapshot: MonitorSnapshot) => void) => () => void;
+    /** Start or stop the live output-peek stream for THIS renderer. Subscribe-gated
+     *  because it is the one monitor push with a standing cost in main (a PTY
+     *  output listener plus a sampling timer); a closed monitor costs nothing. */
+    setPeekSubscribed: (subscribed: boolean) => Promise<void>;
+    /** Changed output peeks, keyed by session id. Only sessions whose visible text
+     *  actually changed are sent, so a repainting TUI whose content is unchanged
+     *  produces no traffic. Patched onto rows in place, like activity. */
+    onPeek: (callback: (peeks: Record<string, string[]>) => void) => () => void;
+  };
+
+  /**
+   * Task-detail ownership: which renderer hosts which task's detail.
+   *
+   * Machine-global arbitration, not a task mutation. Main is the only place that
+   * can answer, because a pop-out is a separate renderer with its own stores and
+   * neither host can see the other's open windows. The two rules it enforces are
+   * documented in src/main/task-detail/detail-owner-registry.ts.
+   */
+  taskDetailOwnership: {
+    /** Ask where this task's detail should open. Main focuses the target window,
+     *  and pushes `onOpenHere` to it unless it is already open. */
+    requestOpen: (
+      projectId: string,
+      taskId: string,
+      host: TaskDetailHost,
+    ) => Promise<TaskDetailDestination>;
+    /**
+     * Report the COMPLETE set of task details this surface currently has mounted,
+     * derived from its window store.
+     *
+     * There is deliberately no `claim` / `release` pair: incremental bookkeeping
+     * could lose a release and strand a claim, leaving the task permanently
+     * unopenable. A full-set report is self-repairing, and removing the incremental
+     * calls from this surface makes reintroducing them a compile error.
+     */
+    syncOwned: (
+      host: TaskDetailHost,
+      entries: ReadonlyArray<{ projectId: string; taskId: string }>,
+    ) => void;
+    /** Main asking a surface in this renderer to mount a task detail. */
+    onOpenHere: (
+      callback: (projectId: string, taskId: string, host: TaskDetailHost) => void,
+    ) => () => void;
+    /** Main asking a surface in this renderer to let go, because another took it. */
+    onCloseHere: (
+      callback: (projectId: string, taskId: string, host: TaskDetailHost) => void,
+    ) => () => void;
+    /**
+     * The details held by OTHER renderers, pushed whenever ownership changes.
+     *
+     * Terminal ownership is "one xterm per PTY", and before this the bottom panel
+     * could only see its own renderer's detail windows - so a detail hosted in the
+     * detached Agent Monitor left the main window free to mount a second xterm on
+     * the same live PTY. Already filtered to exclude this renderer's own claims.
+     */
+    onRemoteOwnersChanged: (
+      callback: (owners: TaskDetailRemoteOwner[]) => void,
+    ) => () => void;
+  };
+
   mobile: {
     getStatus: () => Promise<MobileBridgeStatus>;
     startPairing: () => Promise<MobileStartPairingResult>;
@@ -4357,6 +4989,12 @@ export interface ElectronAPI {
     onPairingConfirmed: (callback: (payload: MobilePairingConfirmedPayload) => void) => () => void;
     onPairingEnded: (callback: (payload: MobilePairingEndedPayload) => void) => () => void;
     onStateChanged: (callback: () => void) => () => void;
+    /** Sessions a phone holds a terminal-wanting stream subscription for (not the
+     *  list-only feed). The bottom panel suspends its terminal for these - the
+     *  resting park owns their grid - so it renders a placeholder instead of an
+     *  xterm that would fit the PTY to its strip. */
+    getTerminalStreams: () => Promise<string[]>;
+    onTerminalStreamsChanged: (callback: (sessionIds: string[]) => void) => () => void;
   };
 
   // Board Config
@@ -4386,9 +5024,15 @@ export interface ElectronAPI {
   // Browser pane: embedded webview capture-and-send
   browser: {
     captureAndSend: (input: BrowserCaptureInput) => Promise<{ filePath: string }>;
-    getUrls: (taskId: string) => Promise<{ projectDefault: string | null; taskOverride: string | null }>;
-    setTaskUrl: (taskId: string, url: string) => Promise<void>;
-    clearTaskUrl: (taskId: string) => Promise<void>;
+    /**
+     * Per-task Browser pane URLs. `projectId` is the project of the TASK, not
+     * the open board's: a popped-out pane outlives a project switch, so
+     * resolving these against the ambient current project wrote one project's
+     * task URL into another project's sidecar.
+     */
+    getUrls: (taskId: string, projectId?: string | null) => Promise<{ projectDefault: string | null; taskOverride: string | null }>;
+    setTaskUrl: (taskId: string, url: string, projectId?: string | null) => Promise<void>;
+    clearTaskUrl: (taskId: string, projectId?: string | null) => Promise<void>;
     clearStorage: () => Promise<void>;
     /** Register an open Browser pane's guest webContents for kangentic_browser_* targeting. */
     registerPane: (input: BrowserPaneRegisterInput) => Promise<void>;
@@ -4404,7 +5048,26 @@ export interface ElectronAPI {
      * webview. The main process applies the zoom and broadcasts the resulting
      * factor so the toolbar % can stay in sync.
      */
-    onZoomChanged: (callback: (factor: number) => void) => () => void;
+    /** Ctrl+wheel zoom applied to a guest. `webContentsId` identifies WHICH pane,
+     *  since one window can host several and each must ignore the others'. */
+    onZoomChanged: (callback: (factor: number, webContentsId: number) => void) => () => void;
+    /**
+     * Main asking this renderer to open a task's Browser pane, on behalf of the
+     * `kangentic_browser_open_pane` MCP tool. Main has already validated the
+     * project, the per-project browser gate, the task, and the URL (which it
+     * seeded into the task sidecar), so the handler's only job is to set the
+     * pane open and make sure a task-detail window exists for it.
+     */
+    onPaneOpenRequest: (callback: (projectId: string, taskId: string) => void) => () => void;
+    /**
+     * Main asking this renderer to close Browser panes, on behalf of
+     * `kangentic_browser_close_pane`. The taskIds are computed by main from the
+     * pane registry: the renderer must not re-derive them, because
+     * `browserOpenTasks` is not project-keyed and the board store only holds the
+     * OPEN project's tasks, so a backgrounded project's retained pane would be
+     * invisible to a board lookup.
+     */
+    onPaneCloseRequest: (callback: (projectId: string, taskIds: string[]) => void) => () => void;
   };
 
   // Search

@@ -1,7 +1,8 @@
 /**
- * Unit tests for the SWIMLANE_UPDATE IPC handler in board.ts.
+ * Unit tests for the SWIMLANE_UPDATE and SWIMLANE_DELETE IPC handlers in board.ts.
  *
- * Focuses on the two branches introduced by the model-change restart feature:
+ * SWIMLANE_UPDATE focuses on the two branches introduced by the model-change
+ * restart feature:
  *
  *   1. MODEL change (prepareInjectionPlan returns needsRestartForModel: true)
  *      -> restartSessionForSettingsChange is called fire-and-forget inside
@@ -17,8 +18,16 @@
  * the async side-effect via vi.waitFor, which is the canonical pattern for
  * assertions on fire-and-forget async callbacks.
  *
+ * SWIMLANE_DELETE focuses on Board Profile pruning: profiles live in
+ * kangentic.json with no FK, so nothing in the DB layer reaches a `columns[uuid]`
+ * delta or a `planExitTarget` naming the deleted column. The handler prunes them
+ * via `pruneDeletedColumnFromProfiles`, and the ORDER matters - the prune must
+ * write `setBoardProfiles` before `triggerWriteBack` re-serializes the on-disk
+ * file, or the write-back carries the stale (unpruned) profiles straight back out.
+ *
  * Pattern: capture the function registered via ipcMain.handle(IPC.SWIMLANE_UPDATE)
- * and invoke it directly - same approach as task-runtime-override-handler.test.ts.
+ * (or IPC.SWIMLANE_DELETE) and invoke it directly - same approach as
+ * task-runtime-override-handler.test.ts.
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
@@ -69,6 +78,9 @@ vi.mock('../../src/main/db/database', () => ({ getProjectDb: vi.fn(() => ({})) }
 vi.mock('../../src/main/db/repositories/session-repository', () => ({
   SessionRepository: class {
     updateAppliedSettings = vi.fn();
+    // Read by the auto_spawn reconcile that SWIMLANE_UPDATE now also dispatches.
+    // Empty: none of these cases flips auto_spawn, so nothing is ever planned.
+    getUserPausedTaskIds = vi.fn(() => new Set<string>());
   },
 }));
 
@@ -82,7 +94,8 @@ vi.mock('../../src/main/ipc/handlers/session-reconcile', () => ({
     hoisted.restartSessionForSettingsChange(...args),
 }));
 
-vi.mock('../../src/main/transition-engine/injection-plan', () => ({
+vi.mock('../../src/main/transition-engine/injection-plan', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../src/main/transition-engine/injection-plan')>()),
   prepareInjectionPlan: (...args: unknown[]) => hoisted.prepareInjectionPlan(...args as [never]),
 }));
 
@@ -130,6 +143,7 @@ interface MockContext {
   sessionManager: {
     getSession: ReturnType<typeof vi.fn>;
     isWritable: ReturnType<typeof vi.fn>;
+    getUsageCache: ReturnType<typeof vi.fn>;
   };
   terminalSubmitScheduler: {
     cancel: ReturnType<typeof vi.fn>;
@@ -166,6 +180,9 @@ function createMockContext(overrides: Partial<MockContext> = {}): MockContext {
     sessionManager: {
       getSession: vi.fn(() => ({ status: 'running' })),
       isWritable: vi.fn(() => true),
+      // Read by resolveLiveEffort; empty = the agent reports no effort, so the
+      // delta source falls back to the session record as it did before.
+      getUsageCache: vi.fn(() => ({})),
     },
     terminalSubmitScheduler: { cancel: vi.fn(), scheduleKeystrokes: vi.fn() },
     boardConfigManager: {
@@ -308,7 +325,6 @@ describe('SWIMLANE_UPDATE handler - restart-on-model and effort live-inject bran
     hoisted.prepareInjectionPlan.mockReturnValue({
       sequence: [],
       verifier: null,
-      verifiedPrefixLength: 0,
       needsRestartForModel: true,
     });
 
@@ -350,9 +366,8 @@ describe('SWIMLANE_UPDATE handler - restart-on-model and effort live-inject bran
 
     // prepareInjectionPlan returns a live-inject plan (no model restart needed).
     hoisted.prepareInjectionPlan.mockReturnValue({
-      sequence: ['/effort xhigh'],
+      sequence: [{ text: '/effort xhigh', verify: 'command-match' }],
       verifier: null,
-      verifiedPrefixLength: 1,
       needsRestartForModel: false,
       appliedSettings: { effort: 'xhigh' },
     });
@@ -364,8 +379,8 @@ describe('SWIMLANE_UPDATE handler - restart-on-model and effort live-inject bran
     expect(context.terminalSubmitScheduler.scheduleKeystrokes).toHaveBeenCalledWith(
       'task-board-2',
       'session-board-2',
-      ['/effort xhigh'],
-      { verifier: null, verifiedPrefixLength: 1 },
+      [{ text: '/effort xhigh', verify: 'command-match' }],
+      { verifier: null },
     );
 
     // No restart should have been triggered for an effort-only change.
@@ -514,9 +529,8 @@ describe('SWIMLANE_UPDATE handler - restart-on-model and effort live-inject bran
 
     // prepareInjectionPlan returns a live-inject plan (model unchanged, no restart needed).
     hoisted.prepareInjectionPlan.mockReturnValue({
-      sequence: ['/effort xhigh'],
+      sequence: [{ text: '/effort xhigh', verify: 'command-match' }],
       verifier: null,
-      verifiedPrefixLength: 1,
       needsRestartForModel: false,
       appliedSettings: { effort: 'xhigh' },
     });
@@ -528,8 +542,8 @@ describe('SWIMLANE_UPDATE handler - restart-on-model and effort live-inject bran
     expect(context.terminalSubmitScheduler.scheduleKeystrokes).toHaveBeenCalledWith(
       'task-board-6',
       'session-board-6',
-      ['/effort xhigh'],
-      { verifier: null, verifiedPrefixLength: 1 },
+      [{ text: '/effort xhigh', verify: 'command-match' }],
+      { verifier: null },
     );
 
     // Model is unchanged, so no restart should be triggered.
@@ -558,7 +572,6 @@ describe('SWIMLANE_UPDATE handler - restart-on-model and effort live-inject bran
     hoisted.prepareInjectionPlan.mockReturnValue({
       sequence: [],
       verifier: null,
-      verifiedPrefixLength: 0,
       needsRestartForModel: true,
     });
     hoisted.restartSessionForSettingsChange.mockResolvedValue({ ok: true });
@@ -596,7 +609,6 @@ describe('SWIMLANE_UPDATE handler - restart-on-model and effort live-inject bran
     hoisted.prepareInjectionPlan.mockReturnValue({
       sequence: [],
       verifier: null,
-      verifiedPrefixLength: 0,
       needsRestartForModel: true,
     });
     hoisted.restartSessionForSettingsChange.mockResolvedValue({ ok: false, reason: 'no session found' });
@@ -610,5 +622,88 @@ describe('SWIMLANE_UPDATE handler - restart-on-model and effort live-inject bran
     }, { timeout: 2000 });
 
     expect(context.mainWindow.webContents.send).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SWIMLANE_DELETE - Board Profile pruning, and its ordering vs the write-back
+// ---------------------------------------------------------------------------
+
+describe('SWIMLANE_DELETE handler - Board Profile pruning', () => {
+  let context: MockContext;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    hoisted.restartSessionForSettingsChange.mockReset();
+    hoisted.restartSessionForSettingsChange.mockResolvedValue({ ok: true });
+    hoisted.prepareInjectionPlan.mockReset();
+    hoisted.prepareInjectionPlan.mockReturnValue(null);
+    capturedHandlers.clear();
+
+    context = createMockContext();
+    registerBoardHandlers(context as never);
+  });
+
+  function callSwimlaneDelete(id: string): unknown {
+    const handler = capturedHandlers.get(IPC.SWIMLANE_DELETE);
+    if (!handler) throw new Error(`Handler for ${IPC.SWIMLANE_DELETE} was not registered`);
+    return handler(null, id);
+  }
+
+  it('prunes both a columns[uuid] delta and a planExitTarget naming the deleted column, and writes profiles BEFORE the kangentic.json write-back', () => {
+    const doomedSwimlane = createSwimlaneBefore({ id: 'lane-doomed', name: 'Brand Review' });
+    // buildProjectRepos's second/third args (update result, tasks-in-lane) are not
+    // read by the delete path - only swimlanes.getById and swimlanes.delete are.
+    const repos = buildProjectRepos(doomedSwimlane, doomedSwimlane, []);
+    mockGetProjectRepos.mockReturnValue(repos);
+
+    context.boardConfigManager.getBoardProfiles.mockReturnValue([
+      {
+        id: 'profile-1',
+        name: 'Heavy',
+        columns: {
+          'lane-doomed': { modelOverride: 'opus' },
+          'lane-planning': { planExitTarget: 'Brand Review' },
+        },
+      },
+    ]);
+
+    callSwimlaneDelete('lane-doomed');
+
+    expect(repos.swimlanes.delete).toHaveBeenCalledWith('lane-doomed');
+    expect(context.boardConfigManager.setBoardProfiles).toHaveBeenCalledTimes(1);
+    const [writtenProfiles] = context.boardConfigManager.setBoardProfiles.mock.calls[0];
+    expect(writtenProfiles[0].columns).not.toHaveProperty('lane-doomed');
+    expect(writtenProfiles[0].columns['lane-planning']).not.toHaveProperty('planExitTarget');
+
+    // Revert proof (a): deleting the `if (doomed) { pruneDeletedColumnFromProfiles(...) }`
+    // block in board.ts reds this assertion - setBoardProfiles is never called.
+    expect(context.boardConfigManager.writeBack).toHaveBeenCalledTimes(1);
+
+    // ORDERING - a test that only checked "both were called" would NOT go red if
+    // the order flipped, and flipping it re-serializes the stale (unpruned)
+    // profiles from the on-disk file straight back out.
+    // Revert proof (b): moving the prune block to AFTER triggerWriteBack(context)
+    // reds only this assertion, leaving the two above green.
+    const setBoardProfilesOrder = context.boardConfigManager.setBoardProfiles.mock.invocationCallOrder[0];
+    const writeBackOrder = context.boardConfigManager.writeBack.mock.invocationCallOrder[0];
+    expect(setBoardProfilesOrder).toBeLessThan(writeBackOrder);
+  });
+
+  it('does not write profiles when nothing referenced the deleted column', () => {
+    const doomedSwimlane = createSwimlaneBefore({ id: 'lane-doomed', name: 'Brand Review' });
+    const repos = buildProjectRepos(doomedSwimlane, doomedSwimlane, []);
+    mockGetProjectRepos.mockReturnValue(repos);
+
+    // A profile exists, but references a DIFFERENT lane - exercises the "computed
+    // a diff, decided not to write" path, not just an empty-profiles short-circuit.
+    context.boardConfigManager.getBoardProfiles.mockReturnValue([
+      { id: 'profile-1', name: 'Heavy', columns: { 'other-lane': { modelOverride: 'opus' } } },
+    ]);
+
+    callSwimlaneDelete('lane-doomed');
+
+    expect(context.boardConfigManager.setBoardProfiles).not.toHaveBeenCalled();
+    expect(context.boardConfigManager.writeBack).toHaveBeenCalledTimes(1);
   });
 });

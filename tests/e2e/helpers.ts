@@ -1,4 +1,4 @@
-import { _electron as electron, type ElectronApplication, type Page } from '@playwright/test';
+import { _electron as electron, expect, type ElectronApplication, type Page } from '@playwright/test';
 import path from 'node:path';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -26,6 +26,35 @@ const TEST_DATA_ROOT = path.join(__dirname, '..', '.test-data', `worker-${proces
  * Keyed on process.pid so concurrent workers never share a path.
  * Removes stale data from previous runs, then recreates the directory.
  */
+/**
+ * Resolve a mock agent CLI path for the CURRENT platform.
+ *
+ * Always use this instead of joining a fixture path by hand. On Windows a bare
+ * `.js` file is not executable: when node-pty spawns it, the shell has no
+ * association for `.js` and Windows pops the "Select an app to open this .js file"
+ * dialog instead of running anything. The agent then never starts, so the session
+ * has no PTY and produces no output - and a spec asserting on "no output" can pass
+ * for entirely the wrong reason while the developer's screen fills with modal
+ * dialogs, one per run.
+ *
+ * Every mock in `tests/fixtures` ships a `.cmd` sibling that shells out to node for
+ * exactly this reason. `tests/unit/e2e-mock-cli-platform.test.ts` fails any spec
+ * that hand-rolls the path without the win32 branch.
+ *
+ * @param mockName Fixture basename with no extension, e.g. `mock-claude`.
+ */
+export function resolveMockAgentPath(mockName: string): string {
+  const fixturesDir = path.join(__dirname, '..', 'fixtures');
+  if (process.platform === 'win32') {
+    return path.join(fixturesDir, `${mockName}.cmd`);
+  }
+  const jsPath = path.join(fixturesDir, `${mockName}.js`);
+  // POSIX needs the executable bit for the shebang to be honoured; harmless to
+  // re-apply on every run.
+  fs.chmodSync(jsPath, 0o755);
+  return jsPath;
+}
+
 export function getTestDataDir(suiteName: string): string {
   const dir = path.join(TEST_DATA_ROOT, suiteName);
   // Remove stale data (global DB, configs) from previous runs
@@ -148,7 +177,16 @@ export async function launchApp(options?: {
   // "Session crashed" desktop notifications on the developer's machine. Tests
   // may pre-write their own config.json (e.g. with mock Claude CLI paths), so
   // merge rather than overwrite.
+  // Also record the running version as already having shown its "What's New"
+  // dialog. Without this the marker merges in as '' from DEFAULT_CONFIG, which
+  // does not match app.getVersion(), and WhatsNewDialog auto-opens a
+  // `fixed inset-0` backdrop over the spec and swallows every click. A test
+  // fixture is an ESTABLISHED install, not a user who just upgraded. Read from
+  // package.json so it tracks the version the launched app actually reports.
   const configPath = path.join(dataDir, 'config.json');
+  const appVersion = JSON.parse(
+    fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf-8'),
+  ).version as string;
   const notificationDefaults = {
     desktop: { onAgentIdle: false, onAgentCrash: false, onPlanComplete: false },
     toasts: { onAgentIdle: false, onAgentCrash: false, onPlanComplete: false, durationSeconds: 4, maxCount: 5 },
@@ -177,12 +215,17 @@ export async function launchApp(options?: {
       };
       changed = true;
     }
+    if (existing.lastWhatsNewShownVersion !== appVersion) {
+      existing.lastWhatsNewShownVersion = appVersion;
+      changed = true;
+    }
     if (changed) fs.writeFileSync(configPath, JSON.stringify(existing));
   } catch {
     fs.writeFileSync(configPath, JSON.stringify({
       hasCompletedFirstRun: true,
       notifications: notificationDefaults,
       compatibilityAcknowledgements,
+      lastWhatsNewShownVersion: appVersion,
     }));
   }
 
@@ -323,8 +366,20 @@ export async function closeApp(app: ElectronApplication | undefined): Promise<vo
       `${CLOSE_TIMEOUT_MS}ms - force-killing Electron process`,
   );
 
-  const electronProcess = app.process();
-  const pid = electronProcess?.pid;
+  // `process()` THROWS rather than returning undefined once Playwright has torn
+  // down its handle, which is exactly what happens when the app died on its own
+  // while `app.close()` was still hanging - the case this force-kill path exists
+  // for. Uncaught, that turns a teardown into a failed test: it surfaces as
+  // "Cannot read properties of undefined (reading '_object')" attributed to
+  // whichever test ran last, which is a flake, not a product regression.
+  // Treat it as the same "nothing left to kill" state the !pid branch handles.
+  let pid: number | undefined;
+  try {
+    pid = app.process()?.pid;
+  } catch (error) {
+    console.warn('[E2E closeApp] Electron process handle already gone - nothing to kill:', error);
+    return;
+  }
 
   if (!pid) {
     console.warn('[E2E closeApp] Could not obtain Electron PID - nothing to kill');
@@ -605,4 +660,72 @@ export async function moveTaskIpc(page: Page, taskId: string, targetSwimlaneId: 
       targetPosition: 0,
     });
   }, { taskId, targetSwimlaneId });
+}
+
+/** One SESSION_PTY_RESIZED echo recorded by armPtyEchoRecorder. */
+export interface PtyEchoEntry {
+  cols: number;
+  rows: number;
+  origin: string;
+}
+
+/**
+ * Subscribe an append-only recorder to the SESSION_PTY_RESIZED broadcast for
+ * one session, via the real preload bridge (production-safe: the bridge is not
+ * tree-shaken, unlike the devtools globals). Re-arming replaces any previous
+ * recorder. Read with readPtyEchoes / settledPtyEchoes.
+ */
+export async function armPtyEchoRecorder(page: Page, sessionId: string): Promise<void> {
+  await page.evaluate((echoSessionIdFilter) => {
+    const globalScope = window as unknown as {
+      __ptyEchoes?: Array<{ cols: number; rows: number; origin: string }>;
+      __ptyEchoUnsubscribe?: () => void;
+    };
+    globalScope.__ptyEchoes = [];
+    globalScope.__ptyEchoUnsubscribe?.();
+    globalScope.__ptyEchoUnsubscribe = window.electronAPI.sessions.onPtyResized(
+      (echoSessionId, cols, rows, origin) => {
+        if (echoSessionId !== echoSessionIdFilter) return;
+        globalScope.__ptyEchoes!.push({ cols, rows, origin });
+      },
+    );
+  }, sessionId);
+}
+
+/** Every echo the recorder has seen so far, in arrival order. */
+export async function readPtyEchoes(page: Page): Promise<PtyEchoEntry[]> {
+  return page.evaluate(() => {
+    const echoes = (window as unknown as { __ptyEchoes?: Array<{ cols: number; rows: number; origin: string }> })
+      .__ptyEchoes ?? [];
+    return echoes.slice();
+  });
+}
+
+/** Poll until the echo log stops growing (two consecutive 500ms reads agree)
+ *  and is non-empty, then return it. */
+export async function settledPtyEchoes(page: Page, timeoutMs: number, message?: string): Promise<PtyEchoEntry[]> {
+  let lastLength = -1;
+  await expect
+    .poll(async () => {
+      const echoes = await readPtyEchoes(page);
+      if (echoes.length === 0) return 'empty';
+      if (echoes.length === lastLength) return 'stable';
+      lastLength = echoes.length;
+      return 'changing';
+    }, {
+      message:
+        message
+        ?? 'The PTY-dims echo log never settled non-empty - either no real grid change '
+        + 'occurred here, or the SESSION_PTY_RESIZED broadcast is broken.',
+      timeout: timeoutMs,
+      intervals: [500],
+    })
+    .toBe('stable');
+  return readPtyEchoes(page);
+}
+
+/** Every width the TUI fixture has drawn a frame at (its RULER-<cols>- marker),
+ *  in scrollback order. */
+export function rulerWidths(scrollback: string): number[] {
+  return Array.from(scrollback.matchAll(/RULER-(\d+)-/g)).map((match) => parseInt(match[1], 10));
 }

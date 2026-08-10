@@ -280,10 +280,11 @@ export class StatusFileReader {
       traceRecorder.recordStatusDelta(sessionId, usage);
       this.callbacks.onUsageParsed(sessionId, usage);
       // First successful status parse: status.json is now flowing. Fire the
-      // handoff signal AFTER onUsageParsed - the latter's one-shot agent
-      // session-id capture (SessionTelemetry.processStatusUpdate) can trigger
-      // a transcript-reader re-attach via onAgentSessionId, and firing the
-      // detach after it cancels that in-flight attach cleanly.
+      // handoff signal AFTER onUsageParsed - the latter's agent session-id
+      // capture (SessionTelemetry.processStatusUpdate, change-sensitive on
+      // this channel) can trigger a transcript-reader re-attach via
+      // onAgentSessionId, and firing the detach after it cancels that
+      // in-flight attach cleanly.
       if (!state.firstStatusDelivered) {
         state.firstStatusDelivered = true;
         this.callbacks.onFirstStatus(sessionId);

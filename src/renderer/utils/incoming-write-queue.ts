@@ -47,11 +47,15 @@ export interface IncomingWriteQueue {
   kick(): void;
   /**
    * Drop buffered (not-yet-dispatched) bytes, acking them so backpressure is
-   * released, and stop. Bytes already handed to `xterm.write` but awaiting its
-   * callback are not covered here; the session-teardown path
-   * (`BackpressureController.release`) clears those. For session change / unmount.
+   * released, and stop. Returns how many were dropped. Bytes already handed to
+   * `xterm.write` but awaiting its callback are not covered here; the
+   * session-teardown path (`BackpressureController.release`) clears those.
+   *
+   * Two callers: session change / unmount, and the scrollback replay, which
+   * drops what the queue is HOLDING because a fresh sample already contains it
+   * (see the stale-held-byte note in useTerminal.ts).
    */
-  reset(): void;
+  reset(): number;
 }
 
 export interface IncomingWriteQueueOptions {
@@ -135,11 +139,12 @@ export function createIncomingWriteQueue(
       draining = true;
       drain();
     },
-    reset(): void {
+    reset(): number {
       const dropped = buffer.length;
       buffer = '';
       draining = false;
       if (dropped > 0) options.ack(dropped);
+      return dropped;
     },
   };
 }
