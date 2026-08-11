@@ -703,6 +703,7 @@ test.describe('agent monitor', () => {
       await expect(page.locator('body')).toHaveAttribute('data-monitor-card-space-default-prevented', 'true');
       await expect.poll(() => ownerHosts(page), { timeout: 10000 })
         .toHaveProperty(`${PROJECT_A}:task-a`, 'monitor');
+      await expect(page.locator('#monitor-detail-layer-root [data-testid="task-detail-close"]')).toBeVisible();
     } finally {
       await browser.close();
     }
@@ -741,6 +742,7 @@ test.describe('agent monitor', () => {
       await expect(page.locator('body')).toHaveAttribute('data-monitor-card-space-default-prevented', 'true');
       await expect.poll(() => ownerHosts(page), { timeout: 10000 })
         .toHaveProperty(`${PROJECT_A}:task-a`, 'monitor');
+      await expect(page.locator('#monitor-detail-layer-root [data-testid="task-detail-close"]')).toBeVisible();
     } finally {
       await browser.close();
     }
