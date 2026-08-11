@@ -40,7 +40,7 @@ import type {
   PerToolStat,
 } from '../../shared/types';
 import type { ActivityEngineOptions, ActivityStatsSnapshot } from '../activity-engine/engine';
-import type { TerminalFocusReport } from '../../shared/terminal-focus-report';
+import type { TerminalResponse } from '../../shared/terminal-response';
 
 export interface SessionManagerOptions {
   /**
@@ -603,9 +603,9 @@ export class SessionManager extends EventEmitter {
     this.writeCoordinator.recordUserInput(sessionId, data, occurredAt);
   }
 
-  writeFocusReport(sessionId: string, report: TerminalFocusReport): void {
+  writeTerminalResponse(sessionId: string, response: TerminalResponse): void {
     if (this.writeCoordinator.getSessionGeneration(sessionId) === null) return;
-    this.writeCoordinator.recordFocusReport(sessionId, report);
+    this.writeCoordinator.recordTerminalResponse(sessionId, response);
   }
 
   acquireUserSubmission(sessionId: string): UserSubmissionLease | null {

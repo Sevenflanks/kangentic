@@ -1,5 +1,5 @@
 import type { WriteQueue } from './write-queue';
-import type { TerminalFocusReport } from '../../shared/terminal-focus-report';
+import type { TerminalResponse } from '../../shared/terminal-response';
 
 export interface SubmissionLease {
   readonly sessionId: string;
@@ -109,13 +109,13 @@ export class SessionWriteCoordinator {
     return marker;
   }
 
-  recordFocusReport(sessionId: string, report: TerminalFocusReport): void {
+  recordTerminalResponse(sessionId: string, response: TerminalResponse): void {
     const state = this.requireState(sessionId);
     if (state.automation?.committed || state.userSubmission) {
-      state.deferredWrites.push(report);
+      state.deferredWrites.push(response);
       return;
     }
-    this.getWriteQueue(sessionId)?.enqueue(report);
+    this.getWriteQueue(sessionId)?.enqueue(response);
   }
 
   getSessionGeneration(sessionId: string): number | null {
@@ -219,8 +219,8 @@ export class SessionWriteCoordinator {
       state.userSubmission = null;
       if (state.automation?.committed) return;
 
-      // submit callback 可能用 writeRaw 分 chunk；ownership 清除後才把 focus reports 接回 FIFO，
-      // 並等 queue drained 才讓下一筆 submit 啟動，避免兩筆 raw submission 夾住 focus bytes。
+      // submit callback 可能用 writeRaw 分 chunk；ownership 清除後才把 terminal responses 接回 FIFO，
+      // 並等 queue drained 才讓下一筆 submit 啟動，避免兩筆 raw submission 夾住 response bytes。
       const queue = this.getWriteQueue(sessionId);
       const deferred = state.deferredWrites.splice(0, state.deferredWrites.length);
       for (const data of deferred) queue?.enqueue(data);

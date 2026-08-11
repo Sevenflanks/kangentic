@@ -3036,9 +3036,9 @@ describe('Input coordination', () => {
 
     // When
     manager.writeUserInput(session.id, 'human-1', 20);
-    manager.writeFocusReport(session.id, '\x1b[I');
+    manager.writeTerminalResponse(session.id, '\x1b[I');
     manager.writeUserInput(session.id, 'human-2', 21);
-    manager.writeFocusReport(session.id, '\x1b[O');
+    manager.writeTerminalResponse(session.id, '\x1b[O');
     automation?.release();
 
     // Then
