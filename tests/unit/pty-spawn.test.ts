@@ -91,6 +91,53 @@ describe('buildSpawnEnv', () => {
   });
 });
 
+describe('buildSpawnEnv OpenCode child bootstrap isolation', () => {
+  const childBootstrapEnvKeys = [
+    'KANGENTIC_OPENCODE_RESUME_SESSION_ID',
+    'KANGENTIC_OPENCODE_INITIAL_PROMPT_PATH',
+    'KANGENTIC_OPENCODE_TUI_INITIAL_PROMPT_PATH',
+  ] as const;
+  const savedHostValues = new Map<string, string | undefined>();
+
+  beforeEach(() => {
+    for (const key of childBootstrapEnvKeys) {
+      savedHostValues.set(key, process.env[key]);
+      process.env[key] = `inherited-${key}`;
+    }
+  });
+
+  afterEach(() => {
+    for (const key of childBootstrapEnvKeys) {
+      const savedHostValue = savedHostValues.get(key);
+      if (savedHostValue === undefined) delete process.env[key];
+      else process.env[key] = savedHostValue;
+    }
+    savedHostValues.clear();
+  });
+
+  it('strips inherited OpenCode child bootstrap variables from a fresh spawn', () => {
+    const env = buildSpawnEnv(undefined);
+
+    for (const key of childBootstrapEnvKeys) {
+      expect(env[key]).toBeUndefined();
+    }
+  });
+
+  it('preserves explicit OpenCode child bootstrap variables for the current spawn', () => {
+    const inputEnv = {
+      KANGENTIC_OPENCODE_RESUME_SESSION_ID: 'current-resume-session',
+      KANGENTIC_OPENCODE_INITIAL_PROMPT_PATH: 'C:/current/initial-prompt.md',
+      KANGENTIC_OPENCODE_TUI_INITIAL_PROMPT_PATH: 'C:/current/tui-initial-prompt.md',
+    };
+
+    const env = buildSpawnEnv(inputEnv);
+
+    for (const [key, value] of Object.entries(inputEnv)) {
+      expect(env[key]).toBe(value);
+    }
+  });
+});
+
 // Claude Code's fullscreen TUI intermittently omits history entries from its
 // incremental scrolled-view updates (anthropics/claude-code#83714). The
 // full-repaint flag removes the incremental path; Kangentic defaults it on

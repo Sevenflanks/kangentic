@@ -82,11 +82,23 @@ export function resolveShellArgs(shell: string): ShellInvocation {
  */
 export const FULL_REPAINT_ENV_KEY = 'CLAUDE_CODE_ALT_SCREEN_FULL_REPAINT';
 
+// Child-scoped OpenCode bootstrap values must not cross a nested Kangentic process
+// boundary, or a fresh child can consume its parent's native session or prompt state.
+const OPENCODE_CHILD_BOOTSTRAP_ENV_KEYS = new Set([
+  'KANGENTIC_OPENCODE_RESUME_SESSION_ID',
+  'KANGENTIC_OPENCODE_INITIAL_PROMPT_PATH',
+  'KANGENTIC_OPENCODE_TUI_INITIAL_PROMPT_PATH',
+]);
+
 export function buildSpawnEnv(
   inputEnv: Record<string, string> | undefined,
   platform: NodeJS.Platform = process.platform,
 ): Record<string, string> {
-  const merged = { ...process.env, ...inputEnv };
+  const ambientEnv = { ...process.env };
+  for (const key of OPENCODE_CHILD_BOOTSTRAP_ENV_KEYS) {
+    delete ambientEnv[key];
+  }
+  const merged = { ...ambientEnv, ...inputEnv };
   const result: Record<string, string> = {};
   for (const [key, value] of Object.entries(merged)) {
     if (value === undefined) continue;
