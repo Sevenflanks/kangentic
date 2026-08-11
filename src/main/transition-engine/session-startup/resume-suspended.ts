@@ -492,12 +492,17 @@ export async function resumeSuspendedSessions(
 
       retireRecord(sessionRepo, input.record.id);
 
+      // spawn DTO 可早於 adapter capture native ID；插入前以 registry 的 live Session 為準。
+      const persistedAgentSessionId = sessionManager.getSession(newSession.id)?.agentSessionId
+        ?? newSession.agentSessionId
+        ?? input.agentSessionId
+        ?? null;
       sessionRepo.insert({
         id: newSession.id,
         task_id: input.task.id,
         session_type: input.record.session_type,
         isolated_swimlane_id: input.record.isolated_swimlane_id,
-        agent_session_id: input.agentSessionId,
+        agent_session_id: persistedAgentSessionId,
         command: input.command,
         cwd: input.cwd,
         permission_mode: input.permissionMode,

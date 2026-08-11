@@ -262,12 +262,17 @@ export async function autoSpawnTasks(
         agent: input.agent,
       });
 
+      // spawn DTO 可早於 adapter capture native ID；插入前以 registry 的 live Session 為準。
+      const persistedAgentSessionId = sessionManager.getSession(newSession.id)?.agentSessionId
+        ?? newSession.agentSessionId
+        ?? input.agentSessionId
+        ?? null;
       sessionRepo.insert({
         id: newSession.id,
         task_id: input.task.id,
         session_type: input.adapter.sessionType,
         isolated_swimlane_id: input.isolatedSwimlaneId,
-        agent_session_id: input.agentSessionId,
+        agent_session_id: persistedAgentSessionId,
         command: input.command,
         cwd: input.cwd,
         permission_mode: input.permissionMode,
