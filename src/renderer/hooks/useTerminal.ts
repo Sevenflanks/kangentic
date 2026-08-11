@@ -352,14 +352,14 @@ export function useTerminal(options: UseTerminalOptions) {
     xtermRef.current = terminal;
     fitAddonRef.current = fitAddon;
 
-    // Send xterm data to PTY. Parser-generated focus responses use their own
-    // non-user route; all ordinary keyboard and clipboard paths retain batching.
+    // Parser-generated terminal responses use their own FIFO route without
+    // becoming human input; keyboard and clipboard paths retain batching.
     if (options.sessionId) {
       const sid = options.sessionId;
       terminal.onData((data) => routeTerminalData(
         data,
         batcher,
-        (report) => window.electronAPI.sessions.writeFocusReport(sid, report, options.projectId),
+        (response) => window.electronAPI.sessions.writeTerminalResponse(sid, response, options.projectId),
       ));
 
       // Debounced PTY resize -- coalesces rapid dimension changes so the

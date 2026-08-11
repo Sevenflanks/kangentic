@@ -5,9 +5,10 @@
  * utility works in isolation. These tests prove the hook wires the batcher
  * correctly:
  *
- *   - xterm onData events are routed through batcher.schedule (not directly
- *     to sessions.write), so a burst of synchronous keystrokes produces one
- *     IPC write per microtask instead of one per character.
+ *   - Ordinary xterm onData events are routed through batcher.schedule (not
+ *     directly to sessions.write), so a burst of synchronous keystrokes
+ *     produces one IPC write per microtask instead of one per character.
+ *     Parser-generated terminal responses use their dedicated IPC route.
  *
  *   - When sessionId is null at flush time (effectiveSessionId=null, xterm
  *     never initialized), sessions.write is never called even if the overlay
@@ -166,7 +167,7 @@ async function openCommandBarWithTerminal(page: Page): Promise<void> {
 }
 
 test.describe('WriteBatcher - useTerminal IPC wiring', () => {
-  test('DECSET focus reporting sends xterm FocusIn through focus-report IPC', async () => {
+  test('DECSET focus reporting sends xterm FocusIn through terminal-response IPC', async () => {
     const { browser, page } = await launchWithState(deterministicSpawnScript);
     try {
       await page.locator('[data-swimlane-name="To Do"]').waitFor({ state: 'visible', timeout: 15000 });
@@ -174,7 +175,7 @@ test.describe('WriteBatcher - useTerminal IPC wiring', () => {
 
       await page.evaluate(() => {
         window.electronAPI.sessions.__writeCalls.length = 0;
-        window.electronAPI.sessions.__focusReportCalls.length = 0;
+        window.electronAPI.sessions.__terminalResponseCalls.length = 0;
         window.__mockFireSessionData('sess-write-batcher-transient-1', '\x1b[?1004h');
       });
 
@@ -186,21 +187,44 @@ test.describe('WriteBatcher - useTerminal IPC wiring', () => {
       await textarea.focus();
 
       await expect.poll(() => page.evaluate(() =>
-        window.electronAPI.sessions.__focusReportCalls.length,
+        window.electronAPI.sessions.__terminalResponseCalls.length,
       )).toBeGreaterThan(0);
-      const focusReportCalls = await page.evaluate(() =>
-        window.electronAPI.sessions.__focusReportCalls,
+      const terminalResponseCalls = await page.evaluate(() =>
+        window.electronAPI.sessions.__terminalResponseCalls,
       );
-      expect(focusReportCalls).toEqual(expect.arrayContaining([
-        { sessionId: TRANSIENT_SESSION_ID, report: '\x1b[I', projectId: PROJECT_ID },
+      expect(terminalResponseCalls).toEqual(expect.arrayContaining([
+        { sessionId: TRANSIENT_SESSION_ID, response: '\x1b[I', projectId: PROJECT_ID },
       ]));
-      expect(focusReportCalls).toEqual(expect.arrayOf(
+      expect(terminalResponseCalls).toEqual(expect.arrayOf(
         {
           sessionId: TRANSIENT_SESSION_ID,
-          report: expect.stringMatching(/^\x1b\[[IO]$/),
+          response: expect.stringMatching(/^\x1b\[[IO]$/),
           projectId: PROJECT_ID,
         },
       ));
+      expect(await page.evaluate(() => window.electronAPI.sessions.__writeCalls)).toEqual([]);
+    } finally {
+      await browser.close();
+    }
+  });
+
+  test('primary device attributes query sends exact DA1 through terminal-response IPC', async () => {
+    const { browser, page } = await launchWithState(deterministicSpawnScript);
+    try {
+      await page.locator('[data-swimlane-name="To Do"]').waitFor({ state: 'visible', timeout: 15000 });
+      await openCommandBarWithTerminal(page);
+
+      await page.evaluate(() => {
+        window.electronAPI.sessions.__writeCalls.length = 0;
+        window.electronAPI.sessions.__terminalResponseCalls.length = 0;
+        window.__mockFireSessionData('sess-write-batcher-transient-1', '\x1b[c');
+      });
+
+      await expect.poll(() => page.evaluate(() =>
+        window.electronAPI.sessions.__terminalResponseCalls,
+      )).toEqual([
+        { sessionId: TRANSIENT_SESSION_ID, response: '\x1b[?1;2c', projectId: PROJECT_ID },
+      ]);
       expect(await page.evaluate(() => window.electronAPI.sessions.__writeCalls)).toEqual([]);
     } finally {
       await browser.close();
