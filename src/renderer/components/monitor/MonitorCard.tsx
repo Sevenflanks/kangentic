@@ -186,13 +186,19 @@ function MonitorCardInner({
     onContextMenu(row, { x: event.clientX, y: event.clientY });
   };
 
+  const handleKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    if (event.key !== 'Enter' && event.key !== ' ') return;
+    if (event.key === ' ') event.preventDefault();
+    onOpen(row);
+  };
+
   if (dense) {
     return (
       <div
         role="button"
         tabIndex={0}
         onClick={() => onOpen(row)}
-        onKeyDown={(event) => { if (event.key === 'Enter') onOpen(row); }}
+        onKeyDown={handleKeyDown}
         onContextMenu={handleContextMenu}
         className="border border-edge rounded-md bg-surface-raised px-2.5 py-1.5 min-w-0 flex items-center gap-2 hover:border-edge-input transition-colors cursor-pointer text-left"
         data-testid="monitor-card"
@@ -224,7 +230,7 @@ function MonitorCardInner({
       role="button"
       tabIndex={0}
       onClick={() => onOpen(row)}
-      onKeyDown={(event) => { if (event.key === 'Enter') onOpen(row); }}
+      onKeyDown={handleKeyDown}
       onContextMenu={handleContextMenu}
       className="border border-edge rounded-md bg-surface-raised p-2.5 min-w-0 flex flex-col cursor-pointer transition-colors hover:border-edge-input text-left"
       data-testid="monitor-card"

@@ -672,6 +672,80 @@ test.describe('agent monitor', () => {
     });
   }
 
+  test('a normal monitor card opens its detail with Enter and Space without scrolling', async () => {
+    const { browser, page } = await launchWithState(monitorPreConfig());
+    try {
+      await openMonitor(page);
+      const card = page.locator('[data-testid="monitor-card"][data-session-id="sess-working"]');
+
+      await card.focus();
+      await card.press('Enter');
+      await expect.poll(() => ownerHosts(page), { timeout: 10000 })
+        .toHaveProperty(`${PROJECT_A}:task-a`, 'monitor');
+      await page.locator('#monitor-detail-layer-root [data-testid="task-detail-close"]').click();
+      await expect.poll(
+        () => page.locator('#monitor-detail-layer-root [data-testid^="window-frame-"]').count(),
+        { timeout: 10000 },
+      ).toBe(0);
+      await expect.poll(async () => (await ownerHosts(page))[`${PROJECT_A}:task-a`] ?? null)
+        .toBeNull();
+
+      await page.evaluate(() => {
+        document.body.dataset.monitorCardSpaceDefaultPrevented = 'unset';
+        document.addEventListener('keydown', (event) => {
+          if (event.key === ' ') {
+            document.body.dataset.monitorCardSpaceDefaultPrevented = String(event.defaultPrevented);
+          }
+        }, { once: true });
+      });
+      await card.focus();
+      await card.press('Space');
+      await expect(page.locator('body')).toHaveAttribute('data-monitor-card-space-default-prevented', 'true');
+      await expect.poll(() => ownerHosts(page), { timeout: 10000 })
+        .toHaveProperty(`${PROJECT_A}:task-a`, 'monitor');
+    } finally {
+      await browser.close();
+    }
+  });
+
+  test('a dense monitor card opens its detail with Enter and Space without scrolling', async () => {
+    const { browser, page } = await launchWithState(monitorPreConfig());
+    try {
+      await openMonitor(page);
+      await page.locator('[data-testid="monitor-layout-list"]').click();
+      const card = page.locator('[data-testid="monitor-card"][data-session-id="sess-working"]');
+      await expect(card).toHaveAttribute('data-dense', 'true');
+
+      await card.focus();
+      await card.press('Enter');
+      await expect.poll(() => ownerHosts(page), { timeout: 10000 })
+        .toHaveProperty(`${PROJECT_A}:task-a`, 'monitor');
+      await page.locator('#monitor-detail-layer-root [data-testid="task-detail-close"]').click();
+      await expect.poll(
+        () => page.locator('#monitor-detail-layer-root [data-testid^="window-frame-"]').count(),
+        { timeout: 10000 },
+      ).toBe(0);
+      await expect.poll(async () => (await ownerHosts(page))[`${PROJECT_A}:task-a`] ?? null)
+        .toBeNull();
+
+      await page.evaluate(() => {
+        document.body.dataset.monitorCardSpaceDefaultPrevented = 'unset';
+        document.addEventListener('keydown', (event) => {
+          if (event.key === ' ') {
+            document.body.dataset.monitorCardSpaceDefaultPrevented = String(event.defaultPrevented);
+          }
+        }, { once: true });
+      });
+      await card.focus();
+      await card.press('Space');
+      await expect(page.locator('body')).toHaveAttribute('data-monitor-card-space-default-prevented', 'true');
+      await expect.poll(() => ownerHosts(page), { timeout: 10000 })
+        .toHaveProperty(`${PROJECT_A}:task-a`, 'monitor');
+    } finally {
+      await browser.close();
+    }
+  });
+
   // ── the persisted layout (AppConfig.monitorWorkspace) ──
   //
   // The monitor's window store is a module singleton, so an in-app close/reopen brings
