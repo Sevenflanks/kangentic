@@ -66,17 +66,17 @@ function makeRecord(overrides: Partial<SessionRecord>): SessionRecord {
 }
 
 interface RecoveryRepoStub {
-  findByAnyId: ReturnType<typeof vi.fn>;
+  findById: ReturnType<typeof vi.fn>;
   getLatestForTask: ReturnType<typeof vi.fn>;
   updateAgentSessionId: ReturnType<typeof vi.fn>;
 }
 
 function makeRecoveryRepo(options: {
-  byAnyId?: SessionRecord;
+  byId?: SessionRecord;
   latestForTask?: SessionRecord;
 }): RecoveryRepoStub {
   return {
-    findByAnyId: vi.fn(() => options.byAnyId),
+    findById: vi.fn(() => options.byId),
     getLatestForTask: vi.fn(() => options.latestForTask),
     updateAgentSessionId: vi.fn(),
   };
@@ -116,12 +116,12 @@ describe('SessionRepository.updateAgentSessionId', () => {
 describe('recoverStaleSessionId', () => {
   it('fresh capture: fills a null agent_session_id on the exact record', () => {
     const record = makeRecord({ id: 'pty-1', agent_session_id: null });
-    const repo = makeRecoveryRepo({ byAnyId: record });
+    const repo = makeRecoveryRepo({ byId: record });
 
     const changed = recoverStaleSessionId(asRepo(repo), 'pty-1', 'task-1', 'captured-id');
 
     expect(changed).toBe(true);
-    expect(repo.findByAnyId).toHaveBeenCalledWith('pty-1');
+    expect(repo.findById).toHaveBeenCalledWith('pty-1');
     expect(repo.updateAgentSessionId).toHaveBeenCalledWith('pty-1', 'captured-id');
     // The exact-record match means the coarse fallback is never consulted.
     expect(repo.getLatestForTask).not.toHaveBeenCalled();
@@ -129,7 +129,7 @@ describe('recoverStaleSessionId', () => {
 
   it('stale recovery / mid-session fork: rewrites a DIFFERENT reported id', () => {
     const record = makeRecord({ id: 'pty-1', agent_session_id: 'pre-clear-id' });
-    const repo = makeRecoveryRepo({ byAnyId: record });
+    const repo = makeRecoveryRepo({ byId: record });
 
     const changed = recoverStaleSessionId(asRepo(repo), 'pty-1', 'task-1', 'post-clear-id');
 
@@ -139,7 +139,7 @@ describe('recoverStaleSessionId', () => {
 
   it('same reported id is a no-op returning false', () => {
     const record = makeRecord({ id: 'pty-1', agent_session_id: 'agent-1' });
-    const repo = makeRecoveryRepo({ byAnyId: record });
+    const repo = makeRecoveryRepo({ byId: record });
 
     const changed = recoverStaleSessionId(asRepo(repo), 'pty-1', 'task-1', 'agent-1');
 
@@ -149,32 +149,32 @@ describe('recoverStaleSessionId', () => {
 
   it('repeated forks keep targeting the same record by primary key', () => {
     // After the first reconcile the record carries fork-1; a second /clear
-    // reports fork-2. findByAnyId is passed the PTY session id (the record's
+    // reports fork-2. findById is passed the PTY session id (the record's
     // PRIMARY KEY), which no rewrite of agent_session_id can unmatch, so the
     // second call still lands on the same row.
     const record = makeRecord({ id: 'pty-1', agent_session_id: 'fork-1' });
-    const repo = makeRecoveryRepo({ byAnyId: record });
+    const repo = makeRecoveryRepo({ byId: record });
 
     const changed = recoverStaleSessionId(asRepo(repo), 'pty-1', 'task-1', 'fork-2');
 
     expect(changed).toBe(true);
-    expect(repo.findByAnyId).toHaveBeenCalledWith('pty-1');
+    expect(repo.findById).toHaveBeenCalledWith('pty-1');
     expect(repo.updateAgentSessionId).toHaveBeenCalledWith('pty-1', 'fork-2');
   });
 
-  it('falls back to the latest task record only when the exact id misses (pre-insert window)', () => {
-    const latest = makeRecord({ id: 'latest-record', agent_session_id: null });
-    const repo = makeRecoveryRepo({ byAnyId: undefined, latestForTask: latest });
+  it('returns false without mutating another task row when the exact id misses before insert', () => {
+    const previousRecord = makeRecord({ id: 'previous-record', agent_session_id: null });
+    const repo = makeRecoveryRepo({ byId: undefined, latestForTask: previousRecord });
 
     const changed = recoverStaleSessionId(asRepo(repo), 'pty-not-inserted-yet', 'task-1', 'captured-id');
 
-    expect(changed).toBe(true);
-    expect(repo.getLatestForTask).toHaveBeenCalledWith('task-1');
-    expect(repo.updateAgentSessionId).toHaveBeenCalledWith('latest-record', 'captured-id');
+    expect(changed).toBe(false);
+    expect(repo.getLatestForTask).not.toHaveBeenCalled();
+    expect(repo.updateAgentSessionId).not.toHaveBeenCalled();
   });
 
   it('returns false when no record exists at all', () => {
-    const repo = makeRecoveryRepo({ byAnyId: undefined, latestForTask: undefined });
+    const repo = makeRecoveryRepo({ byId: undefined, latestForTask: undefined });
 
     const changed = recoverStaleSessionId(asRepo(repo), 'pty-1', 'task-1', 'captured-id');
 
