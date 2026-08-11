@@ -11,7 +11,11 @@ import { autoSpawnForTask } from '../ipc/helpers';
 import { handleTaskMove } from '../ipc/handlers/task-move';
 import { WorktreeManager } from '../git/worktree-manager';
 import { recordPush } from '../diagnostics/ipc-recorder';
-import { propagateBoardProfileChange } from '../ipc/handlers/strategy-propagation';
+import {
+  propagateBoardProfileChange,
+  propagateStrategyToLiveSessions,
+  buildColumnStrategyChanges,
+} from '../ipc/handlers/strategy-propagation';
 import type { CommandContext } from './commands';
 import type { IpcContext } from '../ipc/ipc-context';
 import type { AppConfig } from '../../shared/types';
@@ -71,7 +75,7 @@ export function buildCommandContextForProject(
       // through the active context, and a background project has no live PTYs to
       // update; its tasks pick the change up from config when they next spawn.
       if (projectId === ipcContext.currentProjectId) {
-        propagateBoardProfileChange(ipcContext, previousProfiles, profiles);
+        propagateBoardProfileChange(ipcContext, previousProfiles, profiles, projectId);
       }
     },
 
@@ -133,7 +137,26 @@ export function buildCommandContextForProject(
       return result;
     },
 
-    onSwimlaneUpdated: (swimlane) => {
+    onTasksReordered: (swimlane, orderedTaskIds) => {
+      // SWIMLANE_UPDATED_BY_AGENT, not TASK_UPDATED_BY_AGENT, and the channel
+      // rather than `onSwimlaneUpdated`.
+      //
+      // The channel: the renderer fires a toast per push, and the task one
+      // names a single card ("Task updated by agent: X"), so an eight-card
+      // reorder would announce one arbitrary card. The swimlane handler is
+      // deliberately kind-agnostic ("Column changed by agent") - see the
+      // comment on it in `useAgentDrivenInvalidation` - which is exactly right
+      // for a reorder, and it runs the same `scheduleBoardReload()` that
+      // refetches tasks.
+      //
+      // Not the callback: `onSwimlaneUpdated` also writes back to
+      // `kangentic.json` and propagates column strategy to live sessions. A
+      // reorder changes neither the column's config nor any session.
+      sendToRenderer(ipcContext.mainWindow, IPC.SWIMLANE_UPDATED_BY_AGENT, swimlane.id, swimlane.name, projectId);
+      ipcContext.boardEvents.emitBoardChanged({ projectId, change: 'task-updated', ids: orderedTaskIds });
+    },
+
+    onSwimlaneUpdated: (swimlane, previous) => {
       sendToRenderer(ipcContext.mainWindow, IPC.SWIMLANE_UPDATED_BY_AGENT, swimlane.id, swimlane.name, projectId);
       ipcContext.boardEvents.emitBoardChanged({ projectId, change: 'swimlane-updated', ids: [swimlane.id] });
       // Persist team-shared column fields (color, model/effort/permission
@@ -142,6 +165,42 @@ export function buildCommandContextForProject(
       // so a cross-project update_column reaches the right project's file, not
       // just the currently-active one. Best-effort: writeBackForProject never
       // throws.
+      ipcContext.boardConfigManager.writeBackForProject(projectId, projectPath);
+      // The same live-session propagation the Board Manager's own save runs. This
+      // path used to do NOTHING here, so an agent editing a column missed even
+      // the model/effort injection the UI path has, on top of the auto_spawn
+      // reconcile.
+      //
+      // Scoped to the ACTIVE project deliberately, and NOT because a background
+      // project has no live sessions - it can have them, which is what the
+      // cross-project Agent Monitor and the sidebar's per-project agent counts
+      // are built on. The reason is blast radius: this reconcile SPAWNS, and a
+      // spawn creates a worktree and checks out a branch in a checkout the user
+      // is not looking at. A background project's tasks pick the new column
+      // config up when they next spawn. The cost is that an agent turning
+      // auto_spawn off on a non-focused project leaves that project's agents
+      // running until it is next opened.
+      if (previous && projectId === ipcContext.currentProjectId) {
+        propagateStrategyToLiveSessions(
+          ipcContext,
+          'MCP_UPDATE_COLUMN',
+          buildColumnStrategyChanges({ context: ipcContext, projectId, before: previous, after: swimlane }),
+          projectId,
+        );
+      }
+    },
+
+    onSwimlaneDeleted: (swimlane) => {
+      // Reuses SWIMLANE_UPDATED_BY_AGENT rather than adding a delete channel:
+      // the renderer's only consumer (useAgentDrivenInvalidation) treats it as
+      // "this project's columns changed, re-read them", which is exactly right
+      // for a delete.
+      sendToRenderer(ipcContext.mainWindow, IPC.SWIMLANE_UPDATED_BY_AGENT, swimlane.id, swimlane.name, projectId);
+      ipcContext.boardEvents.emitBoardChanged({ projectId, change: 'swimlane-updated', ids: [swimlane.id] });
+      // Load-bearing, not just for teammates: kangentic.json re-seeds the DB on
+      // project open (applyConfigOnOpen runs before the export), so without this
+      // the deleted column is re-created from the stale file entry - with the
+      // same uuid - the next time the project is opened.
       ipcContext.boardConfigManager.writeBackForProject(projectId, projectPath);
     },
 

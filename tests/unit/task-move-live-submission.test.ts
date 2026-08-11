@@ -61,7 +61,7 @@ describe('handleTaskMove live lane submission', () => {
     expect(scheduler.scheduleKeystrokes).toHaveBeenCalledWith(
       state.task.id,
       'pty-live-1',
-      ['/effort high'],
+      [{ text: '/effort high', verify: 'command-match' }],
       expect.objectContaining({ verifiedPrefixLength: 1 }),
     );
     expect(scheduler.scheduleNativeIdleSubmission).toHaveBeenCalledTimes(1);
@@ -116,7 +116,10 @@ describe('handleTaskMove live lane submission', () => {
     expect(scheduler.scheduleKeystrokes).toHaveBeenCalledWith(
       state.task.id,
       'pty-live-1',
-      ['/effort high', '/task-level-command'],
+      [
+        { text: '/effort high', verify: 'command-match' },
+        { text: '/task-level-command', verify: 'submitted' },
+      ],
       expect.objectContaining({ verifiedPrefixLength: 1 }),
     );
     expect(scheduler.scheduleNativeIdleSubmission).not.toHaveBeenCalled();
@@ -239,7 +242,7 @@ describe('handleTaskMove live lane submission', () => {
     expect(scheduler.scheduleKeystrokes).toHaveBeenCalledWith(
       state.task.id,
       'pty-live-1',
-      ['/effort high'],
+      [{ text: '/effort high', verify: 'command-match' }],
       expect.anything(),
     );
     expect(scheduler.scheduleNativeIdleSubmission).not.toHaveBeenCalled();

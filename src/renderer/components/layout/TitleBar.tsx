@@ -1,10 +1,12 @@
 import React from 'react';
-import { ChartColumn, Command, Compass, Mic, Minus, Settings, Square, X } from 'lucide-react';
+import { ChartColumn, CloudDownload, Command, Compass, Mic, Minus, Settings, Square, SquareActivity, X } from 'lucide-react';
 import { useProjectStore } from '../../stores/project-store';
 import { useConfigStore } from '../../stores/config-store';
 import { useDictationStore } from '../../stores/dictation-store';
 import { useSessionStore } from '../../stores/session-store';
+import { useUpdaterStore } from '../../stores/updater-store';
 import { useUsageDashboardStore } from '../../stores/usage-dashboard-store';
+import { useMonitorStore } from '../../stores/monitor-store';
 import { warmStatsDashboard } from '../stats/LazyStatsDashboard';
 import { usePopOut } from '../../pop-out/usePopOut';
 import { selectCommandTerminalSummary } from '../../stores/session-store/transient-session-slice';
@@ -41,7 +43,7 @@ export function TitleBar({
   const setOnboardingChecklistOpen = useConfigStore((s) => s.setOnboardingChecklistOpen);
   const setSettingsOpen = useConfigStore((s) => s.setSettingsOpen);
   const openProjectSettings = useConfigStore((s) => s.openProjectSettings);
-  const openSettingsToTab = useConfigStore((s) => s.openSettingsToTab);
+  const setLastSettingsTab = useConfigStore((s) => s.setLastSettingsTab);
 
   // Voice dictation mic button: shown only when dictation is enabled; its color
   // reflects whether a push-to-talk session is live (active token), matching the
@@ -49,6 +51,8 @@ export function TitleBar({
   const dictationEnabled = useConfigStore((s) => s.globalConfig.dictation?.enabled ?? false);
   const dictationStatus = useDictationStore((s) => s.status);
   const dictationActive = dictationStatus === 'recording' || dictationStatus === 'finalizing';
+  const pendingUpdate = useUpdaterStore((s) => s.pendingUpdate);
+  const openUpdateModal = useUpdaterStore((s) => s.openModal);
 
   // Aggregate activity across THIS project's Command Terminal sessions, surfaced
   // as the title-bar terminal icon's COLOR (the same active/idle language as the
@@ -65,6 +69,7 @@ export function TitleBar({
   const commandTerminalCombo = useFormattedCombo('commandBar.toggle');
   const settingsCombo = useFormattedCombo('settings.toggle');
   const statsCombo = useFormattedCombo('stats.toggle');
+  const monitorCombo = useFormattedCombo('monitor.toggle');
 
   // Store-direct like the Settings gear (statsOpen is dashboard-store state).
   const statsOpen = useUsageDashboardStore((state) => state.statsOpen);
@@ -81,6 +86,12 @@ export function TitleBar({
   // focuses that window instead of toggling the (suppressed) in-app overlay.
   const statsPopOut = usePopOut('stats', {});
 
+  const monitorOpen = useMonitorStore((state) => state.monitorOpen);
+  const toggleMonitor = useMonitorStore((state) => state.toggle);
+  // Like stats: when detached, this button focuses that window rather than
+  // toggling the (suppressed) in-app overlay.
+  const monitorPopOut = usePopOut('monitor', {});
+
   const isWorktree = currentProject?.path ? isWorktreePath(currentProject.path) : false;
 
   const handleGearClick = () => {
@@ -93,20 +104,23 @@ export function TitleBar({
     }
   };
 
-  // Push-to-talk is the primary trigger; clicking the mic opens settings directly
-  // to the Dictation tab (works with or without a project, since it is global).
   const handleMicClick = () => {
     if (currentProject) {
       openProjectSettings(currentProject.path, currentProject.name, 'dictation');
     } else {
-      openSettingsToTab('dictation');
+      setLastSettingsTab('dictation');
+      setSettingsOpen(true);
     }
   };
 
   return (
-    // The title bar is intentionally NOT a `data-dismiss-surface`: it is the OS
-    // window-drag region (`-webkit-app-region: drag`), so the OS swallows clicks here
-    // to move the window before the renderer ever sees them. A click cannot dismiss.
+    // The title bar carries no `data-dismiss-layer`, and neither does AppLayout's root
+    // above it, so a click here resolves to no light-dismiss scope and closes nothing.
+    // That is the right outcome for an independent reason: this is the OS window-drag
+    // region (`-webkit-app-region: drag`), so the OS swallows clicks here to move the
+    // window before the renderer ever sees them. A click cannot dismiss either way. The
+    // interactive children opt out of the drag region and are <button>s, which the
+    // denylist excludes, so they still act on the first click.
     <div className={`relative h-10 bg-surface border-b border-edge flex items-center select-none flex-shrink-0 ${isMac ? 'pl-20 pr-3' : 'px-3'}`}
          style={{ WebkitAppRegion: 'drag' } as React.CSSProperties}>
       {/* Branding -- logo + app name */}
@@ -114,13 +128,15 @@ export function TitleBar({
         <BrandMark className="w-5 h-5 text-fg-secondary" />
         <span className="text-sm font-semibold text-fg-secondary">Kangentic</span>
         {/*
-          Dev-only (preview): the original task's title after the wordmark, in a muted
-          pill (raised surface + edge border) so it stands out without the low-contrast
-          of a colored fill, so each preview window is identifiable when several are open
-          ("Project N" still tells the two clones apart). Shown in full (no truncation,
-          by request). Surface/edge/fg tokens re-color across all themes. Built out of
-          prod by __KANGENTIC_DEV__; previewTaskTitle is non-null only in `/preview`, so
-          its truthiness gates the render.
+          Dev-only (preview): the original task's `#<id> - <title>` label after the
+          wordmark, in a muted pill (raised surface + edge border) so it stands out without
+          the low-contrast of a colored fill, so each preview window is identifiable when
+          several are open ("Project N" still tells the two clones apart). Main composes
+          the label and reuses the identical string as the OS window title, so the pill and
+          the taskbar thumbnail cannot drift. Shown in full (no truncation, by request).
+          Surface/edge/fg tokens re-color across all themes. Built out of prod by
+          __KANGENTIC_DEV__; previewTaskTitle is non-null only in `/preview`, so its
+          truthiness gates the render.
         */}
         {__KANGENTIC_DEV__ && window.electronAPI.dev?.previewTaskTitle && (
           <span
@@ -150,13 +166,24 @@ export function TitleBar({
       <div className="flex-1" />
 
       <div className="flex items-center gap-1" style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}>
+        {pendingUpdate && (
+          <button
+            onClick={openUpdateModal}
+            className="p-1.5 hover:bg-surface-hover rounded text-attention transition-colors"
+            title={`Version ${pendingUpdate.version} is ready to install`}
+            aria-label="Update available"
+            data-testid="update-available-button"
+          >
+            <CloudDownload size={20} />
+          </button>
+        )}
         {/* "New terminal" + the Command Terminal toggle are the LEFT-MOST icons
             in this row on purpose: this row is right-anchored (the flex-1
             spacer eats the space to its left), so an element's on-screen
             position is fixed by whatever comes AFTER it, not before it. Keeping
             this pair first means the conditional "New terminal" button
             mounting/unmounting as the layer opens/closes never shifts Quick
-            Find / mic / stats / settings / the window controls - only this
+            Find / stats / settings / the window controls - only this
             pair's own position moves. "New terminal" sits to the LEFT of the
             toggle (reads outward from the toggle as the layer gains a spawn
             affordance) and reuses the same terminal glyph with the center `+`
@@ -197,6 +224,48 @@ export function TitleBar({
             <CommandTerminalIcon tone={transientActivityTone} />
           </button>
         )}
+        {/* Agent Monitor, deliberately ADJACENT to the Command Terminal toggle: both
+            open a surface full of running agents, so they belong together.
+
+            NOT an activity mark, and NOT toned. The branding marks all MEAN a state
+            (`agent-idle` is the needs-you envelope), so drawing one here would claim
+            the monitor itself is idle. This icon names a surface. And activity colour
+            belongs to where an agent is spawned from and lives (the board card, the
+            Command Terminal toggle, the sidebar counts); the monitor is a view over
+            those, so tinting it would restate a signal the user already has at its
+            source. Neutral, like Quick Find and Stats.
+
+            Renders unconditionally (like the stats button) because the monitor is
+            machine-global: it spans every registered project and is useful with no
+            project open at all. */}
+        <button
+          onClick={() => (monitorPopOut.isOpen ? monitorPopOut.focus() : toggleMonitor())}
+          className={`p-1.5 hover:bg-surface-hover rounded transition-colors ${
+            monitorOpen || monitorPopOut.isOpen ? 'text-fg bg-surface-hover' : 'text-fg-muted hover:text-fg'
+          }`}
+          title={monitorPopOut.isOpen ? 'Focus agent monitor window' : `Agent Monitor (${monitorCombo})`}
+          aria-label="Agent Monitor"
+          data-testid="agent-monitor-button"
+        >
+          <SquareActivity size={20} />
+        </button>
+        <button
+          onClick={() => (statsPopOut.isOpen ? statsPopOut.focus() : toggleStats())}
+          onMouseEnter={handleStatsHover}
+          className={`p-1.5 hover:bg-surface-hover rounded transition-colors ${
+            statsOpen || statsPopOut.isOpen ? 'text-fg bg-surface-hover' : 'text-fg-muted hover:text-fg'
+          }`}
+          title={statsPopOut.isOpen ? 'Focus usage stats window' : `Usage Stats (${statsCombo})`}
+          aria-label="Usage Stats"
+          data-testid="usage-stats-button"
+        >
+          <ChartColumn size={20} />
+        </button>
+        {/* Quick Find sits to the RIGHT of Usage Stats: it is the one control here
+            that opens a transient overlay the user dismisses immediately, so it
+            reads as the last step out of the icon cluster before Settings, while
+            the monitor and stats buttons (both surfaces over running work) stay
+            adjacent to each other. */}
         {onOpenSearch && (
           <button
             onClick={onOpenSearch}
@@ -222,18 +291,6 @@ export function TitleBar({
             <Mic size={20} />
           </button>
         )}
-        <button
-          onClick={() => (statsPopOut.isOpen ? statsPopOut.focus() : toggleStats())}
-          onMouseEnter={handleStatsHover}
-          className={`p-1.5 hover:bg-surface-hover rounded transition-colors ${
-            statsOpen || statsPopOut.isOpen ? 'text-fg bg-surface-hover' : 'text-fg-muted hover:text-fg'
-          }`}
-          title={statsPopOut.isOpen ? 'Focus usage stats window' : `Usage Stats (${statsCombo})`}
-          aria-label="Usage Stats"
-          data-testid="usage-stats-button"
-        >
-          <ChartColumn size={20} />
-        </button>
         {/* Dev only, and deliberately so. Onboarding is a first-run experience: it shows once
             per project and then retires itself, and a permanent re-entry button in the title
             bar of a shipped app is clutter for a thing the user has already done (or already

@@ -66,6 +66,10 @@ const ALLOWLIST_CHANNELS = new Set([
   'SESSION_WRITE',
   'SESSION_RESIZE',
   'SESSION_SET_FOCUSED',
+  // By-session-id, per-renderer, no project semantics: the whole-set replace
+  // of "which sessions have an xterm mounted" that the resting park's held
+  // check reads (terminal-mount-registry.ts).
+  'SESSION_SET_MOUNTED',
   'SESSION_NOTIFY_USER_INTERRUPT',
   'SESSION_INJECT_SETTINGS',
   'SESSION_SPAWN_TRANSIENT',
@@ -83,6 +87,15 @@ function extractTaskSessionInvokes(source: string): InvokeCall[] {
   const calls: InvokeCall[] = [];
   // Match ipcRenderer.invoke(IPC.TASK_* | IPC.SESSION_*, <args up to the closing paren>).
   // These invoke calls have no nested parens in their argument lists, so [^)]* is safe.
+  //
+  // The MONITOR_* and DETAIL_* channels are deliberately OUT OF SCOPE, not merely
+  // unmatched by accident. They are machine-global: the Agent Monitor spans every
+  // registered project, and task-detail ownership arbitrates WHICH RENDERER hosts a
+  // detail rather than mutating any task. Some of them do carry a projectId in the
+  // payload, but as an identifier of the row being read, not as the routing stamp
+  // this rule is about. If a future DETAIL_*/MONITOR_* channel does mutate
+  // task-scoped state, rename it into the TASK_/SESSION_ prefix so this scan claims
+  // it, or add it here with a reason.
   const pattern = /ipcRenderer\.invoke\(\s*(IPC\.(?:TASK|SESSION)_[A-Z0-9_]+)((?:,\s*[^)]*)?)\)/g;
   let match: RegExpExecArray | null;
   while ((match = pattern.exec(source)) !== null) {

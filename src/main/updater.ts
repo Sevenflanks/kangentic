@@ -3,6 +3,7 @@ import * as path from 'path';
 import { app, BrowserWindow, ipcMain } from 'electron';
 import { autoUpdater } from 'electron-updater';
 import { IPC } from '../shared/ipc-channels';
+import type { UpdateDownloadedInfo } from '../shared/types';
 import { trackEvent, sanitizeErrorMessage } from './analytics/analytics';
 
 const CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000; // 4 hours
@@ -148,7 +149,13 @@ export function initUpdater(mainWindow: BrowserWindow): void {
   autoUpdater.on('update-downloaded', (info) => {
     console.log('[UPDATER] Update downloaded:', info.version);
     if (updaterWindow && !updaterWindow.isDestroyed()) {
-      updaterWindow.webContents.send(IPC.UPDATE_DOWNLOADED, { version: info.version });
+      const update: UpdateDownloadedInfo = {
+        version: info.version,
+        releaseNotes: typeof info.releaseNotes === 'string'
+          ? info.releaseNotes
+          : info.releaseNotes?.map(({ note }) => note ?? '').filter((note) => note.length > 0).join('\n\n') ?? '',
+      };
+      updaterWindow.webContents.send(IPC.UPDATE_DOWNLOADED, update);
     }
   });
 

@@ -24,12 +24,9 @@ export interface TerminalScrollbackCapture {
 
 export type TerminalCaptureReader = () => TerminalScrollbackCapture;
 
-// @ts-expect-error -- Vite handles import.meta.hot; tsc's "module": "commonjs" doesn't support it
 const readers: Map<string, TerminalCaptureReader> = import.meta.hot?.data?.terminalCaptureReaders ?? new Map();
 
-// @ts-expect-error -- Vite handles import.meta.hot
 if (import.meta.hot) {
-  // @ts-expect-error -- Vite handles import.meta.hot
   import.meta.hot.dispose((data: Record<string, unknown>) => {
     data.terminalCaptureReaders = readers;
   });

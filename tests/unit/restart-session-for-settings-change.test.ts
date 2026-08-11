@@ -111,6 +111,11 @@ import { restartSessionForSettingsChange } from '../../src/main/ipc/handlers/ses
 
 const TASK_ID = 'task-restart-1';
 const SESSION_ID = 'live-session-abc';
+// The session id the CLI resumes onto after resumeSuspendedSession succeeds.
+// Deliberately distinct from both SESSION_ID (the pre-suspend id) and null
+// (the value used for the line-116 re-read), so an assertion against this
+// value proves markIdleAuthoritative read the post-respawn row, not a stale one.
+const RESUMED_SESSION_ID = 'resumed-session-def';
 const PROJECT_ID = 'proj-restart';
 const PROJECT_PATH = '/mock/restart-project';
 
@@ -152,6 +157,9 @@ function makeContext(sessionSuspend: ReturnType<typeof vi.fn> = vi.fn(async () =
       suspend: sessionSuspend,
       spawn: vi.fn(),
       getSession: vi.fn(() => null),
+      // The post-respawn idle-authoritative pin (session-reconcile.ts:155).
+      // Asserted directly by the happy-path and no-session-id tests below.
+      markIdleAuthoritative: vi.fn(),
     },
     configManager: {
       getEffectiveConfig: vi.fn(() => ({
@@ -227,14 +235,18 @@ describe('restartSessionForSettingsChange', () => {
   it('suspends the session, re-reads task and lane, and routes an idle explicit resume through spawnAgent', async () => {
     // First getById call (inside applySuspendDbWrites) returns task with session.
     // Second getById call (re-read after applySuspendDbWrites) returns task without
-    // session_id (cleared by applySuspendDbWrites's tasks.update).
+    // session_id (cleared by applySuspendDbWrites's tasks.update). Third getById
+    // call (post-respawn read) returns a task pointed at the newly-resumed
+    // session id, distinct from both SESSION_ID and null.
     const liveTask = makeTask(SESSION_ID);
     const updatedTask = makeTask(null);
+    const resumedTask = makeTask(RESUMED_SESSION_ID);
     const taskRepo = {
       getById: vi.fn()
-        .mockReturnValueOnce(liveTask)   // restartSessionForSettingsChange: initial read (line 83)
-        .mockReturnValueOnce(liveTask)   // applySuspendDbWrites: internal read (line 30)
-        .mockReturnValueOnce(updatedTask) // restartSessionForSettingsChange: re-read after suspend
+        .mockReturnValueOnce(liveTask)    // restartSessionForSettingsChange: initial read (line 98)
+        .mockReturnValueOnce(liveTask)    // applySuspendDbWrites: internal read (line 33)
+        .mockReturnValueOnce(updatedTask) // restartSessionForSettingsChange: re-read after suspend (line 116)
+        .mockReturnValueOnce(resumedTask) // restartSessionForSettingsChange: post-respawn read (line 154)
         ,
       update: vi.fn(),
     };
@@ -280,6 +292,8 @@ describe('restartSessionForSettingsChange', () => {
       attachments: expect.anything(),
     }));
     expect(engine.resumeSuspendedSession).not.toHaveBeenCalled();
+    // Then: a promptless successful respawn marks its newly assigned session idle.
+    expect(context.sessionManager.markIdleAuthoritative).toHaveBeenCalledWith(RESUMED_SESSION_ID);
   });
 
   it('treats a compatibility-required explicit resume as handled after suspension without creating a replacement PTY', async () => {
@@ -320,6 +334,38 @@ describe('restartSessionForSettingsChange', () => {
     }));
     expect(engine.resumeSuspendedSession).not.toHaveBeenCalled();
     expect(context.sessionManager.spawn).not.toHaveBeenCalled();
+  });
+
+  it('does not call markIdleAuthoritative when the post-respawn read has no session_id, and still returns ok: true', async () => {
+    // Given: the post-respawn read (the
+    // 4th getById call) yields a task whose session_id is null - e.g. the
+    // session was suspended again before this read landed. The guard on
+    // `if (resumedSessionId)` must skip the pin without failing the restart.
+    const liveTask = makeTask(SESSION_ID);
+    const updatedTask = makeTask(null);
+    const taskRepo = {
+      getById: vi.fn()
+        .mockReturnValueOnce(liveTask)    // restartSessionForSettingsChange: initial read (line 98)
+        .mockReturnValueOnce(liveTask)    // applySuspendDbWrites: internal read (line 33)
+        .mockReturnValueOnce(updatedTask) // restartSessionForSettingsChange: re-read after suspend (line 116)
+        .mockReturnValueOnce(updatedTask) // restartSessionForSettingsChange: post-respawn read (line 154), no session_id
+        ,
+      update: vi.fn(),
+    };
+    mockGetProjectRepos.mockReturnValue({
+      tasks: taskRepo,
+      swimlanes: { getById: vi.fn(() => makeLane()) },
+      actions: {},
+      attachments: {},
+    });
+    const context = makeContext();
+
+    // When
+    const result = await restartSessionForSettingsChange(context as never, PROJECT_ID, PROJECT_PATH, TASK_ID);
+
+    // Then
+    expect(result).toEqual({ ok: true });
+    expect(context.sessionManager.markIdleAuthoritative).not.toHaveBeenCalled();
   });
 
   // =========================================================================

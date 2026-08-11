@@ -604,9 +604,11 @@ test.describe('Command Terminal', () => {
         // Press Ctrl+Shift+P
         await sharedPage.keyboard.press('Control+Shift+P');
 
-        // Command bar should appear
+        // Command bar should appear. The title carries the window's durable slot
+        // number so two terminals are tellable apart, hence "Command Terminal 1"
+        // rather than the bare name for the first slot.
         await expect(sharedPage.getByTestId('command-terminal-window')).toBeVisible();
-        await expect(sharedPage.getByText('Command Terminal', { exact: true })).toBeVisible();
+        await expect(sharedPage.getByTestId('command-bar-label')).toHaveText('Command Terminal 1');
       });
 
       test('Ctrl+Shift+P toggles the command bar closed', async () => {
@@ -1027,6 +1029,34 @@ test.describe('Command Terminal', () => {
       }
     });
 
+    test('two terminals carry distinct, slot-numbered titles', async () => {
+      // The defect this fixes: two tiled Command Terminals had byte-identical
+      // title bars, and every other fact in that header (agent, model, branch,
+      // cwd) is identical across a project's terminals by construction, so the
+      // slot number is the only thing that can tell them apart.
+      const { browser, page } = await launchWithState(multiTerminalPreConfig());
+      try {
+        await page.locator('[data-swimlane-name="To Do"]').waitFor({ state: 'visible', timeout: 15000 });
+
+        await page.keyboard.press('Control+Shift+P');
+        await expect(page.getByTestId('command-terminal-window')).toHaveCount(1, { timeout: 5000 });
+        await expect(page.getByTestId('command-bar-label')).toHaveText('Command Terminal 1');
+
+        await page.getByTestId('quick-session-new-terminal').click();
+        await expect(page.getByTestId('command-terminal-window')).toHaveCount(2, { timeout: 5000 });
+
+        // Assert the SET, not each index: window order is the engine's business,
+        // and pinning it here would make this test fail on an unrelated tiling
+        // change while still not proving the titles differ.
+        const titles = await page.getByTestId('command-bar-label').allTextContents();
+        expect(titles).toHaveLength(2);
+        expect(new Set(titles).size).toBe(2);
+        expect([...titles].sort()).toEqual(['Command Terminal 1', 'Command Terminal 2']);
+      } finally {
+        await browser.close();
+      }
+    });
+
     test('stopping one of two terminals leaves the other visible and the layer open', async () => {
       // Per-window Stop closes THAT window only. With two windows, stopping one
       // leaves count=1 and the layer stays open.
@@ -1381,30 +1411,10 @@ test.describe('Command Terminal', () => {
   });
 
   // ---------------------------------------------------------------------------
-  // Window layout parity - the command terminal window has the same tile-layout
-  // menu and pop-out (untile back to floating) as the task-detail window.
+  // Window layout parity - the command terminal window has the same pop-out
+  // (untile back to floating) control as the task-detail window.
   // ---------------------------------------------------------------------------
   test.describe('Window layout parity', () => {
-    test('the tile-layout menu lists snap and tiling presets', async () => {
-      const { browser, page } = await launchWithState(multiTerminalPreConfig());
-      try {
-        await page.locator('[data-swimlane-name="To Do"]').waitFor({ state: 'visible', timeout: 15000 });
-        await page.keyboard.press('Control+Shift+P');
-        await expect(page.getByTestId('command-terminal-window')).toBeVisible();
-
-        const layoutButton = page.getByTestId('window-tile-layout').first();
-        await expect(layoutButton).toBeVisible();
-        await layoutButton.click();
-
-        // The menu surfaces the snap halves and the multi-window tilings.
-        await expect(page.getByTestId('tile-preset-left-half')).toBeVisible({ timeout: 3000 });
-        await expect(page.getByTestId('tile-preset-columns')).toBeVisible();
-        await expect(page.getByTestId('tile-preset-grid')).toBeVisible();
-      } finally {
-        await browser.close();
-      }
-    });
-
     test('pop-out appears once a terminal is tiled and floats it back', async () => {
       const { browser, page } = await launchWithState(multiTerminalPreConfig());
       try {
@@ -1973,7 +1983,9 @@ test.describe('Command Terminal', () => {
   //
   // Ring and square are ONE packaged @kangentic/branding mark, so `data-mark` carries both
   // "a ring is showing" and "which state it is": there is no separate stop-square element to
-  // assert, and no animate-spin class (the working mark marches via .kng-march instead).
+  // assert, and no lucide `animate-spin` class - the working ring rotates via the packaged
+  // `.kng-spin`, whose own contract (period, composited property, reduced motion) is pinned in
+  // tests/ui/activity-marks.spec.ts rather than re-asserted here.
   //
   // Each test uses a deterministic spawnTransient override (known session id) so
   // page.evaluate can call updateActivity + markFirstOutput on that exact id
@@ -2061,7 +2073,7 @@ test.describe('Command Terminal', () => {
       // We assert the activity-specific state in each individual test instead.
     }
 
-    test('thinking activity shows the marching active stop ring', async () => {
+    test('thinking activity shows the rotating active stop ring', async () => {
       // Derives expected behavior from the contract in CommandTerminalWindow.tsx:
       //   isThinking = sessionRunning && isActive(activity)
       //   -> the control-stop-working mark, tinted text-active
@@ -2128,7 +2140,7 @@ test.describe('Command Terminal', () => {
         await expect(ring).toBeVisible({ timeout: 3000 });
         await expect(ring).toHaveClass(/text-attention/);
 
-        // Idle is static. The marching variant is a DIFFERENT mark, so its absence is the
+        // Idle is static. The animated variant is a DIFFERENT mark, so its absence is the
         // assertion - there is no motion class to check on the idle one.
         await expect(stopButton.locator('[data-mark="control-stop-working"]')).toHaveCount(0);
 
@@ -2165,7 +2177,7 @@ test.describe('Command Terminal', () => {
         const stopButton = page.getByTestId('command-bar-terminate-button');
 
         // Static attention ring - permission maps to the idle disposition, so it renders the
-        // SAME mark as idle, not the marching one.
+        // SAME mark as idle, not the animated one.
         const ring = stopButton.locator('[data-mark="control-stop-idle"]');
         await expect(ring).toBeVisible({ timeout: 3000 });
         await expect(ring).toHaveClass(/text-attention/);

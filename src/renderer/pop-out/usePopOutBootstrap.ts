@@ -46,9 +46,7 @@ export function usePopOutBootstrap(descriptor: PopOutDescriptor): void {
   // This pop-out root's OWN HMR re-sync (Pattern B, scoped to this window - App.tsx's
   // vite:afterUpdate handler never runs here since the pop-out never mounts App).
   useEffect(() => {
-    // @ts-expect-error -- Vite handles import.meta.hot; tsc's "module": "commonjs" doesn't support it
     if (!import.meta.hot) return;
-    // @ts-expect-error -- Vite handles import.meta.hot
     import.meta.hot.on('vite:afterUpdate', () => {
       // Pattern D (mirrors App.tsx's vite:afterUpdate handler, which never runs in a
       // pop-out window): ChangesPanel's file-tree / history resize dividers set the

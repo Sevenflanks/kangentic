@@ -190,16 +190,14 @@ if (!process.env.MOCK_OPENCODE_NO_HEADER) {
   console.log('session id: ' + sessionId);
 }
 
-// Output test assertion markers
-if (resumed) {
-  console.log('MOCK_OPENCODE_RESUMED:' + sessionId);
-} else {
-  console.log('MOCK_OPENCODE_SESSION:' + sessionId);
-}
-
 // 先送 shell 也會出現的 generic signals；只有 alternate-screen entry 代表 TUI ready。
 process.stdout.write('\x1b[?25l\x1b[?2004h');
-setImmediate(() => process.stdout.write('\x1b[?1049h'));
+process.stdout.write('\x1b[?1049h');
+
+const marker = resumed
+  ? 'MOCK_OPENCODE_RESUMED:' + sessionId
+  : 'MOCK_OPENCODE_SESSION:' + sessionId;
+process.stdout.write(`${marker}\n`);
 
 // Stay alive to simulate a running session (30s gives tests time to interact)
 const timeout = setTimeout(() => { process.exit(0); }, livePaths ? 120000 : 30000);

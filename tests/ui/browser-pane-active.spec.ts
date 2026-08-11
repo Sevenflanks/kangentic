@@ -374,17 +374,8 @@ test.describe('BrowserPaneActive - send button', () => {
   test('captures the active project ID when Send is clicked', async () => {
     await openBrowserPane(sharedPage);
 
-    await sharedPage.evaluate(({ activeProjectId, url, pngDataUrl }) => {
+    await sharedPage.evaluate(({ url, pngDataUrl }) => {
       const pageWindow = window as unknown as BrowserTestWindow;
-      const sendProject = pageWindow.__zustandStores.project
-        .getState()
-        .projects
-        .find((project) => project.id === activeProjectId);
-      if (!sendProject) throw new Error('send-time project fixture was not loaded');
-      pageWindow.__zustandStores.project.setState({
-        currentProject: sendProject,
-      });
-
       const webview = document.querySelector('[data-testid="browser-webview"]') as HTMLElement & {
         capturePage: () => Promise<{ toDataURL: () => string; getSize: () => { width: number; height: number } }>;
         executeJavaScript: <T>(script: string) => Promise<T>;
@@ -403,7 +394,6 @@ test.describe('BrowserPaneActive - send button', () => {
       webview.executeJavaScript = async <T>() => '' as T;
       webview.getURL = () => url;
     }, {
-      activeProjectId: PROJECT_ID_AT_SEND,
       url: TASK_URL,
       pngDataUrl: ONE_PIXEL_PNG,
     });
@@ -415,18 +405,18 @@ test.describe('BrowserPaneActive - send button', () => {
       return typeof pageWindow.__resolveBrowserCapture === 'function';
     });
 
-    await sharedPage.evaluate((renderProjectId) => {
+    await sharedPage.evaluate((nextProjectId) => {
       const pageWindow = window as unknown as BrowserTestWindow;
-      const renderProject = pageWindow.__zustandStores.project
+      const nextProject = pageWindow.__zustandStores.project
         .getState()
         .projects
-        .find((project) => project.id === renderProjectId);
-      if (!renderProject || !pageWindow.__resolveBrowserCapture) {
+        .find((project) => project.id === nextProjectId);
+      if (!nextProject || !pageWindow.__resolveBrowserCapture) {
         throw new Error('browser capture temporal fixture was not armed');
       }
-      pageWindow.__zustandStores.project.setState({ currentProject: renderProject });
+      pageWindow.__zustandStores.project.setState({ currentProject: nextProject });
       pageWindow.__resolveBrowserCapture();
-    }, PROJECT_ID);
+    }, PROJECT_ID_AT_SEND);
 
     await expect.poll(async () => sharedPage.evaluate(() => {
       const pageWindow = window as unknown as BrowserTestWindow;
@@ -438,7 +428,7 @@ test.describe('BrowserPaneActive - send button', () => {
       return pageWindow.__mockBrowser.getCaptureCalls();
     });
     expect(calls[0]).toMatchObject({
-      projectId: PROJECT_ID_AT_SEND,
+      projectId: PROJECT_ID,
       taskId: TASK_ID,
       sessionId: SESSION_ID,
     });

@@ -1,6 +1,7 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron';
 import { IPC } from '../shared/ipc-channels';
-import type { ElectronAPI, NotificationInput, Project, Session, SessionUsage, ActivityState, ActivityReason, SessionEvent, UpdateDownloadedInfo, UsageTimePeriod, UsageStatsScope, UsageDayDrill, UsageCustomWindow, TaskBulkDeleteProgress, ProjectMoveProgress, DictationModelProgress, MobilePairingSasPayload, MobilePairingConfirmedPayload, MobilePairingEndedPayload } from '../shared/types';
+import type { ElectronAPI, NotificationInput, Project, PtyResizeOrigin, Session, SessionUsage, ActivityState, ActivityReason, SessionEvent, UpdateDownloadedInfo, UsageTimePeriod, UsageStatsScope, UsageDayDrill, UsageCustomWindow, TaskBulkDeleteProgress, ProjectMoveProgress, DictationModelProgress, MobilePairingSasPayload, MobilePairingConfirmedPayload, MobilePairingEndedPayload, MonitorSnapshot, TaskDetailHost, TaskDetailRemoteOwner, AutoCommandResultNotice } from '../shared/types';
+import type { Announcement } from '../shared/announcements';
 import type { LiveDeliveryStatus } from '../shared/live-delivery-status';
 import { POPOUT_ARG_PREFIX } from '../shared/pop-out';
 import type { PopOutDescriptor, PopOutKind, PopOutParamsByKind } from '../shared/pop-out';
@@ -101,6 +102,17 @@ const api: ElectronAPI = {
         callback(taskId, targetSwimlaneId, taskTitle, projectId);
       ipcRenderer.on(IPC.TASK_AUTO_MOVED, handler);
       return () => ipcRenderer.removeListener(IPC.TASK_AUTO_MOVED, handler);
+    },
+    onSpawnBlocked: (callback) => {
+      const handler = (_event: Electron.IpcRendererEvent, taskId: string, taskTitle: string, message: string, projectId?: string) =>
+        callback(taskId, taskTitle, message, projectId);
+      ipcRenderer.on(IPC.TASK_SPAWN_BLOCKED, handler);
+      return () => ipcRenderer.removeListener(IPC.TASK_SPAWN_BLOCKED, handler);
+    },
+    onAutoCommandResult: (callback) => {
+      const handler = (_event: Electron.IpcRendererEvent, result: AutoCommandResultNotice) => callback(result);
+      ipcRenderer.on(IPC.TASK_AUTO_COMMAND_RESULT, handler);
+      return () => ipcRenderer.removeListener(IPC.TASK_AUTO_COMMAND_RESULT, handler);
     },
     onCreatedByAgent: (callback) => {
       const handler = (_event: Electron.IpcRendererEvent, taskId: string, taskTitle: string, columnName: string, projectId?: string) =>
@@ -207,6 +219,11 @@ const api: ElectronAPI = {
       return () => ipcRenderer.removeListener(IPC.SESSION_DATA, handler);
     },
     ackData: (id, bytes) => ipcRenderer.send(IPC.SESSION_DRAIN_ACK, id, bytes),
+    onPtyResized: (callback) => {
+      const handler = (_event: Electron.IpcRendererEvent, sessionId: string, cols: number, rows: number, origin: PtyResizeOrigin) => callback(sessionId, cols, rows, origin);
+      ipcRenderer.on(IPC.SESSION_PTY_RESIZED, handler);
+      return () => ipcRenderer.removeListener(IPC.SESSION_PTY_RESIZED, handler);
+    },
     onFirstOutput: (callback) => {
       const handler = (_event: Electron.IpcRendererEvent, sessionId: string, projectId?: string) => callback(sessionId, projectId);
       ipcRenderer.on(IPC.SESSION_FIRST_OUTPUT, handler);
@@ -259,6 +276,7 @@ const api: ElectronAPI = {
     spawnTransient: (input) => ipcRenderer.invoke(IPC.SESSION_SPAWN_TRANSIENT, input),
     killTransient: (id) => ipcRenderer.invoke(IPC.SESSION_KILL_TRANSIENT, id),
     setFocused: (sessionIds: string[]) => ipcRenderer.invoke(IPC.SESSION_SET_FOCUSED, sessionIds),
+    setMounted: (sessionIds: string[]) => ipcRenderer.invoke(IPC.SESSION_SET_MOUNTED, sessionIds),
     notifyUserInterrupt: (sessionId: string) => ipcRenderer.invoke(IPC.SESSION_NOTIFY_USER_INTERRUPT, sessionId),
     injectSettings: (input) => ipcRenderer.invoke(IPC.SESSION_INJECT_SETTINGS, input),
   },
@@ -403,6 +421,67 @@ const api: ElectronAPI = {
     descriptor: popOutDescriptor,
   },
 
+  // Agent Monitor. Machine-global: no projectId is forwarded, because the snapshot
+  // spans every registered project by design.
+  monitor: {
+    getSnapshot: () => ipcRenderer.invoke(IPC.MONITOR_GET_SNAPSHOT),
+    subscribe: () => ipcRenderer.invoke(IPC.MONITOR_SUBSCRIBE),
+    unsubscribe: () => ipcRenderer.invoke(IPC.MONITOR_UNSUBSCRIBE),
+    revealTask: (projectId, taskId) => ipcRenderer.invoke(IPC.MONITOR_REVEAL_TASK, projectId, taskId),
+    // Explicit projectId, unlike the rest of this group: this one read IS
+    // project-scoped (it is the monitor asking about ONE row's own project).
+    getTaskDetail: (projectId, taskId) =>
+      ipcRenderer.invoke(IPC.MONITOR_GET_TASK_DETAIL, projectId, taskId),
+    onChanged: (callback: (snapshot: MonitorSnapshot) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, snapshot: MonitorSnapshot) => callback(snapshot);
+      ipcRenderer.on(IPC.MONITOR_CHANGED, handler);
+      return () => ipcRenderer.removeListener(IPC.MONITOR_CHANGED, handler);
+    },
+    setPeekSubscribed: (subscribed: boolean) =>
+      ipcRenderer.invoke(IPC.MONITOR_SET_PEEK_SUBSCRIBED, subscribed),
+    onPeek: (callback: (peeks: Record<string, string[]>) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, peeks: Record<string, string[]>) => callback(peeks);
+      ipcRenderer.on(IPC.MONITOR_PEEK, handler);
+      return () => ipcRenderer.removeListener(IPC.MONITOR_PEEK, handler);
+    },
+  },
+
+  // Task-detail ownership. Machine-global arbitration of WHICH RENDERER hosts a
+  // task's detail; mutates no task, so it is outside the project-scoped mutation set.
+  taskDetailOwnership: {
+    requestOpen: (projectId, taskId, host) =>
+      ipcRenderer.invoke(IPC.DETAIL_REQUEST_OPEN, projectId, taskId, host),
+    syncOwned: (host, entries) => ipcRenderer.send(IPC.DETAIL_SYNC_OWNED, host, entries),
+    onOpenHere: (callback) => {
+      const handler = (
+        _event: Electron.IpcRendererEvent,
+        projectId: string,
+        taskId: string,
+        host: TaskDetailHost,
+      ) => callback(projectId, taskId, host);
+      ipcRenderer.on(IPC.DETAIL_OPEN_HERE, handler);
+      return () => ipcRenderer.removeListener(IPC.DETAIL_OPEN_HERE, handler);
+    },
+    onCloseHere: (callback) => {
+      const handler = (
+        _event: Electron.IpcRendererEvent,
+        projectId: string,
+        taskId: string,
+        host: TaskDetailHost,
+      ) => callback(projectId, taskId, host);
+      ipcRenderer.on(IPC.DETAIL_CLOSE_HERE, handler);
+      return () => ipcRenderer.removeListener(IPC.DETAIL_CLOSE_HERE, handler);
+    },
+    onRemoteOwnersChanged: (callback) => {
+      const handler = (
+        _event: Electron.IpcRendererEvent,
+        owners: TaskDetailRemoteOwner[],
+      ) => callback(owners);
+      ipcRenderer.on(IPC.DETAIL_REMOTE_OWNERS, handler);
+      return () => ipcRenderer.removeListener(IPC.DETAIL_REMOTE_OWNERS, handler);
+    },
+  },
+
   analytics: {
     trackRendererError: (message: string) => ipcRenderer.send(IPC.TRACK_RENDERER_ERROR, message),
   },
@@ -418,6 +497,15 @@ const api: ElectronAPI = {
       const handler = (_event: Electron.IpcRendererEvent, info: UpdateDownloadedInfo) => callback(info);
       ipcRenderer.on(IPC.UPDATE_DOWNLOADED, handler);
       return () => ipcRenderer.removeListener(IPC.UPDATE_DOWNLOADED, handler);
+    },
+  },
+
+  announcements: {
+    getActive: () => ipcRenderer.invoke(IPC.ANNOUNCEMENTS_GET),
+    onChanged: (callback) => {
+      const handler = (_event: Electron.IpcRendererEvent, active: Announcement[]) => callback(active);
+      ipcRenderer.on(IPC.ANNOUNCEMENTS_CHANGED, handler);
+      return () => ipcRenderer.removeListener(IPC.ANNOUNCEMENTS_CHANGED, handler);
     },
   },
 
@@ -493,6 +581,12 @@ const api: ElectronAPI = {
       ipcRenderer.on(IPC.MOBILE_STATE_CHANGED, handler);
       return () => ipcRenderer.removeListener(IPC.MOBILE_STATE_CHANGED, handler);
     },
+    getTerminalStreams: () => ipcRenderer.invoke(IPC.MOBILE_GET_TERMINAL_STREAMS),
+    onTerminalStreamsChanged: (callback) => {
+      const handler = (_event: Electron.IpcRendererEvent, sessionIds: string[]) => callback(sessionIds);
+      ipcRenderer.on(IPC.MOBILE_TERMINAL_STREAMS_CHANGED, handler);
+      return () => ipcRenderer.removeListener(IPC.MOBILE_TERMINAL_STREAMS_CHANGED, handler);
+    },
   },
 
   boardConfig: {
@@ -528,16 +622,29 @@ const api: ElectronAPI = {
 
   browser: {
     captureAndSend: (input) => ipcRenderer.invoke(IPC.BROWSER_CAPTURE_SEND, input),
-    getUrls: (taskId) => ipcRenderer.invoke(IPC.BROWSER_URL_GET, taskId),
-    setTaskUrl: (taskId, url) => ipcRenderer.invoke(IPC.BROWSER_URL_SET_TASK, taskId, url),
-    clearTaskUrl: (taskId) => ipcRenderer.invoke(IPC.BROWSER_URL_CLEAR_TASK, taskId),
+    getUrls: (taskId, projectId) => ipcRenderer.invoke(IPC.BROWSER_URL_GET, taskId, projectId),
+    setTaskUrl: (taskId, url, projectId) => ipcRenderer.invoke(IPC.BROWSER_URL_SET_TASK, taskId, url, projectId),
+    clearTaskUrl: (taskId, projectId) => ipcRenderer.invoke(IPC.BROWSER_URL_CLEAR_TASK, taskId, projectId),
     clearStorage: () => ipcRenderer.invoke(IPC.BROWSER_CLEAR_STORAGE),
     registerPane: (input) => ipcRenderer.invoke(IPC.BROWSER_PANE_REGISTER, input),
     unregisterPane: (sessionId, webContentsId) => ipcRenderer.invoke(IPC.BROWSER_PANE_UNREGISTER, sessionId, webContentsId),
     onZoomChanged: (callback) => {
-      const handler = (_event: Electron.IpcRendererEvent, factor: number) => callback(factor);
+      const handler = (_event: Electron.IpcRendererEvent, factor: number, webContentsId: number) =>
+        callback(factor, webContentsId);
       ipcRenderer.on(IPC.BROWSER_ZOOM_CHANGED, handler);
       return () => ipcRenderer.removeListener(IPC.BROWSER_ZOOM_CHANGED, handler);
+    },
+    onPaneOpenRequest: (callback) => {
+      const handler = (_event: Electron.IpcRendererEvent, projectId: string, taskId: string) =>
+        callback(projectId, taskId);
+      ipcRenderer.on(IPC.BROWSER_PANE_OPEN_REQUEST, handler);
+      return () => ipcRenderer.removeListener(IPC.BROWSER_PANE_OPEN_REQUEST, handler);
+    },
+    onPaneCloseRequest: (callback) => {
+      const handler = (_event: Electron.IpcRendererEvent, projectId: string, taskIds: string[]) =>
+        callback(projectId, taskIds);
+      ipcRenderer.on(IPC.BROWSER_PANE_CLOSE_REQUEST, handler);
+      return () => ipcRenderer.removeListener(IPC.BROWSER_PANE_CLOSE_REQUEST, handler);
     },
   },
 
@@ -570,9 +677,11 @@ if (__KANGENTIC_DEV__) {
   // BrowserWindow `additionalArguments`) ONLY in dev-preview mode, so this is
   // true for `/preview` and false for the regular `npm start` dogfood.
   const isEphemeralPreview = process.argv.includes('--kangentic-ephemeral');
-  // The original task title (base64-encoded in the BrowserWindow additionalArguments by
-  // main) so the title bar can identify which task the preview clones belong to. Null
-  // when not in preview, or when main could not resolve it.
+  // The original task's label, `#<display_id> - <title>` (base64-encoded in the
+  // BrowserWindow additionalArguments by main), so the title bar can identify which task
+  // the preview clones belong to. Main reuses the identical string as the OS window
+  // title, so the in-app pill and the taskbar thumbnail cannot drift. Null when not in
+  // preview, or when main could not resolve it.
   const PREVIEW_TITLE_FLAG = '--kangentic-preview-task-title=';
   const previewTitleArg = process.argv.find((arg) => arg.startsWith(PREVIEW_TITLE_FLAG));
   const previewTaskTitle = previewTitleArg

@@ -19,7 +19,9 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { EventEmitter } from 'node:events';
 import {
   CAPABILITY_VERBS,
+  bytesToHex,
   createPairingInitiatorHandshake,
+  derivePairingSlotId,
   generateX25519KeyPair,
   sealPairingConfirm,
   type CapabilityVerb,
@@ -123,9 +125,9 @@ vi.mock('../../../src/main/mobile-bridge/transport/transport-factory', () => ({
 
 const { MobileBridgeService } = await import('../../../src/main/mobile-bridge/mobile-bridge-service');
 // Not mocked in this file - identity.ts and roster-store.ts touch only the
-// same mocked fs/electron surfaces already set up above, so the migration
+// same mocked fs/electron surfaces already set up above, so the preservation
 // test below can read back a real identity the service persisted, and seed
-// a real, correctly-signed "legacy" roster entry with it.
+// a real, correctly-signed roster entry with it.
 const { loadBridgeIdentity } = await import('../../../src/main/mobile-bridge/identity');
 const { addOrReplaceDevice } = await import('../../../src/main/mobile-bridge/roster-store');
 const { createTransport } = await import('../../../src/main/mobile-bridge/transport/transport-factory');
@@ -134,10 +136,10 @@ const { createTransport } = await import('../../../src/main/mobile-bridge/transp
  * Creates and persists a real identity via the actual startPairing()
  * trigger (immediately cancelled - a live ceremony is not needed), reads it
  * back through the mocked filesystem, then seeds one roster device directly
- * with addOrReplaceDevice, mirroring the "migrates pre-existing devices"
+ * with addOrReplaceDevice, mirroring the attachContext() preservation
  * setup below. Leaves existsSync/readFileSync wired to serve BOTH the
  * identity and roster files so the caller's next service call
- * (renameDevice, listDevices, attachContext's migration, ...) reads the
+ * (renameDevice, listDevices, attachContext(), ...) reads the
  * seeded state. Returns identityJson so a caller that mutates the roster
  * further (e.g. renameDevice) can re-wire the read mocks onto the newest
  * write via rewireReadsToLatestRosterWrite() below.
@@ -294,6 +296,32 @@ describe('MobileBridgeService.startPairing() is the deliberate identity-creation
   });
 });
 
+describe('MobileBridgeService.startPairing() derives the relay slot id from the pairing token', () => {
+  it('passes createTransport a slotId derived from the minted token, never the token bytes verbatim', async () => {
+    const service = new MobileBridgeService({ enabled: true, relayUrl: 'wss://relay.example.com' });
+    const { qrPayload } = await service.startPairing();
+    const mintedPairingToken = qrPayload.pairingToken;
+
+    // .at(-1), not [0]: createTransport's call history is not cleared between
+    // tests in this file, so an earlier test's startPairing() call is still
+    // in there. The most recent call is the one this test's startPairing()
+    // just made.
+    const transportOptions = vi.mocked(createTransport).mock.calls.at(-1)?.[0];
+    if (!transportOptions) throw new Error('test setup: createTransport was not called');
+
+    expect(transportOptions.slotId).toBe(derivePairingSlotId(mintedPairingToken));
+    // The regression this guards: the slot travels in cleartext in the relay
+    // URL's query string while the pairing token is the Noise IKpsk0
+    // pre-shared key, so dialing the raw token as the slot id would publish
+    // the PSK to every hop that can read a request URI. Asserting the
+    // positive derivation above is not enough by itself, since a broken
+    // derivation that happened to still differ from the raw hex would slip
+    // through it - this assertion is the one that actually catches a revert
+    // back to `bytesToHex(token.token)`.
+    expect(transportOptions.slotId).not.toBe(bytesToHex(mintedPairingToken));
+  });
+});
+
 describe('MobileBridgeService.reconcile()', () => {
   it('cancels an in-progress pairing when the bridge is disabled', async () => {
     const service = new MobileBridgeService({ enabled: true, relayUrl: 'wss://relay.example.com' });
@@ -431,57 +459,21 @@ describe('MobileBridgeService pairing ceremony wiring (real crypto over the mock
   });
 });
 
-describe('MobileBridgeService.attachContext() migrates pre-existing devices to the full capability grant', () => {
-  it('upgrades a device paired under the old read-only default, before the first reconcile() opens any session', async () => {
+describe('MobileBridgeService.attachContext() preserves existing paired-device capability grants', () => {
+  it('keeps a deliberately restricted grant unchanged and does not rewrite the signed roster', async () => {
     const service = new MobileBridgeService({ enabled: true, relayUrl: 'wss://relay.example.com' });
-
-    // Create + persist a real identity the same way a genuine "Pair a
-    // device" click would (startPairing() is the only identity-creation
-    // trigger), then read it back through the same mocked filesystem to get
-    // a real BridgeIdentity this test can sign a legacy roster entry with.
-    await service.startPairing();
-    service.cancelPairing();
-    const identityWriteCall = writeFileSyncSpy.mock.calls.find(([filePath]) => (filePath as string).includes('mobile-bridge-identity.json'));
-    if (!identityWriteCall) throw new Error('test setup: identity was not persisted');
-    const identityJson = identityWriteCall[1] as string;
-    existsSyncSpy.mockImplementation((filePath: string) => filePath.includes('mobile-bridge-identity.json'));
-    readFileSyncSpy.mockReturnValue(identityJson);
-    const identity = loadBridgeIdentity();
-    if (!identity) throw new Error('test setup: could not read back the persisted identity');
-
-    // Seed a "legacy" roster entry: the pre-overhaul read-only default
-    // grant, correctly signed with the real identity above.
-    writeFileSyncSpy.mockClear();
-    addOrReplaceDevice(identity, {
-      deviceId: 'legacy-device',
-      staticPublicKey: generateX25519KeyPair().publicKey,
-      displayName: 'Legacy Phone',
-      capabilities: ['read-stream', 'read-board', 'read-diff', 'board-tool-read', 'register-push'],
-      expiresAt: null,
+    const restrictedCapabilities: CapabilityVerb[] = ['read-stream', 'read-board'];
+    const { deviceId } = await seedServiceWithOnePairedDevice(service, {
+      deviceId: 'restricted-grant-device',
+      capabilities: restrictedCapabilities,
     });
-    const rosterWriteCall = writeFileSyncSpy.mock.calls.find(([filePath]) => (filePath as string).includes('mobile-bridge-roster.json'));
-    if (!rosterWriteCall) throw new Error('test setup: the legacy roster entry was not persisted');
-    const rosterJson = rosterWriteCall[1] as string;
-    existsSyncSpy.mockImplementation((filePath: string) => filePath.includes('mobile-bridge-identity.json') || filePath.includes('mobile-bridge-roster.json'));
-    readFileSyncSpy.mockImplementation((filePath: string) => (filePath.includes('mobile-bridge-roster.json') ? rosterJson : identityJson));
 
-    service.attachContext({ sessionManager: new EventEmitter(), boardEvents: { emitBoardChanged: vi.fn() } } as never);
+    writeFileSyncSpy.mockClear();
+    service.attachContext({ sessionManager: Object.assign(new EventEmitter(), { setMobileTerminalProbe: vi.fn() }), boardEvents: { emitBoardChanged: vi.fn() } } as never);
 
-    // Re-point the mock at whatever the migration itself just wrote -
-    // otherwise listDevices() below would read back the STALE pre-migration
-    // roster JSON captured above, defeating the assertion either way.
-    const migratedRosterWriteCall = writeFileSyncSpy.mock.calls
-      .filter(([filePath]) => (filePath as string).includes('mobile-bridge-roster.json'))
-      .at(-1);
-    if (!migratedRosterWriteCall) throw new Error('test setup: the migration did not persist a roster update');
-    readFileSyncSpy.mockImplementation((filePath: string) =>
-      filePath.includes('mobile-bridge-roster.json') ? (migratedRosterWriteCall[1] as string) : identityJson,
-    );
-
-    const devices = service.listDevices();
-    expect(devices).toHaveLength(1);
-    expect(devices[0].deviceId).toBe('legacy-device');
-    expect(devices[0].capabilities).toEqual(CAPABILITY_VERBS);
+    expect(service.listDevices().find((device) => device.deviceId === deviceId)?.capabilities).toEqual(restrictedCapabilities);
+    const rosterWriteCalls = writeFileSyncSpy.mock.calls.filter(([filePath]) => (filePath as string).includes('mobile-bridge-roster.json'));
+    expect(rosterWriteCalls).toHaveLength(0);
 
     service.dispose();
   });
@@ -494,11 +486,10 @@ describe('MobileBridgeService.attachContext() migrates pre-existing devices to t
     });
 
     writeFileSyncSpy.mockClear();
-    service.attachContext({ sessionManager: new EventEmitter(), boardEvents: { emitBoardChanged: vi.fn() } } as never);
+    service.attachContext({ sessionManager: Object.assign(new EventEmitter(), { setMobileTerminalProbe: vi.fn() }), boardEvents: { emitBoardChanged: vi.fn() } } as never);
 
-    // No roster write at all means migrateDevicesToFullCapabilityGrant()
-    // correctly skipped this device instead of re-signing an entry that was
-    // already fully granted.
+    // attachContext() only wires runtime behavior and must not re-sign any
+    // existing paired-device grant, even when it already has full access.
     const rosterWriteCalls = writeFileSyncSpy.mock.calls.filter(([filePath]) => (filePath as string).includes('mobile-bridge-roster.json'));
     expect(rosterWriteCalls).toHaveLength(0);
 

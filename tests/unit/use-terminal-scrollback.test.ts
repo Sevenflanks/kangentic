@@ -27,6 +27,11 @@
  *      onScrollbackSettled - the signal TerminalTab uses to lift its replay
  *      veil. Exactly one notification per completed operation; a stale
  *      generation never notifies.
+ *   7. Stale held-byte drop: a fresh sample supersedes everything the incoming
+ *      queue is holding, so the queue is RESET the moment the sample resolves
+ *      and before the replay is written. Without it, the end-of-replay kick
+ *      writes pre-sample bytes on top of the fresh frame - the "opens showing
+ *      the previous pane's frame until you resize" bug.
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
@@ -76,6 +81,9 @@ interface PathHooks {
   onEffects?: () => void;
   /** Represents incomingResumeRef.current?.() - the incoming queue's kick(). */
   onResume?: () => void;
+  /** Represents dropHeldBytesSupersededBySample() - the incoming queue's
+   *  reset(), dropping bytes the fresh sample already contains. */
+  onDropHeld?: () => void;
   /** Represents onScrollbackSettledRef.current?.() - the settle notification
    *  TerminalTab uses to lift its replay veil. */
   onSettled?: () => void;
@@ -137,6 +145,10 @@ async function runReloadScrollbackPath(refs: Refs, ipc: MockIpc, hooks: PathHook
       // either.
       if (refs.scrollbackGenerationRef.current !== scrollbackGeneration) return;
 
+      // The sample supersedes everything the queue is holding; drop it before
+      // the write so the end-of-replay kick cannot repaint a pre-sample frame.
+      if (scrollback) hooks.onDropHeld?.();
+
       const afterWrite = () => {
         // A newer replay may have started while this chunked write was in
         // flight; abandon so we don't clobber its pending/fit/focus.
@@ -180,6 +192,9 @@ async function runInitScrollbackPath(
   return Promise.all([resizePromise, scrollbackPromise])
     .then(([, scrollback]) => {
       if (refs.scrollbackGenerationRef.current !== scrollbackGeneration) return;
+
+      // See the matching drop in the reload path above.
+      if (scrollback) hooks.onDropHeld?.();
 
       const afterWrite = () => {
         if (refs.scrollbackGenerationRef.current !== scrollbackGeneration) return;
@@ -814,6 +829,122 @@ describe('useTerminal scrollback orchestration', () => {
       capturedAfterWriteA();
       expect(settledA).not.toHaveBeenCalled();
       expect(settledB).toHaveBeenCalledOnce();
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Gap 7: stale held-byte drop
+  //
+  // The queue HOLDS (does not drop) every byte main flushes while a replay is
+  // in flight, and those bytes predate the sample - main clears its own pending
+  // buffer when it samples, so a fresh sample already contains everything it
+  // had flushed. Kicking the held bytes after the replay therefore repaints an
+  // obsolete frame over the fresh one, and a TUI's subsequent differential
+  // updates never repair it: the terminal shows the PREVIOUS pane's geometry
+  // until the next SIGWINCH. Dropping at resolve time is the fix.
+  // -------------------------------------------------------------------------
+  describe('stale held-byte drop', () => {
+    it('drops the held queue when a sample is about to be replayed', async () => {
+      const dropHeld = vi.fn();
+      const ipc: MockIpc = {
+        resize: vi.fn().mockResolvedValue(undefined),
+        getScrollback: vi.fn().mockResolvedValue('fresh frame'),
+      };
+
+      await runInitScrollbackPath(refs, ipc, false, { onWrite: syncWrite(), onDropHeld: dropHeld });
+
+      expect(dropHeld).toHaveBeenCalledOnce();
+    });
+
+    it('drops BEFORE the write, so the end-of-replay kick cannot resurrect pre-sample bytes', async () => {
+      const callOrder: string[] = [];
+      const ipc: MockIpc = {
+        resize: vi.fn().mockResolvedValue(undefined),
+        getScrollback: vi.fn().mockResolvedValue('fresh frame'),
+      };
+
+      await runInitScrollbackPath(refs, ipc, false, {
+        onWrite: syncWrite(() => callOrder.push('write')),
+        onDropHeld: () => callOrder.push('drop-held'),
+        onResume: () => callOrder.push('kick'),
+      });
+
+      expect(callOrder).toEqual(['drop-held', 'write', 'kick']);
+    });
+
+    it('drops on the reload path too (overlay lift, reveal catch-up, resize settle)', async () => {
+      const dropHeld = vi.fn();
+      const ipc: MockIpc = {
+        resize: vi.fn().mockResolvedValue(undefined),
+        getScrollback: vi.fn().mockResolvedValue('reloaded frame'),
+      };
+
+      await runReloadScrollbackPath(refs, ipc, { onWrite: syncWrite(), onDropHeld: dropHeld });
+
+      expect(dropHeld).toHaveBeenCalledOnce();
+    });
+
+    it('does NOT drop on the suppressed init path: the held bytes are the only copy', async () => {
+      const dropHeld = vi.fn();
+      const ipc: MockIpc = {
+        resize: vi.fn().mockResolvedValue(undefined),
+        getScrollback: vi.fn().mockResolvedValue('never fetched'),
+      };
+
+      await runInitScrollbackPath(refs, ipc, true, { onWrite: syncWrite(), onDropHeld: dropHeld });
+
+      expect(dropHeld).not.toHaveBeenCalled();
+    });
+
+    it('does NOT drop when the sample is empty: nothing supersedes the held bytes', async () => {
+      const dropHeld = vi.fn();
+      const ipc: MockIpc = {
+        resize: vi.fn().mockResolvedValue(undefined),
+        getScrollback: vi.fn().mockResolvedValue(''),
+      };
+
+      await runReloadScrollbackPath(refs, ipc, { onWrite: vi.fn(), onDropHeld: dropHeld });
+
+      expect(dropHeld).not.toHaveBeenCalled();
+    });
+
+    it('does NOT drop when an IPC rejects: no replay lands, so the held bytes must survive', async () => {
+      const dropHeld = vi.fn();
+      const ipc: MockIpc = {
+        resize: vi.fn().mockResolvedValue(undefined),
+        getScrollback: vi.fn().mockRejectedValue(new Error('session killed')),
+      };
+
+      await runReloadScrollbackPath(refs, ipc, { onWrite: syncWrite(), onDropHeld: dropHeld });
+
+      expect(dropHeld).not.toHaveBeenCalled();
+    });
+
+    it('does NOT drop from a stale generation: the newer replay owns the queue', async () => {
+      let resolveStale!: (value: string | null) => void;
+      const staleDrop = vi.fn();
+      const ipcA: MockIpc = {
+        resize: vi.fn().mockResolvedValue(undefined),
+        getScrollback: vi.fn().mockImplementation(() =>
+          new Promise<string | null>((resolve) => { resolveStale = resolve; })
+        ),
+      };
+      const pathA = runReloadScrollbackPath(refs, ipcA, { onWrite: syncWrite(), onDropHeld: staleDrop });
+
+      // A newer replay supersedes it and completes.
+      const freshDrop = vi.fn();
+      const ipcB: MockIpc = {
+        resize: vi.fn().mockResolvedValue(undefined),
+        getScrollback: vi.fn().mockResolvedValue('fresh frame'),
+      };
+      await runReloadScrollbackPath(refs, ipcB, { onWrite: syncWrite(), onDropHeld: freshDrop });
+      expect(freshDrop).toHaveBeenCalledOnce();
+
+      // The stale sample finally arrives: it must not drop bytes the newer
+      // replay has since held for its own settle.
+      resolveStale('stale frame');
+      await pathA;
+      expect(staleDrop).not.toHaveBeenCalled();
     });
   });
 });

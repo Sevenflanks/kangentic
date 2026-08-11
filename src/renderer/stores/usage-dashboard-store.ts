@@ -324,17 +324,14 @@ function createUsageDashboardStore() {
 // module's only runtime export is the non-component hook, so it is not a Fast
 // Refresh boundary; without pinning, a re-eval could hand a second store (and
 // a second config subscription) to part of the tree.
-// @ts-expect-error -- Vite handles import.meta.hot; tsc's "module": "commonjs" doesn't support it
 const preservedUsageDashboardStore: ReturnType<typeof createUsageDashboardStore> | undefined = import.meta.hot?.data?.usageDashboardStore;
 
 export const useUsageDashboardStore = preservedUsageDashboardStore ?? createUsageDashboardStore();
 
-// @ts-expect-error -- Vite handles import.meta.hot; tsc's "module": "commonjs" doesn't support it
 if (import.meta.hot) {
-  // @ts-expect-error -- Vite handles import.meta.hot
   import.meta.hot.data.usageDashboardStore = useUsageDashboardStore;
   // Editing this module's OWN code would leave the pinned instance running stale
   // closures; force a clean full reload instead (prod drops this whole block).
-  // @ts-expect-error -- Vite handles import.meta.hot
-  import.meta.hot.accept(() => import.meta.hot.invalidate());
+  const hot = import.meta.hot;
+  import.meta.hot.accept(() => hot.invalidate());
 }

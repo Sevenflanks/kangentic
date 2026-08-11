@@ -2,13 +2,14 @@ import { create } from 'zustand';
 import type { AppConfig, DeepPartial, AgentDetectionInfo, OnboardingBaseline, OnboardingStepKey, SerializedWorkspace } from '../../shared/types';
 import { DEFAULT_CONFIG } from '../../shared/types';
 import { deepMergeConfig } from '../../shared/object-utils';
+import { computeDismissedIdsAfterDismiss } from '../../shared/announcements';
 import { parseModelId } from '../../shared/model-id';
 import { invalidateAllProjects } from './project-cache';
+import { useAnnouncementsStore } from './announcements-store';
 
 /** Last-viewed settings tab, preserved across HMR (Pattern A) so the panel
  *  reopens to the same section during dogfooding instead of resetting to the
  *  first tab. Session-scoped only: intentionally not persisted across restarts. */
-// @ts-expect-error -- Vite handles import.meta.hot; tsc's "module": "commonjs" doesn't support it
 let lastSettingsTabHmr: string | null = import.meta.hot?.data?.lastSettingsTab ?? null;
 
 /** Onboarding steps ticked off this session, preserved across HMR (Pattern A).
@@ -18,12 +19,9 @@ let lastSettingsTabHmr: string | null = import.meta.hot?.data?.lastSettingsTab ?
  *  `shared/types.ts`, which it imports) rebuilt the store with an empty map and silently
  *  un-ticked completed steps - including `taskDetailOpened`, step 5's ONLY signal. A dogfooder
  *  editing this very feature would watch the checklist walk backwards. */
-// @ts-expect-error -- Vite handles import.meta.hot
 let onboardingStepsCompletedHmr: Record<string, OnboardingStepKey[]> = import.meta.hot?.data?.onboardingStepsCompleted ?? {};
 
-// @ts-expect-error -- Vite handles import.meta.hot
 if (import.meta.hot) {
-  // @ts-expect-error -- Vite handles import.meta.hot
   import.meta.hot.dispose((data: Record<string, unknown>) => {
     data.lastSettingsTab = lastSettingsTabHmr;
     data.onboardingStepsCompleted = onboardingStepsCompletedHmr;
@@ -49,6 +47,9 @@ interface ConfigStore {
   updateConfig: (partial: DeepPartial<AppConfig>) => Promise<void>;
   /** Dismiss the onboarding checklist for a project (adds its id to `onboardedProjectIds`). */
   markProjectOnboarded: (projectId: string) => void;
+  /** Dismiss an in-app announcement (adds its id to `dismissedAnnouncementIds`,
+   *  pruned to ids still in the active feed so the array stays bounded). */
+  dismissAnnouncement: (announcementId: string) => void;
   /** Record what a project's watched settings looked like before the user touched them, so
    *  checklist steps 1 and 2 can tick on a real change rather than on a screen being opened.
    *  No-op when a baseline already exists, so re-opening the checklist never re-baselines
@@ -69,6 +70,15 @@ interface ConfigStore {
   saveCommandTerminalWorkspace: (workspace: SerializedWorkspace) => void;
   /** Synchronous sibling of saveCommandTerminalWorkspace for the quit/unload flush. */
   flushCommandTerminalWorkspace: (workspace: SerializedWorkspace) => void;
+  /** Persist the GLOBAL Agent Monitor detail layout. Same shape as the command-terminal
+   *  pair; written by whichever host currently has the monitor's layer mounted (the
+   *  in-app overlay or the pop-out - never both, they are mutually exclusive), which is
+   *  what lets an open detail cross the renderer boundary between them. */
+  saveMonitorWorkspace: (workspace: SerializedWorkspace) => void;
+  /** Synchronous sibling of saveMonitorWorkspace. Load-bearing beyond the quit path here:
+   *  it also runs when the monitor's layer unmounts (close / detach), which is the moment
+   *  the OTHER host is about to read the blob. */
+  flushMonitorWorkspace: (workspace: SerializedWorkspace) => void;
   /** Internal: whether workspaceByProject has been seeded from disk yet. After the first
    *  config fetch the renderer owns the layout map, so later fetches preserve it instead of
    *  letting a stale disk read clobber an in-flight save. Resets with the store on HMR. */
@@ -110,10 +120,6 @@ interface ConfigStore {
   // -- Settings panel UI --
   settingsOpen: boolean;
   setSettingsOpen: (open: boolean) => void;
-  /** Open the settings panel directly to a given tab (used by the title-bar
-   *  mic button to jump to the global Dictation tab). Works with or without a
-   *  project open, since the target may be a shared (global) tab. */
-  openSettingsToTab: (tabId: string) => void;
   /** Last settings tab the user viewed, so closing and reopening the panel
    *  returns to the same section instead of resetting to the first tab. */
   lastSettingsTab: string | null;
@@ -182,6 +188,13 @@ export const useConfigStore = create<ConfigStore>((set, get) => {
     // at least as fresh as a later disk read, so preserve them across a refetch.
     const workspaceByProject = get().globalConfig.workspaceByProject ?? {};
     const commandTerminalWorkspace = get().globalConfig.commandTerminalWorkspace ?? null;
+    // `monitorWorkspace` is deliberately NOT preserved here, unlike its two siblings.
+    // It is the only layout blob with a writer in ANOTHER renderer: the monitor's
+    // pop-out saves it, and the main window then has to READ that write back. Treating
+    // this window's copy as authoritative would keep its own stale value (usually null)
+    // and make the pop-out's layout invisible here - which is the entire handoff. A
+    // fresh disk read is exactly what the reader wants, and the writer's optimistic
+    // apply keeps its own copy current in the meantime.
     return {
       config: { ...fetched.config, workspaceByProject, commandTerminalWorkspace },
       globalConfig: { ...fetched.globalConfig, workspaceByProject, commandTerminalWorkspace },
@@ -210,6 +223,16 @@ export const useConfigStore = create<ConfigStore>((set, get) => {
     set((state) => ({
       config: { ...state.config, commandTerminalWorkspace: workspace },
       globalConfig: { ...state.globalConfig, commandTerminalWorkspace: workspace },
+    }));
+    return workspace;
+  };
+
+  /** Same optimistic apply for the monitor's detail layout, so a read that follows a
+   *  save in this renderer sees what was just written. */
+  const applyMonitorWorkspaceOptimistic = (workspace: SerializedWorkspace): SerializedWorkspace => {
+    set((state) => ({
+      config: { ...state.config, monitorWorkspace: workspace },
+      globalConfig: { ...state.globalConfig, monitorWorkspace: workspace },
     }));
     return workspace;
   };
@@ -262,6 +285,21 @@ export const useConfigStore = create<ConfigStore>((set, get) => {
       get().updateConfig({ onboardedProjectIds: [...existing, projectId] });
     },
 
+    dismissAnnouncement: (announcementId) => {
+      const existing = get().config.dismissedAnnouncementIds ?? [];
+      if (existing.includes(announcementId)) return;
+      const activeIds = useAnnouncementsStore.getState().active
+        .map((announcement) => announcement.id);
+      // Fire-and-forget, matching the other incidental config writes here:
+      // failing to persist the dismissal must not break hiding the banner.
+      void get()
+        .updateConfig({
+          dismissedAnnouncementIds:
+            computeDismissedIdsAfterDismiss(existing, activeIds, announcementId),
+        })
+        .catch(() => undefined);
+    },
+
     captureOnboardingBaseline: (projectId, baseline) => {
       // First write wins. A later capture would re-baseline against settings the user has
       // ALREADY changed, which would un-tick steps 1 and 2 and lose real progress.
@@ -292,6 +330,16 @@ export const useConfigStore = create<ConfigStore>((set, get) => {
 
     flushCommandTerminalWorkspace: (workspace) => {
       window.electronAPI.config.setSync({ commandTerminalWorkspace: applyCommandWorkspaceOptimistic(workspace) });
+    },
+
+    saveMonitorWorkspace: (workspace) => {
+      window.electronAPI.config.set({ monitorWorkspace: applyMonitorWorkspaceOptimistic(workspace) });
+    },
+
+    flushMonitorWorkspace: (workspace) => {
+      // Synchronous on purpose: this also runs when the monitor's layer unmounts
+      // (close or detach), and the other host may read the blob immediately after.
+      window.electronAPI.config.setSync({ monitorWorkspace: applyMonitorWorkspaceOptimistic(workspace) });
     },
 
     loadAppVersion: async () => {
@@ -407,10 +455,6 @@ export const useConfigStore = create<ConfigStore>((set, get) => {
         };
         return { onboardingStepsCompleted: onboardingStepsCompletedHmr };
       });
-    },
-
-    openSettingsToTab: (tabId) => {
-      set({ settingsOpen: true, projectSettingsInitialTab: tabId });
     },
 
     setSettingsOpen: (open) => {

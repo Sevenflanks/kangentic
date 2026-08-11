@@ -15,13 +15,10 @@
 
 import { useSyncExternalStore } from 'react';
 
-// @ts-expect-error -- Vite handles import.meta.hot; tsc's "module": "commonjs" doesn't support it
 let generation: number = import.meta.hot?.data?.hmrGeneration ?? 0;
 const listeners = new Set<() => void>();
 
-// @ts-expect-error -- Vite handles import.meta.hot
 if (import.meta.hot) {
-  // @ts-expect-error -- Vite handles import.meta.hot
   import.meta.hot.dispose((data: Record<string, unknown>) => {
     // Preserve only; bumpHmrGeneration() in App.tsx's vite:afterUpdate
     // handler is the single source of increments. Adding +1 here would

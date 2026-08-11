@@ -80,20 +80,15 @@ interface ProjectSnapshot {
   };
 }
 
-// @ts-expect-error -- Vite handles import.meta.hot; tsc's "module": "commonjs" doesn't support it
 const preservedCache: Map<string, ProjectSnapshot> | undefined = import.meta.hot?.data?.projectCache;
-// @ts-expect-error -- Vite handles import.meta.hot
 const preservedSeen: Set<string> | undefined = import.meta.hot?.data?.seenProjects;
-// @ts-expect-error -- Vite handles import.meta.hot
 const preservedDirty: Set<string> | undefined = import.meta.hot?.data?.dirtyProjects;
 
 const cache: Map<string, ProjectSnapshot> = preservedCache ?? new Map();
 const seenProjects: Set<string> = preservedSeen ?? new Set();
 const dirtyProjects: Set<string> = preservedDirty ?? new Set();
 
-// @ts-expect-error -- Vite handles import.meta.hot
 if (import.meta.hot) {
-  // @ts-expect-error -- Vite handles import.meta.hot
   import.meta.hot.dispose((data: Record<string, unknown>) => {
     data.projectCache = cache;
     data.seenProjects = seenProjects;

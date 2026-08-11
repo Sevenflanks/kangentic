@@ -263,13 +263,8 @@ export function ProjectSidebar({ onToggleSidebar }: ProjectSidebarProps) {
     );
   };
 
-  // `data-dismiss-surface`: dead space in the project sidebar (e.g. below the project
-  // list) light-dismisses an open task window. Project rows, group headers, the search
-  // box, and buttons are excluded as actions (pointer cursor / real controls). A new
-  // clickable child must carry `cursor-pointer` or `data-no-dismiss`, or a click on it
-  // will also dismiss.
   return (
-    <div className="w-full h-full bg-surface-raised flex flex-col flex-shrink-0" data-dismiss-surface>
+    <div className="w-full h-full bg-surface-raised flex flex-col flex-shrink-0">
       <div className="px-3 pt-3 pb-2 border-b border-edge space-y-2">
         <div className="flex items-center gap-2">
           {onToggleSidebar && (
@@ -302,7 +297,7 @@ export function ProjectSidebar({ onToggleSidebar }: ProjectSidebarProps) {
             }}
             placeholder="Search projects..."
             data-testid="project-sidebar-search"
-            className="w-full h-8 bg-surface/50 border border-edge/50 rounded-md text-xs text-fg placeholder-fg-disabled pl-7 pr-7 outline-none focus:border-edge-input transition-colors"
+            className="w-full h-8 bg-surface/50 border border-edge/50 rounded-md text-xs text-fg placeholder-fg-muted pl-7 pr-7 outline-none focus:border-edge-input transition-colors"
           />
           {search && (
             <button

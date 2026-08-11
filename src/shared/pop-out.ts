@@ -11,9 +11,9 @@
 
 import { IPC } from './ipc-channels';
 
-export type PopOutKind = 'stats' | 'changes' | 'browser';
+export type PopOutKind = 'stats' | 'changes' | 'browser' | 'monitor';
 
-export const POPOUT_KINDS: readonly PopOutKind[] = ['stats', 'changes', 'browser'];
+export const POPOUT_KINDS: readonly PopOutKind[] = ['stats', 'changes', 'browser', 'monitor'];
 
 export function isPopOutKind(value: string): value is PopOutKind {
   return (POPOUT_KINDS as readonly string[]).includes(value);
@@ -28,6 +28,22 @@ export interface PopOutParamsByKind {
   stats: Record<string, never>;
   changes: PopOutTaskParams;
   browser: PopOutTaskParams;
+  monitor: Record<string, never>;
+}
+
+/**
+ * Kinds with no task/project params. Every entry collapses to its own kind as the
+ * instance key (there is only ever one such window). Kept as a set rather than an
+ * inline `kind === 'stats'` check so adding a global surface cannot silently fall
+ * through to the task-params branch and key as `monitor:undefined:undefined`.
+ */
+const GLOBAL_KINDS: readonly PopOutKind[] = ['stats', 'monitor'];
+
+/** True for a kind whose params carry no task/project, so a caller must not read
+ *  `taskId` / `projectId` off them. Exported so every such branch reads the one
+ *  set instead of re-spelling `kind === 'stats'`. */
+export function isGlobalPopOutKind(kind: PopOutKind): boolean {
+  return GLOBAL_KINDS.includes(kind);
 }
 
 export type PopOutParams<K extends PopOutKind = PopOutKind> = PopOutParamsByKind[K];
@@ -47,7 +63,7 @@ export const POPOUT_ARG_PREFIX = '--kangentic-popout=';
  * process's window-tracking map key and the renderer's pop-out-store key.
  */
 export function popOutInstanceKey<K extends PopOutKind>(kind: K, params: PopOutParamsByKind[K]): string {
-  if (kind === 'stats') return 'stats';
+  if (GLOBAL_KINDS.includes(kind)) return kind;
   const taskParams = params as PopOutTaskParams;
   return `${kind}:${taskParams.projectId}:${taskParams.taskId}`;
 }
@@ -104,5 +120,42 @@ export const POP_OUT_SURFACES: Readonly<Record<PopOutKind, PopOutSurfaceMeta>> =
     minSize: { width: 480, height: 360 },
     needsWebview: true,
     channels: [IPC.CONFIG_CHANGED],
+  },
+  monitor: {
+    kind: 'monitor',
+    scope: 'global',
+    title: 'Agent Monitor',
+    defaultBounds: { width: 1100, height: 800 },
+    // Floor is generous on width because the card grid's narrowest useful form is
+    // still a full wide-row; below this the row's metadata line wraps badly.
+    minSize: { width: 560, height: 400 },
+    needsWebview: false,
+    channels: [
+      IPC.MONITOR_CHANGED,
+      // Activity is patched into rows in place without a refetch, so the detached
+      // window needs it directly - it never round-trips through the main window.
+      IPC.SESSION_ACTIVITY,
+      // The output peek is patched in place for the same reason. Unlike the
+      // pushes above it is subscribe-gated, and this window subscribes on its own
+      // behalf, so main is already fanning to it by the time rows exist.
+      IPC.MONITOR_PEEK,
+      IPC.SESSION_STATUS,
+      IPC.SESSION_EXIT,
+      IPC.CONFIG_CHANGED,
+      // This window can host a task detail (and therefore a live terminal) for a
+      // project the board is not on, so it needs the per-session pushes a terminal
+      // consumes. SESSION_DATA and SESSION_FIRST_OUTPUT are NOT listed: those are
+      // routed per-renderer off the focus map rather than fanned to every pop-out,
+      // so a window without that session's terminal never receives its bytes.
+      IPC.SESSION_USAGE,
+      IPC.SESSION_EVENT,
+      // PTY dims echo for the width-drift self-heal. Unlike SESSION_DATA it IS
+      // fanned to every window: echoes only fire on real dim changes, and a
+      // freshly mounted xterm could miss a focus-routed echo during exactly the
+      // mount window where a divergence is born. Any future pop-out surface
+      // that hosts a terminal must declare this channel too.
+      IPC.SESSION_PTY_RESIZED,
+      IPC.TASK_SPAWN_PROGRESS,
+    ],
   },
 };

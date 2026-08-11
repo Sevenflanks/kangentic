@@ -102,6 +102,22 @@ describe('createIncomingWriteQueue', () => {
     expect(ack).toHaveBeenCalledWith(4);
   });
 
+  it('reset reports how many bytes it dropped, and zero when there is nothing held', () => {
+    const ack = vi.fn();
+    const term = { write: () => { /* never calls back */ } } as unknown as Terminal;
+    const queue = createIncomingWriteQueue({
+      getTerminal: () => term,
+      shouldDrop: () => false,
+      shouldHold: () => true,
+      ack,
+      chunkSize: 4,
+    });
+    queue.push('abcdef');
+    // The count is what the replay path traces as the stale frame it discarded.
+    expect(queue.reset()).toBe(6);
+    expect(queue.reset()).toBe(0);
+  });
+
   it('holds buffered bytes without writing or acking while shouldHold is true', async () => {
     const { term, writes } = fakeTerminal();
     const ack = vi.fn();
@@ -183,7 +199,7 @@ describe('createIncomingWriteQueue', () => {
 
   // ---------------------------------------------------------------------
   // useTerminal.ts wiring: shouldDrop: () => suppressDataRef.current,
-  // shouldHold: () => isBoardDragActive() || scrollbackPendingRef.current.
+  // shouldHold: () => scrollbackPendingRef.current.
   // A scrollback replay now HOLDS (not drops) live bytes, so a fullscreen
   // TUI's selection-highlight diff arriving during a replay is never
   // silently discarded - it applies strictly after the replayed frame.

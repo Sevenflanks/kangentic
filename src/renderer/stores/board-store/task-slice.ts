@@ -3,10 +3,13 @@ import { arrayMove } from '@dnd-kit/sortable';
 import type { Task, TaskCreateInput, TaskUpdateInput, TaskMoveInput, TaskSetRuntimeOverrideResult } from '../../../shared/types';
 import { useConfigStore } from '../config-store';
 import { useSessionStore } from '../session-store';
+import { withoutSessionsForTasks } from '../session-store/session-index';
 import { useToastStore } from '../toast-store';
 import { useProjectStore } from '../project-store';
 import { invalidateProject } from '../project-cache';
+import { describeIpcError } from '../../lib/ipc-error';
 import { applyStructuralSharing } from './structural-sharing';
+import { applyTaskListPayload } from './lane-pins';
 import { fetchArchivedReconcile } from './archived-tasks-slice';
 import type { BoardStore } from './types';
 
@@ -36,21 +39,43 @@ export interface TaskSlice {
 }
 
 /**
- * Generation counter for stale reload protection.
- * Each moveTask/reorderTaskInColumn increments before async work.
- * After IPC completes, the reload is only applied if no newer move has
- * started. Persisted across HMR via import.meta.hot.data so the counter
- * doesn't reset to 0 under a new module instance and mis-apply a stale
- * reload.
+ * Per-task generation counters for stale reload protection.
+ * Each moveTask/reorderTaskInColumn increments its OWN task's counter before
+ * async work. After IPC completes, the reload is only applied if no newer move
+ * of THE SAME TASK has started.
+ *
+ * This was a single module-scope number shared by every task, which broke
+ * exactly the case it was meant to protect: dragging two tasks in quick
+ * succession made the first move's reload "superseded" by the second, so the
+ * board's only reconcile was the second move's, and nothing repaired the first
+ * if a stale reload had clobbered it. Worse, the counter is claimed AFTER the
+ * `checkPendingChanges` probe below, so with a global counter the generations
+ * were assigned in probe-completion order rather than drop order and the
+ * earlier-dropped card could end up owning the reload.
+ *
+ * Keyed per task, a cancelled confirmation only ever burns its own task's
+ * generation, so the claim can stay where it is.
+ *
+ * Persisted across HMR via import.meta.hot.data (Pattern A) so the counters
+ * don't reset to 0 under a new module instance and mis-apply a stale reload.
  */
-// @ts-expect-error -- Vite handles import.meta.hot; tsc's "module": "commonjs" doesn't support it
-let moveGeneration: number = import.meta.hot?.data?.moveGeneration ?? 0;
+const moveGenerations: Map<string, number> = import.meta.hot?.data?.moveGenerations ?? new Map<string, number>();
 
-// @ts-expect-error -- Vite handles import.meta.hot
+/** Claim the next generation for a task and return it. */
+function claimMoveGeneration(taskId: string): number {
+  const next = (moveGenerations.get(taskId) ?? 0) + 1;
+  moveGenerations.set(taskId, next);
+  return next;
+}
+
+/** True when a newer move of this same task has started since `generation`. */
+function isSupersededMove(taskId: string, generation: number): boolean {
+  return moveGenerations.get(taskId) !== generation;
+}
+
 if (import.meta.hot) {
-  // @ts-expect-error -- Vite handles import.meta.hot
   import.meta.hot.dispose((data: Record<string, unknown>) => {
-    data.moveGeneration = moveGeneration;
+    data.moveGenerations = moveGenerations;
   });
 }
 
@@ -174,9 +199,7 @@ export const createTaskSlice: StateCreator<BoardStore, [], [], TaskSlice> = (set
     // on rollback - the PTY is gone either way; user can re-spawn if the task
     // pops back.
     useSessionStore.getState().clearLiveDeliveryStatusForTask(id);
-    useSessionStore.setState((s) => ({
-      sessions: s.sessions.filter((session) => session.taskId !== id),
-    }));
+    useSessionStore.setState((s) => withoutSessionsForTasks(s.sessions, id));
 
     try {
       await window.electronAPI.tasks.delete(id, useProjectStore.getState().currentProject?.id ?? null);
@@ -242,16 +265,34 @@ export const createTaskSlice: StateCreator<BoardStore, [], [], TaskSlice> = (set
         return { tasks: s.tasks.filter((t) => t.id !== input.taskId) };
       }
 
-      const task = { ...s.tasks[taskIndex] };
+      const previous = s.tasks[taskIndex];
+      const task = { ...previous };
       task.swimlane_id = input.targetSwimlaneId;
       task.position = input.targetPosition;
       const tasks = [...s.tasks];
       tasks[taskIndex] = task;
-      return { tasks };
+
+      // Same-column reorder: no lane changes, so a lane pin would be a no-op.
+      if (previous.swimlane_id === input.targetSwimlaneId) return { tasks };
+
+      // Pin the destination in the SAME set() as the optimistic lane write -
+      // they are one fact and must commit together. Pinning later (e.g. next to
+      // `claimMoveGeneration`) would leave a gap across the `checkPendingChanges`
+      // await below, and a reload flushed by `endBoardDrag()` lands in exactly
+      // that gap. Dropped by `reconcileLanePins` on the first payload that shows
+      // the move landed. Done moves are excluded above: `completingTaskIds`
+      // already removes them from every lane for the whole flight.
+      const lanePins = new Map(s.lanePins);
+      lanePins.set(input.taskId, {
+        laneId: input.targetSwimlaneId,
+        fromLaneId: previous.swimlane_id,
+        fromUpdatedAt: previous.updated_at,
+      });
+      return { tasks, lanePins };
     });
 
-    // --- Pre-check: confirm before destructive move to To Do ---
-    // Runs before incrementing moveGeneration so cancelled confirmations
+    // Pre-check: confirm before destructive move to To Do.
+    // Runs before claiming this task's generation so cancelled confirmations
     // don't burn generation numbers or interfere with stale-reload guards.
     if (!skipConfirmation) {
       const isColumnChange = prevTask?.swimlane_id !== input.targetSwimlaneId;
@@ -262,14 +303,16 @@ export const createTaskSlice: StateCreator<BoardStore, [], [], TaskSlice> = (set
           try {
             const result = await window.electronAPI.git.checkPendingChanges({ checkPath });
             if (result.hasPendingChanges) {
-              set({
-                pendingMoveConfirm: {
-                  input,
-                  uncommittedFileCount: result.uncommittedFileCount,
-                  unpushedCommitCount: result.unpushedCommitCount,
-                  taskTitle: prevTask.title,
-                  hasWorktree: !!prevTask.worktree_path,
-                },
+              // Enqueued, not assigned: a second move needing confirmation used
+              // to overwrite this one, and THIS move has already returned ok
+              // without calling the IPC - so the overwritten card kept an
+              // optimistic placement that no write backed.
+              get().enqueueMoveConfirm({
+                input,
+                uncommittedFileCount: result.uncommittedFileCount,
+                unpushedCommitCount: result.unpushedCommitCount,
+                taskTitle: prevTask.title,
+                hasWorktree: !!prevTask.worktree_path,
               });
               // Deferred to the confirm dialog; not a failure. confirmPendingMove
               // re-invokes moveTask with the captured projectId.
@@ -277,14 +320,12 @@ export const createTaskSlice: StateCreator<BoardStore, [], [], TaskSlice> = (set
             }
           } catch {
             // Git check failed - show confirmation as safe default
-            set({
-              pendingMoveConfirm: {
-                input,
-                uncommittedFileCount: 0,
-                unpushedCommitCount: 0,
-                taskTitle: prevTask.title,
-                hasWorktree: !!prevTask.worktree_path,
-              },
+            get().enqueueMoveConfirm({
+              input,
+              uncommittedFileCount: 0,
+              unpushedCommitCount: 0,
+              taskTitle: prevTask.title,
+              hasWorktree: !!prevTask.worktree_path,
             });
             // Deferred to the confirm dialog; not a failure.
             return { ok: true };
@@ -293,7 +334,7 @@ export const createTaskSlice: StateCreator<BoardStore, [], [], TaskSlice> = (set
       }
     }
 
-    const thisGen = ++moveGeneration;
+    const thisGen = claimMoveGeneration(input.taskId);
 
     // 活躍 session 的 wait-policy delivery 只可由 LiveDeliveryStatus 顯示固定、
     // 不含 command 的狀態。Renderer 無法得知 main 是否會依目標 adapter、track
@@ -325,7 +366,7 @@ export const createTaskSlice: StateCreator<BoardStore, [], [], TaskSlice> = (set
         const { [input.taskId]: _removedProgress, ...nextSpawnProgress } = state.spawnProgress;
         const { [input.taskId]: _removedLabel, ...nextPendingCommandLabel } = state.pendingCommandLabel;
         return {
-          sessions: state.sessions.filter((session) => session.taskId !== input.taskId),
+          ...withoutSessionsForTasks(state.sessions, input.taskId),
           spawnProgress: nextSpawnProgress,
           pendingCommandLabel: nextPendingCommandLabel,
         };
@@ -334,7 +375,7 @@ export const createTaskSlice: StateCreator<BoardStore, [], [], TaskSlice> = (set
 
     try {
       const moveResult = await window.electronAPI.tasks.move(input, sourceProjectId);
-      if (moveGeneration !== thisGen) return { ok: true }; // Superseded; the newer move owns the reload
+      if (isSupersededMove(input.taskId, thisGen)) return { ok: true }; // Superseded; the newer move of this task owns the reload
 
       // The user switched to another project while this move was in flight. The
       // move itself succeeded (it ran against sourceProjectId), but a reload here
@@ -367,7 +408,7 @@ export const createTaskSlice: StateCreator<BoardStore, [], [], TaskSlice> = (set
         window.electronAPI.tasks.list(),
         fetchArchivedReconcile(get().archivedFullyLoaded),
       ]);
-      if (moveGeneration !== thisGen) return { ok: true }; // Skip stale reload
+      if (isSupersededMove(input.taskId, thisGen)) return { ok: true }; // Skip stale reload
       // A switch can also land during the list round-trip above.
       if (switchedAway()) {
         invalidateProject(sourceProjectId!);
@@ -378,7 +419,7 @@ export const createTaskSlice: StateCreator<BoardStore, [], [], TaskSlice> = (set
       // majority, since only the moved task changed swimlane/position) skip
       // their memo and don't re-render on every drag drop.
       set((state) => ({
-        tasks: applyStructuralSharing(state.tasks, nextTasks),
+        ...applyTaskListPayload(state, nextTasks),
         archivedTasks: applyStructuralSharing(state.archivedTasks, archivedReconcile.tasks),
         archivedTotalCount: archivedReconcile.totalCount,
       }));
@@ -406,7 +447,14 @@ export const createTaskSlice: StateCreator<BoardStore, [], [], TaskSlice> = (set
       }
       return { ok: true };
     } catch (err) {
-      if (moveGeneration !== thisGen) return { ok: true }; // Superseded; not this move's failure
+      if (isSupersededMove(input.taskId, thisGen)) return { ok: true }; // Superseded; not this move's failure
+      // The write never landed, so no payload will ever differ from the pinned
+      // snapshot and the content-based drop can never fire. Release the pin
+      // BEFORE the rollback reload below, or the card is held at the failed
+      // target forever while the DB says otherwise. This is the single most
+      // important explicit drop. The ownership check makes a superseded
+      // failure leave a newer move's pin alone.
+      get().dropTaskLanePin(input.taskId, input.targetSwimlaneId);
       // Clear any optimistic progress indicators set before the IPC call
       useSessionStore.getState().clearPendingCommandLabel(input.taskId);
       useSessionStore.getState().setSpawnProgress(input.taskId, null);
@@ -419,7 +467,7 @@ export const createTaskSlice: StateCreator<BoardStore, [], [], TaskSlice> = (set
         await get().loadBoard();
       }
       useToastStore.getState().addToast({
-        message: `Failed to move task: ${err instanceof Error ? err.message : 'Unknown error'}`,
+        message: `Failed to move task: ${describeIpcError(err)}`,
         variant: 'error',
       });
       return { ok: false };
@@ -444,7 +492,7 @@ export const createTaskSlice: StateCreator<BoardStore, [], [], TaskSlice> = (set
     // Same-tick synchronous reorder; capture the current project so the move
     // routes correctly even though the race window is tiny.
     const reorderProjectId = useProjectStore.getState().currentProject?.id ?? null;
-    const thisGen = ++moveGeneration;
+    const thisGen = claimMoveGeneration(taskId);
 
     // Compute indices from IDs
     const laneTasks = get().tasks
@@ -478,16 +526,16 @@ export const createTaskSlice: StateCreator<BoardStore, [], [], TaskSlice> = (set
         targetSwimlaneId: swimlaneId,
         targetPosition: newIndex,
       }, reorderProjectId);
-      if (moveGeneration !== thisGen) return; // Skip stale reload
+      if (isSupersededMove(taskId, thisGen)) return; // Skip stale reload
 
-      // Lightweight reload -- only tasks (no session changes for same-column reorder)
+      // Lightweight reload - only tasks (no session changes for same-column reorder)
       const nextTasks = await window.electronAPI.tasks.list();
-      if (moveGeneration !== thisGen) return; // Skip stale reload
+      if (isSupersededMove(taskId, thisGen)) return; // Skip stale reload
       // Preserve refs for every untouched task; only the reordered ones
       // actually changed `position`.
-      set((state) => ({ tasks: applyStructuralSharing(state.tasks, nextTasks) }));
+      set((state) => applyTaskListPayload(state, nextTasks));
     } catch (err) {
-      if (moveGeneration !== thisGen) return; // Don't clobber newer state on error
+      if (isSupersededMove(taskId, thisGen)) return; // Don't clobber newer state on error
       await get().loadBoard();
       useToastStore.getState().addToast({
         message: `Failed to reorder task: ${err instanceof Error ? err.message : 'Unknown error'}`,

@@ -3,8 +3,10 @@ import { useSessionStore } from '../../stores/session-store';
 import { useConfigStore } from '../../stores/config-store';
 import { useBoardStore } from '../../stores/board-store';
 import { useProjectStore } from '../../stores/project-store';
+import { useUpdaterStore } from '../../stores/updater-store';
 import { DEFAULT_AGENT } from '../../../shared/types';
 import { Pill } from '../Pill';
+import { bakedReleaseNotes } from '../../lib/baked-release-notes';
 
 /**
  * Bottom status bar: agents/queued/tasks counts, agent-not-found warning, and
@@ -20,6 +22,8 @@ export function StatusBar() {
   const currentProject = useProjectStore((s) => s.currentProject);
   const agentEntry = useConfigStore((s) =>
     s.agentList.find((agent) => agent.name === (currentProject?.default_agent ?? DEFAULT_AGENT)));
+  const openWhatsNewAction = useUpdaterStore((s) => s.openWhatsNew);
+  const openWhatsNew = () => openWhatsNewAction({ autoOpened: false });
 
   const projectSessions = allSessions.filter((s) => s.projectId === currentProject?.id);
   const activeSessions = projectSessions.filter((s) => s.status === 'running').length;
@@ -31,11 +35,18 @@ export function StatusBar() {
   );
   const activeTasks = tasks.filter((t) => !doneSwimlaneIds.has(t.swimlane_id)).length;
 
-  // `data-dismiss-surface`: dead space in the status bar light-dismisses an open task
-  // window. A new clickable child must carry `cursor-pointer` or `data-no-dismiss`,
-  // or a click on it will also dismiss.
+  // `data-dismiss-layer`: the status bar belongs to the board layer, so dead space here
+  // light-dismisses an open task window. It needs its own marker because it sits OUTSIDE
+  // AppLayout's marked shell row rather than inside it. A new clickable child must carry
+  // `cursor-pointer` or `data-no-dismiss`, or a click on it will dismiss instead of acting.
+  // Note this stays board-scoped while the Agent Monitor is open: the monitor overlay
+  // leaves the status bar exposed, and a click here closes a board window the user cannot
+  // currently see. That matches the behavior before the denylist inversion.
   return (
-    <div className="h-9 bg-surface border-t border-edge flex items-center px-3 text-xs text-fg-faint select-none flex-shrink-0" data-dismiss-surface>
+    // `app-status-bar`, not `status-bar`: the bare name is already asserted ABSENT by
+    // task-activity-indicators.spec.ts (the task-detail "initializing" bar), so claiming it
+    // here made that absence check resolve to this always-visible element and fail.
+    <div className="h-9 bg-surface border-t border-edge flex items-center px-3 text-xs text-fg-faint select-none flex-shrink-0" data-testid="app-status-bar" data-dismiss-layer="board">
       {currentProject && (
         <div className="flex items-center gap-4">
           <span className="flex items-center gap-1.5" data-testid="session-count">
@@ -59,7 +70,23 @@ export function StatusBar() {
           <span className="text-red-400" data-testid="agent-not-found">{agentEntry.displayName} not found</span>
         )}
         {appVersion && (
-          <Pill size="sm" className="border border-edge text-fg-muted">v{appVersion}</Pill>
+          // Passing `onClick` makes Pill render a real <button> with
+          // `cursor-pointer`, which is what keeps this from also light-dismissing
+          // an open task window (see the data-dismiss-layer note above).
+          // `undefined` when the build has no notes leaves it a plain <span>: a
+          // clickable pill that opens an empty dialog is worse than a static one -
+          // and a static one correctly reads as dead space that dismisses.
+          <Pill
+            size="sm"
+            onClick={bakedReleaseNotes ? openWhatsNew : undefined}
+            title={bakedReleaseNotes ? `What's new in v${appVersion}` : undefined}
+            data-testid="status-bar-version-pill"
+            className={`border border-edge text-fg-muted${
+              bakedReleaseNotes ? ' hover:text-fg-secondary hover:border-fg-faint transition-colors' : ''
+            }`}
+          >
+            v{appVersion}
+          </Pill>
         )}
       </div>
     </div>

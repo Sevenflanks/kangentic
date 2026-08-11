@@ -606,8 +606,8 @@ describe('kangentic create/move structured immediate outcomes', () => {
     expect(result.structuredContent).toEqual(data);
     expect(mockRunHandler).toHaveBeenCalledWith(
       'move_task',
-      { taskId: 'task-move-1', column: 'Review' },
-      expect.anything(),
+      { taskId: 'task-move-1', column: 'Review', position: null },
+      expect.objectContaining({ getProjectPath: expect.any(Function) }),
     );
   });
 });

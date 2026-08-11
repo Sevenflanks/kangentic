@@ -8,9 +8,17 @@ import { deepMerge, deepMergeConfig } from '../../shared/object-utils';
 /** Dotted paths in AppConfig that must be REPLACED wholesale on a partial update
  *  (not deep-merged), so key/window deletion and a full-blob reset both work. This
  *  covers true `Record<string, ...>` dictionaries (where merge would leak deleted
- *  keys) AND renderer-authoritative layout blobs (`commandTerminalWorkspace`) the
- *  renderer always writes in full. Every other typed-struct field gets MERGE
- *  semantics. Update this list when adding such a field to AppConfig. */
+ *  keys) AND renderer-authoritative layout blobs (`commandTerminalWorkspace`,
+ *  `monitorWorkspace`) the renderer always writes in full.
+ *
+ *  What the layout blobs actually need this for is their OBJECT-shaped fields, not
+ *  their arrays: `deepMerge` already assigns an array wholesale (it recurses only
+ *  into non-array objects), so the `windows` array shrinks correctly either way.
+ *  The entry protects `tileTree` - collapsing a two-pane split to a single leaf
+ *  would otherwise merge-leak the old split's `direction` / `children` / `sizes`
+ *  onto the leaf - plus any legacy key a rewritten blob is meant to drop. Every
+ *  other typed-struct field gets MERGE semantics. Update this list when adding such
+ *  a field to AppConfig. */
 const CONFIG_DICTIONARY_PATHS = [
   'compatibilityAcknowledgements',
   'backlog.labelColors',
@@ -21,6 +29,7 @@ const CONFIG_DICTIONARY_PATHS = [
   'hotkeyOverrides',
   'workspaceByProject',
   'commandTerminalWorkspace',
+  'monitorWorkspace',
   'popOutBounds',
   'terminal.colors',
   'onboardingBaseline',
@@ -94,12 +103,33 @@ export class ConfigManager {
 
     ensureDirs();
     let parsed: Record<string, unknown> | null = null;
+    // `parsed === null` covers two very different states: there is no config file
+    // yet, or there is one and we could not read or parse it. The migrations below
+    // save(), which rewrites the file wholesale - harmless on a fresh install, and
+    // destructive on a file that is merely unparseable. Keep them apart.
+    let configFileUnreadable = false;
     try {
       const raw = fs.readFileSync(PATHS.configFile, 'utf-8');
-      parsed = JSON.parse(raw);
-      this.config = deepMergeConfig(DEFAULT_CONFIG, parsed as Partial<AppConfig>);
+      const rawParsed: unknown = JSON.parse(raw);
+      // JSON.parse can succeed on content that is valid JSON but not a usable config
+      // object: `null`, an array, or a bare primitive (number/string/boolean). None of
+      // those throw here, so without this guard they would fall through as if the file
+      // had been read successfully - `parsed && 'claude' in parsed` below throws on a
+      // primitive (the `in` operator requires an object operand), and for an array
+      // deepMergeConfig silently returns a bare-defaults copy with no error at all,
+      // which the unconditional windowLightDismiss migration further down would then
+      // persist over the file's actual (non-object) contents. Treat this exactly like
+      // an unparseable file: fall back to defaults in memory, leave the file untouched.
+      if (rawParsed !== null && typeof rawParsed === 'object' && !Array.isArray(rawParsed)) {
+        parsed = rawParsed as Record<string, unknown>;
+        this.config = deepMergeConfig(DEFAULT_CONFIG, parsed as Partial<AppConfig>);
+      } else {
+        this.config = { ...DEFAULT_CONFIG };
+        configFileUnreadable = true;
+      }
     } catch {
       this.config = { ...DEFAULT_CONFIG };
+      configFileUnreadable = fs.existsSync(PATHS.configFile);
     }
 
     // One-time migration: claude.* namespace -> agent.* (cliPath -> cliPaths).
@@ -147,6 +177,35 @@ export class ConfigManager {
     if (parsedTerminal && typeof parsedTerminal === 'object' && 'scrollbackLines' in parsedTerminal) {
       delete (this.config.terminal as unknown as Record<string, unknown>).scrollbackLines;
       this.save(this.config);
+    }
+
+    // One-time migration: adopt the `focused` light-dismiss default. Changing
+    // DEFAULT_CONFIG alone reaches fresh installs only, because save() writes the
+    // whole blob and load() lets a persisted value beat the default - so every
+    // install that ran under the old `single` default keeps it. That matters
+    // rather than being cosmetic: `single` resolves to no target once a second
+    // window is open, so click-outside close silently stops working there.
+    //
+    // A persisted `single` is indistinguishable from a deliberate choice, so this
+    // knowingly overrides one made before the flip shipped. The marker bounds it
+    // to a single rewrite, so re-picking `single` afterwards sticks. It runs on a
+    // fresh install too (a no-op on an already-`focused` value) rather than being
+    // gated on `parsed`, so the marker is persisted on the first launch instead of
+    // being re-evaluated on every one until some unrelated save happens to land.
+    if (!this.config.hasMigratedWindowLightDismissDefault) {
+      this.config.hasMigratedWindowLightDismissDefault = true;
+      if (this.config.windowLightDismiss === 'single') {
+        this.config.windowLightDismiss = 'focused';
+      }
+      // The one exception to running unconditionally: an existing file we failed to
+      // parse. Every migration above this one is `parsed`-gated, so before this block
+      // an unparseable config was left on disk untouched and the session merely ran on
+      // defaults. Saving here would replace it with bare defaults at launch and destroy
+      // whatever was hand-recoverable in it. Deferring costs nothing - the marker is
+      // still false next launch and the rewrite is idempotent.
+      if (!configFileUnreadable) {
+        this.save(this.config);
+      }
     }
 
     return this.config;

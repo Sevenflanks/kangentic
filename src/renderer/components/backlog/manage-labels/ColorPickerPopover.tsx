@@ -76,6 +76,10 @@ export function ColorPickerPopover({
   return (
     <div
       ref={popoverRef}
+      // `data-dismissable-layer`: renders in flow inside the board toolbar's labels popover,
+      // which the board layer owns for light dismiss, so without the marker a click on this
+      // popover's own padding would close an open task window behind it.
+      data-dismissable-layer
       className="fixed z-[60] bg-surface-raised border border-edge rounded-lg shadow-xl p-2"
       style={{ top: position.top, left: position.left }}
       onClick={(event) => event.stopPropagation()}
@@ -132,7 +136,7 @@ export function ColorPickerPopover({
             onBlur={() => {
               if (!/^#[0-9a-fA-F]{6}$/.test(hexInput)) setHexInput(color);
             }}
-            className="w-full bg-surface border border-edge-input rounded px-3 py-1.5 text-sm text-fg font-mono focus:outline-none focus:border-accent"
+            className="w-full bg-surface-control border border-edge-input rounded px-3 py-1.5 text-sm text-fg font-mono focus:outline-none focus:border-accent"
             placeholder="#000000"
             maxLength={7}
           />

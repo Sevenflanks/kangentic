@@ -11,6 +11,7 @@ import { createSpawnCompatibilitySlice } from './session-store/spawn-compatibili
 import { mergeRateLimitSnapshot } from '../utils/rate-limit-window';
 import type { LiveDeliveryStatus } from '../../shared/live-delivery-status';
 import type { AutoCommandWarning } from '../../shared/auto-command-outcome';
+import { claimArrivalFocus } from '../utils/terminal-arrival-focus';
 
 const MAX_EVENTS_PER_SESSION = 500;
 const DELIVERY_ERROR_WARNING_MESSAGE = 'Lane command could not be delivered safely.';
@@ -185,13 +186,11 @@ async function safeFetch<T>(
 /** Aborts in-flight syncSessions() calls when the project switches.
  *  Persisted across HMR via import.meta.hot.data so cancelSync() can
  *  still abort an in-flight sync after a module replacement. */
-// @ts-expect-error -- Vite handles import.meta.hot; tsc's "module": "commonjs" doesn't support it
 let syncController: AbortController | null = import.meta.hot?.data?.syncController ?? null;
 
 /** Transient session state preserved across HMR. Without this, the
  *  transientSessions map resets to {} on module re-evaluation, orphaning
  *  live PTY processes in the main process and causing duplicate spawns. */
-// @ts-expect-error -- Vite handles import.meta.hot
 const hmrTransientData: Record<string, unknown> | undefined = import.meta.hot?.data?.transientState;
 const preservedTransientState = hmrTransientData as {
   transientSessions: Record<string, TransientSessionEntry>;
@@ -201,25 +200,18 @@ const preservedTransientState = hmrTransientData as {
  *  emitSpawnProgress push that arrives pre-reload is dropped when the store
  *  re-initializes to defaults - leaving a stale "Initializing..." state on
  *  the task card that the user can't clear without a full app restart. */
-// @ts-expect-error -- Vite handles import.meta.hot
 const preservedSpawnProgress: Record<string, string> = import.meta.hot?.data?.spawnProgress ?? {};
-// @ts-expect-error -- Vite handles import.meta.hot
 const preservedPendingCommandLabel: Record<string, string> = import.meta.hot?.data?.pendingCommandLabel ?? {};
 
 /** Conversation-viewer nav signals preserved across HMR. Without this, an HMR
  *  that re-evaluates this module resets conversationSessionId to null;
  *  useConversationWindowBridge keys on that field and treats null as "the user
  *  closed it," silently closing an open Conversation window mid-edit. */
-// @ts-expect-error -- Vite handles import.meta.hot
 const preservedConversationSessionId: string | null = import.meta.hot?.data?.conversationSessionId ?? null;
-// @ts-expect-error -- Vite handles import.meta.hot
 const preservedScrollToTurnUuid: string | null = import.meta.hot?.data?.scrollToTurnUuid ?? null;
-// @ts-expect-error -- Vite handles import.meta.hot
 const preservedPendingTuiAnchor: PendingTuiAnchor | null = import.meta.hot?.data?.pendingTuiAnchor ?? null;
 
-// @ts-expect-error -- Vite handles import.meta.hot
 if (import.meta.hot) {
-  // @ts-expect-error -- Vite handles import.meta.hot
   import.meta.hot.dispose((data: Record<string, unknown>) => {
     data.syncController = syncController;
     const state = useSessionStore.getState();
@@ -267,6 +259,8 @@ export const useSessionStore = create<SessionStore>((set, get, api) => ({
   detailTaskId: null,
   detailTaskInitialEdit: false,
   dialogSessionIds: [],
+  remoteDetailTaskIds: [],
+  mobileTerminalStreamedSessionIds: [],
   pendingDetailWindowsProjectId: null,
   scrollToEventKey: null,
   conversationSessionId: preservedConversationSessionId,
@@ -652,6 +646,13 @@ export const useSessionStore = create<SessionStore>((set, get, api) => ({
   setActiveSession: (id) => set({ activeSessionId: id }),
 
   selectActiveSession: (id) => {
+    // A tab click is a user gesture naming a terminal that has not mounted yet,
+    // so it claims arrival focus. The bottom panel is not a window: clicking its
+    // tab moves no layer's `focusedWindowId`, so without this claim the arbiter
+    // would keep handing focus to an open detail window and the newly selected
+    // tab would mount unfocused. ACTIVITY_TAB names no session, and passing null
+    // clears any standing claim.
+    claimArrivalFocus(id === ACTIVITY_TAB ? null : id);
     set({ activeSessionId: id });
     // Persist the user's tab choice to AppConfig so it survives project switch
     // and app restart. Skip non-persistable selections: null, the activity tab

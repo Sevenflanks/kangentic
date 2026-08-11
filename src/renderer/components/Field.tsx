@@ -2,17 +2,42 @@ import type { ReactNode } from 'react';
 import { Info } from 'lucide-react';
 
 /**
- * The shared shell for a single-line form control inside a dialog: 34px tall
- * (`py-1.5` + `text-sm` + 1px borders), `rounded`, on the `surface` token.
+ * The shared shell for a single-line form control: 34px tall (`py-1.5` +
+ * `text-sm` + 1px borders), `rounded`, on the `surface-control` token.
  *
  * 34px is the scale because `Select` (settings/shared.tsx) and `Combobox` are
  * both already this height and are used across settings, the board manager, and
  * the task run-mode card - changing THEM ripples app-wide, so everything else
  * comes up to meet them. Height stays padding-derived rather than a fixed
  * `h-[34px]` so the box keeps growing with the font if the text scale changes.
+ *
+ * `--kng-surface-control` is a DEDICATED token, not a borrowed one, and that is
+ * the point. Inputs, comboboxes, and `ToggleCard` all reference it, so a card
+ * and the dropdown beside it read as one family - and re-tuning the control fill
+ * is one value per theme rather than a sweep across ~19 files. Each theme's
+ * value is tuned to a ~1.3:1 step against `surface-raised` (the ground under
+ * BaseDialog, the task-detail window, and the settings panel), extrapolated
+ * along the theme's own raised-to-hover hue ray. The first cut sat 60% of the
+ * way from `surface-raised` to `surface-hover` and did not register (1.09-1.22:1
+ * against that ground): the compressed themes' whole raised-to-hover span falls
+ * short of that same ~1.3:1 step, which is why the fill now sits at or PAST
+ * `surface-hover` where it must. That collapse is safe because nothing grounds a control on
+ * full-strength `surface-hover` - the fill's real neighbours are `surface-raised`
+ * and the segmented track's `surface`, and the fill carrying the separation also
+ * means `edge-input` is now redundant-by-design against the fill in the
+ * compressed themes (the border's job is the ground side, where it stays
+ * legible). `tests/unit/theme-contrast.test.ts` enforces the separation floors.
+ *
+ * Text ON this fill has to be chosen against the WHOLE theme set, not the
+ * default one - that mistake cost several rounds. Worst-case ratios across all
+ * 10 themes: `fg` 8.49:1, `fg-tertiary` 4.63:1, `fg-muted` 3.19:1. So anything a
+ * user must read stays at `fg-tertiary` or brighter; `fg-muted` and `fg-faint`
+ * are for hint text and decoration. Value text is `fg-tertiary`, placeholders
+ * are `fg-muted` (deliberately sub-AA: a placeholder must read dimmer than the
+ * value it stands in for). `tests/unit/theme-contrast.test.ts` enforces this.
  */
 const FIELD_CONTROL_BASE =
-  'w-full bg-surface border border-edge-input rounded py-1.5 text-sm text-fg placeholder-fg-faint focus:outline-none focus:border-accent';
+  'w-full bg-surface-control border border-edge-input rounded py-1.5 text-sm text-fg-tertiary placeholder-fg-muted focus:outline-none focus:border-accent';
 
 export const FIELD_CONTROL_CLASS = `${FIELD_CONTROL_BASE} px-3`;
 

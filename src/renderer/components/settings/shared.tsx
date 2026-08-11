@@ -1,11 +1,12 @@
 import React, { useEffect, useRef } from 'react';
 import { ChevronDown, Search, X } from 'lucide-react';
 import { useOverlayPhase } from '../../hooks/useOverlayPhase';
-import { useSettingVisible, useSettingsSearch } from './settings-search';
+import { useAnySettingVisible, useSettingVisible, useSettingsSearch } from './settings-search';
 import { TIER_LABELS } from './settings-tabs';
 import type { SettingsTabTier } from './settings-tabs';
 import { Pill } from '../Pill';
 import { ToggleCard, ToggleIndicator } from '../ToggleCard';
+import { SettingText, SETTING_LABEL_CLASS, SETTING_DESCRIPTION_CLASS } from '../SettingText';
 
 // Re-export scope primitives so consumers can import everything from './shared'.
 export { SettingsPanelProvider, useScopedUpdate } from './setting-scope';
@@ -131,7 +132,7 @@ export function SettingsPanelShell({ onClose, children, projectSwitcher, tabs, a
                 onChange={(event) => onSearchChange(event.target.value)}
                 placeholder="Search settings..."
                 data-testid="settings-search"
-                className="w-full bg-surface-hover border border-edge-input rounded pl-9 pr-9 py-1.5 text-sm text-fg placeholder-fg-faint focus:outline-none focus:border-accent"
+                className="w-full bg-surface-control border border-edge-input rounded pl-9 pr-9 py-1.5 text-sm text-fg-tertiary placeholder-fg-muted focus:outline-none focus:border-accent"
               />
               {searchQuery && (
                 <button
@@ -258,13 +259,12 @@ interface SectionHeaderProps {
 }
 
 export function SectionHeader({ label, description, prominent, searchIds }: SectionHeaderProps) {
-  const { isSearching, matchingIds } = useSettingsSearch();
-
-  // When searching with searchIds, hide if none of the listed IDs match.
-  if (isSearching && searchIds && searchIds.length > 0) {
-    const anyVisible = searchIds.some((id) => matchingIds.has(id));
-    if (!anyVisible) return null;
-  }
+  // Shared with the section BODIES that sit under a header (see
+  // useAnySettingVisible's own comment): a header and its body must apply the
+  // same any-of-these-ids rule, or the header hides while the body renders on
+  // (or the reverse, orphaning the heading).
+  const visible = useAnySettingVisible(searchIds);
+  if (!visible) return null;
 
   return (
     <div className={prominent ? 'pt-4 mt-4 border-t-2 border-edge first:pt-0 first:mt-0' : 'pt-3 mt-2 first:pt-0 first:mt-0'}>
@@ -296,10 +296,13 @@ export function SettingRow({ label, description, children, searchId, trailing }:
 
   return (
     <div className="space-y-1.5" data-testid={searchId ? `setting-row-${searchId}` : undefined}>
+      {/* Raw classes rather than <SettingText>: this row right-aligns `trailing`
+          against the DESCRIPTION line, a layout the shared component does not
+          own. The values still come from one place. */}
       <div>
-        <div className="text-sm font-medium text-fg-secondary">{label}</div>
+        <div className={SETTING_LABEL_CLASS}>{label}</div>
         <div className="flex items-center justify-between gap-2">
-          <div className="text-xs text-fg-faint">{description}</div>
+          <div className={SETTING_DESCRIPTION_CLASS}>{description}</div>
           {trailing}
         </div>
       </div>
@@ -335,7 +338,7 @@ export function Select({
       {leadingIcon}
       <select
         {...props}
-        className={className ?? 'appearance-none bg-surface-hover border border-edge-input rounded pl-3 pr-10 py-1.5 text-sm text-fg w-full focus:outline-none focus:border-accent disabled:cursor-not-allowed'}
+        className={className ?? 'appearance-none bg-surface-control border border-edge-input rounded pl-3 pr-10 py-1.5 text-sm text-fg-tertiary w-full focus:outline-none focus:border-accent disabled:cursor-not-allowed'}
       >
         {children}
       </select>
@@ -475,12 +478,7 @@ export function CompactToggleList({ items }: { items: CompactToggleItem[] }) {
           onClick={() => item.onChange(!item.checked)}
           className="flex items-center justify-between gap-4 w-full text-left cursor-pointer rounded px-2 py-1.5 hover:bg-surface/60 transition-colors focus:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-accent"
         >
-          <div className="min-w-0">
-            <div className="text-sm text-fg-secondary leading-tight">{item.label}</div>
-            {item.description && (
-              <div className="text-xs text-fg-faint leading-tight">{item.description}</div>
-            )}
-          </div>
+          <SettingText className="leading-tight" label={item.label} description={item.description} />
           <ToggleIndicator checked={item.checked} />
         </button>
       ))}
@@ -488,5 +486,13 @@ export function CompactToggleList({ items }: { items: CompactToggleItem[] }) {
   );
 }
 
-/** Standard input class for text/number inputs. */
-export const INPUT_CLASS = 'bg-surface-hover border border-edge-input rounded px-3 py-1.5 text-sm text-fg w-full focus:outline-none focus:border-accent';
+/**
+ * Standard input class for text/number inputs.
+ *
+ * Fill, border, and value colour all match `FIELD_CONTROL_BASE` (the dialogs'
+ * equivalent) so a control looks the same wherever it appears. `fg-tertiary`
+ * rather than `fg` for the value: `SettingText` renders a setting's title at
+ * full-strength `fg`, so a value at `fg` too leaves the label and the data it
+ * labels at identical weight, with no hierarchy between them.
+ */
+export const INPUT_CLASS = 'bg-surface-control border border-edge-input rounded px-3 py-1.5 text-sm text-fg-tertiary w-full focus:outline-none focus:border-accent';

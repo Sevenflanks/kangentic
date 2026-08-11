@@ -73,7 +73,7 @@ Build-excluded from production via `__KANGENTIC_DEV__` (esbuild dead-code elimin
 | `projectGroup:reorder` | invoke | Reorder groups by ID array |
 | `projectGroup:setCollapsed` | invoke | Toggle group collapsed state |
 
-### Tasks (23 channels)
+### Tasks (25 channels)
 | Channel | Pattern | Purpose |
 |---------|---------|---------|
 | `task:list` | invoke | Fetch tasks, optionally by swimlane |
@@ -96,6 +96,8 @@ Build-excluded from production via `__KANGENTIC_DEV__` (esbuild dead-code elimin
 | `task:updatedByAgent` | on | Event: task was updated by an agent via MCP tool call |
 | `task:deletedByAgent` | on | Event: task was deleted by an agent via MCP tool call |
 | `task:sessionResync` | on | Event: quiet (toast-free) board re-sync after a column model-change session restart, so the board store's stale `task.session_id` reloads |
+| `task:spawnBlocked` | on | Event: the task was created, promoted, unarchived or MCP-auto-spawned, but its agent could not start because another task holds the same checkout. Those paths deliberately keep the task, so without this the result is indistinguishable from a healthy spawn |
+| `task:autoCommandResult` | on | Event: the outcome of a task's auto_command injection (`AutoCommandResultNotice`: state, command, reason, discardedDraft, interruptedTurn, escalated). Rationed by `shouldNotify` so a routine delivery stays silent and only a failure, an escalation, or a discarded draft reaches the user |
 | `task:spawnProgress` | on | Event: spawn progress phase label during task move |
 | `task:getSpawnProgress` | invoke | Fetch the queryable in-flight spawn-progress map (taskId -> phase label) so `syncSessions` can reconcile after HMR / project switch |
 | `task:setDetailViewState` | invoke | Persist the task-detail dialog's layout blob (debounced from the renderer) so it restores across restarts. Pass null to clear. Does not bump `updated_at`. |
@@ -107,7 +109,7 @@ Build-excluded from production via `__KANGENTIC_DEV__` (esbuild dead-code elimin
 | `attachment:add` | invoke | Add attachment (base64 data) |
 | `attachment:remove` | invoke | Delete attachment |
 | `attachment:getDataUrl` | invoke | Get data URL for display |
-| `attachment:open` | invoke | Open attachment in the system default application |
+| `attachment:open` | invoke | Open attachment in the system default application. Resolves to `''` on success or an error string the renderer surfaces as a toast; races a timeout so the invoke is always answered, and reveals the file in the file manager when no default app handles it |
 
 ### Backlog (13 channels)
 | Channel | Pattern | Purpose |
@@ -150,7 +152,7 @@ Build-excluded from production via `__KANGENTIC_DEV__` (esbuild dead-code elimin
 | `backlogAttachment:add` | invoke | Add attachment to a backlog item (base64 data) |
 | `backlogAttachment:remove` | invoke | Delete backlog item attachment |
 | `backlogAttachment:getDataUrl` | invoke | Get data URL for display |
-| `backlogAttachment:open` | invoke | Open attachment in the system default application |
+| `backlogAttachment:open` | invoke | Open attachment in the system default application. Same answer-or-timeout contract and file-manager fallback as `attachment:open` |
 
 ### Swimlanes (6 channels)
 | Channel | Pattern | Purpose |
@@ -160,7 +162,7 @@ Build-excluded from production via `__KANGENTIC_DEV__` (esbuild dead-code elimin
 | `swimlane:update` | invoke | Update swimlane properties |
 | `swimlane:delete` | invoke | Delete swimlane (blocked if has tasks) |
 | `swimlane:reorder` | invoke | Reorder swimlanes by ID array |
-| `swimlane:updatedByAgent` | on | Push event when an MCP agent updates a swimlane |
+| `swimlane:updatedByAgent` | on | Push event when an MCP agent changes a project's columns: a column create, update, or delete, or (reusing the same deliberately kind-agnostic signal) a same-column task reorder via `kangentic_reorder_tasks` / `kangentic_move_task`'s `position`, where no swimlane field itself changed |
 
 ### Actions (4 channels)
 | Channel | Pattern | Purpose |
@@ -177,7 +179,7 @@ Build-excluded from production via `__KANGENTIC_DEV__` (esbuild dead-code elimin
 | `transition:set` | invoke | Set action chain for lane A→B |
 | `transition:getFor` | invoke | Get transitions for lane pair (exact match, then wildcard) |
 
-### Sessions (35 channels)
+### Sessions (37 channels)
 | Channel | Pattern | Purpose |
 |---------|---------|---------|
 | `session:spawn` | invoke | Spawn PTY session (may queue) |
@@ -199,9 +201,11 @@ Build-excluded from production via `__KANGENTIC_DEV__` (esbuild dead-code elimin
 | `session:getEvents` | invoke | Fetch activity log events for one session |
 | `session:getEventsCache` | invoke | Fetch cached event arrays. Optional `projectId` scopes to one project. |
 | `session:setFocused` | invoke | Set which sessions are visible in the renderer (optimizes IPC traffic) |
+| `session:setMounted` | invoke | Set which sessions this renderer has an xterm MOUNTED for. Broader than the focused set: a parked terminal is unfocused but still holds a grid, and main must not reshape a PTY something is still rendering at its own size |
 | `session:notifyUserInterrupt` | invoke | Notify telemetry of a user Ctrl+C; arms the 3-second settle timer that synthesizes Interrupted if hooks don't recover |
 | `session:data` | on | Terminal output available (includes `projectId`) |
 | `session:drainAck` | send | Renderer-to-main flow-control ack for per-session PTY backpressure; fire-and-forget (no projectId) |
+| `session:ptyResized` | on | The PTY's grid actually changed (`cols`, `rows`, `PtyResizeOrigin`). Broadcast to every window; the mounted owner xterm uses it to detect and heal a width divergence (xterm re-sends dims only when its own size changes) |
 | `session:firstOutput` | on | Alternate screen buffer detected - TUI ready (includes `projectId`) |
 | `session:exit` | on | Session exited (includes `projectId`) |
 | `session:status` | on | Session changed - pushes full `Session` object (includes `projectId`) |
@@ -220,6 +224,36 @@ Build-excluded from production via `__KANGENTIC_DEV__` (esbuild dead-code elimin
 | Channel | Pattern | Purpose |
 |---------|---------|---------|
 | `usage:getDashboardStats` | invoke | Composite usage-statistics payload for the dashboard (KPIs, bucketed token/cost time series, by-model / by-agent breakdowns), for one project or rolled up across every registered project, over the Live/Today/Week/Month/All Time ranges. Sources from the append-only `usage_history` + `conversation_turn_usage` ledgers so totals survive task deletion, bulk-archive, and revert-to-backlog; also merges in-flight sessions from the live `SessionManager` on top (skipped for a day drill or custom window, which are pure ledger accounting) so the SESSIONS KPI and Live view are not undercounted. Read-only; the explicit scope argument carries the project id. |
+
+### Agent Monitor (8 channels)
+Machine-global, like the Mobile Bridge channels: the monitor aggregates live sessions across
+**every** registered project, so no channel here takes a trailing `projectId`. The one exception
+is `monitor:getTaskDetail`, which names a project explicitly because it reads ONE task from a
+project that may not be the open one.
+| Channel | Pattern | Purpose |
+|---------|---------|---------|
+| `monitor:getSnapshot` | invoke | Cross-project snapshot of every live and recently-finished agent session: owning project, task title / ticket number / column, activity state and reason, agent, model, runtime, last event, context-window usage, and a seed of the live output peek. A Command Terminal row carries no task, so it is titled by its window slot and names its branch where a task names its column. Built by joining the process-global session registry and activity/event/usage caches against each owning project's DB. Per-project setup is memoized once per snapshot; the row build itself is one indexed task read plus one session read per monitored session. Read-only. |
+| `monitor:subscribe` | invoke | Register the calling renderer as a live monitor consumer and return a fresh snapshot in the same round trip, so a mounting monitor cannot race the next push for its first frame. Main builds and fans out `monitor:changed` only while at least one subscriber is registered; with every monitor closed, a session event costs no snapshot build at all. Main drops the registration itself when the renderer closes, crashes, or hard-reloads (the task-detail-ownership teardown trio), so a lost renderer cannot pin the pipeline on. |
+| `monitor:unsubscribe` | invoke | Explicit counterpart of `monitor:subscribe`, called when the monitor closes. |
+| `monitor:getTaskDetail` | invoke | Everything the task-detail surface needs about a task's OWN project (task row, project name/path, swimlanes, shortcuts, label colors, base branch, worktree/browser flags), so a host that is not that project's board can render it. One bundle rather than stamping five read channels with a projectId. Returns null when the project or task is gone, so the caller closes rather than rendering a husk. Read-only. |
+| `monitor:revealTask` | invoke | Ask main to reveal a task in the MAIN window (switching project if needed) and focus it. Used by the DETACHED monitor, which is its own renderer with its own stores and so cannot open a task by setting local state. Re-emits the existing `notification:clicked` push so there is one reveal path, not two. |
+| `monitor:changed` | on | Fanned to every window (main + open pop-outs) when the DB-resident half of a row changes (a session spawned or exited, or an agent retitled/moved a task), debounced at 250ms and gated on a live `monitor:subscribe` registration. Live activity does NOT come through here - it rides the unbuffered `session:activity` push and is patched onto rows in place, so a state change needs no round trip. |
+| `monitor:peek` | on | The live output peek: the last few rendered terminal lines per session, fanned to every subscribed window and patched onto rows in place like activity. Only sessions whose visible text actually changed are sent, so a repainting TUI whose content is unchanged produces no traffic. Sampled from the parsed grid at most twice a second. |
+| `monitor:setPeekSubscribed` | invoke | Start or stop the peek stream for the CALLING renderer, ref-counted per renderer id so the in-app monitor and a detached pop-out subscribe independently. Separate from `monitor:subscribe` because it gates a DIFFERENT standing cost: that one gates snapshot building, this one gates a PTY output listener plus a sampling timer. A closed monitor pays neither. |
+
+### Task Detail Ownership (5 channels)
+Machine-global, and deliberately outside the `task:` prefix: these mutate no task, they arbitrate
+WHICH RENDERER hosts a task's detail. Only main can answer, because a pop-out is a separate
+renderer with its own stores and neither host can see the other's windows. Ownership is DERIVED
+from a host's complete mounted set, never accumulated from claim/release - see
+`.claude/rules/derived-detail-ownership.md`, which owns the rules.
+| Channel | Pattern | Purpose |
+|---------|---------|---------|
+| `detail:requestOpen` | invoke | Ask main where this task's detail should open. Main focuses the target window and returns `focused-existing` (the requester already holds it, so nothing remounts and a live terminal is not torn down) or `open-here` (the requester wins, naming any surface it displaced). |
+| `detail:openHere` | on | Main telling a surface in this renderer to mount a task's detail. |
+| `detail:closeHere` | on | Main telling the PREVIOUS holder to let go, because another surface took the detail. Sent BEFORE the winner mounts, so the detail is never briefly present twice. |
+| `detail:syncOwned` | send | A host reports the COMPLETE set of details it currently owns, derived from its window store. Replaces a claim/release pair: a lost or out-of-order message cannot strand a claim, which used to make a task permanently unopenable. Owns, not merely mounts: a window RETAINED for a backgrounded project stays mounted but is excluded, since it is holding a Browser pane's guest alive rather than presenting that task's detail, and leaving it in would block the Agent Monitor from hosting the same task. Main reconciles per `(webContentsId, host)`. |
+| `detail:remoteOwners` | on | Main publishing which details are held by a DIFFERENT renderer, filtered per recipient. Terminal ownership ("one xterm per PTY") was renderer-local, so a detail hosted in the detached monitor left the main window free to mount a second xterm on the same live PTY. Only main sees both sides. |
 
 ### Config (10 channels)
 | Channel | Pattern | Purpose |
@@ -252,8 +286,8 @@ Build-excluded from production via `__KANGENTIC_DEV__` (esbuild dead-code elimin
 | Channel | Pattern | Purpose |
 |---------|---------|---------|
 | `boardConfig:exists` | invoke | Check if `kangentic.json` exists for the active project |
-| `boardConfig:export` | invoke | Export current board state to `kangentic.json` (auto-runs on project open) |
-| `boardConfig:apply` | invoke | Apply pending config file changes (reconcile file into DB) |
+| `boardConfig:export` | invoke | Export current board state to `kangentic.json` (auto-runs on project open, AFTER the open-time apply below) |
+| `boardConfig:apply` | invoke | Apply pending config file changes (reconcile file into DB). The same apply also runs unprompted on project open when the file exists, before the export - see [Board Config Sync](configuration.md#board-config-sync-kangenticjson) |
 | `boardConfig:changed` | on | Event: `kangentic.json` or `kangentic.local.json` changed on disk |
 | `boardConfig:getBoardProfiles` | invoke | Get the board's Board Profiles (see [Configuration](configuration.md#board-profiles)) |
 | `boardConfig:setBoardProfiles` | invoke | Replace the board's Board Profiles (team-scoped) |
@@ -263,7 +297,7 @@ Build-excluded from production via `__KANGENTIC_DEV__` (esbuild dead-code elimin
 | `boardConfig:shortcutsChanged` | on | Event: shortcuts file changed |
 | `boardConfig:setDefaultBaseBranch` | invoke | Set the team-shared default base branch in `kangentic.json` |
 
-### Mobile Bridge (12 channels)
+### Mobile Bridge (14 channels)
 Machine-global (like Config), not project-scoped - backs the Mobile Devices settings tab. See [Mobile Bridge](mobile-bridge.md) for the pairing ceremony, roster, capability verbs, and relay transport this group fronts.
 | Channel | Pattern | Purpose |
 |---------|---------|---------|
@@ -279,6 +313,8 @@ Machine-global (like Config), not project-scoped - backs the Mobile Devices sett
 | `mobile:pairingConfirmed` | on | Event: the phone's sealed confirm frame opened and the device was auto-enrolled, with its deviceId and phone-supplied display name |
 | `mobile:pairingEnded` | on | Event: pairing ended with a reason and a `kind` (`'cancelled'` \| `'failed'`); the desktop only surfaces a message for `'failed'` (mismatch, timeout, handshake error) - a plain cancel is already obvious from the UI returning to idle |
 | `mobile:stateChanged` | on | Event: status or device list changed (pairing confirmed/revoke/capability update) |
+| `mobile:getTerminalStreams` | invoke | The set of session ids a phone is streaming a terminal for - the set the bottom panel suspends its own terminals for. Seeds a renderer that mounts after the phone already subscribed (app start with a connected phone, window reload) |
+| `mobile:terminalStreamsChanged` | on | Event: the phone-streamed session id set changed; keeps the renderer's copy current between seeds |
 
 ### Notifications (2 channels)
 | Channel | Pattern | Purpose |
@@ -349,7 +385,7 @@ Machine-global (like Config), not project-scoped - backs the Mobile Devices sett
 | `window:isFocused` | invoke | Check if the sending window has focus (for the renderer's spawn-stall/plan-complete notification gating; the idle/crash desktop notifier resolves focus synchronously in main instead - see `src/main/notifications/desktop-notifier.ts`) |
 
 ### Pop-out Windows (6 channels)
-Detach a registered UI surface (usage stats, git changes, the task Browser pane) into its own OS-level `BrowserWindow`. See `src/shared/pop-out.ts` for the surface registry (`PopOutKind`, params, per-surface push fan-out) and `src/main/pop-out/` for the window manager + broadcast helper. Distinct from the in-app DOM window manager (`src/renderer/window-manager/`), which tiles movable panes inside the single main `BrowserWindow`.
+Detach a registered UI surface (usage stats, git changes, the task Browser pane, the Agent Monitor) into its own OS-level `BrowserWindow`. See `src/shared/pop-out.ts` for the surface registry (`PopOutKind`, params, per-surface push fan-out) and `src/main/pop-out/` for the window manager + broadcast helper. Distinct from the in-app DOM window manager (`src/renderer/window-manager/`), which tiles movable panes inside the single main `BrowserWindow`.
 | Channel | Pattern | Purpose |
 |---------|---------|---------|
 | `popOut:open` | invoke | Open a surface's pop-out window (kind + params), or focus it if already open |
@@ -375,17 +411,19 @@ Detach a registered UI surface (usage stats, git changes, the task Browser pane)
 | `clipboard:readImage` | invoke | Read the native clipboard image, save it to a temp file, returns file path or null |
 | `clipboard:writeText` | invoke | Write text to the native clipboard (focus-independent; used by terminal copy and the OSC 52 handler) |
 
-### Browser pane (8 channels)
+### Browser pane (10 channels)
 | Channel | Pattern | Purpose |
 |---------|---------|---------|
 | `browser:captureSend` | invoke | Composite the embedded webview frame + draw overlay + picked element into a PNG, write it to the session captures dir, and submit a structured prompt to the agent's PTY via PasteEngine |
-| `browser:urlGet` | invoke | Get the project default URL and per-task URL override for a given task |
-| `browser:urlSetTask` | invoke | Persist a per-task URL override |
-| `browser:urlClearTask` | invoke | Remove the per-task URL override (falls back to project default) |
+| `browser:urlGet` | invoke | Get the project default URL and per-task URL override for a given task. Takes a trailing `projectId` (the TASK's project, not the open board's) resolved via `resolveProjectContext`: a popped-out or retained pane outlives a project switch, so the ambient current project would route it to the wrong sidecar |
+| `browser:urlSetTask` | invoke | Persist a per-task URL override. Same trailing `projectId` |
+| `browser:urlClearTask` | invoke | Remove the per-task URL override (falls back to project default). Same trailing `projectId` |
 | `browser:clearStorage` | invoke | Wipe cookies, localStorage, IndexedDB, service workers, and HTTP/auth caches across the per-worktree embedded browser partitions (and the legacy shared jar). Saved URLs are kept. |
-| `browser:zoomChanged` | push | Broadcast the new zoom factor after Ctrl+wheel is applied in the main process (the webview's `zoom-changed` event lives on WebContents, not the DOM tag, so the renderer learns about wheel zoom only via this push) |
-| `browser:paneRegister` | invoke | Register an open Browser pane's guest webContents (taskId, sessionId, webContentsId, url) with the main-process pane registry so the `kangentic_browser_*` MCP tools can target it |
+| `browser:zoomChanged` | push | Broadcast the new zoom factor after Ctrl+wheel is applied in the main process (the webview's `zoom-changed` event lives on WebContents, not the DOM tag, so the renderer learns about wheel zoom only via this push). Carries the guest's `webContentsId` alongside the factor: one window can host several panes, and a factor-only broadcast made all of them adopt a zoom applied to just one |
+| `browser:paneRegister` | invoke | Register an open Browser pane's guest webContents (taskId, sessionId, webContentsId, url) with the main-process pane registry so the `kangentic_browser_*` MCP tools can target it. The handler backfills `projectId` from the session registry rather than trusting the renderer's ambient current project, since that is the field cross-project scoping is enforced on |
 | `browser:paneUnregister` | invoke | Unregister a Browser pane on unmount, scoped to the webContentsId that instance registered with (compare-and-delete) so an out-of-order unmount between the in-app pane and its pop-out cannot clobber a newer registration; the guest's own `destroyed` event is the backstop |
+| `browser:paneOpenRequest` | push | Main asking the renderer to open a task's Browser pane, behind `kangentic_browser_open_pane`. Pane open state is renderer-owned (`browserOpenTasks`), so main cannot set it directly. Fire-and-forget: main validates every precondition itself (the open project, the per-project `browser.enabled` gate, the task row, the URL it seeds first) and then awaits the pane REGISTRY rather than a reply, because only a registered live guest proves the pane is driveable |
+| `browser:paneCloseRequest` | push | Main asking the renderer to close Browser panes, behind `kangentic_browser_close_pane`. Carries the taskIds main computed from the pane registry: the renderer must not re-derive them, since `browserOpenTasks` is not project-keyed and the board store holds only the open project's tasks, so a retained backgrounded pane would be invisible to a board lookup |
 
 ### Updater (3 channels)
 | Channel | Pattern | Purpose |
@@ -393,6 +431,12 @@ Detach a registered UI surface (usage stats, git changes, the task Browser pane)
 | `updater:check` | invoke | Check for application updates |
 | `updater:install` | invoke | Install downloaded update (quit and install) |
 | `updater:downloaded` | on | Event: update has been downloaded and is ready to install |
+
+### Announcements (2 channels)
+| Channel | Pattern | Purpose |
+|---------|---------|---------|
+| `announcements:get` | invoke | Current active announcements (remote feed, already filtered for this client's version/platform in main) |
+| `announcements:changed` | on | Event: the filtered active announcement list changed since the last poll |
 
 ### Search (1 channel)
 | Channel | Pattern | Purpose |
@@ -461,8 +505,8 @@ Stores the project list. Tables:
 
 Created on project open. Stored in the global config directory (not inside the project). Tables:
 
-- **swimlanes** -- Kanban columns. Fields: id, name, role (`todo`/`done`/null), position, color, icon, is_archived, permission_mode, auto_spawn, auto_command, agent_override, model_override, effort_override, handoff_context, plan_exit_target_id, session_target, session_spawn_strategy, is_ghost, created_at
-- **tasks** -- Kanban cards. Fields: id, display_id, title, description, swimlane_id, position, agent, agent_override, model_override, effort_override, permission_mode, auto_command, profile_id, run_mode, session_id, worktree_path, branch_name, pr_number, pr_url, pr_state, head_sha, base_branch, use_worktree, labels, priority, external_id, external_source, external_url, detail_view_state, archived_at, created_at, updated_at
+- **swimlanes** -- Kanban columns. Fields: id, name, role (`todo`/`done`/null), position, color, icon, is_archived, permission_mode, auto_spawn, auto_command, auto_command_mode, agent_override, model_override, effort_override, handoff_context, plan_exit_target_id, session_target, session_spawn_strategy, is_ghost, created_at
+- **tasks** -- Kanban cards. Fields: id, display_id, title, description, swimlane_id, position, agent, agent_override, model_override, effort_override, permission_mode, auto_command, auto_command_state, auto_command_text, auto_command_error, auto_command_at, profile_id, run_mode, session_id, worktree_path, worktree_folder, branch_name, pr_number, pr_url, pr_state, head_sha, base_branch, use_worktree, labels, priority, external_id, external_source, external_url, detail_view_state, archived_at, created_at, updated_at
 - **actions** -- Executable steps. Types: `spawn_agent`, `send_command`, `run_script`, `kill_session`, `create_worktree`, `cleanup_worktree`, `create_pr`, `webhook`. Config stored as JSON.
 - **swimlane_transitions** -- Maps lane pairs to action chains. Fields: from_swimlane_id (`*` = any), to_swimlane_id, action_id, execution_order
 - **sessions** -- Session persistence for recovery/resume. Fields: id, task_id, session_type, agent_session_id, command, cwd, permission_mode, prompt, status (`running`/`queued`/`suspended`/`exited`/`orphaned`), exit_code, timestamps
@@ -473,7 +517,7 @@ Created on project open. Stored in the global config directory (not inside the p
 - **handoffs** -- Cross-agent handoff audit records. Stores source and target agent/session metadata plus a nullable `session_history_path` to the source adapter's native history file. `packet_json` is legacy schema data; current repository queries neither read nor write it. FK on task_id with CASCADE delete.
 - **usage_history** -- Append-only ledger of finalized session usage (cost, tokens, duration, tool count, git stats, model, agent). No FK to `tasks` or `sessions`, so rows survive task deletion, bulk-archive cleanup, and revert-to-backlog. Backs the usage dashboard's period totals, cost-per-day series, and by-model / by-agent breakdowns (Live/Today/Week/Month/All Time) via `usage:getDashboardStats` and the `kangentic_get_usage_stats` MCP tool. Written by `captureSessionMetrics` (UPSERT on `session_record_id`) and `captureGitChurn` (`src/main/ipc/handlers/git-stats-capture.ts`, fired on every session finalization - suspend, move, handoff, respawn, natural exit - not just move-to-Done; writes to exactly one record per task lineage via `setTaskGitStats` to avoid double-counting branch-cumulative churn across `--resume` records). The dashboard's SESSIONS KPI and Live view additionally merge in-flight sessions from the live `SessionManager` (deduped by `session_record_id` against the ledger) so running sessions are not undercounted before they finalize.
 
-Repositories follow a simple pattern -- one class per table, all queries are synchronous (better-sqlite3). Transactions used for position shifts (task move, swimlane reorder).
+Repositories follow a simple pattern -- one class per table, all queries are synchronous (better-sqlite3). Transactions used for position shifts (task move, task reorder, swimlane reorder). Task reorder (`reorderWithinSwimlane`) is a dense 0..N-1 rewrite that heals the position gaps `move()`'s arithmetic shift leaves behind.
 
 ## Agent Resolution
 
@@ -529,6 +573,8 @@ When a task moves between swimlanes, the IPC handler checks priorities in order:
 3. **Target has auto_spawn=false** → Suspend session
 4. **Task has active session** → A permission-only lane change keeps the live session running. The effective model target resolves task override, then lane override, then project default; only a changed, concrete result restarts the session. An effort change is live-swapped when the adapter supports it, otherwise a concrete effort change restarts the session. Agent, session-track, and force-fresh changes also follow the spawn path. See [Transition Engine](transition-engine.md) Priority 3 for the full sub-case order.
 5. **Task has no session** → The normal `spawnAgent` path creates a worktree (if enabled) and runs the transition action chain. Non-OpenCode adapters retain their existing legacy fallback delivery. OpenCode finalizes Auto-command as a skip when there is no active writable compatible Main Session; fresh, resume, handoff, restart, isolated, and no-active paths all skip while their normal lifecycle continues.
+4. **Task has active session** → A permission-mode delta (destination's effective mode differs from the session record's spawn-time mode) suspends and respawns so the new `--permission-mode` / `--model` / `--effort` land as CLI flags. Otherwise live-inject model/effort/auto_command when the adapter supports it, respawn on a concrete model/effort delta without live-swap, or keep the session alive. See [Transition Engine](transition-engine.md) Priority 3 for the full sub-case order.
+5. **Task has no session** → Create worktree (if enabled), execute transition action chain. For resumed sessions, `auto_command` is preloaded as the resume prompt. For fresh spawns, it is injected via `TerminalSubmitScheduler.scheduleKeystrokes`, which escalates to a restart-with-prompt if the keystrokes cannot be confirmed in the transcript. See [Command Injection](command-injection.md) for the delivery ladder.
 
 Transition action chains run for Priority 3 fallthrough and Priority 4 only on the normal `spawnAgent` path; native-history handoff bypasses the chain. The normal action chain runs in `execution_order`: typically `create_worktree` → `spawn_agent`.
 
@@ -557,7 +603,7 @@ The transition engine uses the resolved `AgentAdapter` contract to `detect` the 
 | `create_pr` | Reserved. Not yet implemented. |
 | `webhook` | POST to URL with interpolated body |
 
-Template variables available: `{{title}}`, `{{description}}`, `{{task_xml}}`, `{{taskId}}`, `{{worktreePath}}`, `{{branchName}}`, `{{baseBranch}}`, `{{prUrl}}`, `{{prNumber}}`, `{{attachments}}`. One declaration (`src/shared/task-template-vars.ts`) drives the `auto_command` field, the `spawn_agent` promptTemplate, and the Automation tab's chip list - see [Transition Engine](transition-engine.md#template-variables).
+Template variables available: `{{title}}`, `{{description}}`, `{{task_xml}}`, `{{taskId}}`, `{{worktreePath}}`, `{{branchName}}`, `{{baseBranch}}`, `{{prUrl}}`, `{{prNumber}}`, `{{attachments}}`. One declaration (`src/shared/task-template-vars.ts`) drives the `auto_command` field, the `spawn_agent` promptTemplate, and the Automation section's "Template variable" picker, which lists each variable with its description - see [Transition Engine](transition-engine.md#template-variables).
 
 ## PTY Session Manager
 
@@ -654,20 +700,22 @@ All stores in `src/renderer/stores/`. They call `window.electronAPI.*` for IPC a
 
 ### BoardStore (`board-store.ts`)
 
-State: `tasks`, `swimlanes`, `archivedTasks`, `loading`, `completingTask`, `completingTaskIds`, `completionGates`, `recentlyArchivedId`
+State: `tasks`, `swimlanes`, `archivedTasks`, `loading`, `completingTask`, `completingTaskIds`, `completionGates`, `recentlyArchivedId`, `lanePins`, `pendingMoveConfirms` (with `pendingMoveConfirm` as its head)
 
 - **Optimistic updates** -- all mutations update UI immediately, then sync via IPC. Errors revert via full `loadBoard()`.
-- **Stale move protection** -- `moveGeneration` counter prevents older async reloads from clobbering newer moves.
+- **Stale move protection** - per-task `moveGenerations` counters prevent older async reloads from clobbering newer moves of the same task.
+- **Lane pins** - `loadBoard()` has no staleness guard and `taskContentsMatch` compares `swimlane_id`, so a `tasks.list()` issued before a move's DB write reverts the optimistic lane when it resolves. A `lanePins` entry holds the card at its destination until a payload reports the task at neither the pre-move lane nor the pre-move `updated_at`. Read only at `KanbanBoard`'s `tasksPerLane`, the same chokepoint as `completingTaskIds`; every task payload applies through `applyTaskListPayload` so the reconcile is atomic with the write. See `.claude/rules/board-completing-task-chokepoint.md`.
+- **Move confirmations queue** - `pendingMoveConfirms` is FIFO. As a single slot, a second confirmation overwrote the first, and that move had already returned `ok` without calling the IPC, leaving an optimistic placement no write backed.
 - **Session cascade** -- after task move, reloads sessions to detect spawns/kills from transition engine. Auto-activates new sessions with toast notification.
 - **Completion animation** -- `setCompletingTask()` mounts the FlyingCard with the captured drop rect; a per-task completion gate joins the fly finishing (`markCompletionAnimationDone`) and the move being approved (`approveCompletion`, after a clean worktree probe or a confirmed dialog), and `persistCompletion` runs the actual move once both signals land.
 
 ### SessionStore (`session-store.ts`)
 
-State: `sessions`, `activeSessionId`, `openTaskId`, `dialogSessionIds`, `sessionUsage`, `sessionActivity`, `sessionEvents`
+State: `sessions`, `activeSessionId`, `detailTaskId`, `dialogSessionIds`, `sessionUsage`, `sessionActivity`, `sessionEvents`
 
-- **Terminal ownership handoff** -- `dialogSessionIds` (a string array) lists every session owned by an open task-detail window, so the bottom panel never renders an xterm for a session a window already owns (one xterm per PTY). It replaced the scalar `dialogSessionId` once task detail became modeless and multiple windows can stack. When a window claims a session, the panel unmounts that session's xterm; on release, the panel recreates from scrollback.
+- **Terminal ownership handoff** -- `dialogSessionIds` (a string array) lists every session owned by an open task-detail window, so the bottom panel never renders an xterm for a session a window already owns (one xterm per PTY). It replaced the scalar `dialogSessionId` once task detail became modeless and multiple windows can stack. When a window claims a session, the panel unmounts that session's xterm; on release, the panel recreates from scrollback. The array is renderer-GLOBAL, not per-layer: `useWindowSessionClaims` reconciles it across every window-manager instance in the renderer (`allWindowManagers` - board, Command Terminal, Agent Monitor), resolving each window's taskId through its manager's `anchorToTaskId` since the board anchors by taskId and the monitor by `projectId:taskId`. A reconciler that walked one layer would treat the other layers' claims as stale and erase them, putting a second xterm on a live PTY.
 - **HMR store re-sync** -- The `vite:afterUpdate` handler in `App.tsx` re-fetches all IPC-backed stores (project, config, board, session) after Vite HMR replaces modules, preventing stores from reverting to defaults. A unit test (`hmr-resync.test.ts`) enforces that new stores are included. Usage and events are scoped to the current project; activity is fetched unscoped so sidebar badges work across all projects.
-- **Project switch cleanup** -- On project switch, `activeSessionId`, `dialogSessionIds`, `openTaskId`, `sessionUsage`, and `sessionEvents` are cleared before re-syncing. A generation counter invalidates in-flight syncs from the previous project. `sessionActivity` and `sessions` are preserved for sidebar badge rendering. After sync completes, any `_pendingOpenTaskId` (set by notification click) is applied and cleared.
+- **Project switch cleanup** -- On project switch, `activeSessionId`, `dialogSessionIds`, `detailTaskId`, `sessionUsage`, and `sessionEvents` are cleared before re-syncing. A generation counter invalidates in-flight syncs from the previous project. `sessionActivity` and `sessions` are preserved for sidebar badge rendering. After sync completes, any `_pendingOpenTaskId` (set by notification click) is applied and cleared.
 - **Event capping** -- max 500 events per session to bound DOM size in ActivityLog.
 - **Queue position** -- `getQueuePosition()` returns 1-indexed position sorted by startedAt.
 
@@ -747,18 +795,19 @@ On project open (`src/main/transition-engine/session-startup/`):
 1. **Prune orphaned worktrees** -- delete tasks whose worktree directories were removed externally
 2. **Mark crash recovery** -- leftover `running` DB records become `orphaned`
 3. **Deduplicate** -- keep only the latest record per task_id
-4. **Filter candidates** -- skip To Do/Done, skip auto_spawn=false, skip missing CWD
+4. **Filter candidates** -- skip To Do/Done, skip auto_spawn=false, skip missing CWD. A suspended record in a non-auto-spawn *custom* column still gets a placeholder registered so the renderer keeps offering Resume
 5. **Resume or respawn** -- suspended sessions use `--resume`, others get fresh `--session-id`
 6. **Reconcile** -- spawn fresh agents for tasks in auto_spawn columns with no session
 
 ## Performance
 
-- **WebGL xterm with an attachment budget** - attempts the WebGL renderer first and recovers from context loss (2s/10s retries, then permanent DOM fallback). Live WebGL attachments are capped at `WEBGL_ATTACH_BUDGET` (8) page-wide, below Chromium's ~16-context limit: a coordinator (`useFocusedSessionsSync`) keeps the most-recently-focused terminal windows on WebGL and temporarily suspends the rest to the DOM renderer (`suspendedByBudget` in the renderer report - not a context loss, never escalates to the permanent fallback), re-attaching on focus (`src/renderer/utils/terminal-webgl.ts`, `terminal-visibility.ts`)
-- **Parked-window write gating** - a terminal window that is off-view (board layer parked on the Backlog view, or occluded by a maximized same-layer window) leaves the focused-session set, so main stops emitting its PTY data at the source; any stragglers are acked-and-dropped by the renderer queue (never parsed, never wedging backpressure). On reveal the terminal repaints from the scrollback ring via `reloadScrollback` (`src/renderer/utils/parked-terminals.ts`, `focused-sessions.ts`)
+- **WebGL xterm with an attachment budget** - attempts the WebGL renderer first and recovers from context loss (2s/10s retries, then permanent DOM fallback). Live WebGL attachments are capped at `WEBGL_ATTACH_BUDGET` (8) page-wide, below Chromium's ~16-context limit: a coordinator (`useFocusedSessionsSync`) keeps the most-recently-focused terminal windows on WebGL and temporarily suspends the rest to the DOM renderer (`suspendedByBudget` in the renderer report - not a context loss, never escalates to the permanent fallback), re-attaching on focus (`src/renderer/utils/terminal-webgl.ts`, `terminal-visibility.ts`). The coordinator applies that plan BEFORE it publishes the parked set: swapping the renderer changes the cell metric a fit divides by, and a revealed terminal fits itself synchronously, so a fit taken on a renderer the terminal is about to stop using sizes the grid wrong (see the fit-on-the-renderer-you-keep bullet in [session-lifecycle.md](session-lifecycle.md))
+- **Parked-window write gating** - a terminal window that is off-view (board layer parked on the Backlog view, or occluded by a maximized same-layer window) leaves the focused-session set, so main stops emitting its PTY data at the source; any stragglers are acked-and-dropped by the renderer queue (never parsed, never wedging backpressure). On reveal the terminal repaints from the scrollback ring via `reloadScrollback` (`src/renderer/utils/parked-terminals.ts`, `focused-sessions.ts`). Reveal is the narrow edge: a session can leave the focused set without being parked at all (a detail window a detached monitor owns, a hidden panel, a closed command bar over a transient), so `src/renderer/utils/focused-terminals.ts` repaints on the wider unfocused-to-focused edge too. See the focus-edge catch-up bullet in [session-lifecycle.md](session-lifecycle.md) for the mechanism
+- **Serialized terminal construction** - building an xterm (construct + `open` + WebGL context + fit) costs ~75ms, peaking at 130ms, of which the WebGL context alone is 13-29ms on a COLD first context and 7.4-9.6ms once the GPU process is warm (a real session opens warm far more often than cold, so the unqualified range overstated the steady state). A later phase-split pass over that same measurement - the dev-only `init-timing` renderer trace emitted from `initTerminal` (`src/renderer/hooks/useTerminal.ts`) - puts construct plus WebGL context together at 82-87% of the synchronous beat (median 84%), leaving the fit as the small remainder; that split is the ceiling on what reusing a terminal across an ownership handoff could ever save, since the fit is per-host and has to run either way. Each host defers its own init by a frame, but that is the SAME frame for every host mounting in one commit, so a burst (dragging a batch of tasks into a spawning column, restoring a workspace) compounded into a single multi-hundred-ms block with no paint and no input. `src/renderer/utils/terminal-init-queue.ts` runs at most one construction per animation frame, FIFO. It does not reduce the work, it caps the longest single block at one terminal's cost so input keeps being processed between them; a lone terminal still inits on the very next frame. Measured with `kangentic_devtools_event_loop_lag`'s long-frame ring, which is where the ~75ms figure comes from
 - **Resize debouncing** -- PTY resize calls debounced at 200ms, suppressed during panel drag
-- **Repaint-settled scrollback** - after a width-changing resize, `getScrollback` waits for the agent TUI's async repaint to land before sampling, so a restored terminal never replays a stale narrow frame; while the agent is actively streaming (never quiesces) the wait settles early on the post-resize repaint marker instead of burning the max-wait ceiling (see [session-lifecycle](session-lifecycle.md))
+- **Repaint-settled scrollback** - after a geometry-changing resize (cols or rows), `getScrollback` waits for the agent TUI's async repaint to land before sampling, so a restored terminal never replays a frame drawn for a stale geometry; while the agent is actively streaming (never quiesces) the wait settles early on the post-resize repaint marker instead of burning the max-wait ceiling (see [session-lifecycle](session-lifecycle.md))
 - **Activity log** -- plain DOM list instead of xterm. Events flow through JSONL files, not terminal output.
-- **Terminal ownership handoff** -- one xterm instance per session at a time prevents duplicate resize calls that corrupt TUI output
+- **Terminal ownership handoff** -- one xterm instance per session at a time prevents duplicate resize calls that corrupt TUI output. Enforced ACROSS renderers, not just within one: main pushes `detail:remoteOwners` (per-recipient, own claims filtered out) so the bottom panel yields its terminal to a detail hosted in the detached Agent Monitor. Without it the panel and the pop-out each mounted an xterm on the same PTY and fitted it to two different widths.
 - **Output batching** -- 16ms flush interval prevents per-character IPC overhead
 - **Scrollback cap** -- 512KB prevents unbounded memory growth
 

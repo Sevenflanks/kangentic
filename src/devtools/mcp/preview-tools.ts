@@ -494,7 +494,7 @@ export function registerDevtoolsPreviewTools(server: McpServer): void {
     'kangentic_devtools_event_loop_lag',
     {
       description:
-        'Freeze flight recorder: event-loop lag for the MAIN process AND the RENDERER of the inspected instance. Each report carries the recorded recent stalls (UTC timestamp + duration ms), the worst stall, and the spike count, so a freeze is diagnosed RETROACTIVELY - call this AFTER a user reports lag/freezing to see exactly when and for how long each thread blocked, without having been probing at that instant. The main report is always present; the renderer report needs an attached debugger (it reports `unavailable` otherwise). Dev-only.',
+        'Freeze flight recorder: event-loop lag for the MAIN process AND the RENDERER of the inspected instance. Each report carries the recorded recent stalls (UTC timestamp + duration ms), the worst stall, and the spike count, so a freeze is diagnosed RETROACTIVELY - call this AFTER a user reports lag/freezing to see exactly when and for how long each thread blocked, without having been probing at that instant. The renderer report also carries `recentLongFrames`, which answers WHAT ran rather than only when: each long animation frame lists its heaviest scripts with the source URL and function name that registered them, plus `forcedLayoutMs` (read/write thrash) and a `styleLayoutMs` vs script-time split that says whether the cost was JS, style/layout, or forced reflow. Long frames and lag spikes share a wall-clock stamp, so they line up by timestamp. The main report is always present; the renderer report needs an attached debugger (it reports `unavailable` otherwise), and `recentLongFrames` is `unavailable` where the runtime lacks the long-animation-frame entry type. Dev-only.',
       inputSchema: z.object({
         instanceId: z.string().optional().describe(INSTANCE_ARG_DESCRIPTION),
       }),
@@ -516,6 +516,41 @@ export function registerDevtoolsPreviewTools(server: McpServer): void {
     },
     async ({ instanceId }) =>
       toolResult(await callBridge({ method: 'GET', path: '/pty-pipeline', instanceId })),
+  );
+
+  server.registerTool(
+    'kangentic_devtools_terminal_state',
+    {
+      description:
+        'Every layer\'s view of each live terminal, joined: the PTY grid main holds (ptyCols/ptyRows, the width the buffered bytes were DRAWN at, plus any stashed/desktop dimensions and whether a post-resize repaint is outstanding), each mounted xterm\'s grid and container geometry (cols/rows, host, viewport clientWidth vs offsetWidth, rendered screen size, wrapped-line count) and which surface hosts it, plus the derived invariants ptyMatchesGrid / colsDrift / gridOverflowPx. Use for any terminal that looks mis-sized, clipped, wrapped, blank, or frozen: a PTY whose width has drifted from the grid showing it cannot self-correct (xterm re-sends dimensions only when its OWN size changes), and that gap is invisible from either process alone. Also reports sessions main knows about that no xterm is mounted for, and the pty-pipeline backpressure stats. Dev-only.',
+      inputSchema: z.object({
+        instanceId: z.string().optional().describe(INSTANCE_ARG_DESCRIPTION),
+      }),
+      annotations: READ_ONLY_ANNOTATIONS,
+    },
+    async ({ instanceId }) =>
+      toolResult(await callBridge({ method: 'GET', path: '/terminal-state', instanceId })),
+  );
+
+  server.registerTool(
+    'kangentic_devtools_terminal_forensics',
+    {
+      description:
+        'Row-by-row forensics for ONE session, joining the three layers that can disagree: the renderer\'s xterm viewport (per-row text, cursor, alt-screen flag, DECSTBM margins), main\'s parsed grid (its own headless frame re-parsed to rows), and the tail of the raw PTY byte ring with control bytes escaped. Use when rows are MISSING or blank rather than mis-sized - kangentic_devtools_terminal_state reports how many rows have content, this reports which. Reading it: text absent from the raw tail means the agent never sent it (upstream); present in the raw tail and main\'s grid but not the renderer\'s means it was lost in the IPC/queue/write path; present in both grids means the data is fine and the fault is paint, which a same-instant kangentic_devtools_screenshot_element on .xterm-screen confirms. Caveat: main\'s grid comes from a bare serialize with no tail fold, so a capture taken MID-STREAM can trail the renderer by a frame - capture while the TUI is idle. Dev-only.',
+      inputSchema: z.object({
+        sessionId: z.string().describe('Session to dump. Get one from kangentic_devtools_terminal_state.'),
+        rawTailBytes: z.number().int().min(1).max(262144).optional().describe('Raw ring tail to return, in bytes before escaping. Default 49152.'),
+        instanceId: z.string().optional().describe(INSTANCE_ARG_DESCRIPTION),
+      }),
+      annotations: READ_ONLY_ANNOTATIONS,
+    },
+    async ({ sessionId, rawTailBytes, instanceId }) =>
+      toolResult(await callBridge({
+        method: 'GET',
+        path: '/terminal-forensics',
+        query: { sessionId, rawTailBytes },
+        instanceId,
+      })),
   );
 
   // ── Visual / DOM ─────────────────────────────────────────────────────
@@ -951,7 +986,7 @@ export function registerDevtoolsPreviewTools(server: McpServer): void {
     'kangentic_devtools_script',
     {
       description:
-        'Execute an array of UI steps in order against the inspected preview. Each step: { type: "click" | "type" | "keypress" | "drag" | "wait" | "screenshot" | "eval", ...stepArgs }. Returns a step-by-step trace with ok/durationMs/error. `screenshot` steps persist to disk and the trace entry carries `screenshotPath` + `screenshotUri` (read via Read). `eval` steps carry the serialized return value as `value` on their trace entry (requires the Allow Eval setting). Selectors accept CSS, `text="..."`, or `aria="..."`. Cuts MCP latency dramatically vs. one tool call per step. Dev-only.',
+        'Execute an array of UI steps in order against the inspected preview. Each step: { type: "click" | "type" | "keypress" | "drag" | "wait" | "screenshot" | "eval", ...stepArgs }. Returns a step-by-step trace with ok/durationMs/error. `screenshot` steps persist to disk and the trace entry carries `screenshotPath` + `screenshotUri` (read via Read). `eval` steps carry the serialized return value as `value` on their trace entry (requires Settings -> Developer -> Allow Unsafe Operations). Selectors accept CSS, `text="..."`, or `aria="..."`. Cuts MCP latency dramatically vs. one tool call per step. Dev-only.',
       inputSchema: z.object({
         steps: z
           .array(
@@ -988,7 +1023,7 @@ export function registerDevtoolsPreviewTools(server: McpServer): void {
     'kangentic_devtools_eval',
     {
       description:
-        'Evaluate a JavaScript expression in the inspected preview\'s renderer and return its serialized value (e.g. `{ value: 2 }` for "1 + 1", or an array of element measurements). The return value must be JSON-serializable - DOM nodes and functions do not round-trip; return their measured/string form instead. Requires Settings -> Developer -> Allow Eval (returns an `eval-disabled` error otherwise). For reading store state prefer kangentic_devtools_store_state; for multi-element measurement prefer kangentic_devtools_query_all - both work without the Allow Eval setting. Dev-only.',
+        'Evaluate a JavaScript expression in the inspected preview\'s renderer and return its serialized value (e.g. `{ value: 2 }` for "1 + 1", or an array of element measurements). The return value must be JSON-serializable - DOM nodes and functions do not round-trip; return their measured/string form instead. Requires Settings -> Developer -> Allow Unsafe Operations (returns an `eval-disabled` error otherwise). That toggle is NOT the same as Settings -> Agent Browser -> Allow Eval, which gates kangentic_browser_eval in a task\'s Browser pane. For reading store state prefer kangentic_devtools_store_state; for multi-element measurement prefer kangentic_devtools_query_all - both work without it. Dev-only.',
       inputSchema: z.object({
         expression: z.string().describe('JavaScript expression to evaluate. Its value is returned (awaited if a Promise).'),
         instanceId: z.string().optional().describe(INSTANCE_ARG_DESCRIPTION),
@@ -1041,7 +1076,7 @@ export function registerDevtoolsPreviewTools(server: McpServer): void {
       inputSchema: z.object({
         sessionId: z.string().describe('Kangentic session id (UUID).'),
         keys: z.string().optional().describe('Named key or literal text (XOR with bytes).'),
-        bytes: z.string().optional().describe('Base64-encoded raw bytes. Requires Allow Eval setting.'),
+        bytes: z.string().optional().describe('Base64-encoded raw bytes. Requires Settings -> Developer -> Allow Unsafe Operations.'),
         instanceId: z.string().optional().describe(INSTANCE_ARG_DESCRIPTION),
       }),
       annotations: MUTATING_ANNOTATIONS,

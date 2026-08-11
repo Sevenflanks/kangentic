@@ -54,6 +54,8 @@ export const IPC = {
   TASK_UPDATED_BY_AGENT: 'task:updatedByAgent',
   TASK_DELETED_BY_AGENT: 'task:deletedByAgent',
   TASK_SESSION_RESYNC: 'task:sessionResync',
+  TASK_SPAWN_BLOCKED: 'task:spawnBlocked',
+  TASK_AUTO_COMMAND_RESULT: 'task:autoCommandResult',
   TASK_SPAWN_PROGRESS: 'task:spawnProgress',
   TASK_GET_SPAWN_PROGRESS: 'task:getSpawnProgress',
   TASK_SET_RUNTIME_OVERRIDE: 'task:setRuntimeOverride',
@@ -96,6 +98,7 @@ export const IPC = {
   SESSION_GET_SCROLLBACK: 'session:getScrollback',
   SESSION_DATA: 'session:data',
   SESSION_DRAIN_ACK: 'session:drainAck',
+  SESSION_PTY_RESIZED: 'session:ptyResized',
   SESSION_FIRST_OUTPUT: 'session:firstOutput',
   SESSION_GET_FIRST_OUTPUT: 'session:getFirstOutput',
   SESSION_EXIT: 'session:exit',
@@ -122,6 +125,7 @@ export const IPC = {
   SESSION_SPAWN_TRANSIENT: 'session:spawnTransient',
   SESSION_KILL_TRANSIENT: 'session:killTransient',
   SESSION_SET_FOCUSED: 'session:setFocused',
+  SESSION_SET_MOUNTED: 'session:setMounted',
   SESSION_NOTIFY_USER_INTERRUPT: 'session:notifyUserInterrupt',
   SESSION_INJECT_SETTINGS: 'session:injectSettings',
 
@@ -245,6 +249,74 @@ export const IPC = {
   MOBILE_PAIRING_CONFIRMED: 'mobile:pairingConfirmed',
   MOBILE_PAIRING_ENDED: 'mobile:pairingEnded',
   MOBILE_STATE_CHANGED: 'mobile:stateChanged',
+  MOBILE_GET_TERMINAL_STREAMS: 'mobile:getTerminalStreams',
+  MOBILE_TERMINAL_STREAMS_CHANGED: 'mobile:terminalStreamsChanged',
+
+  // Agent Monitor - machine-global (like mobile bridge), NOT project-scoped. The monitor
+  // aggregates live sessions across EVERY registered project, so these channels deliberately
+  // take no trailing projectId and are outside the project-scoped-ipc mutation set. They are
+  // also deliberately named outside the TASK_/SESSION_ prefixes so the parity test's channel
+  // classification does not claim them. See src/main/monitor/monitor-aggregator.ts.
+  // The view preference itself is NOT a monitor channel: it rides the existing global
+  // config merge (`config.set`), so there is one persistence path, not two.
+  MONITOR_GET_SNAPSHOT: 'monitor:getSnapshot',
+  MONITOR_CHANGED: 'monitor:changed',
+  // Subscription handshake for MONITOR_CHANGED. Main builds and pushes the
+  // cross-project snapshot only while at least one renderer is subscribed;
+  // with no monitor mounted anywhere, every session event skips the snapshot
+  // build entirely. Subscribe returns a fresh snapshot so mounting is one
+  // round trip, not subscribe-then-fetch.
+  MONITOR_SUBSCRIBE: 'monitor:subscribe',
+  MONITOR_UNSUBSCRIBE: 'monitor:unsubscribe',
+  // Reveal a task in the MAIN window. Needed because the detached monitor is its
+  // own renderer with its own stores, so it cannot open a task by setting local
+  // state - the request has to travel through main.
+  MONITOR_REVEAL_TASK: 'monitor:revealTask',
+  // Everything the task-detail surface needs about a task's OWN project, for a
+  // host that is not that project's board. One bundle rather than stamping five
+  // read channels with a projectId - see src/main/monitor/task-detail-bundle.ts.
+  MONITOR_GET_TASK_DETAIL: 'monitor:getTaskDetail',
+  // Live "recent output peek": the last few rendered terminal lines per session,
+  // patched onto rows in place. Deliberately NOT part of the snapshot - terminal
+  // output is not one of the DB-resident changes that rebuilds it, so a peek
+  // carried there would sit frozen. See src/main/monitor/monitor-peek-tracker.ts.
+  MONITOR_PEEK: 'monitor:peek',
+  // Explicit subscribe, because the peek is the one monitor stream with a real
+  // standing cost. Main attaches its PTY output listener only while at least one
+  // monitor surface is subscribed, so a closed monitor costs nothing.
+  MONITOR_SET_PEEK_SUBSCRIBED: 'monitor:setPeekSubscribed',
+
+  // Task-detail ownership - machine-global, and deliberately outside the TASK_ prefix
+  // so the project-scoped-ipc parity test does not classify these as task mutations.
+  // They mutate no task; they arbitrate WHICH RENDERER hosts a task's detail, which is
+  // knowledge only main has (a pop-out is a separate renderer with its own stores).
+  // See src/main/task-detail/detail-owner-registry.ts for the two rules.
+  /** Ask main where this task's detail should open. Main focuses or routes. */
+  DETAIL_REQUEST_OPEN: 'detail:requestOpen',
+  /** Main tells a surface to mount this task's detail. */
+  DETAIL_OPEN_HERE: 'detail:openHere',
+  /** Main tells the PREVIOUS holder to let go, because another surface took it. */
+  DETAIL_CLOSE_HERE: 'detail:closeHere',
+  /**
+   * A host reports the COMPLETE set of task details it currently has mounted.
+   *
+   * Replaces a claim/release pair. Ownership is derived from what a surface
+   * actually has, so a lost or out-of-order message cannot strand a claim - which
+   * used to make a task permanently unopenable (`focused-existing` for a window
+   * that no longer existed). Main reconciles per `(webContentsId, host)`; see
+   * `DetailOwnerRegistry.syncOwned`.
+   */
+  DETAIL_SYNC_OWNED: 'detail:syncOwned',
+  /**
+   * Main tells each renderer which task details are held by a DIFFERENT renderer.
+   *
+   * Terminal ownership ("one xterm per PTY") was renderer-local: a renderer knew
+   * about its own detail windows and nothing else. A detail hosted in the detached
+   * Agent Monitor is a separate renderer, so the main window's bottom panel could
+   * not tell the session was already on screen elsewhere and mounted a second
+   * xterm on the same PTY. Only main knows both sides, so it publishes.
+   */
+  DETAIL_REMOTE_OWNERS: 'detail:remoteOwners',
 
   // Backlog
   BACKLOG_LIST: 'backlog:list',
@@ -297,11 +369,27 @@ export const IPC = {
   // place that knows taskId + sessionId + the guest's getWebContentsId().
   BROWSER_PANE_REGISTER: 'browser:paneRegister',
   BROWSER_PANE_UNREGISTER: 'browser:paneUnregister',
+  // Main -> renderer: open / close a task's Browser pane on behalf of the
+  // kangentic_browser_open_pane / _close_pane MCP tools. Pane open state is
+  // renderer-owned (`browserOpenTasks`), so main cannot set it directly.
+  //
+  // Fire-and-forget by design. Main validates every precondition itself
+  // (current project, per-project browser.enabled, the task row, the resolved
+  // URL) before pushing, and then awaits the PANE REGISTRY rather than an
+  // acknowledgement - a registered live guest is the only proof the pane is
+  // actually driveable, which a reply could not give. See
+  // `src/main/browser/browser-pane-opener.ts`.
+  BROWSER_PANE_OPEN_REQUEST: 'browser:paneOpenRequest',
+  BROWSER_PANE_CLOSE_REQUEST: 'browser:paneCloseRequest',
 
   // Updater
   UPDATE_CHECK: 'updater:check',
   UPDATE_INSTALL: 'updater:install',
   UPDATE_DOWNLOADED: 'updater:downloaded',
+
+  // Announcements (remote feed poll; see src/main/announcements.ts)
+  ANNOUNCEMENTS_GET: 'announcements:get',
+  ANNOUNCEMENTS_CHANGED: 'announcements:changed',
 
   // Search
   SEARCH_EVERYTHING: 'search:everything',

@@ -130,6 +130,15 @@ export class SessionTelemetry {
 
   private readonly sessionParsers = new Map<string, AgentParser>();
   private readonly agentSessionIdChecked = new Set<string>();
+  /**
+   * Last agent session id reported through onAgentSessionId, per PTY session
+   * (any channel seeds it; only the status-file channel consults it). The
+   * streaming status file carries the CURRENT id on every write, so comparing
+   * against the last reported value lets a mid-session fork (the agent starts
+   * a new conversation under a new id, e.g. Claude /clear) re-fire the capture
+   * while same-id churn (a status rewrite every ~10s) stays quiet.
+   */
+  private readonly lastReportedAgentSessionIds = new Map<string, string>();
   private readonly eventCache = new Map<string, SessionEvent[]>();
   private _idleTimeoutMinutes = 0;
   private idleTimeoutInterval: ReturnType<typeof setInterval> | null = null;
@@ -195,15 +204,25 @@ export class SessionTelemetry {
         probe: options.processTreeProbe ?? createProcessTreeProbe(),
         callbacks: {
           getRootPid: (sessionId) => callbacks.getSessionRootPid?.(sessionId),
+          // Both getters deliberately include `exemptBackgroundShellIds`. An
+          // exempt shell is excluded from the PREDICATE, not from tracking:
+          // its process is real and alive, so the watcher must keep capturing
+          // its PID, confirming its liveness, and draining it on exit. Leaving
+          // it out here would shrink `expected = preExistingHelpers + tracked`
+          // below the observed process count, take the watcher's surplus
+          // branch, and permanently fold a real shell into the helper baseline
+          // - corrupting deficit detection for the rest of the session.
           getActiveShellCount: (sessionId) => {
             const state = this.activityEngine.getState(sessionId);
             if (!state) return 0;
-            return state.activeBackgroundShellIds.size + state.anonymousBackgroundShellCount;
+            return state.activeBackgroundShellIds.size
+              + state.exemptBackgroundShellIds.size
+              + state.anonymousBackgroundShellCount;
           },
           getNamedShellIds: (sessionId) => {
             const state = this.activityEngine.getState(sessionId);
             if (!state) return [];
-            return Array.from(state.activeBackgroundShellIds);
+            return [...state.activeBackgroundShellIds, ...state.exemptBackgroundShellIds];
           },
           getPendingToolCount: (sessionId) => {
             const state = this.activityEngine.getState(sessionId);
@@ -330,17 +349,35 @@ export class SessionTelemetry {
 
   /**
    * Rich status-update ingestion for agents whose telemetry comes from
-   * a streaming status file (Claude's statusline). Performs one-shot
-   * agent session ID capture, runs heartbeat recovery (tokens increased
-   * while idle → force thinking), resets the stale-thinking timer, and
-   * replaces the cached usage. Called by `StatusFileReader`.
+   * a streaming status file (Claude's statusline). Performs agent session
+   * ID capture (change-sensitive, see below), runs heartbeat recovery
+   * (tokens increased while idle → force thinking), resets the
+   * stale-thinking timer, and replaces the cached usage. Called by
+   * `StatusFileReader`.
    */
   processStatusUpdate(sessionId: string, usage: SessionUsage): void {
-    if (this.callbacks.onAgentSessionId && !this.agentSessionIdChecked.has(sessionId)) {
-      this.agentSessionIdChecked.add(sessionId);
-      if (usage.sessionId && typeof usage.sessionId === 'string') {
+    // Agent session id capture, status-file channel. Unlike the strictly
+    // one-shot PTY-output/hook channels (notifyAgentSessionId /
+    // captureHookSessionIds), this channel is CHANGE-SENSITIVE: the status
+    // file is authoritative and continuous, and a forked CLI session (a new
+    // conversation under a new id, e.g. Claude /clear) re-reports its id
+    // here and ONLY here. Firing again on a changed id keeps
+    // sessions.agent_session_id resumable after the fork; comparing against
+    // the last reported value keeps same-id status churn quiet. Capturing
+    // here also closes the one-shot channels (the Set), so a later PTY
+    // scrollback echo can never override a status-reported id.
+    if (this.callbacks.onAgentSessionId && usage.sessionId && typeof usage.sessionId === 'string') {
+      if (this.lastReportedAgentSessionIds.get(sessionId) !== usage.sessionId) {
+        this.lastReportedAgentSessionIds.set(sessionId, usage.sessionId);
+        this.agentSessionIdChecked.add(sessionId);
         this.callbacks.onAgentSessionId(sessionId, usage.sessionId);
       }
+    } else if (this.callbacks.onAgentSessionId && !this.agentSessionIdChecked.has(sessionId)) {
+      // Status write without a session id: keep the legacy "checked on first
+      // status" semantics (gates the SessionIdManager diagnostic timer and
+      // output scanning) WITHOUT consuming the capture, so a later id-bearing
+      // status write still lands.
+      this.agentSessionIdChecked.add(sessionId);
     }
 
     const previousUsage = this.usage.getSessionUsage(sessionId);
@@ -454,6 +491,8 @@ export class SessionTelemetry {
     const capturedId = fromHook(hookContext);
     if (!capturedId) return;
     this.agentSessionIdChecked.add(sessionId);
+    // Seed the status channel's change detection (see notifyAgentSessionId).
+    this.lastReportedAgentSessionIds.set(sessionId, capturedId);
     this.callbacks.onAgentSessionId?.(sessionId, capturedId);
   }
 
@@ -513,6 +552,9 @@ export class SessionTelemetry {
   notifyAgentSessionId(sessionId: string, agentReportedId: string): void {
     if (!this.agentSessionIdChecked.has(sessionId)) {
       this.agentSessionIdChecked.add(sessionId);
+      // Seed the status channel's change detection so its first write with
+      // this same id does not redundantly re-fire.
+      this.lastReportedAgentSessionIds.set(sessionId, agentReportedId);
       this.callbacks.onAgentSessionId?.(sessionId, agentReportedId);
     }
   }
@@ -567,6 +609,7 @@ export class SessionTelemetry {
     this.eventCache.delete(sessionId);
     this.sessionParsers.delete(sessionId);
     this.agentSessionIdChecked.delete(sessionId);
+    this.lastReportedAgentSessionIds.delete(sessionId);
     this.prCommandDetector.removeSession(sessionId);
     this.notifySessionEnded(sessionId);
     // Note: we deliberately do NOT remove the debug-dump file here.
@@ -766,6 +809,11 @@ export class SessionTelemetry {
 
   getActivityReason(sessionId: string): ActivityReason | null {
     return this.activityEngine.getActivityReason(sessionId);
+  }
+
+  /** See `ActivityEngine.markIdleAuthoritative`. */
+  markIdleAuthoritative(sessionId: string): void {
+    this.activityEngine.markIdleAuthoritative(sessionId);
   }
 
   /**

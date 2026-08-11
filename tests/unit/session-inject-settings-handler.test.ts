@@ -428,7 +428,7 @@ describe('SESSION_INJECT_SETTINGS handler', () => {
     expect(context.terminalSubmitScheduler.scheduleKeystrokes).toHaveBeenCalledWith(
       'my-session-id',
       'my-session-id',
-      ['/model sonnet'],
+      [{ text: '/model sonnet', verify: 'none' }],
       {},
     );
   });
@@ -456,7 +456,7 @@ describe('SESSION_INJECT_SETTINGS handler', () => {
     expect(context.terminalSubmitScheduler.scheduleKeystrokes).toHaveBeenCalledWith(
       'my-session-id',
       'my-session-id',
-      ['/effort high'],
+      [{ text: '/effort high', verify: 'none' }],
       {},
     );
   });

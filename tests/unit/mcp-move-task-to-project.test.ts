@@ -73,7 +73,9 @@ function makeContext(db: InstanceType<typeof DatabaseType>, projectPath: string)
     onTaskDeleted: vi.fn(),
     onTaskMove: vi.fn(async () => ({ ok: true, autoCommand: { kind: 'not-applicable' } })),
     onTaskAutoSpawn: vi.fn(async () => ({ kind: 'not-applicable' })),
+    onTasksReordered: vi.fn(),
     onSwimlaneUpdated: vi.fn(),
+    onSwimlaneDeleted: vi.fn(),
     onBacklogChanged: vi.fn(),
     onLabelColorsChanged: vi.fn(),
   };

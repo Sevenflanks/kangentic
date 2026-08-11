@@ -379,9 +379,9 @@ Refactors required:
    own `activity`/`exit` events directly instead of a renderer round-trip. This was purely
    desktop-local robustness/de-duplication by the time it landed - the mobile push rationale
    below (pushes firing with the desktop window closed) was already satisfied by the
-   `PushNotifier` built in Phase 2, which listens to `SessionManager` the same way. Full
-   notification-CATEGORY parity with the mobile push taxonomy is separate, ongoing work (see
-   Bridge Phase 3 below).
+   `PushNotifier` built in Phase 2, which listens to `SessionManager` the same way. Aligning the
+   desktop's four notification config booleans with the mobile push taxonomy's five categories is
+   separate work, still open (see Bridge Phase 3 below).
 2. **Session output is focus-gated**: `SessionManager` emits `data` only for
    `focusedSessionIds`. The bridge needs an unfiltered tap or membership in the focused set;
    `getScrollback` works today as the safe pull path.
@@ -429,10 +429,20 @@ Desktop / bridge (kangentic board):
   (`src/main/mobile-bridge/push/push-notifier.ts`) with cooldown/debounce - all shipped in the
   Phase 2 landing. The desktop's OWN should-fire policy (cooldown, focus/active-project gating,
   title assembly) also moved from the renderer into main
-  (`src/main/notifications/desktop-notifier.ts`) as a residual de-duplication pass. Still open:
-  full notification-CATEGORY parity between the two (idle, permission-needed, agent-crash,
-  plan-complete, spawn-stalled) and paired-devices settings UI (list, per-device capabilities,
-  revoke).
+  (`src/main/notifications/desktop-notifier.ts`) as a residual de-duplication pass. The push
+  taxonomy has since settled on five categories (`input-required`, `turn-complete`,
+  `session-failed`, `plan-complete`, `spawn-stalled` - `PUSH_CATEGORIES` in
+  `packages/protocol/src/crypto/push-envelope.ts`). Paired-devices settings UI shipped as the
+  Mobile Devices tab (list, rename, revoke); per-device capability toggles were built and then
+  REMOVED, since pairing now grants all ten verbs (see `docs/mobile-bridge.md`) - the capability
+  check and `setDeviceCapabilities()` remain as the seam for a future narrower preset. Still
+  open: notification-CATEGORY alignment between the two sides. Desktop has no category type at
+  all, only four config booleans (`onAgentIdle`, `onAgentCrash`, `onPlanComplete`,
+  `onSpawnStalled`), of which `DesktopNotifier` fires two - spawn-stall and plan-complete are
+  still renderer-driven over `NOTIFICATION_SHOW`. `onAgentIdle` is a single level-triggered
+  `requiresUserInteraction` gate spanning idle and permission, where the push side splits the
+  same ground into edge-triggered `input-required` and `turn-complete`; the notifier's header
+  comment records that divergence as deliberate.
 - **Bridge Phase 4 (later) - Direct P2P + IPv6 speed upgrade:** WebRTC data channels
   (node-datachannel desktop / react-native-webrtc mobile) with signaling over the existing secure
   channel and DTLS fingerprints pinned at pairing; IPv6-first candidate ordering; opportunistic

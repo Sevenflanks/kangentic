@@ -23,6 +23,7 @@ export const scheduler = {
 
 export const sessionManager = {
   getSession: vi.fn(),
+  getUsageCache: vi.fn(() => ({})),
   isWritable: vi.fn(),
   snapshotNativeIdle: vi.fn(),
   suspend: vi.fn(async () => undefined),

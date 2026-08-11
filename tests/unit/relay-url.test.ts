@@ -1,7 +1,7 @@
 /**
  * Unit tests for src/shared/relay.ts.
  *
- * Two invariants are load-bearing here and get their own dedicated cases:
+ * Three invariants are load-bearing here and get their own dedicated cases:
  * (1) validateRelayUrl delegates its TLS/loopback decision to the protocol
  * package's isSecureRelayAddress rather than reimplementing it with
  * new URL().hostname comparisons - a hostname-based rewrite would silently
@@ -10,19 +10,28 @@
  * resolveRelayUrl always returns either a normalized-and-valid URL or a
  * hardcoded constant, never a raw/un-normalized stored string - so a value
  * saved before this schema existed, or written with WHATWG's IPv4/IPv6
- * canonicalizations, can never reach the pairing QR unnormalized.
+ * canonicalizations, can never reach the pairing QR unnormalized. (3)
+ * relayMode: 'local' resolves to plaintext loopback ONLY in a dev build.
+ * `mobileBridge.*` is global config in a shared configDir, so a value saved
+ * from a dev build (or hand-edited) can reach a production build on the same
+ * machine; resolveRelayUrl must fall through to the hosted relay there
+ * rather than dialing ws://127.0.0.1:8080.
  *
- * Unlike an earlier version of this module, KANGENTIC_HOSTED_RELAY_URL and
- * LOCAL_DEV_RELAY_URL are both build-mode-independent constants now - only
- * the Select's list of *offered* modes varies by build (Local is dev-only),
- * not what a given mode resolves to. So every case below runs identically
- * regardless of vitest.config.ts's __KANGENTIC_DEV__ setting.
+ * KANGENTIC_HOSTED_RELAY_URL and LOCAL_DEV_RELAY_URL are themselves
+ * build-mode-independent constants - only what 'local' MODE resolves TO
+ * depends on __KANGENTIC_DEV__ (invariant 3 above), which vitest.config.ts
+ * pins to `false`, so this suite exercises the production branch: the
+ * 'local' case below asserts the hosted fallback, not loopback. The dev
+ * branch (an actual `npm start` session resolving to loopback) is exercised
+ * by tests/ui/mobile-devices-settings.spec.ts, whose webServer runs in dev
+ * mode.
  */
 import { describe, expect, it } from 'vitest';
 import {
   KANGENTIC_HOSTED_RELAY_URL,
   LOCAL_DEV_RELAY_URL,
   relayHealthUrl,
+  resolveRelayMode,
   resolveRelayUrl,
   validateRelayUrl,
 } from '../../src/shared/relay';
@@ -154,9 +163,9 @@ describe('resolveRelayUrl', () => {
     expect(resolveRelayUrl(bridge)).toBe(KANGENTIC_HOSTED_RELAY_URL);
   });
 
-  it('resolves to the local dev relay when relayMode is "local", regardless of relayUrl', () => {
+  it('resolves relayMode "local" to the hosted relay, not loopback, in a production build (__KANGENTIC_DEV__ = false)', () => {
     const bridge: AppConfig['mobileBridge'] = { relayMode: 'local', relayUrl: 'wss://ignored.example.com' };
-    expect(resolveRelayUrl(bridge)).toBe(LOCAL_DEV_RELAY_URL);
+    expect(resolveRelayUrl(bridge)).toBe(KANGENTIC_HOSTED_RELAY_URL);
   });
 
   it('infers "custom" when relayMode is unset but relayUrl is a saved value (pre-resolver schema)', () => {
@@ -189,6 +198,42 @@ describe('resolveRelayUrl', () => {
   it('resolves a raw un-normalized stored value to its normalized form - the invariant that keeps a raw string out of the QR', () => {
     const bridge: AppConfig['mobileBridge'] = { relayMode: 'custom', relayUrl: 'ws://127.1' };
     expect(resolveRelayUrl(bridge)).toBe('ws://127.0.0.1/');
+  });
+});
+
+/**
+ * resolveRelayMode is what the settings Select binds to, and it exists because
+ * the Select only renders its 'local' <option> in a dev build while the stored
+ * value can still BE 'local' in production (mobileBridge.* is global config in
+ * a shared configDir). Binding inferRelayMode's raw value there gives a
+ * controlled <select> a value matching no <option>, which renders blank.
+ *
+ * This suite compiles with __KANGENTIC_DEV__ = false (vitest.config.ts), i.e.
+ * the production build, so 'local' must come back as 'hosted' here.
+ */
+describe('resolveRelayMode', () => {
+  it('reports a persisted "local" as "hosted" in a production build, so the Select always has a matching option', () => {
+    expect(resolveRelayMode({ relayMode: 'local', relayUrl: '' })).toBe('hosted');
+  });
+
+  it('agrees with resolveRelayUrl for a persisted "local" - the mode shown and the URL dialed cannot disagree', () => {
+    const bridge: AppConfig['mobileBridge'] = { relayMode: 'local', relayUrl: '' };
+    expect(resolveRelayMode(bridge)).toBe('hosted');
+    expect(resolveRelayUrl(bridge)).toBe(KANGENTIC_HOSTED_RELAY_URL);
+  });
+
+  it('passes "hosted" and "custom" through untouched', () => {
+    expect(resolveRelayMode({ relayMode: 'hosted', relayUrl: '' })).toBe('hosted');
+    expect(resolveRelayMode({ relayMode: 'custom', relayUrl: 'wss://relay.example.com' })).toBe('custom');
+  });
+
+  it('still infers "custom" from a pre-relayMode-schema config that only has a relayUrl', () => {
+    expect(resolveRelayMode({ relayUrl: 'wss://legacy.example.com' })).toBe('custom');
+  });
+
+  it('defaults to "hosted" for an empty or absent config', () => {
+    expect(resolveRelayMode(undefined)).toBe('hosted');
+    expect(resolveRelayMode({ relayUrl: '' })).toBe('hosted');
   });
 });
 

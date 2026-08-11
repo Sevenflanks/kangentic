@@ -11,6 +11,7 @@ import { createDoneDropConfirmSlice } from './board-store/done-drop-confirm-slic
 import { createActiveViewSlice } from './board-store/active-view-slice';
 import { createBoardManagerSlice } from './board-store/board-manager-slice';
 import { createBoardFilterSlice } from './board-store/board-filter-slice';
+import { createLanePinSlice } from './board-store/lane-pin-slice';
 
 /**
  * Board store composition. Slice interfaces and implementations live
@@ -50,21 +51,19 @@ export function createBoardStore() {
     ...createActiveViewSlice(...args),
     ...createBoardManagerSlice(...args),
     ...createBoardFilterSlice(...args),
+    ...createLanePinSlice(...args),
   }));
 }
 
-// @ts-expect-error -- Vite handles import.meta.hot; tsc's "module": "commonjs" doesn't support it
 const preservedBoardStore: ReturnType<typeof createBoardStore> | undefined = import.meta.hot?.data?.boardStore;
 
 export const useBoardStore = preservedBoardStore ?? createBoardStore();
 
-// @ts-expect-error -- Vite handles import.meta.hot; tsc's "module": "commonjs" doesn't support it
 if (import.meta.hot) {
-  // @ts-expect-error -- Vite handles import.meta.hot
   import.meta.hot.data.boardStore = useBoardStore;
   // Editing this module's OWN code would leave the pinned instance running stale
   // slice closures; force a clean full reload instead. Rare; prod is unaffected
   // (import.meta.hot is undefined there, so this whole block is dropped).
-  // @ts-expect-error -- Vite handles import.meta.hot
-  import.meta.hot.accept(() => import.meta.hot.invalidate());
+  const hot = import.meta.hot;
+  import.meta.hot.accept(() => hot.invalidate());
 }

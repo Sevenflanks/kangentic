@@ -27,7 +27,6 @@ import { HeaderActionButton } from '../HeaderActionButton';
 import { KebabMenu, KebabMenuItem, KebabMenuDivider } from '../KebabMenu';
 import { CommandPalettePopover } from '../dialogs/task-detail/CommandPalettePopover';
 import { useHeaderPillOverflow, type HeaderPillSpec } from '../dialogs/task-detail/useHeaderPillOverflow';
-import { WindowLayoutMenu } from '../dialogs/WindowLayoutMenu';
 import { resolveTerminalBackground } from '../../hooks/useTerminal';
 import { useKeybinding, useFormattedCombo } from '../../hooks/useKeybinding';
 import { ContextBar } from '../terminal/ContextBar';
@@ -42,6 +41,7 @@ import { useToastStore } from '../../stores/toast-store';
 import { resolveShortcutCommand } from '../../../shared/template-vars';
 import { ICON_REGISTRY } from '../../utils/swimlane-icons';
 import { resolveProjectRoot } from '../../../shared/git-utils';
+import { commandTerminalTitle } from '../../../shared/command-terminal-name';
 import { isActive, requiresUserInteraction } from '../../../shared/activity-state';
 import { getIsHmrReload } from '../../utils/hmr-flag';
 import { useLayerStore } from '../../window-manager';
@@ -56,7 +56,7 @@ const ChangesPanel = lazy(() => import('../dialogs/task-detail/changes/ChangesPa
  * The Stop button glyph, carrying the same activity ring the task-detail header folds into its
  * pause button (`PauseButtonIcon`), but with a STOP square centered instead of pause bars - the
  * command terminal stops (kills the PTY); it never pauses. Activity is encoded by the ring:
- *   - thinking (agent working): a marching active ring around the stop square.
+ *   - thinking (agent working): a rotating active ring around the stop square.
  *   - idle/permission (needs you): a static attention ring around the stop square.
  *   - not yet running / no activity: the plain red CircleStop (rest state).
  *
@@ -100,11 +100,9 @@ export function CommandTerminalWindow({ managedWindow, isMaximized, titleBarPoin
   const useStore = useLayerStore();
   const toggleMaximizeWindow = useStore((state) => state.toggleMaximizeWindow);
   const closeWindow = useStore((state) => state.closeWindow);
-  // Window-layout parity with the task-detail window: tile presets, pop-out
-  // (untile back to floating), and the multi-window gate for columns/grid.
-  const applyTilePreset = useStore((state) => state.applyTilePreset);
+  // Window-layout parity with the task-detail window: pop-out (untile back to
+  // floating) for a pane that is currently part of a tile group.
   const untileWindow = useStore((state) => state.untileWindow);
-  const windowCount = useStore((state) => Object.keys(state.windows).length);
   const isTiled = useStore((state) => state.windows[windowId]?.leafId != null);
   const { hideLayer } = useCommandTerminalLayer();
 
@@ -186,6 +184,12 @@ export function CommandTerminalWindow({ managedWindow, isMaximized, titleBarPoin
   const transientLabel = useSessionStore((state) =>
     projectId ? state.transientSessions[transientKey(projectId, slot)]?.label ?? null : null,
   );
+  // The auto-derived label (summarized from the first prompt) wins when it
+  // exists; until then the slot number is what makes two terminals tellable
+  // apart, since every other fact in this header (agent, model, branch, cwd) is
+  // identical across a project's terminals by construction. `commandTerminalTitle`
+  // is shared with the Agent Monitor so both surfaces print the same name.
+  const windowTitle = transientLabel ?? commandTerminalTitle(slot);
 
   // Spawn this slot's transient session on mount, or reattach to an existing one
   // (the PTY survives a layer hide, so reopening reattaches instead of
@@ -390,10 +394,10 @@ export function CommandTerminalWindow({ managedWindow, isMaximized, titleBarPoin
           <span
             ref={titleSpanRef}
             className="text-base font-semibold text-fg truncate"
-            title={transientLabel ?? 'Command Terminal'}
+            title={windowTitle}
             data-testid="command-bar-label"
           >
-            {transientLabel ?? 'Command Terminal'}
+            {windowTitle}
           </span>
         </div>
 
@@ -457,9 +461,9 @@ export function CommandTerminalWindow({ managedWindow, isMaximized, titleBarPoin
         </div>
 
         {/* Trailing window controls (always protected, so they never get clipped):
-            kebab, layout menu, pop-out (when tiled), maximize. There is no per-window
-            hide/X - Stop destroys this terminal; the backdrop / Ctrl+Shift+W /
-            Ctrl+Shift+P hide the whole layer. */}
+            kebab, pop-out (when tiled), maximize. There is no per-window hide/X -
+            Stop destroys this terminal; the backdrop / Ctrl+Shift+W / Ctrl+Shift+P
+            hide the whole layer. */}
         <div ref={trailingRef} className="flex items-center gap-3 flex-shrink-0">
           <div ref={kebabWrapRef} className="flex-shrink-0">
             <KebabMenu>
@@ -533,12 +537,10 @@ export function CommandTerminalWindow({ managedWindow, isMaximized, titleBarPoin
             anchorRef={kebabWrapRef}
           />
 
-          {/* Divider + window controls: tile layout + pop-out (tiled only) +
-              maximize. Mirrors TaskDetailHeader's divider placement (right
-              after the kebab, before the window-frame cluster). */}
+          {/* Divider + window controls: pop-out (tiled only) + maximize. Mirrors
+              TaskDetailHeader's divider placement (right after the kebab, before
+              the window-frame cluster). */}
           <div className="w-px h-5 bg-surface-hover flex-shrink-0" />
-
-          <WindowLayoutMenu onApply={applyTilePreset} canTileMultiple={windowCount >= 2} />
 
           {isTiled && (
             <button

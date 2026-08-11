@@ -64,7 +64,7 @@ describe('PtyBufferManager', () => {
 
       manager.onData(SESSION, 'some data');
 
-      // Resize with same cols (e.g. rows-only change)
+      // Same-geometry resize (cols and rows both unchanged)
       const colsChanged = manager.onResize(SESSION, 80);
       expect(colsChanged).toBe(false);
 
@@ -143,17 +143,31 @@ describe('PtyBufferManager', () => {
       expect(manager.getScrollback(SESSION)).toContain('live data');
     });
 
-    it('reports colsChanged=false on a same-width resize (rows-only change)', () => {
+    it('reports colsChanged=false on a genuine rows-only resize (return is reporting, arming is separate)', () => {
       const onFlush = vi.fn();
       const manager = new PtyBufferManager({ onFlush });
-      manager.initSession(SESSION, 'previous session output', 120);
-      manager.onResize(SESSION, 120);
+      manager.initSession(SESSION, 'previous session output', 120, 30);
+      manager.onResize(SESSION, 120, 30);
       manager.onData(SESSION, ' plus new data');
 
-      const colsChanged = manager.onResize(SESSION, 120);
+      // A rows-only change arms the repaint settle but the RETURN VALUE stays
+      // colsChanged: it crosses the IPC boundary and the mobile wire, where
+      // nothing consumes a rows flag.
+      const colsChanged = manager.onResize(SESSION, 120, 50);
       expect(colsChanged).toBe(false);
+      expect(manager.getDimensionState(SESSION)?.pendingRepaintAt).not.toBeNull();
       expect(manager.getScrollback(SESSION)).toContain('previous session output');
       expect(manager.getScrollback(SESSION)).toContain('plus new data');
+    });
+
+    it('tracks lastRows through init and resize (dev diagnostics)', () => {
+      const onFlush = vi.fn();
+      const manager = new PtyBufferManager({ onFlush });
+      manager.initSession(SESSION, '', 120, 24);
+      expect(manager.getDimensionState(SESSION)?.lastRows).toBe(24);
+
+      manager.onResize(SESSION, 120, 40);
+      expect(manager.getDimensionState(SESSION)?.lastRows).toBe(40);
     });
 
     it('fresh session seeded at spawn width reports no change on a matching resize', () => {
@@ -169,17 +183,42 @@ describe('PtyBufferManager', () => {
 
   describe('waitForResizeRepaint (repaint-settle before sampling)', () => {
     // Build the precondition the settle keys on: a full-screen TUI frame (with a
-    // \x1b[2J clear) in the buffer, then a width change that stamps the pending
-    // repaint. Returns the manager so each test drives the settle from there.
+    // \x1b[2J clear) in the buffer, then a geometry change that stamps the
+    // pending repaint. Rows are passed explicitly on every call (the defaulted
+    // rows param would otherwise read as a spurious row change - see the
+    // onResize doc). Returns the manager so each test drives the settle.
     function armWidthChange(tui = true): PtyBufferManager {
       const manager = new PtyBufferManager({ onFlush: vi.fn() });
-      manager.initSession(SESSION, '', 120);
+      manager.initSession(SESSION, '', 120, 30);
       manager.onData(SESSION, tui ? '\x1b[2Jold frame at 120 cols' : 'plain shell output');
-      expect(manager.onResize(SESSION, 190)).toBe(true);
+      expect(manager.onResize(SESSION, 190, 30)).toBe(true);
       return manager;
     }
 
-    it('defers sampling until a marker-less post-resize repaint lands and quiesces', async () => {
+    // Same shape armed by a ROWS-ONLY change: cols stay 120, rows 30 -> 50.
+    // onResize returns false (the report stays colsChanged) while arming.
+    function armRowsChange(tui = true): PtyBufferManager {
+      const manager = new PtyBufferManager({ onFlush: vi.fn() });
+      manager.initSession(SESSION, '', 120, 30);
+      manager.onData(SESSION, tui ? '\x1b[2Jold frame at 30 rows' : 'plain shell output');
+      expect(manager.onResize(SESSION, 120, 50)).toBe(false);
+      return manager;
+    }
+
+    it('does NOT settle on a marker-less update plus a lull (it is not a repaint)', async () => {
+      // REVERSED expectation, deliberately. This used to assert that any bytes
+      // after the resize plus a 50ms lull counted as "the repaint landed", and
+      // that heuristic is the open-a-task-detail flicker: a fullscreen TUI emits
+      // ordinary partial updates (a spinner tick, one redrawn line) and then goes
+      // quiet, which is indistinguishable from a redraw under that rule. The
+      // sample was therefore taken BEFORE the real repaint, so the first thing
+      // painted was the pre-resize frame - drawn wide, wrapped into the narrower
+      // window - and the held live bytes then replaced it. See
+      // tests/unit/repaint-settle-marker.test.ts for the harness that isolates it.
+      //
+      // For a session this wait has already identified as a fullscreen TUI, only a
+      // full-screen ERASE means the frame was redrawn. Everything else rides the
+      // deadline.
       vi.useFakeTimers();
       const manager = armWidthChange();
 
@@ -188,26 +227,20 @@ describe('PtyBufferManager', () => {
         settled = true;
       });
 
-      // No repaint yet: the settle is still pending.
       await vi.advanceTimersByTimeAsync(16);
       expect(settled).toBe(false);
 
-      // The SIGWINCH repaint lands WITHOUT a full-frame marker (no \x1b[2J or
-      // \x1b[H), so the marker-based early settle does not apply and the wait
-      // falls back to the quiesce heuristic. (A marker-bearing repaint settles
-      // immediately - covered by the streaming early-settle test below.)
-      manager.onData(SESSION, 'repaint at 190 cols');
-
-      // Data just arrived: not yet quiesced.
-      await vi.advanceTimersByTimeAsync(16);
+      // A partial update with no erase, then silence well past the old 50ms
+      // quiesce window. Previously this settled; now it must not.
+      manager.onData(SESSION, 'partial update, no erase');
+      await vi.advanceTimersByTimeAsync(96);
       expect(settled).toBe(false);
 
-      // Quiesce window elapses -> the settle resolves.
-      await vi.advanceTimersByTimeAsync(80);
+      // The genuine repaint erases the screen, and that settles it.
+      manager.onData(SESSION, '\x1b[2Jrepaint at 190 cols');
+      await vi.advanceTimersByTimeAsync(16);
       await waitPromise;
       expect(settled).toBe(true);
-
-      // The sample now includes the fitted-width repaint, not just the stale frame.
       expect(manager.getScrollback(SESSION)).toContain('repaint at 190 cols');
 
       vi.useRealTimers();
@@ -244,7 +277,18 @@ describe('PtyBufferManager', () => {
       vi.useRealTimers();
     });
 
-    it('settles early when a streaming session lands a post-resize BARE cursor-home marker (\\x1b[H, no \\x1b[2J)', async () => {
+    it('does NOT settle on a BARE cursor-home (\\x1b[H is a partial update, not a repaint)', async () => {
+      // REVERSED expectation, deliberately - this test previously asserted the
+      // behavior that caused the flicker. A bare \x1b[H was accepted as proof of a
+      // full-frame repaint, but a fullscreen TUI emits cursor-home constantly for
+      // partial updates: measured on a live Claude session, 169 cursor-homes to 56
+      // full-screen clears in one 512KB ring. So the FIRST routine byte after the
+      // resize satisfied the settle, getScrollback sampled the pre-resize frame,
+      // and the user saw that stale wide frame before the held live bytes replaced
+      // it with the real repaint.
+      //
+      // The accelerator survives for the marker that actually means it (\x1b[2J,
+      // covered above); only this false positive is removed.
       vi.useFakeTimers();
       const manager = armWidthChange();
 
@@ -253,20 +297,17 @@ describe('PtyBufferManager', () => {
         settled = true;
       });
 
-      // Marker-free streaming: bytes keep arriving so the quiesce heuristic
-      // can never fire.
       manager.onData(SESSION, 'streaming output without a marker');
       await vi.advanceTimersByTimeAsync(16);
       expect(settled).toBe(false);
-      manager.onData(SESSION, 'more streaming output');
+
+      // A bare cursor-home mid-stream. Previously this settled the wait here.
+      manager.onData(SESSION, '\x1b[Hpartial update at the old width');
       await vi.advanceTimersByTimeAsync(16);
       expect(settled).toBe(false);
 
-      // The SIGWINCH repaint lands mid-stream with a BARE cursor-home
-      // (\x1b[H, no \x1b[2J clear anywhere in the post-resize bytes): the
-      // wait settles on the next poll via the \x1b[H arm of the marker
-      // check, same as the \x1b[2J case above.
-      manager.onData(SESSION, '\x1b[Hrepaint at 190 cols');
+      // The genuine repaint erases first, and only that settles it.
+      manager.onData(SESSION, '\x1b[2Jrepaint at 190 cols');
       await vi.advanceTimersByTimeAsync(16);
       await waitPromise;
       expect(settled).toBe(true);
@@ -493,11 +534,26 @@ describe('PtyBufferManager', () => {
       vi.useRealTimers();
     });
 
-    it('samples immediately when the session has no full-screen TUI (no clear marker)', async () => {
+    it('settles a no-marker session within the short grace, far below the TUI ceiling', async () => {
       vi.useFakeTimers();
       const manager = armWidthChange(false);
 
-      await manager.waitForResizeRepaint(SESSION);
+      let settled = false;
+      const waitPromise = manager.waitForResizeRepaint(SESSION).then(() => {
+        settled = true;
+      });
+
+      // Not instant anymore: a fullscreen TUI that has not drawn its FIRST
+      // frame yet also has no marker, so the wait gives in-flight bytes a
+      // short window instead of sampling a near-empty ring.
+      await vi.advanceTimersByTimeAsync(16);
+      expect(settled).toBe(false);
+
+      // A silent session (a shell answering SIGWINCH with nothing) settles at
+      // the grace - never the TUI's 400ms ceiling.
+      await vi.advanceTimersByTimeAsync(64);
+      await waitPromise;
+      expect(settled).toBe(true);
 
       vi.useRealTimers();
     });
@@ -524,16 +580,186 @@ describe('PtyBufferManager', () => {
       vi.useRealTimers();
     });
 
-    it('does not arm a wait when the width did not change', async () => {
+    it('does not arm a wait when the geometry did not change', async () => {
       vi.useFakeTimers();
       const manager = new PtyBufferManager({ onFlush: vi.fn() });
-      manager.initSession(SESSION, '', 120);
-      manager.onData(SESSION, '\x1b[2Jframe at 120 cols');
-      // Same-width resize: colsChanged false, no pending repaint stamped.
-      expect(manager.onResize(SESSION, 120)).toBe(false);
+      manager.initSession(SESSION, '', 120, 30);
+      manager.onData(SESSION, '\x1b[2Jframe at 120x30');
+      // Same cols AND rows: nothing changed, no pending repaint stamped.
+      expect(manager.onResize(SESSION, 120, 30)).toBe(false);
 
       // No pending repaint -> short-circuits with no timers.
       await manager.waitForResizeRepaint(SESSION);
+
+      vi.useRealTimers();
+    });
+
+    it('a rows-only resize arms the settle: the old-row-count frame is not sampled early', async () => {
+      // The bug this pins (measured live 2026-07-31, 12/12 trials): a rows-only
+      // resize left the settle unarmed, so getScrollback sampled ~1ms after the
+      // resize and replayed the frame laid out for the OLD row count. The
+      // repaint always arrived 21-122ms later carrying a full \x1b[2J erase, so
+      // arming lets the marker settle the wait early.
+      vi.useFakeTimers();
+      const manager = armRowsChange();
+
+      let settled = false;
+      const waitPromise = manager.waitForResizeRepaint(SESSION).then(() => {
+        settled = true;
+      });
+
+      // Unarmed, this would have resolved immediately; armed, it waits.
+      await vi.advanceTimersByTimeAsync(16);
+      expect(settled).toBe(false);
+
+      // The rows repaint lands with the erase marker: early settle.
+      manager.onData(SESSION, '\x1b[2Jrepaint at 50 rows');
+      await vi.advanceTimersByTimeAsync(16);
+      await waitPromise;
+      expect(settled).toBe(true);
+      expect(manager.getScrollback(SESSION)).toContain('repaint at 50 rows');
+
+      vi.useRealTimers();
+    });
+
+    it('a rows-only arm on a plain-shell session settles at the short grace (no TUI marker)', async () => {
+      vi.useFakeTimers();
+      const manager = armRowsChange(false);
+
+      // Discriminating precondition: the rows-only change actually armed the
+      // settle. Without this, a reverted arming path would pass this test
+      // vacuously (nothing to clear means "resolves quickly" either way).
+      expect(manager.getDimensionState(SESSION)?.pendingRepaintAt).not.toBeNull();
+
+      // No \x1b[2J anywhere in the scrollback and nothing arriving: the
+      // no-marker wait settles at its short grace and clears the arm.
+      const waitPromise = manager.waitForResizeRepaint(SESSION);
+      await vi.advanceTimersByTimeAsync(80);
+      await waitPromise;
+
+      // The no-tui-marker path must have cleared the arm.
+      expect(manager.getDimensionState(SESSION)?.pendingRepaintAt).toBeNull();
+
+      vi.useRealTimers();
+    });
+
+    it('a rows-only arm with no post-resize marker rides the max-wait ceiling, not an early sample', async () => {
+      // Mirrors "resolves at the max-wait ceiling when no repaint ever
+      // arrives" (armWidthChange), but for a ROWS-ONLY arm: proves the
+      // deadline path is reachable from a rows change too, not just the
+      // early-settle-on-marker path already covered above.
+      vi.useFakeTimers();
+      const manager = armRowsChange(); // TUI session, rows-only 30 -> 50
+
+      let settled = false;
+      const waitPromise = manager.waitForResizeRepaint(SESSION).then(() => {
+        settled = true;
+      });
+
+      // No marker ever follows the resize. Just short of the 400ms ceiling:
+      // still unsettled.
+      await vi.advanceTimersByTimeAsync(399);
+      expect(settled).toBe(false);
+
+      // The ceiling (400ms from entry) is reached: resolves without a repaint.
+      await vi.advanceTimersByTimeAsync(1);
+      await waitPromise;
+      expect(settled).toBe(true);
+
+      vi.useRealTimers();
+    });
+
+    it('a rows change stacked on a pending cols repaint requires marker AND quiesce', async () => {
+      vi.useFakeTimers();
+      const manager = armWidthChange(); // 120x30 -> 190x30 stamps the first pending repaint
+      // A rows-only change lands before the width repaint arrived: two
+      // repaints are now (or may be) in flight, so the wait is stacked.
+      expect(manager.onResize(SESSION, 190, 50)).toBe(false);
+
+      let settled = false;
+      const waitPromise = manager.waitForResizeRepaint(SESSION).then(() => {
+        settled = true;
+      });
+
+      // The FIRST geometry's repaint arrives late: marker alone must not
+      // settle a stacked wait.
+      manager.onData(SESSION, '\x1b[2Jrepaint at 190x30 (stale rows)');
+      await vi.advanceTimersByTimeAsync(16);
+      expect(settled).toBe(false);
+
+      // The correct-geometry repaint lands and data quiesces: settles.
+      manager.onData(SESSION, '\x1b[2Jrepaint at 190x50');
+      await vi.advanceTimersByTimeAsync(96);
+      await waitPromise;
+      expect(settled).toBe(true);
+      expect(manager.getScrollback(SESSION)).toContain('repaint at 190x50');
+
+      vi.useRealTimers();
+    });
+
+    it('a cols change stacked on a pending rows repaint requires marker AND quiesce', async () => {
+      vi.useFakeTimers();
+      const manager = armRowsChange(); // 120x30 -> 120x50 stamps the first pending repaint
+      expect(manager.onResize(SESSION, 190, 50)).toBe(true);
+
+      let settled = false;
+      const waitPromise = manager.waitForResizeRepaint(SESSION).then(() => {
+        settled = true;
+      });
+
+      manager.onData(SESSION, '\x1b[2Jrepaint at 120x50 (stale cols)');
+      await vi.advanceTimersByTimeAsync(16);
+      expect(settled).toBe(false);
+
+      manager.onData(SESSION, '\x1b[2Jrepaint at 190x50');
+      await vi.advanceTimersByTimeAsync(96);
+      await waitPromise;
+      expect(settled).toBe(true);
+
+      vi.useRealTimers();
+    });
+
+    it('an omitted rows argument after a real-rows resize reads as a row change (test-only trap)', () => {
+      // rows defaults to DEFAULT_HEADLESS_ROWS (30). Production always passes
+      // real rows (SessionManager.resize), so this path is reachable only from
+      // tests - pinned here so the behavior is documented rather than
+      // rediscovered: an omitted rows after rows=50 reads 50 -> 30 and arms.
+      const manager = new PtyBufferManager({ onFlush: vi.fn() });
+      manager.initSession(SESSION, '', 120, 30);
+      manager.onData(SESSION, '\x1b[2Jframe');
+      expect(manager.onResize(SESSION, 120, 50)).toBe(false);
+      expect(manager.getDimensionState(SESSION)?.pendingRepaintAt).not.toBeNull();
+
+      // Omitting rows now reads as 50 -> 30: it re-arms, stacked on the first.
+      expect(manager.onResize(SESSION, 120)).toBe(false);
+      expect(manager.getDimensionState(SESSION)?.pendingRepaintStacked).toBe(true);
+      expect(manager.getDimensionState(SESSION)?.lastRows).toBe(30);
+    });
+
+    it('an unconsumed arm older than REPAINT_MAX_WAIT_MS does not stack the next resize', () => {
+      // Age-gates the stacked flag: an arm nothing ever sampled (a bottom-panel
+      // height drag with no replay after it) must not slow the NEXT unrelated
+      // resize down to marker-and-quiesce. The sibling "fresh arm still
+      // stacks" case is pinned above (immediate re-resize -> stacked true);
+      // this test is the complementary stale case.
+      vi.useFakeTimers();
+      const manager = new PtyBufferManager({ onFlush: vi.fn() });
+      manager.initSession(SESSION, '', 120, 30);
+      manager.onData(SESSION, '\x1b[2Jframe');
+
+      // First geometry change stamps pendingRepaintAt. Nothing ever consumes
+      // it (no waitForResizeRepaint call).
+      expect(manager.onResize(SESSION, 120, 50)).toBe(false);
+      expect(manager.getDimensionState(SESSION)?.pendingRepaintAt).not.toBeNull();
+
+      // Advance well past REPAINT_MAX_WAIT_MS (400ms) with the arm still
+      // unconsumed: its repaint has landed or never will by now.
+      vi.advanceTimersByTime(500);
+
+      // A second, unrelated geometry change lands. The stale arm must NOT
+      // mark it stacked.
+      expect(manager.onResize(SESSION, 190, 50)).toBe(true);
+      expect(manager.getDimensionState(SESSION)?.pendingRepaintStacked).toBe(false);
 
       vi.useRealTimers();
     });
@@ -1207,6 +1433,270 @@ describe('PtyBufferManager', () => {
     it('returns empty string for an unknown session', async () => {
       const manager = new PtyBufferManager({ onFlush: vi.fn() });
       expect(await manager.getSerializedFrame('nonexistent')).toBe('');
+    });
+  });
+
+  describe('getReplaySnapshot (desktop replay payload)', () => {
+    // Real timers, like the getSerializedFrame block above: the frame branch
+    // awaits the headless parser's macrotask flush barrier.
+    it('serves a parsed-grid frame that keeps static cells a capped byte replay drops', async () => {
+      const manager = new PtyBufferManager({ onFlush: vi.fn() });
+      manager.initSession(SESSION, '', 80, 24);
+
+      // Same fixture as the getSerializedFrame regression above: a write-once
+      // static cell, then a >512KB dynamic flood that never redraws it.
+      const STATIC_SEGMENT = 'auto mode on';
+      manager.onData(SESSION, `\x1b[?1049h\x1b[2J\x1b[1;1H${STATIC_SEGMENT}`);
+      const MAX_SCROLLBACK = 512 * 1024;
+      const dynamicUnit = '\x1b[24;1H' + 'x'.repeat(20); // stays on row 24, 20 cols < 80: no wrap, no scroll
+      const dynamicChunk = dynamicUnit.repeat(80);
+      let floodedBytes = 0;
+      while (floodedBytes < MAX_SCROLLBACK + 400 * 1024) {
+        manager.onData(SESSION, dynamicChunk);
+        floodedBytes += dynamicChunk.length;
+      }
+
+      // Precondition: the ring is genuinely truncated past the write-once
+      // region, so the raw byte replay has lost the static cell.
+      expect(manager.getScrollback(SESSION)).not.toContain(STATIC_SEGMENT);
+
+      // The replay payload the desktop mount receives reconstructs it.
+      const snapshot = await manager.getReplaySnapshot(SESSION);
+      expect(snapshot).toContain(STATIC_SEGMENT);
+      // The frame carries its own alt-screen switch, and exactly one: the
+      // snapshot path must not prepend the byte path's hand-built preamble on
+      // top of the one the serialize addon emits.
+      expect(snapshot.split('\x1b[?1049h').length - 1).toBe(1);
+      // And the switch precedes the alt-grid content: the addon serializes the
+      // normal buffer first, then switches, so a frame emitting alt rows ahead
+      // of the switch would paint them into the wrong buffer.
+      expect(snapshot.indexOf('\x1b[?1049h')).toBeLessThan(snapshot.indexOf(STATIC_SEGMENT));
+
+      manager.removeSession(SESSION);
+    });
+
+    it('re-asserts mouse-encoding modes the serialize addon cannot emit', async () => {
+      const manager = new PtyBufferManager({ onFlush: vi.fn() });
+      manager.initSession(SESSION, '', 80, 24);
+      // A fullscreen TUI with wheel-scroll support: mouse tracking (1000) in
+      // SGR encoding (1006), like Claude Code. The serialize addon re-asserts
+      // TRACKING from terminal.modes (?1000h) but has no API for the ENCODING
+      // modes (1005/1006/1015/1016), so a bare frame leaves xterm reporting
+      // legacy X10 bytes that an SGR-expecting TUI ignores: wheel scroll went
+      // dead after every same-grid remount until the TUI happened to re-assert
+      // its own modes in the live stream.
+      manager.onData(SESSION, '\x1b[?1049h\x1b[?1000h\x1b[?1006h\x1b[2J\x1b[1;1HTUI frame');
+
+      const snapshot = await manager.getReplaySnapshot(SESSION);
+      // The folded DEC prefix (buildDecPrivateModePrefix) re-asserts every
+      // tracked input/reporting mode after the frame; 1006 must be a member
+      // (terminated by ';' or the trailing 'h', never a substring of a longer
+      // parameter).
+      expect(snapshot).toMatch(/\x1b\[\?(?:[0-9]+;)*1006[;h]/);
+
+      manager.removeSession(SESSION);
+    });
+
+    it('passes a non-alt-screen session through to the raw byte replay', async () => {
+      const manager = new PtyBufferManager({ onFlush: vi.fn() });
+      manager.initSession(SESSION, '', 80, 24);
+      manager.onData(SESSION, 'plain shell output\r\nsecond line');
+
+      const snapshot = await manager.getReplaySnapshot(SESSION);
+      // Byte-for-byte the getScrollback value (stable across reads with no new
+      // data), preamble and all.
+      expect(snapshot).toBe(manager.getScrollback(SESSION));
+      expect(snapshot).toContain('plain shell output');
+
+      manager.removeSession(SESSION);
+    });
+
+    it('drains the pending buffer on the frame branch like getScrollback does', async () => {
+      const onFlush = vi.fn();
+      const manager = new PtyBufferManager({ onFlush });
+      manager.initSession(SESSION, '', 80, 24);
+      manager.onData(SESSION, '\x1b[?1049h\x1b[2J\x1b[1;1Hpending frame bytes');
+
+      const snapshot = await manager.getReplaySnapshot(SESSION);
+      expect(snapshot).toContain('pending frame bytes');
+      expect(manager.getBufferStats(SESSION)?.pendingBytes).toBe(0);
+      // The already-queued 16ms flush finds an empty buffer and stays silent,
+      // so nothing baked into the frame is delivered a second time.
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      expect(onFlush).not.toHaveBeenCalled();
+
+      manager.removeSession(SESSION);
+    });
+
+    it('returns empty string for an unknown or empty session', async () => {
+      const manager = new PtyBufferManager({ onFlush: vi.fn() });
+      expect(await manager.getReplaySnapshot('nonexistent')).toBe('');
+      manager.initSession(SESSION, '', 80, 24);
+      expect(await manager.getReplaySnapshot(SESSION)).toBe('');
+      manager.removeSession(SESSION);
+    });
+
+    it('folds bytes that race the sample into the reply exactly once, never via a flush', async () => {
+      const onFlush = vi.fn();
+      const manager = new PtyBufferManager({ onFlush });
+      manager.initSession(SESSION, '', 80, 24);
+      manager.onData(SESSION, '\x1b[?1049h\x1b[2J\x1b[1;1Halt frame');
+
+      const pendingSnapshot = manager.getReplaySnapshot(SESSION); // do not await yet
+      manager.onData(SESSION, 'RACE_BYTES'); // lands during the await window
+      const snapshot = await pendingSnapshot;
+
+      // The atomic serialize (see HeadlessFrameBuffer.serialize) bakes in only
+      // the bytes fed before the drain, so the race bytes cannot land inside
+      // the frame itself - they can only appear once, as the tail folded on
+      // after the await.
+      expect(snapshot.split('RACE_BYTES').length - 1).toBe(1);
+
+      // The held flush tick (replaySamplesInFlight, see scheduleFlush) must
+      // never deliver them a second time via onFlush: the tail fold already
+      // drained state.buffer, so the re-armed tick finds nothing to emit.
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      for (const call of onFlush.mock.calls) {
+        expect(call[1]).not.toContain('RACE_BYTES');
+      }
+
+      manager.removeSession(SESSION);
+    });
+
+    it('resolves empty when the session is torn down mid-sample', async () => {
+      const manager = new PtyBufferManager({ onFlush: vi.fn() });
+      manager.initSession(SESSION, '', 80, 24);
+      manager.onData(SESSION, '\x1b[?1049h\x1b[2J\x1b[1;1Halt frame');
+
+      const pendingSnapshot = manager.getReplaySnapshot(SESSION); // do not await yet
+      manager.removeSession(SESSION);
+
+      // The post-await teardown check must settle the reply to an empty
+      // string rather than leaving it hanging on a disposed parser, whether
+      // the serialize barrier resolves before or after REPLAY_SERIALIZE_MAX_WAIT_MS.
+      const snapshot = await pendingSnapshot;
+      expect(snapshot).toBe('');
+    });
+
+    it('resumes normal flush delivery once a sample completes (replaySamplesInFlight must not stick)', async () => {
+      const onFlush = vi.fn();
+      const manager = new PtyBufferManager({ onFlush });
+      manager.initSession(SESSION, '', 80, 24);
+      manager.onData(SESSION, '\x1b[?1049h\x1b[2J\x1b[1;1Halt frame');
+
+      await manager.getReplaySnapshot(SESSION);
+
+      // The frame branch drains everything into the reply (see "drains the
+      // pending buffer" above), so nothing should have flushed yet.
+      expect(onFlush).not.toHaveBeenCalled();
+
+      // Bytes fed AFTER the sample has fully resolved must still reach
+      // onFlush on the ordinary 16ms tick. If replaySamplesInFlight's finally
+      // decrement were ever lost (an early return before it, an off-by-one),
+      // the counter would stay above zero, scheduleFlush's tick would re-arm
+      // forever, and this data would never be delivered - the renderer would
+      // go permanently silent for the session.
+      manager.onData(SESSION, 'POST_SAMPLE_BYTES');
+      await expect
+        .poll(
+          () => onFlush.mock.calls.some((call) => typeof call[1] === 'string' && call[1].includes('POST_SAMPLE_BYTES')),
+          { timeout: 2000, interval: 20 },
+        )
+        .toBe(true);
+
+      manager.removeSession(SESSION);
+    });
+
+    it('propagates a HeadlessFrameBuffer.serialize rejection rather than swallowing it', async () => {
+      const manager = new PtyBufferManager({ onFlush: vi.fn() });
+      manager.initSession(SESSION, '', 80, 24);
+      manager.onData(SESSION, '\x1b[?1049h\x1b[2J\x1b[1;1Halt frame');
+
+      // Force the underlying serializer to throw. HeadlessFrameBuffer.serialize's
+      // own try/catch (see tests/unit/headless-frame.test.ts) turns that into a
+      // REJECTED promise rather than an uncaught main-process exception - but
+      // getReplaySnapshot has no catch of its own around the Promise.race, so
+      // that rejection must propagate all the way out to the caller
+      // (SessionManager.getScrollback, then the IPC reply) rather than resolve
+      // to a frame, the byte replay, or an empty string. The renderer's
+      // existing getScrollback().catch() (useTerminal.ts) is the actual safety
+      // net downstream; this pins that getReplaySnapshot itself does not
+      // silently absorb the failure first.
+      interface ManagerInternals {
+        buffers: Map<string, { headless: { serializer: { serialize: (...args: unknown[]) => string } } }>;
+      }
+      const bufferState = (manager as unknown as ManagerInternals).buffers.get(SESSION);
+      if (!bufferState) throw new Error('test setup: session buffer state missing');
+      bufferState.headless.serializer.serialize = () => {
+        throw new Error('serializer disposed mid-sample');
+      };
+
+      await expect(manager.getReplaySnapshot(SESSION)).rejects.toThrow('serializer disposed mid-sample');
+
+      manager.removeSession(SESSION);
+    });
+  });
+
+  describe('getOutputPeek (live PTY-grid-to-peek wiring)', () => {
+    // Real timers, mirroring the getSerializedFrame block above: the headless
+    // parser drains its write buffer on a macrotask. getOutputPeek itself is
+    // deliberately SYNCHRONOUS and does not flush (see its doc comment on
+    // PtyBufferManager) - in production it self-heals on the next 500ms sample
+    // tick - so each test below forces the flush via getSerializedFrame (the
+    // only public path to HeadlessFrameBuffer's private flush()) and discards
+    // the serialized string. That is not a copy-paste mistake: it is the same
+    // flush barrier the getSerializedFrame tests above rely on, reused here
+    // because both methods read the SAME underlying headless parser instance.
+    it('returns the real parsed-grid tail lines after feeding text through onData', async () => {
+      const { manager } = createManager();
+
+      manager.onData(SESSION, 'alpha\r\nbravo\r\ncharlie\r\n');
+      await manager.getSerializedFrame(SESSION);
+
+      expect(manager.getOutputPeek(SESSION)).toEqual(['alpha', 'bravo', 'charlie']);
+
+      manager.removeSession(SESSION);
+    });
+
+    it('excludes the trailing prompt line the cursor currently sits on', async () => {
+      const { manager } = createManager();
+
+      manager.onData(SESSION, 'alpha\r\nbravo\r\ncharlie\r\nPS C:\\project> ');
+      await manager.getSerializedFrame(SESSION);
+
+      const peek = manager.getOutputPeek(SESSION);
+      expect(peek).toEqual(['alpha', 'bravo', 'charlie']);
+      expect(peek.join('\n')).not.toContain('PS C:');
+
+      manager.removeSession(SESSION);
+    });
+
+    it('honors an explicit count, keeping the newest lines', async () => {
+      const { manager } = createManager();
+
+      manager.onData(SESSION, 'alpha\r\nbravo\r\ncharlie\r\ndelta\r\n');
+      await manager.getSerializedFrame(SESSION);
+
+      expect(manager.getOutputPeek(SESSION, 2)).toEqual(['charlie', 'delta']);
+
+      manager.removeSession(SESSION);
+    });
+
+    it('returns [] for a session that has produced no output yet', async () => {
+      const { manager } = createManager();
+
+      await manager.getSerializedFrame(SESSION);
+      expect(manager.getOutputPeek(SESSION)).toEqual([]);
+
+      manager.removeSession(SESSION);
+    });
+
+    it('returns [] for a session id the manager has never heard of', () => {
+      const { manager } = createManager();
+
+      expect(manager.getOutputPeek('nonexistent-session')).toEqual([]);
+
+      manager.removeSession(SESSION);
     });
   });
 });

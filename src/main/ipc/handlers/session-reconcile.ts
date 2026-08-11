@@ -92,6 +92,18 @@ export async function restartSessionForSettingsChange(
   projectId: string,
   projectPath: string,
   taskId: string,
+  options: {
+    /**
+     * Text to hand the CLI as its prompt argument on resume.
+     *
+     * This is rung 3 of the auto_command delivery ladder: when keystroke
+     * injection cannot be confirmed, the command is delivered as an argv
+     * prompt instead, where arrival is guaranteed by the spawn rather than by
+     * TUI timing. Omitted for the ordinary settings-change restart, which
+     * resumes idle by contract.
+     */
+    resumePrompt?: string;
+  } = {},
 ): Promise<{ ok: true } | { ok: false; reason: string }> {
   try {
     const { tasks, swimlanes, actions, attachments } = getProjectRepos(context, projectId);
@@ -140,12 +152,26 @@ export async function restartSessionForSettingsChange(
         task: updatedTask,
         fromSwimlaneId: updatedTask.swimlane_id,
         toLane: updatedLane ?? null,
-        mode: { kind: 'explicit-resume' },
+        mode: { kind: 'explicit-resume', resumePrompt: options.resumePrompt },
         skipPromptTemplate: true,
         projectId,
         projectPath,
         attachments,
       });
+      // This restart resumes IDLE by contract (no prompt, no auto_command), but
+      // `--resume` still runs the CLI's resume-picker context reload: a turn
+      // that fires NO hooks while growing `total_output_tokens`. The status
+      // heartbeat force-thinks exactly that shape unless the idle is
+      // authoritative, which painted a fixed 30s spurious `thinking` on a
+      // parked agent after a ContextBar model switch. Assert what the contract
+      // above already guarantees. Not sticky: any real turn hook clears it.
+      //
+      // Skipped when a resumePrompt was supplied: that resume starts a REAL
+      // turn, so asserting idle would paint a working agent as parked.
+      const resumedSessionId = tasks.getById(taskId)?.session_id;
+      if (resumedSessionId && !options.resumePrompt) {
+        context.sessionManager.markIdleAuthoritative(resumedSessionId);
+      }
       return { ok: true };
     } catch (respawnError) {
       if (isAbortError(respawnError)) return { ok: false, reason: 'respawn aborted' };

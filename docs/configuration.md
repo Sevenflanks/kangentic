@@ -30,6 +30,7 @@ These settings appear only in App Settings and cannot be overridden per-project:
 - `columnWidth`, `terminalPanelVisible`, `animationsEnabled`, `statusBarVisible`, `diffViewMode`
 - `cardDensity`, `showTaskNumbers` (Task tab)
 - `diffDefaultScope`, `diffIgnoreWhitespace`, `diffCollapseUnchanged`, `diffFileSort`, `diffFlatList`
+- `monitor` (the Agent Monitor's own toolbar controls, not a Settings-panel entry)
 - `restoreWindowPosition`
 - `agent.cliPaths`, `agent.maxConcurrentSessions`, `agent.queueOverflow`, `agent.autoResumeSessionsOnRestart`
 - `agent.executionServers` (per-agent remote-server url + auth; the Agent tab's Server URL / Authentication fields, shown when the selected agent declares remote-execution support)
@@ -81,18 +82,29 @@ These settings appear in both App Settings (as defaults) and Project Settings (a
 | `diffCollapseUnchanged` | boolean | `false` | Fold away large unchanged regions so only changed hunks (with a little surrounding context) are shown. Global-only. |
 | `diffFileSort` | `'name'` \| `'status'` \| `'size'` | `'name'` | How the Changes panel orders files: by name, by status (added / modified / deleted), or by size (most changes first). Global-only. |
 | `diffFlatList` | boolean | `false` | Show changed files as a flat list of full paths instead of a nested directory tree. Global-only. |
+| `monitor` | MonitorView | see below | Persisted Agent Monitor view. Global-only: the monitor spans every project, so a per-project override would be meaningless. Not surfaced in the Settings panel - these are the monitor's own toolbar controls, written debounced on every change so the view survives a quit or crash, not just an orderly close. |
+| `monitor.layout` | `'cards'` \| `'table'` \| `'list'` | `'cards'` | How sessions are arranged. `cards` reflows 1 to 5 columns by the surface's own width (a container query, so the detached pop-out lays out by its own size rather than the main window's), stepping at 850 / 1300 / 1750 / 2200px to keep a card near a board column's width; `list` is one dense line per session. A persisted `'compact'` (the old name for `list`) is migrated on read. |
+| `monitor.groupBy` | `'state'` \| `'project'` | `'project'` | Section rows by owning project or by attention bucket (Idle / Active / Paused / Recently finished). There is no "none": rows are always sectioned, and the labelled separator is what makes a card moving between sections legible rather than arbitrary. Project is the default because this view exists to span projects, so "whose agents are these" is the question a user arrives with. Attention-first ordering is a property of `state` grouping, so it applies once that is picked. An unrecognised persisted value (including the retired `'flat'`) falls back to `project`. |
+| `monitor.sort` | `'longest-running'` \| `'recently-started'` | `'longest-running'` | Order WITHIN a section, shown as "Oldest" / "Newest", purely by when the session started. Ordering by attention is not offered: `state` grouping already emits its sections attention-first. Sorting by project was dropped too, since it duplicated `groupBy: 'project'`. An unrecognised persisted value (including the retired `'attention'`) falls back to `longest-running`. |
+| `monitor.liveOnly` | boolean | `false` | Show only sessions with a live agent, hiding paused, queued, and recently finished ones. Reads a legacy `hideIdle` value if present. |
+| `monitor.projectFilter` | string[] | `[]` | Project ids to show. Empty means every project. No toolbar control writes this: a monitor whose job is to show every agent everywhere does not need a one-project scope (that is the board), and each row names its owning project anyway. Cleared on load, so a value persisted by an older build cannot hide rows with no control able to bring them back. |
+| `monitor.stateFilter` | MonitorStateBucket[] | `[]` | Attention buckets to show, as raw values: `needs-you` (shown as "Idle"), `working` ("Active"), `idle` ("Paused"), `finished` ("Recently finished"). Empty means every bucket. Like `projectFilter`, not written by any control today and cleared on load - `liveOnly` covers the case users actually asked for. |
+| `monitor.textFilter` | string | `''` | Substring match across task title, project, column, agent, model, ticket number, and labels. |
 | `skipDeleteConfirm` | boolean | `false` | Skip confirmation dialog on task delete. Written by the delete dialog's "don't ask again" checkbox. No longer surfaced in the Settings panel. |
 | `autoFocusIdleSession` | boolean | `false` | Auto-switch to session tab when agent goes idle. Idle tabs are always highlighted regardless of this setting. |
-| `windowLightDismiss` | `'off'` \| `'single'` \| `'focused'` \| `'all'` | `'single'` | Click-outside (light-dismiss) policy for modeless task-detail windows. `off` disables; `single` closes the lone window (any state); `focused` closes the focused window (any state); `all` closes every window. Closing a window does not kill its session. Global-only. |
+| `windowLightDismiss` | `'off'` \| `'single'` \| `'focused'` \| `'all'` | `'focused'` | Click-outside (light-dismiss) policy for modeless task-detail windows. Clicking empty space outside a window closes it, except a control, a task card, or a running terminal, which still act on the first click. Overlays that mount outside the shell's dismiss scope (the settings panel, palettes, dialogs) never dismiss. `off` disables; `single` closes the lone window (any state) and nothing at all once a second is open; `focused` closes the focused window (any state), whether one or five are open; `all` closes every window. Closing a window does not kill its session. Global-only. |
+| `hasMigratedWindowLightDismissDefault` | boolean | `false` | Internal one-shot marker. `windowLightDismiss` defaulted to `single` before the click-outside denylist landed, and because the whole config blob is persisted on every save, an upgrading install keeps that value as if it were a choice. On the first load after this key appears, a stored `single` is rewritten to `focused` once and the marker is set, so a later deliberate `single` sticks. Not persisted when the config file exists but cannot be parsed as a usable config object (invalid JSON, or valid JSON that is not an object - null, an array, a bare primitive), since the in-memory rewrite still applies for that session, so an unreadable file is not replaced with defaults on disk. Auto-set, not shown in UI. |
 | `restoreWindowPosition` | boolean | `true` | Remember window size and position between launches. Global-only. |
 | `hasCompletedFirstRun` | boolean | `false` | Legacy: set true on first task creation, kept for schema/fixture compatibility. No onboarding UI reads it, and it is not the walkthrough gate: creating a task is step 3 of the walkthrough, so this flips mid-flow. The walkthrough is suppressed once `onboardedProjectIds` is non-empty. Auto-set, not shown in UI. |
+| `dismissedAnnouncementIds` | string[] | `[]` | Ids of [in-app announcements](#in-app-announcements) dismissed from the banner. Pruned on write to ids still present in the active feed, so the array stays bounded with no separate cleanup. Auto-set, not shown in UI. |
 | `onboardedProjectIds` | string[] \| undefined | `undefined` | Project ids whose onboarding checklist the user has dismissed. `undefined` means the one-time upgrade backfill (on first app hydration) has not run yet; `[]` means it has run and nothing is dismissed. Global, keyed by project id like `lastActiveTaskByProject`. **Emptiness, not membership, gates the walkthrough:** the checklist auto-opens only while this list is empty, because the walkthrough teaches the app rather than a repo and must not replay on every newly added project. It becomes non-empty by three routes, all meaning "not a first run": the backfill finding an existing project, a real dismissal, or all five steps completed. Auto-set, not shown in UI. |
 | `onboardingBaseline` | Record\<string, object\> \| undefined | `undefined` | Per-project snapshot of the settings the onboarding checklist watches (`defaultAgent`, `defaultModel`, `defaultEffort`, `permissionMode`, and a `swimlaneSignature` string encoding of the board's shape), captured on first checklist open. Adding a project does not capture one: the auto-open gate is install-scoped, so a second project has no baseline until the checklist is opened there by hand. Checklist steps 1 and 2 tick when live state DIFFERS from this, so opening a settings screen and closing it unchanged earns no checkmark. Both are guarded on the baseline existing, so a baseline-less project reports them un-ticked rather than complete. Keyed by project id; replaced wholesale on write (a `CONFIG_DICTIONARY_PATHS` entry). Auto-set, not shown in UI. |
 | `windowBounds` | object \| null | `null` | Persisted window bounds `{x, y, width, height}`. Auto-saved, not shown in UI. |
 | `windowMaximized` | boolean | `false` | Whether the window was maximized at last close. Auto-saved, not shown in UI. |
-| `popOutBounds` | object | `{}` | Persisted bounds + last target display id for each detached pop-out surface (usage stats, git changes, the Browser pane), keyed by `PopOutKind` so a surface reopens on the monitor it was last placed on. Auto-saved, not shown in UI. |
+| `popOutBounds` | object | `{}` | Persisted bounds + last target display id for each detached pop-out surface (usage stats, git changes, the Browser pane, the Agent Monitor), keyed by `PopOutKind` so a surface reopens on the monitor it was last placed on. Auto-saved, not shown in UI. |
 | `workspaceByProject` | Record\<string, object\> | `{}` | In-app window-manager layout keyed by project ID: each entry holds the open windows (task-detail or conversation), their tiling tree, and fractional geometry. Persisted per-project (survives a project switch and an app restart), restored after sessions resolve, and anchored by taskId (task-detail) or session id (conversation) so a session respawn never orphans a window. Each entry carries a schema `version` and is clamped/validated on restore. Auto-saved, not shown in UI. |
 | `commandTerminalWorkspace` | object \| null | `null` | GLOBAL layout for the Command Terminal window layer (Ctrl+Shift+P): the open command terminal window(s) and their tiling, shared across ALL projects (one blob, not keyed by project). Slot-anchored and fractional; the session stays per-project and ephemeral, so only the geometry/arrangement persists. Same schema shape as a `workspaceByProject` entry. Auto-saved, not shown in UI. |
+| `monitorWorkspace` | object \| null | `null` | GLOBAL layout for the Agent Monitor's task-detail window layer: which details are open over the monitor and how they are arranged. One blob, not keyed by project, because the monitor is cross-project (windows are anchored by `projectId:taskId`). Unlike the other two layout blobs this one crosses a renderer boundary: the monitor can be hosted in the main window or in its own pop-out, each with its own window store, so this is what carries an open detail between them. Nothing stays mounted while the monitor is closed; the layout is restored on next open, skipping any task another surface has since opened. Same schema shape as a `workspaceByProject` entry. Auto-saved, not shown in UI. |
 | `skipBoardConfigConfirm` | boolean | `false` | When a `kangentic.json` board change is detected (from a teammate or your own pulled-back commit), apply it immediately instead of showing the confirmation dialog. Global-only. |
 | `statusBarPeriod` | UsageTimePeriod | `'live'` | Deprecated. Drove the old status-bar usage strip (removed in favor of the usage dashboard); now read once as a seed fallback for `usageStatsPeriod` and never written. Global-only. |
 | `usageStatsPeriod` | UsageTimePeriod | `'live'` | Persisted time range for the usage stats dashboard. Values: `live`, `today`, `week`, `month`, `all`. One global value shared across all projects. Global-only. |
@@ -212,8 +224,8 @@ IPC channels for shortcuts are in the Board Config group: `boardConfig:getShortc
 ### Board Profiles
 
 A **Board Profile** is a named alternate set of per-column strategy settings (agent, model, effort,
-permission mode, auto-command, auto-spawn, handoff context, session target, session spawn strategy,
-plan-exit target). A task selects one and rides its ladder as it moves - so one task can run Planning
+permission mode, auto-command, auto-command mode, auto-spawn, handoff context, session target,
+session spawn strategy, plan-exit target). A task selects one and rides its ladder as it moves - so one task can run Planning
 in Opus xhigh and Merge in Sonnet high while another runs the same board more cheaply. Column
 *identity* (which columns exist, their name, order, role, color, icon) is singular across profiles;
 only strategy is profile-scoped.
@@ -277,11 +289,11 @@ profiles (including across projects) via the `kangentic_*_board_profile` MCP too
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `notifications.desktop.onAgentIdle` | boolean | `true` | Desktop notification when agent goes idle on non-visible project |
-| `notifications.desktop.onAgentCrash` | boolean | `true` | Desktop notification when session exits with error (always on) |
+| `notifications.desktop.onAgentCrash` | boolean | `true` | Desktop notification when session exits with error |
 | `notifications.desktop.onPlanComplete` | boolean | `true` | Desktop notification when plan completes and task auto-moves |
 | `notifications.desktop.onSpawnStalled` | boolean | `true` | Desktop notification when a task spawn stays in a preparing phase (worktree/git queue) past the stall threshold (~8s) |
 | `notifications.toasts.onAgentIdle` | boolean | `true` | In-app toast when agent goes idle |
-| `notifications.toasts.onAgentCrash` | boolean | `true` | In-app toast when session exits with error (always on) |
+| `notifications.toasts.onAgentCrash` | boolean | `true` | In-app toast when a session exits (error or clean); the `notifications.desktop.onAgentCrash` row fires on error exits only |
 | `notifications.toasts.onPlanComplete` | boolean | `true` | In-app toast when plan completes |
 | `notifications.toasts.onSpawnStalled` | boolean | `true` | In-app toast (with a Cancel action) when a task spawn stalls past the threshold while preparing |
 | `notifications.toasts.durationSeconds` | number | `4` | Toast auto-dismiss time in seconds (1-30) |
@@ -324,7 +336,7 @@ All context bar settings are global-only and cannot be overridden per-project.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `browser.enabled` | boolean | `true` | Show the Browser pill in task detail headers. Disable for security-sensitive projects that should not embed external sites. Per-project overridable (stored per-project; not seeded into new projects). |
+| `browser.enabled` | boolean | `true` | Show the Browser pill in task detail headers, and let agents open the pane (`kangentic_browser_open_pane` refuses with `browser-pane-disabled` when off). Disable for security-sensitive projects that should not embed external sites. Per-project overridable (stored per-project; not seeded into new projects). |
 | `browser.defaultUrl` | string \| undefined | `undefined` | Project default URL when a task has no per-task URL override. Auto-saved when the user first navigates the Browser pane. Per-project overridable (stored per-project; not seeded into new projects). |
 
 **Action (not a config key):** the Browser tab also exposes a destructive **Clear Browser Data** button (registry id `browser.clearStorage`) that wipes cookies, localStorage, IndexedDB, service workers, and HTTP/auth caches across the per-worktree embedded browser partitions (`persist:kngbrowser-<hash(worktreePath)>`) plus the legacy shared jar (`persist:kangentic-browser`). Saved URLs are kept. Backed by the `browser:clearStorage` IPC channel; not persisted in `AppConfig`.
@@ -352,7 +364,7 @@ config-only (driven by the Mode preset + Live/Refinement model dropdowns).
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `dictation.enabled` | boolean | `false` | Master on/off. Shows the mic button and enables push-to-talk. (Transcription section row.) |
+| `dictation.enabled` | boolean | `false` | Master on/off. Enables push-to-talk. (Transcription section row.) |
 | `dictation.language` | string (BCP-47) | `'en'` | Spoken language. The Live/Refinement model dropdowns narrow to models that support it; non-English uses the multilingual Whisper builds. (Transcription section row.) |
 | `dictation.punctuation` | boolean | `true` | Add punctuation + capitalization to the committed text. (Transcription section row.) |
 | `dictation.autoSubmit` | boolean | `true` | Press Enter automatically after inserting (via the paste engine's settle -> Enter -> evidence path), or leave the text in the input for review. (Input section row.) |
@@ -366,7 +378,7 @@ config-only (driven by the Mode preset + Live/Refinement model dropdowns).
 
 ### Hotkeys
 
-Lists every keyboard hotkey grouped by area (General, Task Detail, Git Changes, Windows, Browser, Terminal, Developer) and lets the user rebind the configurable ones. Global-only (per-machine). Each row's capture widget records the next key chord or a mouse button press (middle or side buttons, so an action can be bound to either input; Escape cancels) and probes whether that combo is already claimed by the OS or another app (via the `keybindings:probeGlobal` IPC channel), warning if so. Two actions resolving to the same combo in overlapping scopes are flagged as a conflict. Reset-to-default is available per row and for all at once. Terminal clipboard combos (Copy, Paste) and Escape are shown read-only. The registry of every hotkey + default combo lives in `src/shared/keybindings.ts`; handlers read their effective combo through the `useKeybinding` hook. Overrides persist to the `hotkeyOverrides` key (see the Top-Level table above). The **Git Changes** group adds four cross-file diff-navigation hotkeys for the Changes panel, scoped to the task dialog and gated on the focused window: `changes.nextChange` (Alt+Down, also F7) and `changes.prevChange` (Alt+Up, also Shift+F7) step through hunks and roll over into the adjacent file at the boundaries, while `changes.nextFile` (Alt+Shift+Down) and `changes.prevFile` (Alt+Shift+Up) jump whole files.
+Lists every keyboard hotkey grouped by area (General, Task Detail, Git Changes, Windows, Browser, Terminal, Developer) and lets the user rebind the configurable ones. Global-only (per-machine). Each row's capture widget records the next key chord or a mouse button press (middle or side buttons, so an action can be bound to either input; Escape cancels) and probes whether that combo is already claimed by the OS or another app (via the `keybindings:probeGlobal` IPC channel), warning if so. Two actions resolving to the same combo in overlapping scopes are flagged as a conflict. Reset-to-default is available per row and for all at once. Terminal clipboard combos (Copy, Paste) and Escape are shown read-only. The registry of every hotkey + default combo lives in `src/shared/keybindings.ts`; handlers read their effective combo through the `useKeybinding` hook. Overrides persist to the `hotkeyOverrides` key (see the Top-Level table above). The **Git Changes** group adds four cross-file diff-navigation hotkeys for the Changes panel, scoped to the task dialog and gated on the focused window: `changes.nextChange` (Alt+Down, also F7) and `changes.prevChange` (Alt+Up, also Shift+F7) step through hunks and roll over into the adjacent file at the boundaries, while `changes.nextFile` (Alt+Shift+Down) and `changes.prevFile` (Alt+Shift+Up) jump whole files. The **General** group also carries the description editor's three fixed formatting keys, shown read-only for the same reason the terminal clipboard combos are: `description.bold` (Mod+B), `description.italic` (Mod+I), and `description.link` (Mod+K) wrap the selection in markdown, and are handled inside the editor's own keydown handler rather than through `useKeybinding`. Their sibling `description.pastePlain` (Mod+Shift+V) is `hidden` and so does not appear at all. Because `detectConflicts` resolves rebindable actions only, a later rebind landing on one of these four combos is not flagged as a conflict; the listing is the warning.
 
 ### Memory
 
@@ -402,11 +414,13 @@ The Mobile Devices tab hosts the desktop half of the mobile companion app's pair
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `mobileBridge.enabled` | boolean | `false` | Master switch. When `false`, no relay connection is held and pairing is unavailable; the relay Select and pairing controls are disabled in the UI. |
-| `mobileBridge.relayMode` | `'hosted' \| 'local' \| 'custom'` | `'hosted'` | `'hosted'` always dials the Kangentic-hosted relay (`wss://relay.kangentic.com`), in every build. `'local'` dials `ws://127.0.0.1:8080` - a dev-only option, only offered by the Select in a dev build (see `src/shared/relay.ts`'s `LOCAL_DEV_RELAY_URL`). `'custom'` dials `relayUrl` instead, for self-hosters. |
+| `mobileBridge.enabled` | boolean | `false` | Master switch. When `false`, no relay connection is held and pairing is unavailable. The relay Select, its URL field, and Test connection carry a real `disabled`; the pairing controls are instead made inert by their section wrapper's `pointer-events-none`. Each of the tab's two sections ends in a documentation link (**How the relay works**, **How to install and pair**) rendered OUTSIDE that gating, since someone still deciding whether to enable the bridge is exactly the person who has not enabled it. |
+| `mobileBridge.relayMode` | `'hosted' \| 'local' \| 'custom'` | `'hosted'` | `'hosted'` always dials the Kangentic-hosted relay (`wss://relay.kangentic.com`), in every build. `'local'` is a dev-only mode: the Select only offers it in a dev build, and `resolveRelayMode()` itself gates the mode on `__KANGENTIC_DEV__` - a dev build dials `ws://127.0.0.1:8080` (`src/shared/relay.ts`'s `LOCAL_DEV_RELAY_URL`), while a production build reports and dials `'hosted'` even if a persisted `relayMode: 'local'` reaches it (e.g. carried over from a dev build's config in the same shared configDir). Both `resolveRelayUrl()` and the settings Select read `resolveRelayMode()`, so the mode shown and the URL dialed cannot disagree. `'custom'` dials `relayUrl` instead, for self-hosters. |
 | `mobileBridge.relayUrl` | string | `''` | The self-hosted relay to dial. Only consulted when `relayMode === 'custom'`; resolve the actual dial address through `resolveRelayUrl()` rather than reading this key directly - it normalizes the value and falls back to the hosted relay if this is empty or fails validation, so it never resolves to `''`. |
 
-**Actions (not config keys):** the Mobile Devices tab also exposes two settings-registry entries that are UI surfaces, not `AppConfig` keys: **Pair a Device** (registry id `mobileBridge.pairing`) starts the QR pairing ceremony described in [Mobile Bridge](mobile-bridge.md#pairing-ceremony), and **Paired Devices** (registry id `mobileBridge.devices`) lists currently paired phones, identified by key fingerprint, with rename and revoke actions - pairing grants all ten capability verbs uniformly, so there is no per-device capability control. Both are backed by the `mobile:*` IPC channels and the signed device roster (`src/main/mobile-bridge/roster-store.ts`), not persisted in `AppConfig`.
+**Tab layout:** below the master switch the tab is two peer sections, **Relay** (where this desktop connects) and **Mobile** (which phones may use it). Each is a gated control area followed by an ungated documentation link. `Relay` is a section heading only, never also a row label inside itself. The Mobile section is named for the device rather than the ceremony: "Pairing" over a `Pair a device` button and a `Paired Devices` list stacked three "pair"s deep.
+
+**Actions (not config keys):** the tab also exposes three settings-registry entries that are UI surfaces, not `AppConfig` keys. **Pair a Device** (registry id `mobileBridge.pairing`) starts the QR pairing ceremony described in [Mobile Bridge](mobile-bridge.md#pairing-ceremony), and **Paired Devices** (registry id `mobileBridge.devices`) lists currently paired phones, identified by key fingerprint, with rename and revoke actions - pairing grants all ten capability verbs uniformly, so there is no per-device capability control. Both live under the Mobile heading, which carries all three ids as its `searchIds`; `Paired Devices` renders as a sub-label rather than a third peer heading. The third entry (registry id `mobileBridge.getApp`) is the Mobile section's documentation tail: a one-line blurb plus a **How to install and pair** button linking to the Kangentic Mobile docs (`https://www.kangentic.com/mobile/`), where the install instructions live so they can change without a desktop release. It is deliberately NOT conditioned on the paired-device list being empty - the target is a docs landing page, so a paired user is most of its audience. The first two are backed by the `mobile:*` IPC channels and the signed device roster (`src/main/mobile-bridge/roster-store.ts`), not persisted in `AppConfig`; the docs tail is purely informational.
 
 ### Privacy
 
@@ -434,6 +448,7 @@ Each swimlane has its own overrides (stored in the per-project DB):
 | `permission_mode` | PermissionMode \| null | null | Permission mode override for this column |
 | `auto_spawn` | boolean | true | Whether moving a task here spawns an agent |
 | `auto_command` | string \| null | null | Command injected into running session on task arrival |
+| `auto_command_mode` | `'immediate'` \| `'deferred'` | `'immediate'` | Whether the auto-command interrupts the agent's current turn or waits for it to finish |
 | `plan_exit_target_id` | string \| null | null | Target column when plan-mode agent exits |
 | `agent_override` | string \| null | null | Agent CLI override for sessions spawned in this column |
 | `model_override` | string \| null | null | Adapter-specific model identifier passed at spawn time (e.g. Claude `--model opus`). A concrete model change on an automated path suspends and respawns the active session with the resolved model flag; it is never live-applied via `/model`. |
@@ -453,13 +468,71 @@ Kangentic supports shareable board configuration via JSON files in the project r
 
 When both files exist, `kangentic.local.json` is merged over `kangentic.json` by matching columns, actions, and transitions by ID. Unmatched local entries are appended.
 
-### Auto-Export
+### Board Config Sync (kangentic.json)
 
-Every time a project is opened, Kangentic writes the current database state to `kangentic.json` in the project root. This ensures the team always has a current file to commit. If the file already exists and matches the DB state, no write occurs.
+**The sync is bidirectional, and the two directions do not fire on the same events.** Getting
+this backwards is the single easiest mistake to make here, so it is spelled out before the
+mechanics: editing `kangentic.json` by hand IS a real way to change the board, and it is a
+*different* removal path from the UI or MCP with *different* rules.
+
+**Database -> file (export).** Unconditional and automatic. Every swimlane, action, and
+transition mutation triggers a debounced write-back, and opening a project writes one too, so the
+team always has a current file to commit. If the file already matches the DB state, no write
+occurs.
+
+**File -> database (apply).** Gated, but it happens more often than the banner suggests:
+
+1. **On project open**, if `kangentic.json` exists, Kangentic applies it to the database
+   **before** the export above. On a conflict the file wins. There is no banner and no prompt on
+   this path.
+2. **On an external edit while the project is open**, the file watcher raises a reconciliation
+   banner (or applies silently when `skipBoardConfigConfirm` is set).
+
+The open-time apply is why a hand-edited `kangentic.json` sticks: the app is not merely writing
+to the file, it reads it back as the source of truth for column identity every time the project
+loads. It is also why a column deleted through the UI or `kangentic_delete_column` must update
+the file in the same operation. If it did not, the next open would re-create the column from the
+stale file entry, reusing its original UUID, with nothing logged.
+
+**Removing a column by editing the file is softer than deleting it.** The DB, MCP, and UI paths
+all *refuse* to delete a column that still holds tasks. The file path does not: it **ghosts** a
+non-empty column instead (see Reconciliation below) and hard-deletes an empty one. Pick the file
+path when you want a column retired without first emptying it.
+
+**But the file path does not clean up Board Profiles.** Deleting a column through the UI or
+`kangentic_delete_column` also prunes that column out of every profile: the uuid-keyed entry in
+`profiles[].columns`, and any `planExitTarget` naming it. Removing the column by hand-editing the
+file (or letting an emptied ghost be reaped) does not - those entries are left pointing at a
+column that no longer exists. They are inert rather than harmful - strategy resolution looks an
+entry up by the *live* column's uuid, so a key no column has is simply never read - but they
+accumulate, and a hand-editor reading the file will wonder. The asymmetry is
+deliberate: the serializer cannot tell a *deleted* column apart from one a teammate has and you
+do not, and it preserves the latter on purpose. If you retire a column by editing the file, drop
+its `profiles[].columns` entries in the same edit.
+
+**Two gotchas worth knowing:**
+
+- A hand-written config whose columns carry **no `id` fields is additive only** - it can add and
+  update columns but never removes one. Removal requires at least one config column with an `id`.
+  Write-back then serializes the real UUIDs for future reconciliation.
+- If `kangentic.json` is **unparseable or invalid**, the apply is skipped entirely - but the export
+  still runs and **overwrites the file from the database**. How much you lose depends on which
+  kind of broken it is:
+  - **Unparseable** (bad JSON) loses the keys the database has no column for: `shortcuts`,
+    `profiles`, and `defaultBaseBranch`. The export carries those across from the previous file
+    contents, so a file it cannot read is a file it cannot carry anything across from.
+  - **Parseable but invalid** (missing `version`, zero columns, two columns sharing a name) keeps
+    all three. The board still loads from the database and the columns in the file are ignored,
+    but the export re-reads the file to preserve those keys, and reading them succeeded.
+
+  Either way the column layout in the file is discarded, so validate a hand edit before opening the
+  project.
 
 ### File Watching and Reconciliation
 
 Kangentic watches both `kangentic.json` and `kangentic.local.json` for changes. When a change is detected (e.g., a teammate pulls a new version), a reconciliation banner appears in the UI. The user can apply the changes or dismiss the banner. If `skipBoardConfigConfirm` is enabled, changes are applied automatically without the banner.
+
+The same matching rules below also run unprompted on project open, per the sync section above.
 
 Reconciliation matches columns by `id`:
 - **Matched columns** are updated with the new properties (name, color, icon, etc.)
@@ -493,6 +566,7 @@ Ghost columns are invisible on the board but still exist in the database. Once a
       "autoSpawn": true,
       "permissionMode": "default",
       "autoCommand": null,
+      "autoCommandMode": "immediate",
       "planExitTarget": null,
       "agentOverride": null,
       "modelOverride": null,
@@ -572,11 +646,48 @@ Config files written by hand (without `id` fields on columns) are treated as add
 | `boardConfig:shortcutsChanged` | Event: shortcuts file changed |
 | `boardConfig:setDefaultBaseBranch` | Update the default base branch in `kangentic.json` |
 
+## In-App Announcements
+
+The desktop app periodically fetches a static JSON feed, `announcements.json` on this repo's
+`main` branch (served via `raw.githubusercontent.com`), and shows the highest-priority active
+announcement as a dismissible banner above the board content; "Learn more" opens a dialog with
+the markdown body, external links, and a QR code. There is no backend and no account: an
+unreachable, malformed, or empty feed simply means no banner (offline and self-hosted setups
+lose nothing). The poll runs 10 seconds after launch and every 4 hours (`src/main/announcements.ts`),
+is skipped entirely under `NODE_ENV=test`, and never emits error telemetry.
+
+Feed schema (`src/shared/announcements.ts`): each entry carries `id`, `title` (banner line),
+`body` (markdown intro), `links` (label + https URL; a link flagged `qr: true` renders a large
+scannable QR code above its button, for phone-destined links like store opt-in pages), optional
+`sections` (titled sub-messages, each `{ heading?, body?, links? }`, for one announcement that
+carries several messages such as per-platform statuses), `minVersion` / `maxVersion` (inclusive
+version window), `platforms` (`win32` / `darwin` / `linux`; omitted = all - note this targets
+the DESKTOP OS, not the user's phone), `publishedAt` / `expiresAt` (ISO 8601), and `priority`.
+Unknown fields and malformed entries are ignored, so the feed can grow without breaking released
+clients; an entry needing new client behavior sets `minVersion` instead.
+
+**Publishing warning:** an edit to `announcements.json` on `main` is a production push - it
+reaches every released client within one poll cycle (about 4 hours, plus ~5 minutes of CDN
+cache). Set targeting fields conservatively and put an `expiresAt` on every entry.
+`tests/unit/announcements-json-valid.test.ts` validates the committed file through the real
+parser on every push, so a typo'd entry (which production would silently drop) fails CI on the
+content PR instead of shipping invisible.
+
+**Authoring contract - no scrolling:** an announcement must fit its dialog without a scrollbar
+on a typical desktop window (QR links lay out side by side to help; the dialog's scroll is a
+safety valve for very small windows only, and a UI test pins the contract for a realistic
+two-QR announcement). Keep bodies to a few short paragraphs and QR links to two or three; if a
+message wants more, it should be a link to a page, not a longer announcement.
+
+Dismissals persist per-announcement-id in `dismissedAnnouncementIds` (see the
+[Top-Level reference](#top-level)).
+
 ## Environment Variables
 
 | Variable | Purpose |
 |----------|---------|
 | `KANGENTIC_DATA_DIR` | Override the config/data directory path |
+| `KANGENTIC_ANNOUNCEMENTS_URL` | Override the announcements feed URL (for testing against a local fixture) |
 
 ## Legacy Migration
 

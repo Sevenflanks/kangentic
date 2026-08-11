@@ -1,6 +1,7 @@
 import { v4 as uuidv4 } from 'uuid';
 import type Database from 'better-sqlite3';
-import type { Task, TaskCreateInput, TaskUpdateInput, TaskMoveInput, ArchivedTasksPreview } from '../../../shared/types';
+import type { Task, TaskCreateInput, TaskUpdateInput, TaskMoveInput, ArchivedTasksPreview, AutoCommandState } from '../../../shared/types';
+import { worktreeFolderUnderRoot } from '../../../shared/worktree-folder';
 
 /** Raw row from SQLite - labels stored as JSON string. */
 interface TaskRow extends Omit<Task, 'labels'> {
@@ -137,17 +138,117 @@ export class TaskRepository {
     return row ? rowToTask(row) : undefined;
   }
 
+  /**
+   * Allocate the next display_id. MONOTONIC: the high-water mark in
+   * `project_meta` only moves forward, so deleting the highest-numbered task
+   * never hands its number to the next one created. That matters because a
+   * task's worktree directory is named after its display_id, and a recycled
+   * number could adopt a leftover directory belonging to the deleted task.
+   *
+   * `MAX(display_id)` stays in the calculation so the counter self-heals if the
+   * meta row is lost or the database is restored from an older copy.
+   *
+   * Callers must already be inside a transaction.
+   */
+  private allocateDisplayId(): number {
+    const storedHighWater = this.db
+      .prepare("SELECT value FROM project_meta WHERE key = 'display_id_high_water'")
+      .get() as { value: string } | undefined;
+    const parsedHighWater = storedHighWater ? Number.parseInt(storedHighWater.value, 10) : 0;
+    const highWater = Number.isFinite(parsedHighWater) ? parsedHighWater : 0;
+
+    const maxDisplayId = this.db
+      .prepare('SELECT COALESCE(MAX(display_id), 0) as max FROM tasks')
+      .get() as { max: number };
+
+    const displayId = Math.max(highWater, maxDisplayId.max) + 1;
+    this.db.prepare(`INSERT INTO project_meta (key, value) VALUES ('display_id_high_water', ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(String(displayId));
+    return displayId;
+  }
+
+  /**
+   * Record a task's worktree directory name. Write-once: the `worktree_folder IS
+   * NULL` guard means a second call with a different value is a no-op, so a
+   * task's worktree can never be relocated by a later write. See the JSDoc on
+   * `Task.worktree_folder`.
+   */
+  setWorktreeFolder(id: string, folder: string): void {
+    this.db
+      .prepare('UPDATE tasks SET worktree_folder = ? WHERE id = ? AND worktree_folder IS NULL')
+      .run(folder, id);
+  }
+
+  /**
+   * Persist a freshly created worktree: its path, its branch, and the directory
+   * name that must never change again.
+   *
+   * Atomic on purpose. Written as two statements, a crash in between would leave
+   * `worktree_path` set with `worktree_folder` still null; the
+   * `basename(worktree_path)` fallback would mask that until the task reached
+   * Done, which nulls the path and would lose the folder permanently.
+   */
+  recordWorktree(id: string, worktreePath: string, branchName: string, worktreeFolder: string): void {
+    this.db.transaction(() => {
+      this.update({ id, worktree_path: worktreePath, branch_name: branchName });
+      this.setWorktreeFolder(id, worktreeFolder);
+    })();
+  }
+
+  /**
+   * Recover, and persist, the worktree directory name a task used BEFORE the
+   * numeric scheme, for a task whose `worktree_path` has already been cleared.
+   * Returns null when there is nothing to recover, in which case the task takes
+   * the numeric name on its next creation.
+   *
+   * This exists because a Done move nulls `worktree_path`, so a pre-existing
+   * task moved back out is a fresh creation with no record of where it used to
+   * live. `sessions.cwd` is that record: it holds the exact historical worktree
+   * path for every task that ever ran an agent, and survives Done cleanup (the
+   * only `DELETE FROM sessions` is `deleteByTaskId`, called from full-reset
+   * paths whose tasks correctly fall through to the numeric name here).
+   *
+   * The `worktreesRoot` anchor is what makes this safe. Kangentic can be opened
+   * AT a worktree path (an opened worktree, or a /preview ephemeral project), in
+   * which case the project root itself contains `.kangentic/worktrees/` and a
+   * bare marker search would hand a task that never had a worktree the enclosing
+   * worktree's folder name - permanently, since the column is write-once. Only a
+   * direct child of this project's own worktrees root counts.
+   */
+  recoverLegacyWorktreeFolder(taskId: string, worktreesRoot: string): string | null {
+    const latestSession = this.db
+      .prepare('SELECT cwd FROM sessions WHERE task_id = ? ORDER BY started_at DESC LIMIT 1')
+      .get(taskId) as { cwd: string } | undefined;
+    const folder = worktreeFolderUnderRoot(worktreesRoot, latestSession?.cwd);
+    if (folder) this.setWorktreeFolder(taskId, folder);
+    return folder;
+  }
+
   create(input: TaskCreateInput): Task {
+    return this.db.transaction(() => this.createWithinTransaction(input))();
+  }
+
+  /**
+   * The raw `position` that appends past everything currently in a swimlane.
+   *
+   * Counts ARCHIVED rows too, unlike `list()`. That asymmetry is deliberate and
+   * long-standing: archiving leaves `position` untouched, so an append that
+   * ignored archived rows could reuse a position an archived task still holds.
+   * Callers placing a task by ordinal slot need this as their append anchor -
+   * see `resolveRawPosition` in `agent/commands/task-ordering.ts`.
+   */
+  nextPositionInSwimlane(swimlaneId: string): number {
+    const maxPosition = this.db.prepare('SELECT COALESCE(MAX(position), -1) as max FROM tasks WHERE swimlane_id = ?').get(swimlaneId) as { max: number };
+    return maxPosition.max + 1;
+  }
+
+  private createWithinTransaction(input: TaskCreateInput): Task {
     const now = new Date().toISOString();
     const createdAt = input.createdAt ?? now;
     const id = uuidv4();
-    // Get next position in the target swimlane
-    const maxPos = this.db.prepare('SELECT COALESCE(MAX(position), -1) as max FROM tasks WHERE swimlane_id = ?').get(input.swimlane_id) as { max: number };
-    const position = maxPos.max + 1;
+    const position = this.nextPositionInSwimlane(input.swimlane_id);
 
-    // Get next display_id (auto-incrementing human-readable ID)
-    const maxDisplayId = this.db.prepare('SELECT COALESCE(MAX(display_id), 0) as max FROM tasks').get() as { max: number };
-    const displayId = maxDisplayId.max + 1;
+    const displayId = this.allocateDisplayId();
 
     const labels = input.labels ?? [];
     const priority = input.priority ?? 0;
@@ -171,6 +272,7 @@ export class TaskRepository {
       agent: null,
       session_id: null,
       worktree_path: null,
+      worktree_folder: null,
       branch_name: input.customBranchName?.trim() || null,
       pr_number: null,
       pr_url: null,
@@ -191,6 +293,12 @@ export class TaskRepository {
       profile_id: exclusive.profile_id,
       run_mode: exclusive.run_mode,
       attachment_count: 0,
+      // A brand-new task has never run an auto_command. These four columns are
+      // written only by `recordAutoCommandOutcome`, never by create/update.
+      auto_command_state: null,
+      auto_command_text: null,
+      auto_command_error: null,
+      auto_command_at: null,
       detail_view_state: null,
       archived_at: null,
       created_at: createdAt,
@@ -297,9 +405,83 @@ export class TaskRepository {
     tx();
   }
 
+  /**
+   * Rewrite a column's task order as dense positions (0..n-1) in one
+   * transaction. This is the write behind the MCP placement surface:
+   * `kangentic_reorder_tasks`, and `kangentic_move_task`'s same-column
+   * `position`.
+   *
+   * A dense rewrite rather than a sequence of `move()` calls, for three
+   * reasons. It is atomic. It is immune to the ordinal-vs-raw hazard `move()`
+   * inherits from gapped positions (`archive()` leaves `position` untouched and
+   * `create` takes `MAX(position) + 1` over archived rows, so a column's live
+   * cards can sit at 0, 5, 9). And it HEALS those gaps, in any column where
+   * every id passed is a member of that column - which is what both callers
+   * guarantee. A stray id consumes its slot as a no-op (the `swimlane_id`
+   * guard), so a caller that skipped that check would leave the column gapped
+   * rather than dense.
+   *
+   * It writes `position` and NOTHING ELSE - deliberately, and this is
+   * load-bearing rather than an omission. `move()` bumps `updated_at` only on
+   * the row that actually moved; its two position-shift UPDATEs leave siblings
+   * alone. `lane-pins.ts` builds on exactly that: a lane pin holds while the
+   * server keeps telling the pre-move story, and it drops the moment a payload
+   * differs in {presence, lane, `updated_at`}, so a sibling merely shifting
+   * position must not carry a fresh stamp or it spuriously drops a pin and the
+   * user's in-flight card snaps back mid-drag. Stamping every reordered row
+   * would break that. The board still repaints, because
+   * `structural-sharing.ts` compares `position` field-by-field rather than
+   * keying off `updated_at`. The `position != ?` guard keeps re-issuing the
+   * same order a no-write, and the `swimlane_id` guard makes an id from another
+   * column a no-op rather than a cross-column corruption.
+   *
+   * Deliberately NOT wrapped in `withTaskLock`
+   * (`.claude/rules/task-lifecycle-lock.md`, which is path-scoped to
+   * `src/main/ipc/**` and so does not auto-load at the call sites): that lock is
+   * per-task and documented non-reentrant, so there is no correct way to hold it
+   * for the N tasks a reorder mutates. The rule's own carve-out covers this
+   * instead - the whole rewrite is synchronous, so it cannot interleave with
+   * anything and there is no race to serialize. Two accepted residuals, both
+   * presentation-only and both self-healing on the next drag or reorder:
+   * `handleTaskMove` captures a task's `originalPosition` before its unlocked
+   * git I/O and restores it on rollback, so a reorder landing inside that window
+   * makes the rollback restore a stale position; and `handleMoveTask`'s
+   * CROSS-column path resolves an ordinal to a raw anchor synchronously but
+   * hands it to a fire-and-forget `onTaskMove`, so a reorder of the destination
+   * lane before that write lands leaves the incoming card beside a different
+   * neighbour than the one the anchor named.
+   */
+  reorderWithinSwimlane(swimlaneId: string, orderedTaskIds: string[]): void {
+    const updatePositionStatement = this.db.prepare(
+      'UPDATE tasks SET position = ? WHERE id = ? AND swimlane_id = ? AND position != ?',
+    );
+    const tx = this.db.transaction(() => {
+      orderedTaskIds.forEach((taskId, index) => {
+        updatePositionStatement.run(index, taskId, swimlaneId, index);
+      });
+    });
+    tx();
+  }
+
   archive(id: string): void {
     const now = new Date().toISOString();
     this.db.prepare('UPDATE tasks SET archived_at = ?, updated_at = ? WHERE id = ?').run(now, now, id);
+  }
+
+  /**
+   * Record the outcome of this task's most recent auto_command delivery.
+   *
+   * Deliberately NOT part of `update()`: this is engine telemetry, not a user
+   * edit, so it must not bump `updated_at` and trip the board's
+   * something-changed paths on every column move.
+   */
+  recordAutoCommandOutcome(
+    id: string,
+    outcome: { state: AutoCommandState; command: string; error: string | null },
+  ): void {
+    this.db.prepare(
+      'UPDATE tasks SET auto_command_state = ?, auto_command_text = ?, auto_command_error = ?, auto_command_at = ? WHERE id = ?',
+    ).run(outcome.state, outcome.command, outcome.error, new Date().toISOString(), id);
   }
 
   unarchive(id: string, targetSwimlaneId: string, position: number): Task {

@@ -1,0 +1,55 @@
+{
+  "session_id": "dcef969b-9d7b-4ee3-8458-83d2f773a7c7",
+  "transcript_path": "C:\\Users\\dev\\.claude\\projects\\C--Users-dev-AppData-Local-Temp-kangentic-clear-fork-3n6sYF\\dcef969b-9d7b-4ee3-8458-83d2f773a7c7.jsonl",
+  "cwd": "C:\\Users\\dev\\AppData\\Local\\Temp\\kangentic-clear-fork-3n6sYF",
+  "prompt_id": "5f1d8101-f1cc-4ee7-88b6-8d8a9f5dd899",
+  "session_name": "Acknowledge confirmation",
+  "model": {
+    "id": "claude-haiku-4-5-20251001",
+    "display_name": "Haiku 4.5"
+  },
+  "workspace": {
+    "current_dir": "C:\\Users\\dev\\AppData\\Local\\Temp\\kangentic-clear-fork-3n6sYF",
+    "project_dir": "C:\\Users\\dev\\AppData\\Local\\Temp\\kangentic-clear-fork-3n6sYF",
+    "added_dirs": []
+  },
+  "version": "2.1.220",
+  "output_style": {
+    "name": "default"
+  },
+  "cost": {
+    "total_cost_usd": 0.07164500000000001,
+    "total_duration_ms": 7860,
+    "total_api_duration_ms": 2650,
+    "total_lines_added": 0,
+    "total_lines_removed": 0
+  },
+  "context_window": {
+    "total_input_tokens": 35440,
+    "total_output_tokens": 40,
+    "context_window_size": 200000,
+    "current_usage": {
+      "input_tokens": 10,
+      "output_tokens": 40,
+      "cache_creation_input_tokens": 35430,
+      "cache_read_input_tokens": 0
+    },
+    "used_percentage": 18,
+    "remaining_percentage": 82
+  },
+  "exceeds_200k_tokens": false,
+  "fast_mode": false,
+  "thinking": {
+    "enabled": true
+  },
+  "rate_limits": {
+    "five_hour": {
+      "used_percentage": 57.99999999999999,
+      "resets_at": 1785785400
+    },
+    "seven_day": {
+      "used_percentage": 22,
+      "resets_at": 1786334400
+    }
+  }
+}

@@ -40,15 +40,12 @@ function createPopOutStore() {
 // HMR instance pinning (Pattern E, see .claude/rules/hmr-patterns.md): this module's
 // only runtime export is the non-component hook, so it is not a Fast Refresh boundary;
 // without pinning, a re-eval could hand a second store to part of the tree.
-// @ts-expect-error -- Vite handles import.meta.hot; tsc's "module": "commonjs" doesn't support it
 const preservedPopOutStore: ReturnType<typeof createPopOutStore> | undefined = import.meta.hot?.data?.popOutStore;
 
 export const usePopOutStore = preservedPopOutStore ?? createPopOutStore();
 
-// @ts-expect-error -- Vite handles import.meta.hot; tsc's "module": "commonjs" doesn't support it
 if (import.meta.hot) {
-  // @ts-expect-error -- Vite handles import.meta.hot
   import.meta.hot.data.popOutStore = usePopOutStore;
-  // @ts-expect-error -- Vite handles import.meta.hot
-  import.meta.hot.accept(() => import.meta.hot.invalidate());
+  const hot = import.meta.hot;
+  import.meta.hot.accept(() => hot.invalidate());
 }
