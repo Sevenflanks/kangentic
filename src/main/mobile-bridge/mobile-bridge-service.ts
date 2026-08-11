@@ -2,7 +2,6 @@ import { EventEmitter } from 'node:events';
 import {
   bytesToHex,
   capabilitySetFromArray,
-  CAPABILITY_VERBS,
   derivePairingSlotId,
   deriveSessionSlotId,
   encodePairingQrPayload,
@@ -156,7 +155,9 @@ export class MobileBridgeService extends EventEmitter {
    * the context for syncSessions() to use. Called once from register-all.ts
    * after IpcContext is assembled - IpcContext does not exist yet at this
    * service's construction time, so it cannot be a constructor argument.
-   * Registers handlers exactly once; never call this more than once.
+   * Registers handlers exactly once; never call this more than once. Signed
+   * per-device grants are an authorization boundary: only explicit
+   * setDeviceCapabilities() or a new pairing may change them.
    */
   attachContext(context: IpcContext): void {
     this.ipcContext = context;
@@ -238,32 +239,6 @@ export class MobileBridgeService extends EventEmitter {
       onStall: (taskId) => this.pushNotifier?.notifyTaskStalled(taskId),
     });
     this.spawnStallWatcher.start();
-    // Runs exactly once, before the first reconcile()'s syncSessions() opens
-    // any BridgeSession - see the method's own doc comment for why this
-    // cannot be a plain roster field mutation.
-    this.migrateDevicesToFullCapabilityGrant();
-  }
-
-  /**
-   * One-shot upgrade for devices paired before pairing granted the full
-   * verb set: capabilities live inside the Ed25519-signed roster payload
-   * (roster-store.ts), so mutating them without re-signing would fail
-   * verifyRosterEntry and silently drop the device from the roster on the
-   * next load. Routing through the public setDeviceCapabilities (which
-   * re-signs) is what makes this safe, and it also updates any
-   * already-open BridgeSession's live capability set - though at
-   * attachContext() time no session has opened yet, so in practice this
-   * only rewrites the on-disk roster before syncSessions() reads it.
-   */
-  private migrateDevicesToFullCapabilityGrant(): void {
-    const identity = this.tryLoadIdentity();
-    if (!identity) return;
-    const fullGrant = new Set<CapabilityVerb>(CAPABILITY_VERBS);
-    for (const device of loadRoster(identity).devices) {
-      const currentGrant = new Set(device.capabilities);
-      const hasFullGrant = currentGrant.size === fullGrant.size && CAPABILITY_VERBS.every((verb) => currentGrant.has(verb));
-      if (!hasFullGrant) this.setDeviceCapabilities(device.deviceId, [...CAPABILITY_VERBS]);
-    }
   }
 
   private getOrCreateSubscriptions(deviceId: string): SubscriptionRegistry {
