@@ -469,6 +469,33 @@ describe('OpenCode Adapter', () => {
       expect(env).toBeNull();
     });
 
+    it('carries a local resume session ID independently of MCP', () => {
+      const env = adapter.buildEnv(makeOptions({
+        resume: true,
+        sessionId: 'ses_resume_without_mcp_123',
+        mcpServerEnabled: false,
+      }));
+
+      expect(env).toEqual({
+        KANGENTIC_OPENCODE_RESUME_SESSION_ID: 'ses_resume_without_mcp_123',
+      });
+    });
+
+    it('combines a local resume session ID with configured MCP environment', () => {
+      const env = adapter.buildEnv(makeOptions({
+        resume: true,
+        sessionId: 'ses_resume_with_mcp_123',
+        mcpServerEnabled: true,
+        mcpServerUrl: 'http://127.0.0.1:51234/mcp/proj-abc',
+        mcpServerToken: 'token-deadbeef',
+      }));
+
+      expect(env).toMatchObject({
+        KANGENTIC_OPENCODE_RESUME_SESSION_ID: 'ses_resume_with_mcp_123',
+        OPENCODE_CONFIG_CONTENT: expect.any(String),
+      });
+    });
+
     it('returns null when mcpServerUrl is missing', () => {
       const env = adapter.buildEnv(makeOptions({
         mcpServerEnabled: true,

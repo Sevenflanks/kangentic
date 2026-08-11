@@ -3,6 +3,8 @@ import { interpolateTemplate } from '../../shared/template-utils';
 import { buildHooks } from './hook-manager';
 import type { PermissionMode, ResolvedExecutionTarget } from '../../../../shared/types';
 
+const RESUME_SESSION_ID_ENV = 'KANGENTIC_OPENCODE_RESUME_SESSION_ID';
+
 export interface OpenCodeCommandOptions {
   opencodePath: string;
   taskId: string;
@@ -108,9 +110,9 @@ export class OpenCodeCommandBuilder {
    *
    * This only wires MCP for a LOCAL spawn (`opencode [project]`), where
    * the process we spawn is the server itself and legitimately reads its
-   * own `OPENCODE_CONFIG_CONTENT` at startup. Returns `null` when MCP
-   * wiring is disabled or any of the required URL / token values are
-   * missing.
+   * own `OPENCODE_CONFIG_CONTENT` at startup. A local resume also carries
+   * its native session ID independently of MCP. Returns `null` only when
+   * neither resume identity nor complete MCP wiring is available.
    */
   buildOpenCodeEnv(options: OpenCodeCommandOptions): Record<string, string> | null {
     // Remote mode (`options.executionTarget` set): the process Kangentic
@@ -126,8 +128,15 @@ export class OpenCodeCommandBuilder {
     // way for Kangentic to deliver its MCP tools to a remote OpenCode
     // session; see the `remoteModeCaveat` on the adapter.
     if (options.executionTarget) return null;
-    if (!options.mcpServerEnabled) return null;
-    if (!options.mcpServerUrl || !options.mcpServerToken) return null;
+
+    const resumeEnv: Record<string, string> = {};
+    if (options.resume && options.sessionId) {
+      resumeEnv[RESUME_SESSION_ID_ENV] = options.sessionId;
+    }
+
+    if (!options.mcpServerEnabled || !options.mcpServerUrl || !options.mcpServerToken) {
+      return Object.keys(resumeEnv).length > 0 ? resumeEnv : null;
+    }
 
     const inlineConfig = {
       mcp: {
@@ -142,7 +151,10 @@ export class OpenCodeCommandBuilder {
       },
     };
 
-    return { OPENCODE_CONFIG_CONTENT: JSON.stringify(inlineConfig) };
+    return {
+      ...resumeEnv,
+      OPENCODE_CONFIG_CONTENT: JSON.stringify(inlineConfig),
+    };
   }
 
   interpolateTemplate(template: string, variables: Record<string, string>): string {
