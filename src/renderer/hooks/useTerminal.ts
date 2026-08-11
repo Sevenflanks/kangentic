@@ -907,14 +907,14 @@ export function useTerminal(options: UseTerminalOptions) {
         // Arms the post-interaction repaint nudge. Any REAL input counts, not
         // just a wheel event: the confirmed repro of the missing-rows family is
         // a KEYBOARD jump (Ctrl+End / Ctrl+Home), so a wheel-only trigger would
-        // miss it entirely. But `onData` also carries xterm's own focus and
+        // miss it entirely. But `onData` also carries xterm's own protocol and
         // mouse-motion reports, which are not input at all and would otherwise
         // self-arm the nudge on every replay - see isUserInputData.
         if (isUserInputData(data)) repaintNudgeRef.current?.noteInput();
         routeTerminalData(
           data,
           batcher,
-          (report) => window.electronAPI.sessions.writeFocusReport(sid, report, options.projectId),
+          (response) => window.electronAPI.sessions.writeTerminalResponse(sid, response, options.projectId),
         );
       });
 

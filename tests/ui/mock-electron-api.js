@@ -1657,10 +1657,10 @@
       write: async function (sessionId, payload) {
         window.electronAPI.sessions.__writeCalls.push({ sessionId: sessionId, payload: payload });
       },
-      // Call log for focus-report assertions. Each entry is { sessionId, report, projectId }.
-      __focusReportCalls: [],
-      writeFocusReport: async function (sessionId, report, projectId) {
-        window.electronAPI.sessions.__focusReportCalls.push({ sessionId: sessionId, report: report, projectId: projectId });
+      // Call log for terminal-response assertions. Each entry is { sessionId, response, projectId }.
+      __terminalResponseCalls: [],
+      writeTerminalResponse: async function (sessionId, response, projectId) {
+        window.electronAPI.sessions.__terminalResponseCalls.push({ sessionId: sessionId, response: response, projectId: projectId });
       },
       // Call log for test assertions. Each entry is { sessionId, cols, rows },
       // in call order. Mirrors the __writeCalls log above. Reset between tests

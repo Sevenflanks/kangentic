@@ -1,7 +1,7 @@
 import type { PopOutDescriptor, PopOutKind, PopOutParamsByKind } from './pop-out';
 import type { LiveDeliveryStatus } from './live-delivery-status';
 import type { TaskMoveResult } from './auto-command-outcome';
-import type { TerminalFocusReport } from './terminal-focus-report';
+import type { TerminalResponse } from './terminal-response';
 import type { CompatibilityRequirement, CompatibilityResolveResult } from './compatibility-requirement';
 import type { Announcement } from './announcements';
 
@@ -4548,7 +4548,7 @@ export interface ElectronAPI {
     reconcile: (taskId: string, projectId?: string | null) => Promise<Session | null>;
     reset: (taskId: string, projectId?: string | null) => Promise<void>;
     write: (sessionId: string, data: string) => Promise<void>;
-    writeFocusReport: (sessionId: string, report: TerminalFocusReport, projectId: string | null) => Promise<void>;
+    writeTerminalResponse: (sessionId: string, response: TerminalResponse, projectId: string | null) => Promise<void>;
     /**
      * `colsChanged` is intentionally unused by the renderer (main orders the
      * geometry change ahead of any scrollback sample on its own - see the

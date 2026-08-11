@@ -23,7 +23,7 @@ import type { PtyResizeOrigin, Session, TaskResolvePrResult } from '../../../sha
 import type { IpcContext } from '../ipc-context';
 import { isAbortError } from '../../../shared/abort-utils';
 import { broadcast } from '../../pop-out/window-broadcast';
-import { isTerminalFocusReport } from '../../../shared/terminal-focus-report';
+import { isTerminalResponse } from '../../../shared/terminal-response';
 
 // Track session start times for duration calculation on exit
 const sessionStartTimes = new Map<string, number>();
@@ -57,14 +57,14 @@ export function registerSessionHandlers(context: IpcContext): void {
   // they use the input coordinator that preserves prompt drafts against an
   // injected auto_command.
   ipcMain.handle(IPC.SESSION_WRITE, (_, id, data) => context.sessionManager.writeUserInput(id, data));
-  ipcMain.handle(IPC.SESSION_WRITE_FOCUS_REPORT, (_, id, data: unknown, projectId: string | null) => {
-    if (!projectId) throw new Error('Focus report project id is required');
+  ipcMain.handle(IPC.SESSION_WRITE_TERMINAL_RESPONSE, (_, id, data: unknown, projectId: string | null) => {
+    if (!projectId) throw new Error('Terminal response project id is required');
     if (context.sessionManager.getSessionProjectId(id) !== projectId) {
-      throw new Error('Focus report project does not match session');
+      throw new Error('Terminal response project does not match session');
     }
-    if (isTerminalFocusReport(data)) return context.sessionManager.writeFocusReport(id, data);
+    if (isTerminalResponse(data)) return context.sessionManager.writeTerminalResponse(id, data);
     if (typeof data === 'string') return context.sessionManager.writeUserInput(id, data);
-    throw new TypeError('Focus report payload must be a string');
+    throw new TypeError('Terminal response payload must be a string');
   });
   // Renderer drain acknowledgement for per-session output backpressure. One-way
   // (send, not invoke): the renderer reports bytes it has consumed so main can

@@ -1,3 +1,5 @@
+import { isTerminalResponse } from '../../shared/terminal-response';
+
 /**
  * Post-interaction repaint nudge for fullscreen agent TUIs.
  *
@@ -63,7 +65,6 @@ export const REPAINT_NUDGE_BYTES = '\x1b[O\x1b[I';
  * interactions, and a click healing a bad frame is the observation this whole
  * mechanism is built on.
  */
-const FOCUS_REPORT_PATTERN = /^\x1b\[[IO]$/;
 const SGR_MOUSE_REPORT_PATTERN = /^\x1b\[<(\d+);\d+;\d+[Mm]$/;
 const X10_MOUSE_REPORT_PATTERN = /^\x1b\[M([\s\S])/;
 /** Bit 5 of a mouse report's button byte marks motion (drift or drag). */
@@ -75,7 +76,7 @@ const MOUSE_MOTION_BIT = 32;
  * without a live terminal or a PTY.
  */
 export function isUserInputData(data: string): boolean {
-  if (FOCUS_REPORT_PATTERN.test(data)) return false;
+  if (isTerminalResponse(data)) return false;
 
   const sgrReport = SGR_MOUSE_REPORT_PATTERN.exec(data);
   if (sgrReport) return (Number(sgrReport[1]) & MOUSE_MOTION_BIT) === 0;

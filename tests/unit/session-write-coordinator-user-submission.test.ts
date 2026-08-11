@@ -99,8 +99,8 @@ describe('SessionWriteCoordinator user submission', () => {
     expect(submit).toHaveBeenCalledTimes(1);
 
     // When
-    coordinator.recordFocusReport('s1', '\x1b[I');
-    coordinator.recordFocusReport('s1', '\x1b[O');
+    coordinator.recordTerminalResponse('s1', '\x1b[I');
+    coordinator.recordTerminalResponse('s1', '\x1b[O');
 
     // Then
     expect(writes).toEqual([]);

@@ -8,7 +8,9 @@ import {
   cleanupTestDataDir,
   closeApp,
   createProject,
+  createTask,
   createTempProject,
+  getTaskIdByTitle,
   getTestDataDir,
   launchApp,
   mockAgentPath,
@@ -23,12 +25,23 @@ const INTERACTIVE_PROBE_CANARY = 'interactive-probe-canary';
 const USER_INPUT_CANARY = 'user-input-canary';
 const STATUS_CAPTURE_ID = 'live-delivery-status-capture';
 const POLL_INTERVAL_MS = 50;
+const DA1_RESPONSE = Buffer.from('\x1b[?1;2c');
 
 async function waitForFile(pathname: string, expected: string): Promise<void> {
   await expect.poll(
     async () => fs.existsSync(pathname) ? fs.promises.readFile(pathname, 'utf8') : '',
     { intervals: [POLL_INTERVAL_MS], timeout: 15_000 },
   ).toContain(expected);
+}
+
+async function waitForAppendedBytes(pathname: string, expected: Buffer, byteOffset: number): Promise<void> {
+  await expect.poll(
+    async () => {
+      const bytes = fs.existsSync(pathname) ? await fs.promises.readFile(pathname) : Buffer.alloc(0);
+      return bytes.subarray(byteOffset).includes(expected);
+    },
+    { intervals: [POLL_INTERVAL_MS], timeout: 15_000 },
+  ).toBe(true);
 }
 
 async function emitTrigger(pathname: string): Promise<void> {
@@ -70,6 +83,32 @@ async function waitForLiveStatus(
     intervals: [POLL_INTERVAL_MS],
     timeout: 15_000,
   }).toMatchObject(expected);
+}
+
+async function captureLiveDeliveryStatuses(page: Page): Promise<void> {
+  await page.evaluate((captureId) => {
+    const capture = document.createElement('output');
+    capture.id = captureId;
+    capture.textContent = '[]';
+    document.body.append(capture);
+    window.electronAPI.sessions.onLiveDeliveryStatus((status) => {
+      const events: LiveDeliveryStatus[] = JSON.parse(capture.textContent ?? '[]');
+      capture.textContent = JSON.stringify([...events, status]);
+    });
+  }, STATUS_CAPTURE_ID);
+}
+
+async function mountTaskTerminal(page: Page, taskTitle: string, sessionId: string): Promise<void> {
+  await page.locator(`text=${taskTitle}`).first().click();
+  await page.locator('[data-testid="task-detail-dialog"]').first().waitFor({ state: 'visible', timeout: 15_000 });
+  const terminalContainer = page.locator('[data-testid="terminal-tab-container"]');
+  await terminalContainer.waitFor({ state: 'visible', timeout: 15_000 });
+  await expect.poll(async () => page.evaluate(async (id) => {
+    const firstOutput = await window.electronAPI.sessions.getFirstOutput();
+    return firstOutput[id] ?? false;
+  }, sessionId), { intervals: [POLL_INTERVAL_MS], timeout: 15_000 }).toBe(true);
+  await expect(terminalContainer.locator('[data-testid="launch-overlay"]')).toHaveCount(0, { timeout: 15_000 });
+  await expect(terminalContainer.locator('[data-testid="terminal-replay-veil"]')).toHaveCount(0, { timeout: 15_000 });
 }
 
 test.describe('OpenCode live lane command delivery', () => {
@@ -125,16 +164,7 @@ test.describe('OpenCode live lane command delivery', () => {
       const { page } = launched;
       await createProject(page, `OpenCode Live Delivery ${runId}`, tmpDir);
       await setProjectDefaultAgent(page, 'opencode');
-      await page.evaluate((captureId) => {
-        const capture = document.createElement('output');
-        capture.id = captureId;
-        capture.textContent = '[]';
-        document.body.append(capture);
-        window.electronAPI.sessions.onLiveDeliveryStatus((status) => {
-          const events: LiveDeliveryStatus[] = JSON.parse(capture.textContent ?? '[]');
-          capture.textContent = JSON.stringify([...events, status]);
-        });
-      }, STATUS_CAPTURE_ID);
+      await captureLiveDeliveryStatuses(page);
 
       const lanes = await page.evaluate(async () => {
         const swimlanes = await window.electronAPI.swimlanes.list();
@@ -150,9 +180,8 @@ test.describe('OpenCode live lane command delivery', () => {
       if (!lanes.todo || !lanes.executing || !lanes.review || !lanes.tests || !lanes.shipping) {
         throw new Error('OpenCode live delivery E2E requires To Do, Executing, Code Review, Tests, and Ship It lanes');
       }
-      const taskId = await page.evaluate(async ({ todo, executing, review, tests, shipping, bootstrap, command, title, description }) => {
-        const project = await window.electronAPI.projects.getCurrent();
-        const holding = await window.electronAPI.swimlanes.create({
+      await page.evaluate(async ({ executing, review, tests, shipping, bootstrap, command }) => {
+        await window.electronAPI.swimlanes.create({
           name: 'Live Delivery Holding',
           auto_spawn: false,
         });
@@ -160,25 +189,16 @@ test.describe('OpenCode live lane command delivery', () => {
         await window.electronAPI.swimlanes.update({ id: review, auto_command: command });
         await window.electronAPI.swimlanes.update({ id: tests, auto_command: command });
         await window.electronAPI.swimlanes.update({ id: shipping, auto_command: command });
-        if (!project) return null;
-        const task = await window.electronAPI.tasks.create({
-          title,
-          description,
-          swimlane_id: todo,
-        }, project.id);
-        return task.id;
       }, {
-        todo: lanes.todo,
         executing: lanes.executing,
         review: lanes.review,
         tests: lanes.tests,
         shipping: lanes.shipping,
         bootstrap: BOOTSTRAP_PROMPT_CANARY,
         command: LIVE_COMMAND_CANARY,
-        title: taskTitle,
-        description: taskDescription,
       });
-      if (!taskId) throw new Error('OpenCode live delivery E2E requires a current project');
+      await createTask(page, taskTitle, taskDescription);
+      const taskId = await getTaskIdByTitle(page, taskTitle);
       const freshMove = await moveTaskIpc(page, taskId, lanes.executing);
       expect(freshMove).toEqual({
         ok: true,
@@ -213,6 +233,11 @@ test.describe('OpenCode live lane command delivery', () => {
         const events = await window.electronAPI.sessions.getEvents(id);
         return events.some((event) => event.type === 'session_start');
       }, sessionId), { intervals: [POLL_INTERVAL_MS], timeout: 15_000 }).toBe(true);
+      await page.reload();
+      await page.locator(`text=${taskTitle}`).first().waitFor({ state: 'visible', timeout: 15_000 });
+      await captureLiveDeliveryStatuses(page);
+      await mountTaskTerminal(page, taskTitle, sessionId);
+      await page.evaluate(async (id) => window.electronAPI.sessions.setFocused([id]), sessionId);
 
       const activeMove = await moveTaskIpc(page, taskId, lanes.review);
       expect(activeMove).toEqual({
@@ -256,20 +281,60 @@ test.describe('OpenCode live lane command delivery', () => {
       await page.evaluate(async ({ id }) => window.electronAPI.sessions.write(id, 'readiness-reset-canary\r'), {
         id: sessionId,
       });
-      await moveTaskIpc(page, taskId, lanes.tests);
-      await waitForLiveStatus(page, taskId, { state: 'waiting' });
-      await page.evaluate(async ({ id, text }) => window.electronAPI.sessions.write(id, text), {
-        id: sessionId,
-        text: USER_INPUT_CANARY,
+      const secondMove = await moveTaskIpc(page, taskId, lanes.tests);
+      expect(secondMove).toEqual({
+        ok: true,
+        autoCommand: {
+          kind: 'scheduled',
+          transport: 'native-idle',
+          generation: expect.any(Number),
+        },
       });
+      await waitForLiveStatus(page, taskId, { state: 'waiting' });
+      const terminalContainer = page.locator('[data-testid="terminal-tab-container"]');
+      await expect(terminalContainer.locator('[data-testid="launch-overlay"]')).toHaveCount(0, { timeout: 15_000 });
+      await expect(terminalContainer.locator('[data-testid="terminal-replay-veil"]')).toHaveCount(0, { timeout: 15_000 });
+      const inputLengthBeforeTerminalResponse = (await fs.promises.stat(paths.inputCapture)).size;
+      const projectId = await page.evaluate(async () => (await window.electronAPI.projects.getCurrent())?.id ?? null);
+      if (!projectId) throw new Error('OpenCode live delivery E2E requires an active project');
+      await page.evaluate(async ({ id, projectId }) =>
+        window.electronAPI.sessions.writeTerminalResponse(id, '\x1b[?1;2c', projectId), {
+        id: sessionId,
+        projectId,
+      });
+      await waitForAppendedBytes(paths.inputCapture, DA1_RESPONSE, inputLengthBeforeTerminalResponse);
+      await waitForLiveStatus(page, taskId, { state: 'waiting' });
+      expect(await fs.promises.readFile(paths.receipt, 'utf8')).toBe('received\n');
+      const secondIdleCount = await idleEventCount(page, sessionId);
+      await emitTrigger(paths.rootIdleTrigger);
+      await expect.poll(() => idleEventCount(page, sessionId)).toBeGreaterThan(secondIdleCount);
+      await waitForLiveStatus(page, taskId, { state: 'delivered' });
+      await waitForFile(paths.receipt, 'received\nreceived');
+      expect(await fs.promises.readFile(paths.receipt, 'utf8')).toBe('received\nreceived\n');
+
+      await page.evaluate(async ({ id }) => window.electronAPI.sessions.write(id, 'readiness-reset-canary\r'), {
+        id: sessionId,
+      });
+      const userInputMove = await moveTaskIpc(page, taskId, lanes.shipping);
+      expect(userInputMove).toEqual({
+        ok: true,
+        autoCommand: {
+          kind: 'scheduled',
+          transport: 'native-idle',
+          generation: expect.any(Number),
+        },
+      });
+      await waitForLiveStatus(page, taskId, { state: 'waiting' });
+      await page.evaluate(async (id) => window.electronAPI.sessions.setFocused([id]), sessionId);
+      await page.keyboard.type(USER_INPUT_CANARY);
       await waitForLiveStatus(page, taskId, { state: 'cancelled', reason: 'user-input' });
       const postInputIdleCount = await idleEventCount(page, sessionId);
       await emitTrigger(paths.rootIdleTrigger);
       await expect.poll(() => idleEventCount(page, sessionId)).toBeGreaterThan(postInputIdleCount);
-      expect(await fs.promises.readFile(paths.receipt, 'utf8')).toBe('received\n');
-      await page.evaluate(async ({ id }) => window.electronAPI.sessions.write(id, '\r'), { id: sessionId });
+      expect(await fs.promises.readFile(paths.receipt, 'utf8')).toBe('received\nreceived\n');
+      await page.keyboard.press('Enter');
 
-      await moveTaskIpc(page, taskId, lanes.shipping);
+      await moveTaskIpc(page, taskId, lanes.review);
       await waitForLiveStatus(page, taskId, { state: 'waiting' });
       const errorIdleCount = await idleEventCount(page, sessionId);
       await emitTrigger(paths.errorTrigger);
@@ -278,14 +343,14 @@ test.describe('OpenCode live lane command delivery', () => {
       const postErrorIdleCount = await idleEventCount(page, sessionId);
       await emitTrigger(paths.rootIdleTrigger);
       await expect.poll(() => idleEventCount(page, sessionId)).toBeGreaterThan(postErrorIdleCount);
-      expect(await fs.promises.readFile(paths.receipt, 'utf8')).toBe('received\n');
+      expect(await fs.promises.readFile(paths.receipt, 'utf8')).toBe('received\nreceived\n');
 
       await page.evaluate(async ({ id, text }) => window.electronAPI.sessions.write(id, `${text}\r`), {
         id: sessionId,
         text: INTERACTIVE_PROBE_CANARY,
       });
       await waitForFile(paths.probeReceipt, 'received');
-      expect(await fs.promises.readFile(paths.receipt, 'utf8')).toBe('received\n');
+      expect(await fs.promises.readFile(paths.receipt, 'utf8')).toBe('received\nreceived\n');
       expect(readPromptCaptures(paths.capture)).toHaveLength(1);
       expect(readPromptCaptures(paths.capture)).not.toContain(LIVE_COMMAND_CANARY);
       expect(await fs.promises.readFile(paths.launchMarkers, 'utf8')).toBe('launch\n');
