@@ -431,12 +431,17 @@ export class TransitionEngine {
         retireRecord(this.sessionRepo, intent.retireRecordId);
       }
 
+      // spawn DTO 可早於 adapter capture native ID；插入前以 registry 的 live Session 為準。
+      const persistedAgentSessionId = this.sessionManager.getSession(session.id)?.agentSessionId
+        ?? session.agentSessionId
+        ?? agentSessionId
+        ?? null;
       this.sessionRepo.insert({
         id: ptySessionId,
         task_id: task.id,
         session_type: adapter.sessionType,
         isolated_swimlane_id: isolatedSwimlaneId,
-        agent_session_id: agentSessionId ?? null,
+        agent_session_id: persistedAgentSessionId,
         command: spawnInput.command,
         cwd,
         permission_mode: permissionMode,
