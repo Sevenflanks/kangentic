@@ -20,6 +20,7 @@ import fs from 'node:fs';
 
 // allow: SIZE_OK - 單一安裝 asset 保留 bootstrap closure，避免 OpenCode plugin discovery 失配。
 const INITIAL_PROMPT_PATH_ENV = 'KANGENTIC_OPENCODE_INITIAL_PROMPT_PATH';
+const RESUME_SESSION_ID_ENV = 'KANGENTIC_OPENCODE_RESUME_SESSION_ID';
 
 function nativeSessionIdFrom(properties) {
   const value = properties?.sessionID ?? properties?.info?.id ?? null;
@@ -202,8 +203,13 @@ function appendSanitizedError(eventsPath, nativeSessionId = null) {
 export const KangenticActivity = ({ client, directory } = {}) => {
   const eventsPath = process.env.KANGENTIC_EVENTS_PATH;
   const initialPromptSourcePath = process.env[INITIAL_PROMPT_PATH_ENV];
+  const resumeSessionID = process.env[RESUME_SESSION_ID_ENV];
+  const bootstrapOwnsSessionStart = Boolean(initialPromptSourcePath || resumeSessionID);
   let bootstrapTimerScheduled = false;
-  let bootstrapSessionID;
+  // 已知的 promptless resume 可能在 timer 前送來 session.created；匹配 ID 必須等 session.get 成功後才可發布。
+  let bootstrapSessionID = resumeSessionID;
+  let pendingBootstrapSessionStart = null;
+  let bootstrapSessionValidated = false;
   let bootstrapSessionStartWritten = false;
   let bootstrapFailureReported = false;
 
@@ -232,12 +238,17 @@ export const KangenticActivity = ({ client, directory } = {}) => {
   const hooks = {
     event: ({ event }) => {
       const extracted = extractSessionEvent(event);
-      if (extracted?.type === 'session_start') {
+      if (extracted?.type === 'session_start' && bootstrapOwnsSessionStart) {
         const nativeSessionID = extracted.privateNativeBoundary?.nativeSessionId ?? null;
-        if (nativeSessionID !== null && nativeSessionID === bootstrapSessionID) {
-          appendBootstrapSessionStart(extracted);
+        if (!bootstrapSessionValidated) {
+          if (nativeSessionID !== null) {
+            bootstrapSessionID = nativeSessionID;
+            pendingBootstrapSessionStart = extracted;
+          }
           return;
         }
+        if (nativeSessionID === bootstrapSessionID) appendBootstrapSessionStart(extracted);
+        return;
       }
       appendEvent(eventsPath, extracted);
     },
@@ -256,37 +267,43 @@ export const KangenticActivity = ({ client, directory } = {}) => {
       let claimPath = null;
 
       const runBootstrap = async () => {
-        try {
-          claimPath = claimInitialPromptSource(initialPromptSourcePath);
-        } catch {
-          reportSanitizedBootstrapFailure(claimPath);
-          return;
-        }
-        if (!claimPath) return;
+        let payload = null;
+        if (initialPromptSourcePath) {
+          try {
+            claimPath = claimInitialPromptSource(initialPromptSourcePath);
+          } catch {
+            reportSanitizedBootstrapFailure(claimPath);
+            return;
+          }
+          if (!claimPath) return;
 
-        let rawText;
-        try {
-          rawText = fs.readFileSync(claimPath, 'utf8');
-        } catch {
-          reportSanitizedBootstrapFailure(claimPath);
-          return;
-        }
-        if (!removeClaimPath(claimPath)) {
-          // 已嘗試刪除 claim；不可再交給 reporter，避免 failure handling 變成隱性 retry。
-          reportSanitizedBootstrapFailure();
-          return;
-        }
-        claimPath = null;
+          let rawText;
+          try {
+            rawText = fs.readFileSync(claimPath, 'utf8');
+          } catch {
+            reportSanitizedBootstrapFailure(claimPath);
+            return;
+          }
+          if (!removeClaimPath(claimPath)) {
+            // 已嘗試刪除 claim；不可再交給 reporter，避免 failure handling 變成隱性 retry。
+            reportSanitizedBootstrapFailure();
+            return;
+          }
+          claimPath = null;
 
-        const payload = readInitialPromptPayload(rawText);
-        if (!payload) {
-          reportSanitizedBootstrapFailure();
-          return;
+          payload = readInitialPromptPayload(rawText);
+          if (!payload) {
+            reportSanitizedBootstrapFailure();
+            return;
+          }
         }
 
-        const sessionID = payload.sessionId;
-        bootstrapSessionID = sessionID;
-        rootSessionId = sessionID;
+        const requestedSessionID = payload?.sessionId ?? resumeSessionID;
+        if (typeof requestedSessionID !== 'string' || requestedSessionID.length === 0) return;
+        bootstrapSessionID ??= requestedSessionID;
+        let sessionID = bootstrapSessionID;
+        let firstValidationSucceeded = true;
+        // 第一個 target 成功或失敗後都要比較最新 native identity；最多只驗證一次替代 ID，避免無界重試。
         try {
           await client.session.get({
             path: { id: sessionID },
@@ -294,10 +311,40 @@ export const KangenticActivity = ({ client, directory } = {}) => {
             throwOnError: true,
           });
         } catch {
+          firstValidationSucceeded = false;
+        }
+        if (bootstrapSessionID !== sessionID) {
+          sessionID = bootstrapSessionID;
+          try {
+            await client.session.get({
+              path: { id: sessionID },
+              query: { directory },
+              throwOnError: true,
+            });
+          } catch {
+            reportSanitizedBootstrapFailure();
+            return;
+          }
+          if (bootstrapSessionID !== sessionID) {
+            reportSanitizedBootstrapFailure();
+            return;
+          }
+        } else if (!firstValidationSucceeded) {
           reportSanitizedBootstrapFailure();
           return;
         }
-        appendBootstrapSessionStart(makeBootstrapSessionStart(sessionID));
+        bootstrapSessionID = sessionID;
+        rootSessionId = sessionID;
+        bootstrapSessionValidated = true;
+        const pendingNativeSessionID = pendingBootstrapSessionStart
+          ?.privateNativeBoundary?.nativeSessionId ?? null;
+        appendBootstrapSessionStart(
+          pendingNativeSessionID === sessionID
+            ? pendingBootstrapSessionStart
+            : makeBootstrapSessionStart(sessionID),
+        );
+
+        if (!payload) return;
 
         try {
           await client.session.promptAsync({
