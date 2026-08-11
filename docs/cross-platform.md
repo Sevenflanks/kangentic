@@ -111,6 +111,8 @@ The deb package declares `depends` on Electron's required system libraries (`lib
 
 The fork does not provide an auto-update feed. When `app-update.yml` is absent, the guard in `src/main/updater.ts` disables auto-update without affecting local startup. The `npx kangentic` launcher is an upstream distribution path, never a path to this fork.
 
+Release notes and update dialogs are not part of this fork's supported distribution path. The upstream launcher remains documented separately in `packages/launcher/README.md`; it does not download or update this fork.
+
 ## Security Fuses
 
 Electron fuses enabled for production builds:
@@ -124,7 +126,108 @@ Electron fuses enabled for production builds:
 
 ## Windows Long Paths
 
-Git worktrees live under `.kangentic/worktrees/<slug>/`, which can push deeply nested file paths past Windows' default 260-character limit. Kangentic enables `core.longpaths=true` on Windows during worktree creation (both as a per-command flag for `git worktree add` and as a persistent config in the worktree's local git config). This activates the `\\?\` extended-length path prefix, allowing paths up to 32,767 characters. macOS and Linux are unaffected (1024-4096 byte `PATH_MAX`). See [Worktree Strategy](worktree-strategy.md#windows-long-paths) for details.
+Git worktrees live under `.kangentic/worktrees/<n>/`, which can push deeply nested file paths past Windows' default 260-character limit. Kangentic enables `core.longpaths=true` on Windows during worktree creation (both as a per-command flag for `git worktree add` and as a persistent config in the worktree's local git config). This activates the `\\?\` extended-length path prefix, allowing paths up to 32,767 characters. macOS and Linux are unaffected (1024-4096 byte `PATH_MAX`). See [Worktree Strategy](worktree-strategy.md#windows-long-paths) for details.
+
+## Windows MAX_PATH is mostly not the wall people expect
+
+It is tempting to treat 260 as a hard ceiling for everything inside a worktree. Measurement says
+otherwise. Taken on 2026-07-30 inside a 98-character Kangentic worktree of a React Native / Expo
+project, with `node_modules` a real directory rather than a junction:
+
+| | |
+|---|---|
+| Files | 75,133 |
+| Longest absolute path | **337** |
+| Files already over MAX_PATH (260) | **1,958** |
+| `npm install`, `expo prebuild`, Gradle | all completed |
+| `LongPathsEnabled` | `0` |
+
+Node, the JVM and Git route around MAX_PATH with the `\\?\` prefix, so they are unaffected by the
+registry setting and unaffected by depth at these scales. **A length-based warning would have fired
+on that healthy tree and told the user nothing true.**
+
+### The limit that does bind is still MAX_PATH, applied to a string you never see
+
+The one thing that failed in that worktree was the native compile. It is tempting to blame CMake's
+`CMAKE_OBJECT_PATH_MAX` (250 on Windows), because that warning floods the log. Measurement says
+otherwise: raising it to 1000 took the warnings from **402 to zero and the build failed
+identically**, so it is a policy warning the build routinely survives, not the cause.
+
+The real mechanism is MAX_PATH applied to a composed path that never appears in any log:
+
+```
+ninja explain: output ../prefab/arm64-v8a/prefab/lib/aarch64-linux-android/cmake/
+               ReactAndroid/ReactAndroidConfig.cmake of phony edge with no inputs doesn't exist
+```
+
+That file exists. Its normalized absolute path is 254 characters. But ninja stats it **relative to
+the build directory**, and Windows measures the composed string *before* collapsing the `..`:
+
+| | |
+|---|---|
+| build directory | 170 |
+| relative path | 96 |
+| **what Windows actually resolves** | **267** |
+| normalized path that exists on disk | 254 |
+
+The stat fails, ninja concludes a required output is missing, re-runs the generator, and loops until
+`ninja: error: manifest 'build.ninja' still dirty after 100 tries` - a message that names no path, no
+limit, and no file.
+
+A second, independent case appears once the first is cleared: CMake hashes leading components of an
+object name to fit its own limit, but when even the hashed floor exceeds that limit it gives up and
+emits the **full** unshortened name (395 characters, where the floor would have been 254), and ninja
+reports `Filename longer than 260 characters`.
+
+Both are MAX_PATH, and both scale with the checkout root, which is why a short root works:
+
+| Checkout | Root | Native build |
+|---|---|---|
+| `C:\kw` | 5 | builds |
+| The project at its normal location | 48 | builds |
+| Kangentic worktree, numeric scheme | 73 | fails |
+| Kangentic worktree, pre-numeric scheme | 98 | fails |
+
+The practical limit for a given project can only be found by building it, and it moves with the
+toolchain: the binding module here was whichever one had the deepest build directory combined with
+the longest prefab dependency name.
+
+### What Kangentic does about it
+
+It keeps its own overhead small and bounded, and otherwise stays out of the way. The numeric worktree
+folder took Kangentic's contribution from about 49 characters to about 24 (`\.kangentic\worktrees\`
+plus a short number); see
+[Worktree Directory Naming](worktree-strategy.md#worktree-directory-naming).
+
+There is deliberately **no path-length threshold, no proactive warning, and no configurable worktree
+root**. A length check fires on length rather than on the presence of a native toolchain, so it warns
+the majority about a failure they will never see, and it cannot observe the case that actually breaks
+(the overflow surfaces inside Gradle, in the agent's terminal).
+
+A short worktree root **does** help, as the table above shows, but it can never be a guarantee:
+Kangentic controls neither where the user's project lives nor how deep a toolchain builds beneath it.
+Bounding its own contribution is the honest limit of what it can promise.
+
+`src/shared/windows-path-budget.ts` therefore holds no reserves. It recognizes a path-length failure
+**after** one has happened, from the error text (`ENAMETOOLONG`, "filename or extension is too long",
+"Filename too long", "Filename longer than", "manifest 'build.ninja' still dirty after"), matching
+through a wrapped `cause` chain, and `describeWorktreePathLengthCause` appends an explanation so the
+user is not left reading raw git output. It is a no-op off Windows.
+
+The CMake `CMAKE_OBJECT_PATH_MAX` strings are deliberately **not** in that list. They are a policy
+warning builds routinely survive: measured, they fired 402 times on a build that failed for the ninja
+reason above, and zero times on a build that still failed after the limit was raised.
+
+A project whose native toolchain genuinely cannot fit has two options, and the second is usually
+better. It can live at a shorter path, which is a property of the project's location rather than of
+Kangentic. Or it can point the toolchain's build output somewhere short: Android's
+`externalNativeBuild.cmake.buildStagingDirectory`, for instance, moves `.cxx` out of the source tree
+and takes checkout depth out of the calculation entirely, which fixes the case at **any** depth
+rather than buying a fixed number of characters.
+
+Note that Node resolves through the worktree's `node_modules` junction using the pre-resolution
+path, so a tool inside a worktree sees the worktree path even though the junction target lives at
+the project root. A junction is not a way around any of this.
 
 ## WSL Support
 
@@ -135,7 +238,18 @@ Git worktrees live under `.kangentic/worktrees/<slug>/`, which can push deeply n
 
 ## Environment Stripping
 
-When spawning PTY sessions, Kangentic strips the `CLAUDECODE` environment variable from `process.env`. This prevents spawned Claude CLI sessions from refusing to start when Kangentic itself was launched from inside a Claude Code session.
+When spawning PTY sessions, `buildSpawnEnv` (`src/main/pty/spawn/pty-spawn.ts`) strips `CLAUDECODE`
+and every `CLAUDE_CODE_*` identity marker from the merged environment. Kangentic is often launched
+from inside a Claude Code session, and those markers would otherwise re-parent the spawned agent to
+the launching session, so a later `--resume` finds nothing. A Kangentic-spawned agent must always be
+a clean top-level session. `ANTHROPIC_*` keys (BYOK / API auth) are deliberately left untouched.
+
+One key is keeplisted: `CLAUDE_CODE_ALT_SCREEN_FULL_REPAINT`. It is a renderer tuning flag, not an
+identity marker, so it cannot re-parent a session. Kangentic defaults it to `1` on **win32 only**,
+matching what Claude Code's own agent views do on Windows, because the fullscreen TUI otherwise
+intermittently drops history entries from its incremental scrolled-view updates. An explicit value
+already present in the environment always wins, including a user's opt-out. Non-Claude agents ignore
+the variable.
 
 ## See Also
 

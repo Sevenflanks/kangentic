@@ -1,11 +1,8 @@
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
-import { ipcMain, shell } from 'electron';
+import { ipcMain } from 'electron';
 import { IPC } from '../../../shared/ipc-channels';
-import { getProjectRepos } from '../helpers';
-import { applyProfileToLane, findTaskProfile } from '../../transition-engine/column-strategy';
-import { propagateStrategyToLiveSessions, propagateBoardProfileChange } from './strategy-propagation';
+import { getProjectRepos, openAttachmentFile } from '../helpers';
+import { pruneDeletedColumnFromProfiles } from '../../config/board-config/prune-profile-references';
+import { propagateStrategyToLiveSessions, propagateBoardProfileChange, buildColumnStrategyChanges } from './strategy-propagation';
 import { runWithProjectLogContext } from '../../diagnostics/project-log-context';
 import type { BoardProfile, ShortcutConfig } from '../../../shared/types';
 import type { IpcContext } from '../ipc-context';
@@ -45,17 +42,11 @@ export function registerBoardHandlers(context: IpcContext): void {
     return attachments.getDataUrl(id);
   });
 
-  ipcMain.handle(IPC.ATTACHMENT_OPEN, (_, id: string) => {
+  ipcMain.handle(IPC.ATTACHMENT_OPEN, async (_, id: string) => {
     const { attachments } = getProjectRepos(context);
     const attachment = attachments.getById(id);
     if (!attachment) throw new Error(`Attachment ${id} not found`);
-    // Copy to temp dir with original filename to avoid long-path issues on Windows
-    // and ensure the OS opens it with the correct default app
-    const tempDir = path.join(os.tmpdir(), 'kangentic-attachments');
-    fs.mkdirSync(tempDir, { recursive: true });
-    const tempPath = path.join(tempDir, attachment.id + '_' + attachment.filename);
-    fs.copyFileSync(attachment.file_path, tempPath);
-    return shell.openPath(tempPath);
+    return openAttachmentFile(attachment);
   });
 
   // === Swimlanes ===
@@ -72,7 +63,11 @@ export function registerBoardHandlers(context: IpcContext): void {
   });
 
   ipcMain.handle(IPC.SWIMLANE_UPDATE, (_, input) => {
-    const { swimlanes, tasks } = getProjectRepos(context);
+    // Captured once, up front, and threaded down: the propagation below now
+    // SPAWNS and SUSPENDS as well as injecting, so it must not re-resolve the
+    // project from ambient state part-way through.
+    const projectId = context.currentProjectId;
+    const { swimlanes } = getProjectRepos(context, projectId);
     const before = swimlanes.getById(input.id);
     const result = swimlanes.update(input);
     triggerWriteBack(context);
@@ -97,39 +92,38 @@ export function registerBoardHandlers(context: IpcContext): void {
     // model into a task whose profile pins a different one here. The shared
     // helper owns the gate and the inject-vs-restart decision, so a profile edit
     // (below) behaves identically.
-    const boardProfiles = context.boardConfigManager.getBoardProfiles();
-    const laneList = swimlanes.list();
-    const strategyChanges = tasks.list(result.id).map((task) => {
-        const profile = findTaskProfile({ profiles: boardProfiles, profileId: task.profile_id, taskId: task.id });
-        return {
-          task,
-          before: applyProfileToLane(before, profile, laneList),
-          after: applyProfileToLane(result, profile, laneList),
-          sourceName: result.name,
-        };
-      });
-
-    for (const change of strategyChanges) {
-      const { before: beforeStrategy, after: afterStrategy, task } = change;
-      const liveDeliveryChanged = beforeStrategy !== null && afterStrategy !== null && (
-        beforeStrategy.auto_spawn !== afterStrategy.auto_spawn
-        || beforeStrategy.auto_command !== afterStrategy.auto_command
-        || beforeStrategy.agent_override !== afterStrategy.agent_override
-        || beforeStrategy.session_target !== afterStrategy.session_target
-        || beforeStrategy.session_spawn_strategy !== afterStrategy.session_spawn_strategy
-        || beforeStrategy.model_override !== afterStrategy.model_override
-        || beforeStrategy.effort_override !== afterStrategy.effort_override
-      );
-      if (liveDeliveryChanged) context.terminalSubmitScheduler.cancel(task.id);
-    }
-    propagateStrategyToLiveSessions(context, 'SWIMLANE_UPDATE', strategyChanges);
+    //
+    // An auto_spawn flip is reconciled through the same call: tasks already in
+    // the column spawn when it is switched on and suspend when it is switched
+    // off, instead of waiting for the next project open.
+    propagateStrategyToLiveSessions(
+      context,
+      'SWIMLANE_UPDATE',
+      buildColumnStrategyChanges({ context, projectId, before, after: result }),
+      projectId,
+    );
 
     return result;
   });
 
   ipcMain.handle(IPC.SWIMLANE_DELETE, (_, id) => {
     const { swimlanes } = getProjectRepos(context);
+    // Snapshot before the delete: pruning profiles needs the name, which is gone
+    // from the DB once the row is.
+    const swimlaneToDelete = swimlanes.getById(id);
     swimlanes.delete(id);
+    // Board Profiles live in kangentic.json with no FK, so nothing else clears a
+    // delta keyed to this column or a planExitTarget naming it. Must run BEFORE
+    // the write-back, which carries `profiles` across from the on-disk file.
+    if (swimlaneToDelete) {
+      pruneDeletedColumnFromProfiles(
+        {
+          getBoardProfiles: () => context.boardConfigManager.getBoardProfiles(),
+          setBoardProfiles: (profiles) => context.boardConfigManager.setBoardProfiles(profiles),
+        },
+        { columnId: swimlaneToDelete.id, columnName: swimlaneToDelete.name },
+      );
+    }
     triggerWriteBack(context);
   });
 
@@ -214,9 +208,10 @@ export function registerBoardHandlers(context: IpcContext): void {
     // sessions in that column. Without this a task on an edited profile kept its
     // old model until the user moved it out and back - the settings-edit path
     // silently applied to one authoring surface and not the other.
+    const projectId = context.currentProjectId;
     const previousProfiles = context.boardConfigManager.getBoardProfiles();
     context.boardConfigManager.setBoardProfiles(profiles);
-    propagateBoardProfileChange(context, previousProfiles, profiles);
+    propagateBoardProfileChange(context, previousProfiles, profiles, projectId);
   });
 
   ipcMain.handle(IPC.BOARD_CONFIG_GET_SHORTCUTS, () => {

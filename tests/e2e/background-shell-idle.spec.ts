@@ -254,6 +254,10 @@ async function sessionDirForTask(
   throw new Error(`No session for task "${taskTitle}" after ${timeoutMs}ms (${lastError})`);
 }
 
+function sessionIdForSessionDir(sessionDir: string): string {
+  return path.basename(sessionDir);
+}
+
 async function readBgShellPid(sessionDir: string, timeoutMs = 10000): Promise<number> {
   const pidFile = path.join(sessionDir, 'bg-shell.pid');
   const diagFile = path.join(sessionDir, 'bg-shell.diag');
@@ -326,6 +330,7 @@ test.describe('Background-shell idle bug -- positive control (bg Bash + live det
     await waitForScrollbackMarker(page, 'MOCK_CLAUDE_SESSION:');
 
     const sessionDir = await sessionDirForTask(page, tmpDir, title);
+    const sessionId = sessionIdForSessionDir(sessionDir);
     const pid = await readBgShellPid(sessionDir);
 
     // Wait for the engine to ingest the mock's event cycle
@@ -341,7 +346,7 @@ test.describe('Background-shell idle bug -- positive control (bg Bash + live det
           const activity = await page.evaluate(() =>
             window.electronAPI.sessions.getActivity(),
           );
-          return Object.values(activity as Record<string, string>);
+          return (activity as Record<string, string>)[sessionId];
         },
         {
           timeout: 10_000,
@@ -396,6 +401,7 @@ test.describe('Background-shell idle bug -- positive control (bg Bash + live det
     await waitForScrollbackMarker(page, 'MOCK_CLAUDE_SESSION:');
 
     const sessionDir = await sessionDirForTask(page, tmpDir, title);
+    const sessionId = sessionIdForSessionDir(sessionDir);
     const eventsPath = path.join(sessionDir, 'events.jsonl');
 
     // First poll: while the mock's bg_shell_start is live, activity
@@ -406,11 +412,29 @@ test.describe('Background-shell idle bug -- positive control (bg Bash + live det
           const activity = await page.evaluate(() =>
             window.electronAPI.sessions.getActivity(),
           );
-          return Object.values(activity as Record<string, string>);
+          return (activity as Record<string, string>)[sessionId];
         },
         { timeout: 10_000, message: 'Expected activity to settle on thinking pre-kill' },
       )
       .toContain('thinking');
+
+    await expect
+      .poll(
+        async () => {
+          if (!fs.existsSync(eventsPath)) return { hasStart: false, hasIdle: false };
+          const entries = fs
+            .readFileSync(eventsPath, 'utf-8')
+            .split('\n')
+            .filter((line) => line.trim().length > 0)
+            .map((line) => JSON.parse(line) as { type: string });
+          return {
+            hasStart: entries.some((entry) => entry.type === 'background_shell_start'),
+            hasIdle: entries.some((entry) => entry.type === 'idle'),
+          };
+        },
+        { timeout: 10_000, message: 'Expected own events.jsonl to contain start and idle before KillBash append' },
+      )
+      .toEqual({ hasStart: true, hasIdle: true });
 
     // Append a background_shell_end (as if the agent called KillBash)
     // directly to events.jsonl -- the file watcher will pick it up
@@ -426,7 +450,7 @@ test.describe('Background-shell idle bug -- positive control (bg Bash + live det
           const activity = await page.evaluate(() =>
             window.electronAPI.sessions.getActivity(),
           );
-          return Object.values(activity as Record<string, string>);
+          return (activity as Record<string, string>)[sessionId];
         },
         {
           timeout: 5000,
@@ -480,6 +504,7 @@ test.describe('Background-shell idle bug -- negative control (no detached child)
     await waitForScrollbackMarker(page, 'MOCK_CLAUDE_SESSION:');
 
     const sessionDir = await sessionDirForTask(page, tmpDir, title);
+    const sessionId = sessionIdForSessionDir(sessionDir);
     const eventsPath = path.join(sessionDir, 'events.jsonl');
     fs.mkdirSync(path.dirname(eventsPath), { recursive: true });
 
@@ -500,7 +525,7 @@ test.describe('Background-shell idle bug -- negative control (no detached child)
       .poll(
         async () => {
           const activity = await page.evaluate(() => window.electronAPI.sessions.getActivity());
-          return Object.values(activity as Record<string, string>);
+          return (activity as Record<string, string>)[sessionId];
         },
         { timeout: 5000, message: 'Expected session to reach idle within 5 seconds' },
       )

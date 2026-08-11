@@ -11,12 +11,14 @@ import { interpolateTemplate, resolveTaskTemplateVars } from '../agent/shared';
 import { resolveExecutionTarget } from '../agent/shared/execution-target';
 import { resolveLaunchOptions } from '../agent/shared/launch-options';
 import { WorktreeManager, prepareWorktreeForRemoval, GitQueuePriority } from '../git/worktree-manager';
+import { prepareWorktreeFolder } from '../git/task-worktree-folder';
 import { agentRegistry } from '../agent/agent-registry';
 import { appendCallerSession } from '../agent/mcp-http/caller-url';
 import { retireRecord, markRecordSuspended } from './session-lifecycle';
 import { resolveEffectivePermissionMode } from './spawn-preamble';
 import { resolveSpawnIntent } from './spawn-intent';
 import { migrateResumeCwdIfRenamed } from './resume-cwd-migration';
+import { reconcileResumeAgentSessionId } from './resume-id-reconcile';
 import { sessionOutputPaths } from './session-paths';
 import type { ActionRepository } from '../db/repositories/action-repository';
 import type { TaskRepository } from '../db/repositories/task-repository';
@@ -235,11 +237,22 @@ export class TransitionEngine {
     const canResume = intent.mode === 'resume';
 
     // agent_session_id: the agent CLI's real session ID for --resume/--session-id.
-    // - Resume: use the captured/specified ID from the DB record
+    // - Resume: use the captured/specified ID from the DB record, reconciled
+    //   against the retiring record's own status.json (a /clear-style fork in
+    //   the final seconds before suspend can leave the DB one id behind - see
+    //   resume-id-reconcile.ts). Runs BEFORE migrateResumeCwdIfRenamed below so
+    //   the cwd migration keys on the id actually being resumed.
     // - Fresh + Claude (supportsCallerSessionId): generate UUID, pass via --session-id
     // - Fresh + Codex/Gemini: null (CLI generates its own ID, captured later via hooks)
     const agentSessionId = canResume
-      ? intent.agentSessionId
+      ? await reconcileResumeAgentSessionId({
+          adapter,
+          recordId: intent.retireRecordId,
+          storedAgentSessionId: intent.agentSessionId,
+          cwd: intent.resumeFromCwd,
+          projectPath: appConfig.projectPath || cwd,
+          sessionRepo: this.sessionRepo,
+        })
       : (adapter.supportsCallerSessionId ? randomUUID() : null);
 
     // Continuation is resume-only; generic resumePrompt still governs promptless fresh delivery.
@@ -543,6 +556,11 @@ export class TransitionEngine {
     const appConfig = this.getConfig();
     if (!appConfig.projectPath) return;
 
+    // Recover the pre-numeric-scheme folder for a legacy task whose worktree_path
+    // was already cleared by a Done move, so it returns to its original path
+    // rather than being relocated. See TaskRepository.recoverLegacyWorktreeFolder.
+    prepareWorktreeFolder(task, this.taskRepo, appConfig.projectPath);
+
     const wm = new WorktreeManager(appConfig.projectPath);
     const gitConfig = {
       ...appConfig.gitConfig,
@@ -561,11 +579,15 @@ export class TransitionEngine {
     );
     if (!result) return;
 
-    this.taskRepo.update({
-      id: task.id,
-      worktree_path: result.worktreePath,
-      branch_name: result.branchName,
-    });
+    this.taskRepo.recordWorktree(task.id, result.worktreePath, result.branchName, result.worktreeFolder);
+    // Refresh the in-memory task, as ensureTaskWorktree does after the same
+    // write. executeTransition hands ONE task object to every action in the
+    // chain with no re-read between them, so a `create_worktree` followed by
+    // `spawn_agent` would otherwise spawn with `task.worktree_path` still null
+    // and run the agent unisolated in the main checkout. `prepareWorktreeFolder`
+    // above already mutates `worktree_folder` in place, which makes a stale
+    // `worktree_path` on the same object harder to notice, not easier.
+    Object.assign(task, this.taskRepo.getById(task.id));
   }
 
   private async executeCleanupWorktree(task: Task): Promise<void> {

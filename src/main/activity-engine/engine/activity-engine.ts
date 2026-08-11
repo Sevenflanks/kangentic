@@ -202,6 +202,7 @@ export class ActivityEngine {
       subagentDepth: state.subagentDepth,
       backgroundShellIds: Array.from(state.activeBackgroundShellIds),
       anonymousBackgroundShellCount: state.anonymousBackgroundShellCount,
+      exemptBackgroundShellIds: Array.from(state.exemptBackgroundShellIds),
       turnActive: state.turnActive,
       permissionPending: state.permissionPending,
       permissionAwaitedToolId: state.permissionAwaitedToolId,
@@ -387,6 +388,24 @@ export class ActivityEngine {
     state.subagentDepth = 0;
     state.activeBackgroundShellIds.clear();
     state.anonymousBackgroundShellCount = 0;
+    // Neither `exemptBackgroundShellIds` nor `pendingExemptShellToolIds` is
+    // cleared here. Every caller of this method leaves the agent CLI process
+    // RUNNING - `applyInterruptedBypass` hard-ends the turn, and
+    // `applyRetryableFailureHold` deliberately keeps it alive across a retry -
+    // so an exempt shell's OS process is still up either way. Dropping a live
+    // shell out of `getActiveShellCount` shrinks the watcher's `expected`,
+    // takes its surplus branch, and permanently folds a real process into
+    // `preExistingHelpers`. Same reasoning as the watchdog resets. Only
+    // `forceIdle`, whose caller is a dead root process, clears them.
+    //
+    // The memo is held to the same rule, and must be: a bg shell's PreToolUse
+    // and PostToolUse are ~1.7s apart, so an interrupt landing between them
+    // would drop the memo, leave the arriving PostToolUse no record of the
+    // exemption, and file the still-running shell in the HOLDING set - pinning
+    // the session thinking for the preview's whole lifetime, which is the bug
+    // the exemption exists to prevent. `MAX_PENDING_EXEMPT_SHELL_TOOL_IDS`
+    // already bounds the memo, so clearing it here bought no safety.
+    // Pinned by the `mid-promotion` case in `activity-engine-replay.test.ts`.
     state.currentTool = null;
     state.idleHintPending = false;
     state.retryFailurePending = false;
@@ -500,6 +519,23 @@ export class ActivityEngine {
     state.subagentDepth = 0;
     state.activeBackgroundShellIds.clear();
     state.anonymousBackgroundShellCount = 0;
+    // Unlike `resetInFlightCounters`, this path is reached with a dead agent
+    // process, so every descendant shell is gone too - including the exempt
+    // ones. Clearing them here keeps the watcher's `expected` honest rather
+    // than corrupting it.
+    //
+    // `forceIdle` has two other callers (`handlePtyIdle` and `forceActivity`)
+    // that do NOT imply a dead process, so that premise is about which of them
+    // can reach a session holding exempt shells, not about the method at
+    // large: only a hooks-driven agent can populate the exempt set, and for
+    // those the PTY and history paths are both inert (the adapter declares
+    // `ActivityDetection.hooks()`, which gates `notifyPtyIdle`, and its history
+    // parser never emits an activity). So in practice `onRootProcessDied` is
+    // the only caller that reaches a non-empty exempt set. Should a
+    // PTY-driven agent ever gain this flag, revisit this clear - it would then
+    // be dropping live shells, the corruption the sibling reset avoids.
+    state.exemptBackgroundShellIds.clear();
+    state.pendingExemptShellToolIds.clear();
     state.currentTool = null;
     state.pendingIdleAt = null;
     state.idleHintPending = false;
@@ -529,6 +565,46 @@ export class ActivityEngine {
         this.scheduleTimer(sessionId, state);
       }
     }
+  }
+
+  /**
+   * Mark the session's CURRENT idle as hook-authoritative without firing a
+   * transition, i.e. "we know from outside the hook stream that this agent is
+   * parked and started no work".
+   *
+   * The one caller is the settings-change restart
+   * (`restartSessionForSettingsChange`), whose documented contract is that the
+   * session resumes IDLE: it sends no prompt and re-runs no auto_command. But a
+   * `--resume` respawn still runs the CLI's resume-picker context reload, a
+   * CLI-INTERNAL turn that fires no hooks while growing `total_output_tokens`.
+   * The status heartbeat's recovery gate (`session-telemetry.ts`) force-thinks
+   * exactly that shape unless the idle is authoritative, so a user-initiated
+   * model switch painted the card `thinking` for a fixed 30s
+   * (`DEFAULT_STALE_AFTER_HEARTBEAT_FORCED_MS`) with the agent parked the whole
+   * time - reproduced live, task-shows-active.
+   *
+   * Safe because it only asserts what the restart already guarantees, and it
+   * cannot latch. The flag is provenance for the CURRENT idle, and every path
+   * that commits the NEXT idle rewrites it: a hook turn-end sets it true,
+   * `forceIdle` and the watchdog hatch set it false. An idle commit requires
+   * `!turnActive`, and every site that clears `turnActive` also rewrites the
+   * flag, so a `true` set here cannot survive into a later idle. Note the
+   * turn-initiating branch does NOT clear it - the non-stickiness is structural,
+   * not a per-hook reset. Deliberately narrower than `forceIdle`, which resets
+   * counters and commits a transition; there is nothing to reset here.
+   *
+   * Two no-ops bound its reach, both silent by design. A respawn still `queued`
+   * behind `SessionQueue` has no engine state yet (`initSession` runs only in
+   * `performSpawn`), so the assertion is dropped and that resume can still be
+   * force-thought. And a fresh-intent respawn is seeded `thinking`, so only the
+   * resume-intent branch is covered.
+   */
+  markIdleAuthoritative(sessionId: string): void {
+    if (this.disposed) return;
+    const state = this.states.get(sessionId);
+    if (!state) return;
+    if (state.activity !== 'idle') return;
+    state.idleAuthoritative = true;
   }
 
   /**
@@ -653,8 +729,18 @@ export class ActivityEngine {
       // Identity-aware decrement. If the shell isn't tracked under
       // this id, treat as no-op - the caller named a specific shell,
       // falling through would silently corrupt the anonymous count.
-      if (!state.activeBackgroundShellIds.has(shellId)) return;
-      state.activeBackgroundShellIds.delete(shellId);
+      //
+      // Exempt shells drain through here too: this is the path every
+      // watcher-driven exit takes (Tier A PID exit, transcript termination,
+      // quiescence reclaim), so it is what actually releases the preview
+      // watcher when the preview stops.
+      if (state.activeBackgroundShellIds.has(shellId)) {
+        state.activeBackgroundShellIds.delete(shellId);
+      } else if (state.exemptBackgroundShellIds.has(shellId)) {
+        state.exemptBackgroundShellIds.delete(shellId);
+      } else {
+        return;
+      }
     } else {
       // Anonymous decrement (count-based heuristic from the watcher).
       // The watcher saw N fewer descendants - SOMETHING ended. We drain

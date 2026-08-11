@@ -26,7 +26,7 @@ Claude Code agent calls MCP tool (e.g. kangentic_create_task)
 | Component | File | Purpose |
 |-----------|------|---------|
 | MCP HTTP Server | `src/main/agent/mcp-http-server.ts` | In-process Node `http` server using `@modelcontextprotocol/sdk` Streamable HTTP transport. Binds 127.0.0.1 by default (configurable via `mcpServer.bindAddress`), random `:0` port, random per-launch token validated via `X-Kangentic-Token`. See [Network Access](#network-access). |
-| Task Tools | `src/main/agent/mcp-http/task-tools.ts` | Board/task/column mutations + related reads (`kangentic_create_task`, `kangentic_move_task`, `kangentic_update_task`, `kangentic_link_pr`, `kangentic_update_column`, `kangentic_delete_task`, `kangentic_list_columns`, `kangentic_find_task`, `kangentic_get_current_task`, etc.). |
+| Task Tools | `src/main/agent/mcp-http/task-tools.ts` | Board/task/column mutations + related reads (`kangentic_create_task`, `kangentic_move_task`, `kangentic_reorder_tasks`, `kangentic_update_task`, `kangentic_link_pr`, `kangentic_update_column`, `kangentic_create_column`, `kangentic_delete_column`, `kangentic_delete_task`, `kangentic_list_columns`, `kangentic_find_task`, `kangentic_get_current_task`, etc.). |
 | Profile Tools | `src/main/agent/mcp-http/profile-tools.ts` | Board Profile read + authoring (`kangentic_list_board_profiles`, `kangentic_create_board_profile`, `kangentic_update_board_profile`, `kangentic_delete_board_profile`). Entries are keyed by column NAME so a profile can be copied between projects; see [Board Profiles](#board-profiles). |
 | Session Tools | `src/main/agent/mcp-http/session-tools.ts` | Session inspection, backlog, read-only SQL (`kangentic_list_sessions`, `kangentic_get_transcript`, `kangentic_get_session_files`, `kangentic_get_session_events`, `kangentic_get_activity_intervals`, `kangentic_query_db`, `kangentic_list_backlog`, etc.). |
 | Steering Tools | `src/main/agent/mcp-http/steering-tools.ts` | The write side of the session surface (`kangentic_send_session_message`) plus its debugging read (`kangentic_get_session_messages_sent`). Kept out of `session-tools.ts` because the send needs live main-process singletons (SessionManager, TerminalSubmit) that `CommandContext` does not carry. |
@@ -39,6 +39,7 @@ Claude Code agent calls MCP tool (e.g. kangentic_create_task)
 | Usage Tools | `src/main/agent/mcp-http/usage-tools.ts` | Aggregated usage statistics (`kangentic_get_usage_stats`): tokens, cost, burn rate, and by-model / by-agent / by-effort breakdowns, per project or app-wide, over the shared time ranges. Reads the same usage-stats service as the in-app dashboard. |
 | Command Handlers | `src/main/agent/commands/` | Per-domain handlers shared by the HTTP tools: task, column, profile (`profile-commands.ts`: the four `*_board_profile` commands plus the shared `resolveProfileSelector` used by create/update task), inventory, search, analytics, usage, backlog, handoff, inspect (`get_transcript`, `query_db`), session-files (`get_session_files`, `get_session_events`), and activity-interval (`get_activity_intervals`) commands. |
 | Column Resolver | `src/main/agent/commands/column-resolver.ts` | Shared case-insensitive column name to swimlane lookup used by multiple handlers. |
+| Task Ordering | `src/main/agent/commands/task-ordering.ts` | Pure ordinal-slot arithmetic shared by `handleMoveTask`'s same-column reposition and `handleReorderTasks`: slot clamping, prefix-merge reordering, and ordinal-to-raw-position translation. |
 | MCP Config Delivery | `src/main/agent/adapters/claude/command-builder.ts` | Writes session `mcp.json` (with the per-launch URL + token) and adds `--mcp-config` flag to CLI command. |
 | Trust Manager | `src/main/agent/adapters/claude/trust-manager.ts` | Pre-approves kangentic MCP server in `~/.claude.json`. |
 | Board Refresh | `src/main/ipc/handlers/sessions.ts` | Forwards task-created/updated/backlog-changed events to renderer via IPC. |
@@ -59,7 +60,7 @@ This approach keeps `.mcp.json` completely untouched - no injection, no cleanup,
 
 ## Cross-Project Calls
 
-Every Kangentic MCP tool except `kangentic_get_current_task` accepts an optional `project` parameter. Use it to route a tool call at a *different* Kangentic project than the one the MCP client is bound to - no need to switch projects in the UI or reconfigure MCP.
+Every Kangentic MCP tool accepts an optional `project` parameter, with two deliberate exceptions: `kangentic_get_current_task` (it resolves the project from the caller's own worktree) and the whole `kangentic_browser_*` family (see [Browser automation tool surface](#browser-automation-tool-surface-kangentic_browser_): no argument names another project, and driving is confined to the connection's own, with `kangentic_browser_close_pane`'s `includeOtherProjects` the one opt-in that reaches beyond it). Use it to route a tool call at a *different* Kangentic project than the one the MCP client is bound to - no need to switch projects in the UI or reconfigure MCP.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
@@ -124,7 +125,7 @@ Create a task on the board (default: the To Do column on the active board) or in
 | `prUrl` | string | No | Pull request URL this task is about (e.g. `https://github.com/owner/repo/pull/123`). Board tasks only. |
 | `prNumber` | number | No | Pull request number this task is about. This is the field the linker actually anchors on (Tier 1); it is derived from `prUrl` when omitted, so passing the URL alone is enough for a standard `/pull/<n>` URL. Board tasks only. |
 
-**Filing a review task:** `prUrl` / `prNumber` are how a task names the PR it is about, and they are what links it. Writing the URL into `description` instead does **not** link it - the linker's anchors are git state and the stored `pr_number` only, never authored prose (see [PR Integration](pr-integration.md#the-confidence-ladder)). Both are applied as a follow-up update immediately after the row is created, so `pr_state` starts null and the next resolve fills in the live PR state.
+**Filing a review task:** `prUrl` / `prNumber` are how a task names the PR it is about, and they are what links it. Writing the URL into `description` instead does **not** link it - the linker's anchors are git state and the stored `pr_number` only, never authored prose (see [PR Integration](pr-integration.md#the-confidence-ladder)). Both are applied as a follow-up update immediately after the row is created, so `pr_state` starts null; a forced resolve fires right after the write and fills in the live PR state, so the card shows its state chip without waiting for the background sweep.
 
 `profile` is **mutually exclusive** with `agentOverride` / `modelOverride` / `effortOverride` / `permissionMode` / `runMode: "agent_override"`: a profile changes settings per column, those pin one value for the task's whole life. Passing both is rejected and nothing is created, rather than silently discarding one side (the repository enforces the same exclusivity on write). An unknown profile name is an error too - a typo must not quietly produce a task that looks tiered and runs on the plain board settings.
 
@@ -222,6 +223,12 @@ a sweep like *"change every profile's Opus 4.8 to Opus 5"* safe to run column by
 `replaceColumns: true` for a wholesale swap, the usual choice when copying a profile from another
 board.
 
+On the ACTIVE project this reaches live sessions, exactly as the Board Manager's own profile save
+does: retuning `modelOverride` / `effortOverride` restarts or live-injects the sessions of tasks
+riding the profile, and retuning `autoSpawn` for a column spawns or suspends the tasks already
+sitting in it. A profile edit targeting a background project (via `project`) only writes the file;
+see the blast-radius note under `kangentic_update_column`.
+
 ### kangentic_delete_board_profile
 
 Delete a Board Profile.
@@ -231,17 +238,30 @@ Delete a Board Profile.
 | `profile` | string | Yes | Profile name (case-insensitive) or id |
 | `project` | string | No | Delete from another project's board |
 
-Tasks riding the deleted profile are **not** rewritten; they fall back to each column's own settings
-and keep running, and the response reports how many were affected. Rewriting those rows would make
-a delete far more destructive than it looks and could not be undone by re-creating the profile.
+Tasks riding the deleted profile are **not** rewritten; they fall back to each column's own settings,
+and the response reports how many were affected. Rewriting those rows would make a delete far more
+destructive than it looks and could not be undone by re-creating the profile.
+
+Falling back to the column's own settings IS a settings change for a running session, so on the
+active project it propagates like any other profile edit. Usually that just re-tunes the model or
+effort and the session keeps running. The one case where it does not: if the deleted profile was
+what turned `autoSpawn` **on** for a column whose own setting is off, the fallback is a true-to-false
+flip, and the live session there is suspended (resumable by hand) rather than left running.
 
 ### kangentic_list_tasks
 
-List tasks, optionally filtered by column.
+List tasks, optionally filtered by column. Tasks come back in board order (top to bottom within each column).
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `column` | string | No | Filter by column name. If omitted, returns all tasks. |
+
+Each task reports a `position`: its zero-based ordinal slot within its own column, counting only
+non-archived tasks. This is the same slot vocabulary
+[kangentic_move_task](#kangentic_move_task)'s `position` and
+[kangentic_reorder_tasks](#kangentic_reorder_tasks) accept, so the listing can be read and handed
+straight back. It is deliberately not the raw stored `tasks.position` value, which develops gaps
+as tasks are archived.
 
 ### kangentic_search_tasks
 
@@ -275,7 +295,7 @@ Resolve the task that corresponds to the current working directory and/or git br
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `cwd` | string | No | Absolute working directory path. The tool extracts the worktree slug from `.kangentic/worktrees/<slug>` and matches against `tasks.worktree_path`. |
+| `cwd` | string | No | Absolute working directory path. The tool extracts the worktree folder name from `.kangentic/worktrees/<folder>` and matches against `tasks.worktree_path`. |
 | `branch` | string | No | Current git branch name. Exact (case-insensitive) match against `tasks.branch_name`. |
 
 At least one parameter is required. Returns the same task fields as `kangentic_find_task` (id, displayId, title, description, column, branchName, baseBranch, worktreePath, prNumber, prUrl, useWorktree, status). Returns `data: null` when no match is found, a single task object when one matches, or an array when multiple tasks match.
@@ -345,6 +365,12 @@ Get detailed column configuration: description, auto-spawn, permission mode, pla
 |-----------|------|----------|-------------|
 | `column` | string | Yes | Column name (case-insensitive) |
 
+Also returns `taskOrder`: the column's tasks top to bottom, each with its `position` (the
+zero-based ordinal slot described under [kangentic_list_tasks](#kangentic_list_tasks)). That makes
+this a complete read-before-write call for
+[kangentic_reorder_tasks](#kangentic_reorder_tasks). The rendered message caps the listing at 50
+tasks and says how many were omitted; `data.taskOrder` always carries the whole column.
+
 ### kangentic_update_task
 
 Update a task's title, description (full replace, in-place find/replace edits, or append), PR info, agent assignment, model/effort/permission overrides, priority, labels, base branch, worktree toggle, or attachments. To move a task between columns, use `kangentic_move_task` instead.
@@ -357,7 +383,7 @@ Update a task's title, description (full replace, in-place find/replace edits, o
 | `descriptionEdits` | array | No | Ordered exact-string replacements applied to the current description, like the file `Edit` tool: `[{ find: string, replace: string }]` (1-100 edits; each `find`/`replace` up to 50000 chars). Each `find` must be present and unique in the text as it stands after prior edits in the list, or the whole call fails and nothing is written. Mutually exclusive with `description`; may combine with `appendDescription` (edits apply first). |
 | `appendDescription` | string | No | Text appended to the end of the current description, exactly as given (no separator inserted, max 50000 chars). Mutually exclusive with `description`; may combine with `descriptionEdits` (edits apply first, then this append). |
 | `prUrl` | string | No | Pull request URL (e.g. `https://github.com/owner/repo/pull/123`). This is what links the task to a PR; a URL written into `description` does not. |
-| `prNumber` | number | No | Pull request number. The field the linker anchors on (Tier 1); derived from `prUrl` when omitted, so a URL-only write can never strand the previous PR's number. A number-only write leaves `pr_url` until the next resolve re-points it, which is harmless: the resolve follows the number you gave. |
+| `prNumber` | number | No | Pull request number. The field the linker anchors on (Tier 1); derived from `prUrl` when omitted, so a URL-only write can never strand the previous PR's number. A number-only write leaves `pr_url` pointing at the previous PR until the immediate link-time resolve re-points it, which is harmless: the resolve follows the number you gave. |
 | `agent` | string | No | Agent name to assign (e.g. `"claude"`, `"codex"`). Empty string clears. |
 | `priority` | number | No | Task priority 0-4 (0=none, 4=highest) |
 | `labels` | string[] | No | Replace the task's label list. Pass `[]` to clear. |
@@ -372,7 +398,7 @@ Update a task's title, description (full replace, in-place find/replace edits, o
 
 At least one updatable field is required.
 
-Setting `prUrl` or `prNumber` also clears the task's stored PR state, so the three PR columns never disagree. The next resolve fills the state back in from the PR itself. See [PR Integration](pr-integration.md#where-pr-state-is-persisted).
+Setting `prUrl` or `prNumber` also clears the task's stored PR state, so the three PR columns never disagree; a forced resolve fires immediately after the write and fills the state back in from the PR itself, so the card shows its state chip without waiting for the background sweep. See [PR Integration](pr-integration.md#where-pr-state-is-persisted).
 
 `profile` is **mutually exclusive** with `model` / `effort` / `permissionMode` / `runMode:
 "agent_override"` (and the task's `agent_override`): setting a profile clears the pins and forces
@@ -398,12 +424,54 @@ Returns the linked PR (number, url, state) on success, or a message when no PR i
 
 ### kangentic_move_task
 
-Move a task to a different column. Triggers the same lifecycle as a UI drag: spawning/suspending agents, creating/cleaning up worktrees, and running configured transition actions. Moving to the Done column auto-archives the task. Moving to To Do kills the session and removes the worktree.
+Move a task to a different column, optionally placing it at a chosen slot in that column. Triggers the same lifecycle as a UI drag: spawning/suspending agents, creating/cleaning up worktrees, and running configured transition actions. Moving to the Done column auto-archives the task. Moving to To Do kills the session and removes the worktree.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `taskId` | string | Yes | Task ID (numeric display ID or full UUID) |
 | `column` | string | Yes | Target column name (case-insensitive, e.g. `"Review"`, `"Done"`) |
+| `position` | number | No | Zero-based ordinal slot among the column's tasks (not a raw stored position); the tasks at and below it shift down. Clamped to the column, so a value past the end lands last. Omit to append to the end of the column, which is the default. |
+
+Naming the task's **current** column together with `position` repositions it in place. That path is
+presentation only: it does not change the task's column, session, worktree, or `session_id`, and it
+deliberately does not run the move lifecycle at all - so it cannot disturb a drag the user has in
+flight for the same card. Repositioning counts slots among the *other* tasks in the column, so
+`position: 0` is the top and the highest legal slot is one less than the column's length; moving
+*into* a different column counts slots among that column's existing tasks, where the column's length
+is the appending slot.
+
+`position` has no useful effect when moving into Done, which archives the task and takes it off the
+board.
+
+To re-sequence several tasks at once, use [kangentic_reorder_tasks](#kangentic_reorder_tasks).
+
+### kangentic_reorder_tasks
+
+Set the order of tasks within one column, top to bottom, in a single atomic call. This is the tool
+for sequencing a column by priority or execution order ("order To Do so the auth work comes first").
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `column` | string | Yes | Column name whose tasks are being reordered (case-insensitive) |
+| `taskIds` | string[] | Yes | Task IDs (numeric display IDs or full UUIDs), in the order they should appear from the top. Every ID must already be in that column. |
+| `project` | string | No | Project selector to target a different project |
+
+**Prefix semantics.** The listed tasks take the top slots in the order given; any task in the column
+you do not list keeps its relative order below them. So passing every ID sets the column's full
+order, and passing three IDs pins those three to the top. Being a prefix rather than a strict
+full-list contract is what makes the call safe against a live board: a task created between your
+read and your write simply sinks below the ones you named instead of failing the call.
+
+Read the current order first with [kangentic_list_tasks](#kangentic_list_tasks) or
+[kangentic_get_column_detail](#kangentic_get_column_detail).
+
+Reordering is presentation only. It never changes a task's column and never spawns, suspends, or
+otherwise touches a session or worktree - use [kangentic_move_task](#kangentic_move_task) to change
+a task's column. An ID that names a task in another column (or an archived one) is rejected rather
+than silently moved. Duplicate IDs are rejected too.
+
+Returns the column's resulting order as `{ id, displayId, position }` entries; the rendered message
+echoes the first 25 display IDs.
 
 ### kangentic_move_task_to_project
 
@@ -427,16 +495,71 @@ Update a swimlane (column) configuration. Use `kangentic_get_column_detail` to i
 | `description` | string \| null | No | Free-form column purpose shown as a header tooltip and shared via `kangentic.json` (max 1000 chars). `null` clears. |
 | `color` | string | No | Hex color (e.g. `"#71717a"`) |
 | `icon` | string \| null | No | Lucide icon name, or `null` to clear |
-| `autoSpawn` | boolean | No | Whether moving a task into this column auto-spawns an agent |
+| `autoSpawn` | boolean | No | Whether moving a task into this column auto-spawns an agent. For the ACTIVE project, changing it also applies to the tasks already in the column, immediately: switching it on spawns for each task with no session (never for a user-paused one, and never in To Do or Done), switching it off suspends the live sessions there |
 | `autoCommand` | string \| null | No | Slash command template injected on agent spawn (e.g. `"/review --strict"`). `null` clears. |
 | `agentOverride` | string \| null | No | Force a specific agent for this column. `null` uses project default. |
-| `modelOverride` | string \| null | No | Adapter-specific model identifier passed at spawn time (e.g. Claude `"opus"`, `"sonnet"`, `"claude-opus-4-7"`). `null` inherits the agent default. |
-| `effortOverride` | string \| null | No | Adapter-specific effort/reasoning level (e.g. Claude `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`). Valid values are agent-specific. `null` inherits the agent default. |
+| `modelOverride` | string \| null | No | Adapter-specific model identifier passed at spawn time (e.g. Claude `"opus"`, `"sonnet"`, `"claude-opus-4-7"`). `null` inherits the agent default. For the ACTIVE project this reaches sessions already running in the column: a model change restarts them in place with `--resume`. |
+| `effortOverride` | string \| null | No | Adapter-specific effort/reasoning level (e.g. Claude `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`). Valid values are agent-specific. `null` inherits the agent default. For the ACTIVE project this reaches sessions already running in the column: an effort change is injected live, without a restart. |
 | `permissionMode` | string \| null | No | One of: `default`, `plan`, `acceptEdits`, `dontAsk`, `bypassPermissions`, `auto`. `null` uses project default. |
 | `handoffContext` | boolean | No | Enable multi-agent handoff context preservation when entering this column |
 | `planExitTargetColumn` | string \| null | No | Column to auto-move the task to when an agent in plan mode exits planning. `null` disables. |
 
 At least one updatable field is required.
+
+**Cross-project edits write the setting but do not reconcile.** When you target another board with
+`project`, the column is updated and persisted to that project's `kangentic.json`, but no session
+there is spawned, suspended, restarted, or injected. That is a blast-radius decision, not an
+assumption that the project is idle: a background project CAN have live sessions (the Agent Monitor
+and the sidebar's per-project agent counts exist for exactly that). Spawning creates a worktree and
+checks out a branch in a checkout the user is not looking at, so the reconcile is held back and the
+project's tasks pick the new settings up when they next spawn. The cost is that turning `autoSpawn`
+off on a non-focused project leaves its agents running until it is next opened.
+
+### kangentic_create_column
+
+Add a new swimlane (column) to the board. Column names must be unique (case-insensitive) across
+every lane, including the archived Done lane.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `name` | string | Yes | Column name, unique on this board (max 100 chars) |
+| `description` | string | No | Free-form column purpose shown as a header tooltip and shared via `kangentic.json` (max 1000 chars) |
+| `color` | string | No | Hex color (e.g. `"#71717a"`). Defaults to blue. |
+| `icon` | string | No | Lucide icon name |
+| `autoSpawn` | boolean | No | Whether moving a task into this column auto-spawns an agent. Defaults to `true`. |
+| `autoCommand` | string | No | Slash command template injected on agent spawn (e.g. `"/review --strict"`) |
+| `agentOverride` | string | No | Force a specific agent for this column. Omit to use the project default. |
+| `modelOverride` | string | No | Adapter-specific model identifier passed at spawn time (e.g. Claude `"opus"`, `"sonnet"`) |
+| `effortOverride` | string | No | Adapter-specific effort/reasoning level (e.g. Claude `"low"`, `"high"`, `"xhigh"`) |
+| `permissionMode` | string | No | One of: `default`, `plan`, `acceptEdits`, `dontAsk`, `bypassPermissions`, `auto` |
+| `handoffContext` | boolean | No | Enable multi-agent handoff context preservation when entering this column |
+| `planExitTargetColumn` | string | No | Column to auto-move the task to when an agent in plan mode exits planning |
+| `position` | number | No | Zero-based ordinal slot among the board's columns (not a raw stored `position`); later columns shift right. Clamped between the role columns: a value below the lowest legal slot lands immediately after To Do (so `position: 0` does not come first), and a value at or past Done lands immediately before Done, never after it. Omit for the default placement just before Done. |
+
+Roles are structural and cannot be set: every board already has its To Do and Done columns.
+
+### kangentic_delete_column
+
+Delete a swimlane (column) from the board. Refused in two cases, deliberately:
+
+- **The column still holds tasks.** Move them with `kangentic_move_task` (or delete them) first.
+  This tool never touches a task: bulk-moving or orphaning them is a far larger action than the
+  caller asked for.
+- **The column is a role column** (To Do / Done). The board depends on both. Rename one instead if
+  you only want different wording.
+
+Everything that pointed at the column is cleaned up in the same operation: lane transitions,
+other columns' `planExitTargetColumn` values, Board Profile entries keyed to it, and any profile
+`planExitTarget` naming it. The response reports the counts. The committed `kangentic.json` mirror
+is rewritten too, which is load-bearing rather than cosmetic - see
+[Board Config Sync](configuration.md#board-config-sync-kangenticjson): the file re-seeds the
+database on project open, so a delete that left the file alone would be undone on the next open.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `column` | string | Yes | Column name to delete (case-insensitive) |
+
+This cannot be undone.
 
 ### kangentic_delete_task
 
@@ -743,33 +866,272 @@ Enumerate worktrees for one or every registered project. Each `WorktreeRecord` c
 
 These **shipped** tools let an agent drive the embedded **Browser pane** of a task (an Electron `<webview>` showing the user's own dev server, e.g. `ng serve` on `http://localhost:4200`). They are distinct from the dev-only `kangentic_devtools_*` tools below, which debug Kangentic itself. They attach Chrome DevTools Protocol to the pane's guest webContents in-process (no HTTP bridge, no lockfile). Implementation: `src/main/agent/mcp-http/browser-tools.ts` plus `src/main/browser/` (pane registry, driver, shared CDP driver).
 
-Targeting: every tool takes an optional `sessionId` or `taskId`; omit both to use the single open pane (errors with candidates when more than one is open). `kangentic_browser_list_panes` lists open panes.
+Targeting is scoped to the connection's own project (the `<projectId>` segment of the MCP URL). Every **driving** tool (navigate, observe, interact, eval) takes an optional `sessionId` or `taskId`, which must name a pane in that project; one in another project is refused with the `foreign-project` error kind. Omit both and resolution walks a precedence chain: the pane registered under the caller's own sessionId, then the caller's own taskId (a separate step so a session rotation such as `/clear` still finds the task's pane), then the single pane open in the project (errors with candidates when more than one is open). A step that matches nothing falls through to the next, so a caller with no session segment (a human-driven client, or the two-segment `.kangentic/mcp-config.json` URL) still resolves normally. `kangentic_browser_list_panes` lists the panes you can drive.
 
-Gating: the global **Agent Browser** settings tab controls the family, read live per request. `browserAutomation.enabled` is the master switch: when off, the entire `kangentic_browser_*` family is not registered, so the tools never appear in `tools/list` and the instructions omit their guidance section (they would be unusable anyway, and advertising them is wasted context). When `enabled` is on, the sub-capability gates apply: `allowInteraction` gates click/type/keypress/drag (off = observe-only); `allowNavigation` gates navigate; `allowEval` gates eval (off by default); `restrictNavigationToLocalhost` confines navigation to localhost/private hosts (off by default). With `enabled` on, each tool returns an actionable `{ kind, detail }` error when one of those sub-capabilities is gated off or no driveable pane exists.
+No tool in the family takes a `project` argument, so there is no way to *drive* another project's pane. Two tools sit outside the driving rule above, both deliberately:
 
-Tool categories (14 tools):
-- **Discovery:** `kangentic_browser_list_panes` - list open Browser panes and their URLs
+- `kangentic_browser_open_pane` takes neither `sessionId` nor `taskId`, because it always targets the caller's own task.
+- `kangentic_browser_close_pane` reaches other projects only on an explicit `includeOtherProjects`, which widens `all` and also lets an explicitly named foreign `sessionId` / `taskId` resolve. That is a deliberate carve-out for "close all browsers": closing a pane is not reading or controlling someone else's page, and retention keeps a backgrounded project's panes alive, so those are exactly what such a request should reach. Without the flag it stays scoped like everything else. Note the asymmetry - a foreign pane can be *seen* (`list_panes` with `includeOtherProjects`) and *closed*, never driven.
+
+Gating: the global **Agent Browser** settings tab controls the family, read live per request. `browserAutomation.enabled` is the master switch: when off, the entire `kangentic_browser_*` family is not registered, so the tools never appear in `tools/list` and the instructions omit their guidance section (they would be unusable anyway, and advertising them is wasted context). When `enabled` is on, the sub-capability gates apply: `allowInteraction` gates click/type/keypress/drag (off = observe-only); `allowNavigation` gates navigate; `allowEval` gates eval (off by default); `restrictNavigationToLocalhost` confines navigation to localhost/private hosts (off by default). With `enabled` on, each tool returns an actionable `{ kind, detail }` error when one of those sub-capabilities is gated off, when no driveable pane exists (`no-pane-open`), when the named pane belongs to another project (`foreign-project`), or when the window holding the pane is minimized and therefore composites no frames (`pane-not-rendering`). Screenshots have a further constraint: a window that is hidden or fully occluded also stops compositing, and Electron cannot report that to the main process, so `pane-not-rendering` does not catch it. Those captures instead fail after a short bound with a `driver-error` telling the user to bring the window to the front. Non-pixel tools (`query_dom`, `click`, `type`, and the rest) are unaffected and keep working against a backgrounded pane.
+
+Tool categories (16 tools):
+- **Discovery:** `kangentic_browser_list_panes` - list the Browser panes open in your project and their URLs. Each entry carries `sameProject` and `driveable`, and the response reports `otherProjectPaneCount` / `unknownProjectPaneCount` so an empty list is never mistaken for an idle machine. Pass `includeOtherProjects: true` to also list other projects' panes, which are visible but not driveable
+- **Lifecycle:** `kangentic_browser_open_pane`, `kangentic_browser_close_pane` - open and put away panes (below)
 - **Navigate:** `kangentic_browser_navigate` - point the pane at an http(s) URL
 - **Observe:** `kangentic_browser_screenshot`, `kangentic_browser_screenshot_element`, `kangentic_browser_query_dom`, `kangentic_browser_query_all`, `kangentic_browser_bounding_box`, `kangentic_browser_console`, `kangentic_browser_wait`
 - **Interact:** `kangentic_browser_click`, `kangentic_browser_type`, `kangentic_browser_keypress`, `kangentic_browser_drag`
 - **Eval:** `kangentic_browser_eval` - evaluate a JavaScript expression in the loaded page; gated by `browserAutomation.allowEval`
 
+### Opening and closing a pane
+
+`kangentic_browser_open_pane` opens the Browser pane for the **caller's own task** and loads a URL, so an agent that hits `no-pane-open` can get itself unstuck instead of stopping to ask the user. It takes no `sessionId` / `taskId`: naming another task is exactly the cross-project hole the caller-scoping work closed, so the target is always the caller's own task and there is no argument that can widen it.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `url` | string | No | Absolute http(s) URL to load. Falls back to the task's saved Browser URL, then the project default. |
+
+The URL is part of the same call by necessity: a pane with no URL renders the empty state and registers no `<webview>` guest, so it is invisible to `list_panes`, `navigate`, `screenshot`, and every other tool in the family. An open-without-navigate would strand the agent in a state nothing can act on. When no `url` is passed and neither fallback exists, the tool fails with `no-url` rather than opening an unusable pane.
+
+Behavior worth knowing:
+
+- **It opens the task's detail window if one is not already open.** That changes what is on the user's screen, which is deliberate: refusing would put the agent right back at the dead end this tool exists to remove.
+- **It returns only once the pane is registered and driveable**, resolved through the same `withGuest` chokepoint every driving tool uses, so the agent's very next call cannot race it. The wait is bounded (10s), after which it fails with `pane-open-timeout`. The one exception is a call that navigates nothing (the pane is already open and no `url` was passed): that returns the pane's registry status directly, having confirmed the guest is live but not that it is driveable.
+- **It is idempotent.** Called again with a different `url`, it navigates the existing pane rather than reopening it; the response's `opened` / `navigated` flags say which happened.
+- **It carries the `navigate` capability tier**, since it always loads a URL. Turning off "Allow navigation" in the Agent Browser settings therefore disables this tool too. The tier is checked before anything happens, so a gated-off call never opens a window or seeds a URL first.
+- Refusals it can return besides the shared ones: `no-caller-task` (the connection is not bound to a task, e.g. a Command Terminal), `project-not-open` (the caller's project is not the one currently open in Kangentic, so no window can be mounted for its tasks), `browser-pane-disabled` (the project has the Browser pane turned off), `task-not-found`, and `no-url`.
+
+`kangentic_browser_close_pane` puts panes away exactly as the user's Browser pill does. It closes the pane, never the task-detail window hosting it.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `sessionId` | string | No | Close the pane for this session. |
+| `taskId` | string | No | Close the pane for this task. |
+| `all` | boolean | No | Close every pane in scope instead of a single target. Use for "close all browsers". Takes precedence over `sessionId` / `taskId`, which are ignored when set. |
+| `includeOtherProjects` | boolean | No | Also close panes belonging to other projects. Widens `all` and an explicitly named target; it does not widen a bare no-argument call, which always means "my own pane". Default false. |
+
+With no arguments it resolves the caller's own pane through the same precedence chain the driving tools use. Unlike opening, it does **not** require the caller's project to be the one currently open: retention keeps a backgrounded project's panes alive, and those are exactly what a "close everything" request should reach.
+
+Scope is the caller's project by default, and the response always names the scope it applied (`this-project` / `all-projects`) plus `otherProjectPaneCount` for what it left alone, so a partial close is never reported as complete. `includeOtherProjects: true` is the explicit opt-in for a genuinely global close; it is off by default because another project may have an agent mid-verification in its pane. The response's `closed` and `skipped` arrays report what actually happened rather than what was attempted: a pane detached into its own pop-out window is the expected straggler, since it is mutually exclusive with the in-app mount and clearing the open flag does not unmount it.
+
 Cookie isolation is per worktree (`persist:kngbrowser-<hash(worktreePath)>`) so concurrent worktrees' dev environments never share a `localhost` cookie jar. See [embedded-browser.md](embedded-browser.md).
+
+### Shared target parameters
+
+Every **driving** tool below takes the same optional target pair. They are listed in each tool's table for completeness; the resolution precedence and the `foreign-project` rule are described once, above.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `sessionId` | string | No | Session whose Browser pane to target. Must name a pane in your own project. |
+| `taskId` | string | No | Task whose Browser pane to target. An alternative to `sessionId`, likewise same-project. |
+
+Omitting both resolves your own pane, then the single pane open in the project. Alongside the per-tool errors listed below, any driving tool can return the shared refusals raised while resolving and attaching to a pane: `no-pane-open`, `multiple-panes` (more than one is open and neither argument was given; the error carries the candidates), `foreign-project`, `pane-destroyed`, `pane-not-rendering`, `cdp-attach-failed`, and `driver-error`.
+
+The capability gate (`capabilityGate` in `src/main/browser/browser-pane-driver.ts`, the single source of the tier rules) adds four more: `automation-disabled` when the master switch is off, and `interaction-disabled` / `navigation-disabled` / `eval-disabled` for the tool's own tier. `automation-disabled` is reachable even though the family is not registered while the master switch is off, because the policy is read live per request: a switch flipped mid-session refuses the next call rather than waiting for a reconnect.
+
+### kangentic_browser_list_panes
+
+List the Browser panes open in your project, so you can discover a `sessionId` / `taskId` to drive or confirm the user has a dev server loaded. Returns an empty list when no pane is open. Not a driving tool: it takes no target pair.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `includeOtherProjects` | boolean | No | Also list panes in other projects. They are listed for visibility only and cannot be driven from this connection. Default false. |
+
+Returns `{ automationEnabled, projectId, panes, otherProjectPaneCount, unknownProjectPaneCount }`. Each pane carries its `sessionId`, `taskId`, current URL, liveness / debugger-attached state, plus `sameProject` and `driveable`. The two counts are why an empty `panes` list is never mistaken for an idle machine.
+
+### kangentic_browser_navigate
+
+Point the pane at an http(s) URL. This navigates the in-app pane the user has open, not a general web browser; the pane's URL bar and the per-task saved URL both update. Capability tier: `navigate`.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `sessionId` | string | No | Target pane by session. |
+| `taskId` | string | No | Target pane by task. |
+| `url` | string | Yes | Absolute http(s) URL to load, e.g. `http://localhost:4200`. |
+
+Returns `{ ok: true, url }` with the validated URL. The URL is checked before the pane is resolved, so a malformed URL or a non-http(s) scheme (`invalid-url`), or a non-local host while `restrictNavigationToLocalhost` is on (`navigation-host-blocked`), is refused without touching the pane.
+
+### kangentic_browser_screenshot
+
+Capture the pane's loaded page and return an inline image plus viewport and scale metadata for mapping image coordinates back to the page. Capability tier: `observe`.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `sessionId` | string | No | Target pane by session. |
+| `taskId` | string | No | Target pane by task. |
+| `fullPage` | boolean | No | Capture the full scrollable page instead of the viewport. Default false. |
+| `format` | string | No | `png` or `jpeg`. Default `jpeg`. |
+| `quality` | number | No | JPEG quality 1-100, ignored for png. Defaults to 80 for jpeg. |
+| `maxBytes` | number | No | Soft cap on decoded image bytes; the capture downscales and recompresses to fit. |
+
+Error modes beyond the shared set: `screenshot-failed` when CDP returns no data. A window that is hidden or fully occluded composites no frames and cannot be detected as such from the main process, so those captures fail after a short bound with a `driver-error` asking for the window to be brought forward. Non-pixel tools keep working against that same backgrounded pane.
+
+### kangentic_browser_screenshot_element
+
+Capture a screenshot clipped to a single element. Capability tier: `observe`.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `sessionId` | string | No | Target pane by session. |
+| `taskId` | string | No | Target pane by task. |
+| `selector` | string | Yes | CSS selector (or `text=` / `aria=` form) of the element to capture. |
+| `format` | string | No | `png` or `jpeg`. Default `png`. |
+| `quality` | number | No | JPEG quality 1-100, ignored for png. |
+| `maxBytes` | number | No | Soft cap on decoded image bytes. |
+
+Error modes: `selector-not-found` when nothing matches, `screenshot-failed` when the clip returns no data.
+
+### kangentic_browser_query_dom
+
+Read the `outerHTML` of the first element matching a selector. Capability tier: `observe`.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `sessionId` | string | No | Target pane by session. |
+| `taskId` | string | No | Target pane by task. |
+| `selector` | string | No | CSS selector (or `text=` / `aria=` form). Defaults to `html`. |
+| `includeBox` | boolean | No | Also return the element's `{x, y, width, height}` viewport box. |
+
+Returns `{ selector, outerHTML }`, plus `box` when `includeBox` is set. `box` is `null` when the element matched but CDP returned no usable box model. Error mode: `selector-not-found`.
+
+### kangentic_browser_query_all
+
+Measure every element matching a selector in one round-trip, instead of one call per element. Capability tier: `observe`.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `sessionId` | string | No | Target pane by session. |
+| `taskId` | string | No | Target pane by task. |
+| `selector` | string | Yes | CSS selector (or `text=` / `aria=` form). |
+| `includeHtml` | boolean | No | Include each element's `outerHTML`, clipped to 1024 characters. |
+| `limit` | number | No | Max elements to return. Default 100, max 1000. |
+
+Returns one entry per match with its tag, box, and attributes (attributes are always included). Error modes: `evaluate-failed` when the page-side query throws, `query-failed` when it returns nothing.
+
+### kangentic_browser_bounding_box
+
+Read the raw CDP box model (content, padding, border, and margin quads) of one element. Use `query_dom` with `includeBox` for the simpler rectangle. Capability tier: `observe`.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `sessionId` | string | No | Target pane by session. |
+| `taskId` | string | No | Target pane by task. |
+| `selector` | string | Yes | CSS selector of the element. |
+
+Returns `{ selector, ...boxModel }`. Error mode: `selector-not-found`.
+
+### kangentic_browser_console
+
+Read console messages captured from the pane. Capability tier: `observe`.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `sessionId` | string | No | Target pane by session. |
+| `taskId` | string | No | Target pane by task. |
+| `since` | string | No | ISO timestamp; only return entries at or after this time. |
+| `level` | string | No | One of `log`, `warn`, `error`, `info`, `debug`, `verbose`, `all`. Default `all`. |
+| `limit` | number | No | Max entries, newest last. Default 100, max 500. |
+
+Each entry is `{ ts, level, text, url, lineNumber }`. The underlying ring holds the most recent 500 messages per attached pane and starts filling when the debugger attaches, so messages logged before that are not retrievable. This is the product tool for the user's own page, separate from the dev-only `kangentic_devtools_console`, which reads Kangentic's own renderer.
+
+### kangentic_browser_wait
+
+Poll until an element appears, optionally containing text, or until a string appears anywhere in the body. Capability tier: `observe`.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `sessionId` | string | No | Target pane by session. |
+| `taskId` | string | No | Target pane by task. |
+| `selector` | string | No | CSS selector to wait for. |
+| `domText` | string | No | Text to wait for, within `selector` if given, else anywhere in `body`. |
+| `timeoutMs` | number | No | Max wait. Default 30000, max 60000. |
+| `intervalMs` | number | No | Poll interval. Default 250, max 5000. |
+
+Returns `{ matched: true, matchedAt }` or `{ matched: false, timedOutAfterMs }`. A timeout is an ordinary result, not an error, so check `matched` rather than assuming success. Error mode: `missing-condition` when neither `selector` nor `domText` is given.
+
+### kangentic_browser_click
+
+Click an element by selector, or a point by coordinates. Capability tier: `interact`.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `sessionId` | string | No | Target pane by session. |
+| `taskId` | string | No | Target pane by task. |
+| `selector` | string | No | CSS selector (or `text=` / `aria=` form) to click at its center. |
+| `x` | number | No | X coordinate. Use with `y` instead of `selector`. |
+| `y` | number | No | Y coordinate. |
+| `coordSpace` | string | No | `viewport` (default) or `image`, which maps screenshot pixels back via the device scale factor. |
+
+Pass either `selector` or both `x` and `y`. Returns `{ ok: true }`, plus the mapped `dispatched: { x, y }` on the coordinate path. Error modes: `selector-not-found`, `missing-target` when neither form is supplied, and `coord-mapping-failed` when `coordSpace: "image"` is used but the device scale factor could not be read.
+
+### kangentic_browser_type
+
+Type text into the pane. Capability tier: `interact`.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `sessionId` | string | No | Target pane by session. |
+| `taskId` | string | No | Target pane by task. |
+| `text` | string | Yes | Text to type. |
+| `selector` | string | No | CSS selector to focus before typing. Focus is taken by clicking the element's center. |
+| `clearFirst` | boolean | No | Select-all and delete before typing. Requires `selector`, since it runs as part of focusing. |
+
+Returns `{ ok: true }`. Error mode: `selector-not-found`. With no `selector`, the text goes to whatever the page currently has focused.
+
+### kangentic_browser_keypress
+
+Send a key or chord. Single printable characters are typed. Capability tier: `interact`.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `sessionId` | string | No | Target pane by session. |
+| `taskId` | string | No | Target pane by task. |
+| `keys` | string | Yes | Key or chord, e.g. `Enter`, `Escape`, `Tab`, `Ctrl+Shift+P`, `ArrowDown`. |
+
+Returns `{ ok: true }`. Error mode: `unknown-key` when the combo cannot be parsed.
+
+### kangentic_browser_drag
+
+Drag from one element to another: mouse press, move in steps, release. Capability tier: `interact`.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `sessionId` | string | No | Target pane by session. |
+| `taskId` | string | No | Target pane by task. |
+| `fromSelector` | string | Yes | CSS selector of the drag source. |
+| `toSelector` | string | Yes | CSS selector of the drop target. |
+| `steps` | number | No | Intermediate move steps. Default 10, max 60. Raise it for libraries that need several move events to register a drag. |
+
+Returns `{ ok: true }`. Error mode: `selector-not-found`, which covers either selector failing to match.
+
+### kangentic_browser_eval
+
+Evaluate a JavaScript expression in the loaded page's origin and return its value. Capability tier: `eval`, which is **off by default**: turn it on at Settings > Agent Browser > Allow eval.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `sessionId` | string | No | Target pane by session. |
+| `taskId` | string | No | Target pane by task. |
+| `expression` | string | Yes | JavaScript expression to evaluate. The resolved value is returned. |
+
+Returns `{ value }` with the serialized result. Error mode: `evaluate-failed`, carrying the page-side error text.
 
 ## Dev-only tool surface (`kangentic_devtools_*`)
 
-When `developer.previewInspectionServer` is enabled in dev builds (the toggle is excluded from production binaries via `__KANGENTIC_DEV__` esbuild dead-code elimination), 28 additional `kangentic_devtools_*` tools are registered against the same MCP server. They wrap a localhost-only HTTP inspection bridge that powers agent-driven UI inspection and interaction. Implementation lives in `src/devtools/mcp/preview-tools.ts` (build-excluded from production).
+When `developer.previewInspectionServer` is enabled in dev builds (the toggle is excluded from production binaries via `__KANGENTIC_DEV__` esbuild dead-code elimination), 32 additional `kangentic_devtools_*` tools are registered against the same MCP server. They wrap a localhost-only HTTP inspection bridge that powers agent-driven UI inspection and interaction. Implementation lives in `src/devtools/mcp/preview-tools.ts` (build-excluded from production).
 
 Tool categories:
 - **Discovery:** `list_instances` - enumerate running preview instances by lockfile
-- **State:** `engine_state`, `renderer_state`, `store_state` - live ActivityStatsSnapshot, the fixed Zustand snapshot, and arbitrary store reads by name plus dot/bracket path
+- **State:** `engine_state`, `renderer_state`, `store_state` - live ActivityStatsSnapshot, the fixed Zustand snapshot, and arbitrary store reads by name plus dot/bracket path. `store_state` also answers MAIN-side namespaces that are not Zustand stores: `detailOwners` returns the task-detail ownership map plus its recent mutation history (resolve / sync / release-all). That one exists because ownership was otherwise observable only by calling `requestOpen`, which focuses and can mount a window - probing changed what was being measured
 - **Visual / DOM:** `screenshot`, `screenshot_element`, `query_dom`, `query_all`, `computed_style`, `bounding_box`, `bounding_box_all`, `accessibility_tree`, `mutations` - the `_all` variants measure every matching element in one call
-- **React:** `react_query`, `react_tree`, `react_recent_renders` - fiber walker via `__REACT_DEVTOOLS_GLOBAL_HOOK__`
+- **React:** `react_query`, `react_tree`, `react_recent_renders` - fiber walker via `__REACT_DEVTOOLS_GLOBAL_HOOK__`. Caveat on `react_recent_renders`: in a Vite dev server it returns `[]`, because `@vitejs/plugin-react`'s react-refresh preamble installs the global hook AFTER preload has already looked for one, so the commit-ring wrapper is never attached. Read that `[]` as "not instrumented", never as "no React work happened" - use `event_loop_lag`'s `recentLongFrames` for render attribution instead
+- **Performance:** `event_loop_lag` - the freeze flight recorder for BOTH the main process and the renderer. Timestamped stalls past a 75ms threshold answer when the thread blocked; the renderer's `recentLongFrames` answers what ran, listing each long animation frame's heaviest scripts with the source URL and function that registered them. The breakdown is the diagnosis: script time means JS, `styleLayoutMs` means a style or layout cost, and a script's `forcedLayoutMs` means it read geometry it had just invalidated. Both rings carry wall-clock stamps, so a spike and its frame join by timestamp. Note `capture_trace` is NOT a CPU profile (it bundles a session's activity-engine JSONL taps for replay)
 - **Console:** `console` - CDP `Console.messageAdded` ring buffer (separate from product `tail_logs`)
 - **Drive (interaction):** `click`, `type`, `keypress`, `drag`, `wait`, `script` - dispatched via Chrome DevTools Protocol (the `script` `eval` step returns its value and is gated by `developer.previewEvalEnabled`)
 - **Eval:** `eval` - evaluate a JavaScript expression and return its serialized value; gated by `developer.previewEvalEnabled`
 - **Cross-instance:** `run_command` - run a product MCP command inside a specific preview instance
 - **Sessions:** `pty_input`, `inject_session_event`, `capture_trace` - `inject_session_event` and `pty_input` raw bytes are gated additionally by `developer.previewEvalEnabled`
+- **Terminal:** `pty_pipeline`, `terminal_state`, `terminal_forensics` - `pty_pipeline` reports per-session backpressure (pending / in-flight bytes, paused, scrollback size). `terminal_state` is the cross-process join: every mounted xterm's grid and pixel geometry next to that session's PTY dimensions, with `ptyMatchesGrid` / `colsDrift` / `gridOverflowPx` derived, plus the main and renderer lifecycle traces merged by timestamp (fits, PTY resizes, repaint-settle decisions, replay start / write / abort / done). Neither process can see a grid-vs-PTY mismatch or a replay ordering bug alone, which is why this is one call rather than two. `terminal_forensics` narrows to ONE session and answers which rows rather than how many: the renderer's xterm viewport row by row, main's own frame re-parsed to rows, and the raw PTY byte ring with control bytes escaped. Text missing from the raw tail means the agent never sent it (upstream); present there and in main's grid but not the renderer's means it was lost in the IPC / queue / write path; present in both grids means the fault is paint. Capture while the TUI is idle - main's grid comes from a bare serialize with no tail fold, so a mid-stream capture can trail the renderer by a frame
 
 These tools are excluded from production builds at compile time and have no effect in shipped binaries.
 
@@ -822,7 +1184,8 @@ The committed `.claude/settings.json` `mcp__kangentic` entry remains for humans 
 - **Runaway-loop safeguard** - task creations are capped at a fixed 500 per app launch, enforced atomically by the shared `TaskCounter`. This is an internal circuit breaker against a looping agent, not a user-tunable knob; the count resets on restart.
 - **Input validation** - Zod schemas enforce title (200 chars) and description (50000 chars for tasks; 10000 chars for backlog item descriptions) limits at the protocol level, and the command handlers validate again. A backlog item created via `kangentic_create_task` shares the task 50000-char Zod schema, so `handleCreateTask` enforces the 10000 backlog cap itself and rejects an over-cap backlog description rather than truncating it.
 - **Column safety** - `kangentic_create_task` defaults to the To Do column; creating in an auto_spawn column intentionally triggers agent spawn. `kangentic_move_task_to_project` follows the same rule on the destination board: landing in an auto_spawn `column` there spawns an agent.
-- **Destructive operations are explicit** - `kangentic_delete_task`, `kangentic_delete_backlog_item`, `kangentic_remove_task_attachment`, `kangentic_move_task`, and `kangentic_move_task_to_project` mutate the board. Agents must invoke them by name; there is no implicit fallback.
+- **Destructive operations are explicit** - `kangentic_delete_task`, `kangentic_delete_backlog_item`, `kangentic_delete_column`, `kangentic_remove_task_attachment`, `kangentic_move_task`, and `kangentic_move_task_to_project` mutate the board. Agents must invoke them by name; there is no implicit fallback.
+- **Column deletion never touches a task** - `kangentic_delete_column` refuses a column that still holds tasks, and refuses a role column (To Do / Done). Emptying a column is the caller's explicit, separate step; there is no `force` or bulk-move escape hatch.
 - **Cross-project relocation is scoped to To Do** - `kangentic_move_task_to_project` refuses to relocate a task outside the To Do column, since only a To Do task is guaranteed to have no live session or worktree that would be stranded in the source project's repo.
 - **Honest mutating annotations** - mutating tools carry `readOnlyHint: false`, so the plan-mode auto-approval surface is exactly the read-only set. Deletes, moves, and creates always prompt while planning, even though the auto-allow injection pre-approves them in default mode.
 

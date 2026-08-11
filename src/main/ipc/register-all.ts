@@ -44,6 +44,8 @@ import { registerMobileBridgeHandlers } from './handlers/mobile-bridge';
 import { registerUsageStatsHandlers } from './handlers/usage-stats';
 import { registerPopOutHandlers } from './handlers/pop-out';
 import { registerCompatibilityHandlers } from './handlers/compatibility';
+import { registerMonitorHandlers } from './handlers/monitor';
+import { registerTaskDetailOwnershipHandlers } from './handlers/task-detail-ownership';
 import { retrievalService } from '../retrieval/retrieval-service';
 import { MobileBridgeService } from '../mobile-bridge/mobile-bridge-service';
 import { BoardEventBus } from '../mobile-bridge/board-event-bus';
@@ -222,10 +224,7 @@ export function registerAllIpc(mainWindow: BrowserWindow, mcpServerHandle: McpHt
 
   const effectiveConfig = context.configManager.getEffectiveConfig(context.currentProjectPath ?? undefined);
   mobileBridgeService.reconcile({
-    // Dev-only until the mobile app launches: a production build never
-    // enables the bridge regardless of persisted config (paired gates:
-    // system.ts's config:set reconcile and the renderer's settings tab).
-    enabled: __KANGENTIC_DEV__ && (effectiveConfig.mobileBridge?.enabled ?? false),
+    enabled: effectiveConfig.mobileBridge?.enabled ?? false,
     relayUrl: resolveRelayUrl(effectiveConfig.mobileBridge),
   });
 
@@ -247,6 +246,8 @@ export function registerAllIpc(mainWindow: BrowserWindow, mcpServerHandle: McpHt
   registerUsageStatsHandlers(context);
   registerSystemHandlers(context);
   registerMobileBridgeHandlers(context);
+  registerMonitorHandlers(context);
+  registerTaskDetailOwnershipHandlers();
   registerPopOutHandlers(context);
   registerCompatibilityHandlers(context);
 

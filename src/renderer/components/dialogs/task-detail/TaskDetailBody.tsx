@@ -8,8 +8,7 @@ import { SessionSummaryPanel } from '../SessionSummaryPanel';
 import { BrowserPane } from '../../browser/BrowserPane';
 import { PriorityBadge } from '../../backlog/PriorityBadge';
 import { LabelPills } from '../../Pill';
-import { useConfigStore } from '../../../stores/config-store';
-import { useProjectStore } from '../../../stores/project-store';
+import { useTaskDetailHost } from './task-detail-host';
 import { QueuedPlaceholder } from './QueuedPlaceholder';
 import { taskHasDescriptionContent } from './description-content';
 import { AttachmentChipStrip } from '../AttachmentChipStrip';
@@ -76,7 +75,7 @@ interface TaskDetailBodyProps {
   pendingCommandLabel: string | null;
   savedAttachments: AttachmentWithPreview[];
   handlePreview: (attachment: AttachmentWithPreview) => void;
-  handleOpenExternal: (attachment: AttachmentWithPreview) => void;
+  handleOpenExternal: (attachment: AttachmentWithPreview) => Promise<void>;
   handleToggle: () => void;
   changesOpen: boolean;
   projectPath: string;
@@ -86,6 +85,13 @@ interface TaskDetailBodyProps {
   browserOpen: boolean;
   /** Whether the description peek is open (only relevant when hasSessionContext is true). */
   descriptionPeekOpen?: boolean;
+  /** The OWNING project's id when this window is retained for a BACKGROUNDED
+   *  project: mounted only so its Browser pane's `<webview>` guest survives.
+   *  Drops the terminal (an xterm parsing PTY output for a project the user is
+   *  not looking at is pure cost) while leaving every surrounding element in
+   *  place, and keeps the pane resolving against its OWN project rather than the
+   *  open board's, which the host context supplies. */
+  retainedProjectId?: string;
 }
 
 export function TaskDetailBody({
@@ -111,15 +117,26 @@ export function TaskDetailBody({
   onResetSession,
   browserOpen,
   descriptionPeekOpen = false,
+  retainedProjectId,
 }: TaskDetailBodyProps) {
-  const labelColors = useConfigStore((state) => state.config.backlog?.labelColors) ?? {};
-  const defaultBaseBranch = useConfigStore((state) => state.config.git.defaultBaseBranch);
-  // Default-agent tasks leave `task.agent` null; fall back to the project's
-  // default agent so the ContextBar picker can resolve capabilities (mirrors
-  // CommandBarOverlay). Non-null `task.agent` wins inside ContextBar.
-  const projectDefaultAgent = useProjectStore((state) => state.currentProject?.default_agent ?? null);
-  const projectId = useProjectStore((state) => state.currentProject?.id ?? '');
-  const browserPopOut = usePopOut('browser', { taskId: task.id, projectId });
+  const retained = retainedProjectId !== undefined;
+  // Project-scoped values come from the HOST, never from the open board: this
+  // surface can be hosted by the Agent Monitor for a task in another project.
+  // Default-agent tasks leave `task.agent` null; falling back to the hosting
+  // project's default agent lets the ContextBar picker resolve capabilities
+  // (mirrors CommandBarOverlay). Non-null `task.agent` wins inside ContextBar.
+  const {
+    projectId,
+    defaultAgent: projectDefaultAgent,
+    config: { labelColors, defaultBaseBranch },
+  } = useTaskDetailHost();
+  // The pane's project is the TASK's, not the open board's. They differ only for
+  // a retained window, whose project is backgrounded while the host context still
+  // reports whatever board is now open. Getting this wrong points the task-URL
+  // lookup at the wrong project's sidecar, which empties the pane and unmounts
+  // the guest retention exists to preserve.
+  const paneProjectId = retainedProjectId ?? projectId;
+  const browserPopOut = usePopOut('browser', { taskId: task.id, projectId: paneProjectId });
   const changesPopOut = usePopOut('changes', { taskId: task.id, projectId });
   const changesViewMode = useSessionStore((state) => state.changesViewMode[task.id] ?? 'split');
   const setChangesViewMode = useSessionStore((state) => state.setChangesViewMode);
@@ -302,6 +319,7 @@ export function TaskDetailBody({
               sessionId={sessionId}
               taskId={task.id}
               cwd={task.worktree_path ?? projectPath}
+              projectId={paneProjectId}
             />
           ) : changesPresent ? (
             changesContent
@@ -321,16 +339,28 @@ export function TaskDetailBody({
               style={rightPanelPresent ? { flexBasis: `${splitRatio * 100}%` } : undefined}
             >
               <div className="absolute inset-0">
-                <TerminalTab
-                  key={sessionId}
-                  sessionId={sessionId}
-                  taskId={task.id}
-                  active={true}
-                  releaseEscapeWhenPointerOutside={true}
-                  // The task-detail surface is window-hosted: refit immediately on
-                  // the window's resize/snap/maximize/divider dispatch (no 50ms lag).
-                  immediatePanelResize={true}
-                />
+                {/* A retained window is mounted ONLY to keep its Browser pane's
+                    <webview> guest alive while its project is backgrounded, so
+                    the terminal comes down: an xterm parsing PTY output for a
+                    surface nobody can see is pure cost, and it remounts from
+                    scrollback on return exactly as the ownership handoff already
+                    does. Swapping the child here (rather than dropping the
+                    wrapping divs) is deliberate: the sibling slots around
+                    `rightPanelElement` must keep their positions, because React
+                    matches these fixed children by index and a shifted index
+                    would remount BrowserPane and destroy the guest. */}
+                {retained ? null : (
+                  <TerminalTab
+                    key={sessionId}
+                    sessionId={sessionId}
+                    taskId={task.id}
+                    active={true}
+                    releaseEscapeWhenPointerOutside={true}
+                    // The task-detail surface is window-hosted: refit immediately on
+                    // the window's resize/snap/maximize/divider dispatch (no 50ms lag).
+                    immediatePanelResize={true}
+                  />
+                )}
               </div>
             </div>
           )}

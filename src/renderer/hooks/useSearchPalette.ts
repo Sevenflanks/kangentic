@@ -3,12 +3,9 @@ import { useKeybinding } from './useKeybinding';
 
 /** Preserved across HMR so the search palette stays mounted during hot
  *  module replacement instead of resetting to closed. */
-// @ts-expect-error -- Vite handles import.meta.hot
 const hmrSearchPaletteOpen: boolean = import.meta.hot?.data?.searchPaletteOpen ?? false;
 
-// @ts-expect-error -- Vite handles import.meta.hot
 if (import.meta.hot) {
-  // @ts-expect-error -- Vite handles import.meta.hot
   import.meta.hot.dispose((data: Record<string, unknown>) => {
     data.searchPaletteOpen = _lastIsOpen;
   });

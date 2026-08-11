@@ -5,6 +5,7 @@ Kangentic injects per-column `auto_command` values and supported effort changes 
 OpenCode 的初始內容走獨立私有 plugin 路徑。fresh launch 以 `OPENCODE_TUI_CONFIG` 載入 packaged `kangentic-startup.mjs`，由 mounted TUI plugin 在 route API 可用時建立並直接導向 session；project-local `.opencode/plugins/kangentic-activity.js` 則保留 activity telemetry 與 resume bootstrap。
 
 fresh 與 resume 使用不同 payload-path env，避免 TUI/server plugin 跨 Worker 搶同一私有檔案。fresh plugin 依序呼叫 flat v2 `session.create`、`route.navigate('session', { sessionID })`、`session.promptAsync`；resume server plugin 維持 legacy client 的 `session.get` 與 `promptAsync`。兩者皆不把 prompt 放進 argv、environment value 或 TUI config，也不以 sleep、poll、retry 或 `tui.session.select` 取代 route readiness。
+Kangentic injects per-column "auto-commands" and per-column model/effort settings into a live agent session when a task moves between columns. `TerminalSubmitScheduler` (`src/main/transition-engine/terminal-submit-scheduler.ts`) schedules each task's burst, decides WHEN it is delivered, and records the outcome. `TerminalSubmit.submitKeystrokes` (`src/main/pty/terminal-submit.ts`) executes the byte-level sequence (`Ctrl+U? → text → Esc? → Enter` per command), where the leading `Ctrl+U` clears any draft on a warm session and the `Esc` fires only for a `/`-prefixed command, at most once, and never during a live turn. Each step is a drain plus output-settle handshake rather than a fixed sleep. This document covers how the **command-injection** verification context confirms each chained command lands cleanly on the agent's TUI.
 
 ## What gets injected (the settings delta)
 
@@ -17,13 +18,25 @@ a **source** against a **target**:
   two override-less columns on a project with a default model/effort set would read source = the
   applied project default (recorded at the last spawn) vs target = null, and spuriously
   restart/re-inject even though nothing actually changed.
-- **Source** is the value the live session is *actually running at*, read from the session
-  record's `applied_model` / `applied_effort` columns: `task.<override> ?? record.applied_<field> ?? null`.
-  It is NOT the leaving column's config. The leaving column disagrees with reality after an
-  in-flight ContextBar switch or a `kangentic.json` column-config edit, and is null on a move
-  with no resolvable leaving-column - either case used to manufacture a redundant `/effort`
-  injection even though the spawn/resume `--model` / `--effort` flags had already applied the value.
-  A per-task override still wins for that field (source = target = pin, so no slash fires).
+- **Source** is the value the live session is *actually running at*. It is NOT the leaving
+  column's config. The leaving column disagrees with reality after an in-flight ContextBar switch
+  or a `kangentic.json` column-config edit, and is null on a move with no resolvable
+  leaving-column - either case used to manufacture a redundant `/effort` injection even though the
+  spawn/resume `--model` / `--effort` flags had already applied the value.
+  - **Effort:** `task.effort_override ?? <agent-reported effort> ?? record.applied_effort ?? null`
+    (`resolveSourceEffort`). `applied_effort` records what Kangentic *asked for*; an `/effort` the
+    user types straight into the terminal never reaches it. Preferring the agent's own reported
+    level fixes the case where applied = `high`, the user switched to `medium` by hand, and the
+    destination column requires `high`: source and target both read `high`, no slash fires, and
+    the session silently keeps running at `medium`. Callers resolve the live value with
+    `resolveLiveEffort(usageCacheReader, sessionId)`, where the reader is anything exposing
+    `getUsageCache()` (the handlers pass `context.sessionManager`). It is null for agents with no
+    live telemetry and for models with no effort levels, where the behaviour is unchanged.
+  - **Model:** `task.model_override ?? record.applied_model ?? null`. Deliberately *not* sourced
+    from telemetry: the agent reports a canonical id (`claude-opus-4-8`) while the configured
+    values are flag strings (`opus`), so comparing across those id spaces would read "changed" on
+    almost every move and `needsRestartForModel` would turn that into a PTY restart each time.
+  - A per-task override still wins for either field (source = target = pin, so no slash fires).
 
 When supported effort changes to a concrete target, the returned `InjectionPlan` carries
 `appliedSettings: { effort? }` for the emitted write. The `task-move` Priority 3c path and
@@ -31,6 +44,13 @@ When supported effort changes to a concrete target, the returned `InjectionPlan`
 scheduling the burst, so the session's recorded running value stays current and the *next*
 transition diffs against the truth. Model state is recorded by spawn or resume with the resolved
 launch overrides.
+When effort changes to a concrete target, the returned `InjectionPlan` carries an
+`appliedSettings: { effort? }`. Model is never recorded there: a model change restarts, and the
+respawn records `applied_model` itself via its `--model` flag. Each caller (the `task-move`
+Priority 3c path, the `SWIMLANE_UPDATE` propagation, and the `task:setRuntimeOverride` live path)
+persists it via `SessionRepository.updateAppliedSettings` after scheduling the burst, so the
+session's recorded running value stays current and the *next* transition diffs against the truth.
+The same `updateAppliedSettings` is written at spawn/resume with the resolved spawn overrides.
 
 ## Why verification exists
 
@@ -51,12 +71,33 @@ type SubmissionContextType = 'paste' | 'command-injection';
 
 type SubmissionContext =
   | { type: 'paste' }
-  | { type: 'command-injection'; text: string; agentSessionId?: string; cwd?: string; sentAt?: number };
+  | {
+      type: 'command-injection';
+      text: string;
+      agentSessionId?: string;
+      cwd?: string;
+      sentAt?: number;
+      mode?: 'command-match' | 'submitted';
+    };
 
 type SubmissionVerifier = (context: SubmissionContext) => Promise<boolean>;
 ```
 
-For the `'command-injection'` context, the verifier receives the literal command text plus session metadata (the captured `agent_session_id`, the session `cwd`, and `sentAt` - the wall-clock timestamp of the most recent Enter the verifier should match against) and returns `true` once it confirms the command was processed. `sentAt` advances on each retry-Enter so stale transcript entries from previous attempts cannot satisfy the current verification.
+For the `'command-injection'` context, the verifier receives the literal command text plus session metadata (the `agent_session_id`, the session `cwd`, and `sentAt` - the wall-clock timestamp of the most recent Enter the verifier should match against) and returns `true` once it confirms the command was processed. `sentAt` advances on each retry-Enter so stale transcript entries from previous attempts cannot satisfy the current verification. `mode` selects HOW strongly the command must be confirmed; see "Per-command verification modes" below.
+
+The `agent_session_id` is NOT captured once at plan-build time: `buildCommandInjectionVerifier`
+re-reads the session record by primary key (`findByAnyId(recordId)`) on every poll, and when the
+record's id has changed mid-burst it accepts a match under either the current or the
+plan-build-time id. A `/clear` during an in-flight burst forks the live conversation to a new id
+(see docs/adapter-session-history.md, "Mid-session fork reconcile"); polling only the
+plan-build-time id would never confirm, so the burst would spend its whole retry budget pressing
+Enter into a session whose evidence is being written somewhere else.
+
+The record is re-read on a 250ms TTL rather than on every poll. `findByAnyId` calls `db.prepare`
+inline and better-sqlite3 is synchronous, so polling it at the 25ms verify cadence would put 40
+blocking DB round trips per second per in-flight burst on the thread that services IPC. The TTL
+stays well inside a single 400ms retry attempt, so a fork is still picked up in the attempt that
+follows it.
 
 ## Claude's JSONL-polling implementation
 
@@ -69,24 +110,126 @@ A combined-args entry like `claude-opus-4-7\n/effort xhigh` is **not** a match b
 
 The scan is bounded by a 50ms tolerance window around the send time (`Date.now()` at the moment of the Enter), so the polling cadence (~25ms) lands on the expected entry within ~50-100ms in the happy path.
 
-## Retry semantics in `TerminalSubmit`
+## The delivery ladder
 
-`TerminalSubmitScheduler.scheduleKeystrokes` hands a chain of commands to `TerminalSubmit.submitKeystrokes`, which delivers them with the following timing:
+`auto_command` reaches the agent by more than one mechanism, and they do not have equal guarantees. Delivery is an ordered ladder that ends in one:
 
 0. **Optional leading `Ctrl+C`** (`sendCtrlC` opt-in, default true). The scheduler passes `sendCtrlC: false` when `opts.freshlySpawned` is true so fresh-spawn auto_command bursts skip the interrupt entirely. Regular live-injection paths (supported effort changes and board column edits on a running session) keep `sendCtrlC: true` so they can interrupt mid-thinking before delivering the new write. OpenCode trailing live lane commands are a separate `wait-for-native-idle` path: they use `sendCtrlC: false` and are cancelled if user input arrives before admission.
 1. Initial write of command text + Escape + Enter (text → `\x1b` → `\r`).
 2. **If the command falls within `verifiedPrefixLength`**: poll the verifier every 25ms for up to 400ms. If unconfirmed, re-fire `\r` and try again. After 4 retries, log a warning, send Ctrl+C to clear the prompt buffer, and continue with the next command.
 3. **Otherwise** (no verifier, or command falls outside the verified prefix): wait a fixed 500ms settle window before the next command.
+| Rung | Mechanism | When | Guarantee |
+|---|---|---|---|
+| 1 | **argv prompt** | The session is being spawned or resumed anyway (fresh spawn; a move that already needs a restart for a model change) | Guaranteed by the spawn |
+| 2 | **keystrokes** | A live warm session | Verified in the transcript, or falls to rung 3 |
+| 3 | **restart + argv prompt** | Rung 2 exhausted its retries on a *verifiable* command | Guaranteed by the spawn |
+| 4 | **recorded failure + notice** | Rung 3 unavailable or itself failed | Observable |
+
+Rung 1 is the most reliable path and must not be regressed into keystrokes (see `agent-spawn.ts`: a promptless isolated spawn never emits `'thinking'`, so the keystroke scheduler would burn its full 30s fallback and read as "the auto_command never ran").
+
+Rung 3 is what makes the guarantee falsifiable rather than aspirational. It routes through `restartSessionForSettingsChange`, which is already allowlisted as a non-first-spawn direct engine call, so escalation adds no new spawn entry point. Three constraints hold:
+
+- It is gated on the same turn-completion predicate deferred mode uses, never a bare `idle` check. A bare idle would fire during an API retry backoff or a `Monitor` wait and kill live work.
+- It is attempted at most once. If the restart's argv prompt still does not confirm, the outcome is `failed`.
+- It carries **only** the user's auto_command. An adapter-emitted settings write joined into an argv prompt stops being a slash invocation and becomes literal message text, and `--resume` preserves already-applied settings anyway.
+
+## Handshakes, not fixed sleeps
+
+`submitKeystrokes` used to sleep a flat 100ms between keypresses, sized against the worst observed Ink picker render. That is correct on an idle machine and wrong on a busy one, which is exactly why delivery degraded under load: when the picker took longer than 100ms, the Esc landed before it mounted (a no-op), the picker then rendered, and it ate the Enter.
+
+Each keystroke now waits for the TUI's own render instead:
+
+```
+Ctrl+U (if warranted) -> drain -> settle
+text                  -> drain -> settle    // longer idle for a slash picker
+Esc (slash, once, no live turn) -> drain -> settle   // separate READ
+Enter                 -> drain -> verify    // retries re-press Enter only
+```
+
+### Which keys, and why (verified against Claude Code's docs)
+
+Three key choices were originally wrong, and each produced a distinct reported bug. They are now grounded in Claude Code's documented behaviour rather than inference.
+
+| key | why |
+|---|---|
+| **Ctrl+U** clears the prompt | The docs name it directly: "Up arrow to edit queued messages or **Ctrl+U to clear the input line**". It replaced Ctrl+C, which means CANCEL and **exits the CLI on a double press**, and which did not reliably clear a draft - producing `Tell me about 10 planets with details/merge-pull-request`. Ctrl+U is line editing, so it also leaves a running turn alone. |
+| **no interrupt, ever** | "When a command is sent while Claude is responding, it typically **queues** and runs after the current turn finishes." Immediate mode therefore types and presses Enter; the CLI queues it. Interrupting was both unnecessary and the cause of the "it looked like it was editing a message already in flight" behaviour. |
+| **Esc at most once, never during a live turn** | Esc is not picker-scoped - the docs describe it as "**stop Claude while it is generating output**". So it must never fire while a turn is running (it would abort the agent), and never twice: on a non-empty prompt the first press prints "Esc again to clear" and the second **clears the command being submitted**. |
+
+Three details are load-bearing:
+
+- **The drain is what makes the wait mean anything.** `sessionManager.write` enqueues; the queue drains over later ticks. A delay measured without draining is a delay from the enqueue, not from the PTY.
+- **Settle observes `'data-tap'`, not `'data'`.** The `'data'` event is gated on renderer focus and is default-closed. Auto_command injection normally targets a session whose terminal is not the one on screen, so observing `'data'` would degrade every such delivery to the wall-clock cap.
+- **Esc and Enter must land in SEPARATE reads.** `\x1b` immediately followed by `\r` in one read *is* the terminal's Meta encoding: the TUI parses it as Alt+Enter, which Claude Code binds to "insert a newline" rather than "submit". `drain()` does not prevent this - it empties Kangentic's write queue and says nothing about how ConPTY chunks bytes to the child, so the two writes routinely coalesce. The two are separated by an output-settle wait (idle-based, capped by `ESC_SETTLE_CAP_MS`, currently 400ms), not a fixed sleep. What the gap buys is an encoding boundary, not a render wait: it matters only that the bytes land in separate reads, not how long the pause is.
+
+  This shipped briefly and was caught in manual testing: the command typed correctly, then every retry added a blank line to the prompt instead of submitting, and the burst escalated to a restart. An earlier version of this document argued the opposite - that Esc and Enter should stay adjacent to dodge a picker mounting between them. That trade was wrong twice over: nothing new is typed between the two keystrokes, so no new picker can mount, and the adjacency silently changed which KEY the TUI received.
+
+  The load rig missed it because `SimulatedSessionManager` delivered every `write()` as its own key event, which is not how a PTY behaves. It now buffers incoming bytes and parses them on a coalesce window, so Meta sequences form the same way they do in a real terminal. Removing the gap drops the no-verifier sweep from 85.7% to 57.1% and produces submissions like `"/code-review\n"`.
+
+**Esc is sent only for `/`-prefixed commands.** Its job is dismissing the slash-command picker, which only opens for a slash. On a plain-prose auto_command no picker exists and Esc is not a no-op on Claude Code's prompt, so sending it risks clearing the text just typed.
+
+### Retry, and what happens on exhaustion
+
+For a verifiable command, each attempt polls the verifier for 400ms; up to 5 attempts. **Retries re-press Enter alone.** Esc is sent at most once, on the first attempt only, because it is not a picker-scoped key: Claude Code documents it as "stop Claude while it is generating output", and on a non-empty prompt with no picker the first press prints "Esc again to clear", so a second press would delete the very command being submitted.
+
+On exhaustion the code does **not** write `Ctrl+C`. If the command actually did submit and verification merely lagged, that Ctrl+C would kill the turn it just started, and it was the only path that could produce two consecutive Ctrl+C presses and exit the CLI. Exhaustion reports a failure, and the scheduler escalates.
+
+### Prompt-state policy
+
+The clear is not a blunt universal. Three states:
+
+1. **Empty prompt** - nothing to clear. A fresh spawn's prompt is empty by construction, so the clear is skipped; sending it would only add a keystroke that historically landed mid-render.
+2. **User has text typed** - clear it, then type. Concatenation becomes impossible because the prompt is empty when we type. The discarded text is surfaced in a notice so it is recoverable rather than silently lost.
+3. **Agent mid-turn** - in immediate mode the clear *is* the interrupt, and it is reported rather than silent. Deferred mode cannot reach this state.
+
+"Empty at spawn time" is not "empty at delivery time": fresh-spawn delivery is deferred, and a user can type during the wait. That is the realistic path to the reported `instead can we/pull-request` bug, and it is why the fresh-spawn path still clears when the draft ledger saw the user type.
 
 ### Fresh-spawn concatenation failure mode
 
-The `Ctrl+C` opt-out exists to prevent a distinct concatenation failure mode from the chained-command one above. Fresh-spawn auto_command paths just consumed the CLI prompt arg (e.g. `claude -- "<task>...</task>"`) and the CLI is mid-render of that first user turn. On Windows ConPTY + Ink, sending `Ctrl+C` during that render lands in a state where the just-submitted prompt and the follow-up keystrokes get rendered as one user message: `</task>/test` glued together. Suppressing the leading `Ctrl+C` lets the keystrokes queue cleanly behind the in-flight turn and submit as a distinct second user message.
+Fresh-spawn auto_command paths just consumed the CLI prompt arg (e.g. `claude -- "<task>...</task>"`) and the CLI is mid-render of that first user turn. On Windows ConPTY + Ink, sending `Ctrl+C` during that render landed in a state where the just-submitted prompt and the follow-up keystrokes rendered as one user message: `</task>/test` glued together. That was a *timing* failure, and the drain + settle handshake after the clear is what fixes it properly; skipping the clear on an already-empty prompt is a separate, smaller decision.
 
 對 OpenCode 而言，Auto-command 只允許 already-running active writable compatible Main Session 的 later live path。它必須等待稍後相符的 root-native clean idle evidence，採 `sendCtrlC: false`，並在 user-input cancellation 時停止；generic public idle、child idle 或 timer 完成都不能授權。fresh、resume、handoff、restart、isolated、no-active lifecycle cases 都 finalizes a skip。ordinary Task prompt 與 continuation prompt 保持 separate，OpenCode plugin 的初始 payload transport 不會承接 Auto-command。Non-OpenCode existing legacy command-injection behavior remains intact.
 
 An action-backed spawn runs its own prompt and still finalizes the central Auto-command disposition.
 
 The `verifiedPrefixLength` distinction is critical: the deterministic adapter-emitted `/effort Y` write from `getInjectionSequence` is safe to verify because we know exactly what JSONL entry to expect. A trailing user-supplied `auto_command` is **not** verified: it may not produce a matching JSONL entry the verifier recognizes, and retry exhaustion would drop the user's intended action. So we let auto-commands sail through with a time-based settle.
+## The prompt-draft ledger
+
+`PromptDraftLedger` (`src/main/pty/prompt-draft-ledger.ts`) answers "has the user typed something and not sent it?" without reading the screen. The main process sees a raw ANSI byte stream, not a rendered screen, and the rendered screen lives in a renderer that may not even be showing this session - but every byte the user types passes through `SessionManager.write`, so accumulating those is a direct measure rather than an inference.
+
+`write` takes a `WriteOrigin` (`'user' | 'system'`, defaulting to `'system'`). The human-facing entry points (renderer `SESSION_WRITE`, dictation, the mobile bridge's interactive terminal and permission answers) pass `'user'`. Submit and clear bytes empty the ledger whatever their origin, since they empty the real prompt too; printable text counts only from `'user'`, so an injected command passing through is never mistaken for a draft.
+
+It is deliberately **not** load-bearing for correctness: a warm session clears unconditionally, so a stale or missed entry degrades the message the user sees, never the delivery. It changes behavior in exactly one place - the fresh-spawn path, where it only ever *adds* a clear that would otherwise be skipped.
+
+## Per-command verification modes
+
+Each command carries how its delivery may be confirmed:
+
+| Mode | Used for | Question answered |
+|---|---|---|
+| `command-match` | adapter-emitted settings writes (`/effort xhigh`) | did the transcript record a discrete invocation with exactly these args? |
+| `submitted` | the user's `auto_command` | did exactly this text become a user turn? |
+| `none` | adapters with no verifier | nothing; the outcome is `unconfirmed` |
+
+This replaced a single `verifiedPrefixLength` count. That shape could express only ONE semantic for a whole burst, so the trailing user auto_command - the thing users actually care about - had to be excluded from verification entirely and settled on a fixed timer. Per-command modes remove the hole by construction rather than by tuning a number.
+
+`submitted` is strictly weaker than `command-match`, and therefore always available: a user's command may be plain prose or an unregistered `/foo`, and Claude only treats a *leading* slash as a command anyway. The match must be **exact** - `instead can we/pull-request` *contains* `/pull-request`, so a substring test would confirm the precise bug this exists to catch.
+
+## Outcomes
+
+Every scheduled injection ends in exactly one recorded outcome, persisted on the task (`auto_command_state`, `auto_command_text`, `auto_command_error`, `auto_command_at`):
+
+| Outcome | Meaning | Notifies? |
+|---|---|---|
+| `confirmed` | seen in the transcript | only if it discarded a draft |
+| `unconfirmed` | nothing could be checked | no |
+| `escalated` | keystrokes went unconfirmed, so the command was delivered by restarting the session with it as the argv prompt | yes - a session respawn is never silent |
+| `failed` | a verifiable command exhausted its retries, and no restart delivered it either | yes |
+| `cancelled` | superseded or the session went away | no |
+
+`escalated` is checked BEFORE `confirmed` in `toState()` (`src/main/ipc/helpers/auto-command-outcome.ts`), so a delivery that required a restart is never reported as `confirmed`. Escalation resolving means the restart was ISSUED and argv delivery is guaranteed by the spawn; it does not mean a verifier watched it land, which is why it is neither `confirmed` nor `failed`.
+
+`unconfirmed` is **not** a failure. Only Claude implements a `command-injection` verifier, so on every other agent every delivery lands there; conflating the two would make the field meaningless off Claude and turn a normal delivery into an error notice for most users.
 
 ## When to use `'paste'` vs `'command-injection'`
 
@@ -115,21 +258,56 @@ Paste acceptance evidence is evaluated after Enter. It is distinct from initial-
 
 When an adapter returns `null`, the caller falls back to:
 - `'paste'`: activity event or any post-`\r` data byte (within 3s).
-- `'command-injection'`: a fixed 500ms inter-command settle.
+- `'command-injection'`: the handshake chain alone, with an outcome of `unconfirmed`.
 
-A non-Claude adapter could implement `'command-injection'` verification once its CLI exposes a comparable structured signal (e.g. a CLI-emitted JSONL transcript with command markers). Until then, time-based settles are the safest universal default.
+An adapter with no verifier cannot reach 100% delivery: with no confirmation signal there is nothing to retry against, and no failure to escalate. Measured on the load rig it reaches ~93% against Claude's 100%, and its safety property still holds absolutely (a delivery may be missed, but a wrong one is never submitted). A non-Claude adapter closes that gap by implementing `'command-injection'` verification once its CLI exposes a comparable structured signal.
+
+## Delivery modes
+
+A column declares WHEN its auto_command fires, via `Swimlane.auto_command_mode`:
+
+- **`immediate`** (default) - inject as soon as the task lands, interrupting the agent's current turn if there is one. The interruption is reported, not silent.
+- **`deferred`** - hold until the agent's current turn genuinely finishes.
+
+"Finishes" is the two-signal predicate in `src/main/transition-engine/turn-completion.ts`: activity is `idle` **and** the PTY has produced no output for a quiet window. A bare `idle` is not enough, because the catalogued sustained false idles (an API 529 retry backoff, a `Monitor` wait) report idle for minutes while the CLI keeps painting - a stability window expires inside both. Note the direction: output *present* holds delivery back; output *absent* is never taken as proof of anything on its own. `permission` is excluded from the completion set, since injecting there would answer the prompt with the command text.
+
+That single predicate is shared with rung-3 escalation; there is deliberately no second idle check.
+
+## Measured delivery rate
+
+`tests/unit/injection-load-rig.test.ts` drives the real `TerminalSubmit` against a TUI model that can fail the way the real one fails (a picker with a render delay that eats Enter, a prompt buffer that survives, a startup window that swallows Ctrl+C, an asynchronous write queue, and reads that coalesce so Meta sequences form). Before and after the rebuild:
+
+| Scenario | before | after |
+|---|---|---|
+| picker-render sweep | 57.1% | 100% |
+| loaded sweep (seeded jitter) | 57.5% | 100% |
+| draft present, warm session | 64.3% | 100% |
+| fresh spawn, user typed during wait | 0% | 100% |
+| startup render swallows the clear | 64.3% | 100% |
+| adapter with no verifier | 57.1% | 92.9% |
+
+Every "before" failure in the picker sweep fell in the 100-200ms band - exactly `KEYPRESS_DELAY < pickerRender < 2 * KEYPRESS_DELAY`. The fresh-spawn row is the reported bug verbatim: all 14 trials submitted `instead can we/code-review` as a single message.
 
 ## Test coverage
 
-- `tests/unit/agent-submission-verifier-shape.test.ts` enforces every registered adapter implements `getSubmissionVerifier`.
-- `tests/unit/terminal-submit.test.ts` covers the byte-level keystroke contract (Ctrl+C → text → Esc → Enter), sanitization, abort handling, and verifier integration including retry-on-Enter.
-- `tests/unit/terminal-submit-scheduler.test.ts` covers task-keyed scheduling: immediate delivery, drag-burst coalesce, freshlySpawned wait, queued wait, cancel/cancelAll.
-- `tests/unit/injection-plan.test.ts` covers `prepareInjectionPlan` building the sequence + verifier the scheduler consumes.
+- `tests/unit/injection-load-rig.test.ts` - the delivery-rate rig and its recorded before/after.
+- `tests/unit/injection-tui-simulator.ts` - the shared TUI model (not a test file).
+- `tests/unit/terminal-submit.test.ts` - byte contract, prompt-state policy, verification modes, retry recovery, and that exhaustion never writes Ctrl+C.
+- `tests/unit/terminal-submit-scheduler.test.ts` - scheduling, the FIFO queue (no silent drop), deferred mode, escalation, outcome reporting.
+- `tests/unit/turn-completion.test.ts` - the two-signal predicate, including the sustained false-idle cases.
+- `tests/unit/prompt-draft-ledger.test.ts` - draft accounting.
+- `tests/unit/auto-command-outcome.test.ts` - what is persisted vs what notifies.
+- `tests/unit/injection-plan.test.ts` - plan building and per-command verify modes.
+- `tests/unit/agent-submission-verifier-shape.test.ts` - every registered adapter implements `getSubmissionVerifier`.
 
 ## Files
 
-- `src/main/transition-engine/injection-plan.ts` -- builds the chained sequence + verifier from a column transition spec; sources the delta from the session record's `applied_model` / `applied_effort` and returns `appliedSettings` for the caller to persist.
-- `src/main/transition-engine/terminal-submit-scheduler.ts` -- task-keyed lifecycle wrapper: cancel-on-rerun, freshlySpawned wait, drag-burst coalesce, and `sendCtrlC` routing (suppressed for fresh-spawn, enabled for live-injection).
-- `src/main/pty/terminal-submit.ts` -- byte-level engine: `submitContent` (bracketed paste) + `submitKeystrokes` (manual keypress sequence with retry-on-unconfirmed).
-- `src/main/agent/adapters/claude/slash-command-verifier.ts` -- Claude-specific JSONL-polling implementation.
-- `src/shared/types.ts` -- `SubmissionContext`, `SubmissionContextType`, `SubmissionVerifier` type definitions.
+- `src/main/transition-engine/injection-plan.ts` - builds the command sequence (each with its verify mode) + verifier from a column transition spec; sources the effort delta from the agent's reported level ahead of the session record's `applied_effort` (`resolveLiveEffort` / `resolveSourceEffort`), the model delta from `applied_model` alone, and returns `appliedSettings` for the caller to persist.
+- `src/main/transition-engine/terminal-submit-scheduler.ts` - task-keyed lifecycle: the burst FIFO, fresh-spawn wait, deferred wait, escalation, and outcome reporting.
+- `src/main/transition-engine/turn-completion.ts` - the shared turn-completion predicate.
+- `src/main/pty/terminal-submit.ts` - byte-level engine: `submitContent` (bracketed paste) + `submitKeystrokes` (handshake chain, prompt-state policy, per-command verification).
+- `src/main/pty/output-settle.ts` - the settle primitive, shared with `paste-engine.ts`.
+- `src/main/pty/prompt-draft-ledger.ts` - unsent-user-text accounting.
+- `src/main/ipc/helpers/auto-command-outcome.ts` - persists the outcome and rations the notice.
+- `src/main/agent/adapters/claude/slash-command-verifier.ts` - Claude's JSONL-polling implementation, including the `submitted` exact-content scan.
+- `src/shared/types.ts` - `SubmissionContext`, `SubmissionContextType`, `SubmissionVerifier`, `AutoCommandMode`, `AutoCommandState`, `AutoCommandResultNotice`.

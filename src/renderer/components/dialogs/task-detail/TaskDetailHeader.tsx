@@ -14,12 +14,10 @@ import { useHeaderPillOverflow, type HeaderPillSpec } from './useHeaderPillOverf
 import { MaximizeToggleButton } from '../dialog-maximize';
 import { PriorityBadge } from '../../backlog/PriorityBadge';
 import { useToastStore } from '../../../stores/toast-store';
-import { useProjectStore } from '../../../stores/project-store';
+import { useTaskDetailHost } from './task-detail-host';
 import { useSessionStore } from '../../../stores/session-store';
 import { captureTerminalScrollback } from '../../../utils/terminal-capture-registry';
 import type { Task, AgentCommand, ShortcutConfig, Swimlane } from '../../../../shared/types';
-import { type TilePreset } from '../../../window-manager/tiling/presets';
-import { WindowLayoutMenu } from '../WindowLayoutMenu';
 
 /**
  * The pause/resume button glyph. The pause stays centered and visible for a
@@ -50,7 +48,7 @@ function PauseButtonIcon({
   if (toggling) return <Loader2 size={18} className="animate-spin" />;
 
   // Active and idle/permission share one packaged mark, differing only by color and motion
-  // (a marching dash vs a static ring), so the two states read as one visual language.
+  // (a rotating dashed arc vs a static ring), so the two states read as one visual language.
   //
   // Rendered at 20 in a 20px box, which is a pixel-for-pixel match for the lucide Circle +
   // hand-drawn bars this replaced: the packaged control ring is r=10 on a 20-unit ink box, so
@@ -119,11 +117,6 @@ interface TaskDetailHeaderProps {
   /** When provided (the window is tiled), render a "pop out" control that floats
    *  this pane out of the tiling - the only reliable undock in a full layout. */
   onUndock?: () => void;
-  /** Apply a one-shot tiling preset to the open windows (window mode only). When
-   *  omitted, the tile-layout control is hidden. */
-  onApplyTilePreset?: (preset: TilePreset) => void;
-  /** Whether 2+ windows are open, so the columns / grid presets are usable. */
-  canTileMultiple?: boolean;
 }
 
 /**
@@ -133,9 +126,12 @@ interface TaskDetailHeaderProps {
  * valid session id works - prefer the live one (readily available), otherwise
  * resolve the newest via listSessions. Shared by the header's Conversation
  * pill and the kebab "View conversation" item.
+ *
+ * `projectId` is passed in rather than read from the project store: this surface
+ * can be hosted for a task in a project other than the open board's, and the
+ * transcript lives in that project's DB.
  */
-async function openTaskConversation(taskId: string): Promise<void> {
-  const projectId = useProjectStore.getState().currentProject?.id ?? null;
+async function openTaskConversation(taskId: string, projectId: string | null): Promise<void> {
   let sessionId = useSessionStore.getState()._sessionByTaskId.get(taskId)?.id ?? null;
   // Capture the terminal's visible scrollback NOW, at click time, before the
   // async listSessions() gap below (during which live output could keep
@@ -202,14 +198,13 @@ export function TaskDetailHeader({
   isMaximized,
   onToggleMaximized,
   onUndock,
-  onApplyTilePreset,
-  canTileMultiple,
 }: TaskDetailHeaderProps) {
   const headerRef = useRef<HTMLDivElement>(null);
   const leadingRef = useRef<HTMLDivElement>(null);
   const trailingRef = useRef<HTMLDivElement>(null);
   const pillsRef = useRef<HTMLDivElement>(null);
   const titleSpanRef = useRef<HTMLSpanElement>(null);
+  const { projectId: hostProjectId } = useTaskDetailHost();
   const { copied: displayIdCopied, copy: copyDisplayId } = useCopyDisplayId(task.display_id);
   const closeCombo = useFormattedCombo('panel.close');
   const browserCombo = useFormattedCombo('taskDetail.toggleBrowser');
@@ -228,13 +223,12 @@ export function TaskDetailHeader({
     }
     let cancelled = false;
     setHistoricalConversationAvailable(false);
-    const projectId = useProjectStore.getState().currentProject?.id ?? null;
     window.electronAPI.transcripts
-      .listSessions(task.id, projectId)
+      .listSessions(task.id, hostProjectId || null)
       .then((list) => { if (!cancelled) setHistoricalConversationAvailable(list.length > 0); })
       .catch(() => { if (!cancelled) setHistoricalConversationAvailable(false); });
     return () => { cancelled = true; };
-  }, [task.id, liveSessionId]);
+  }, [task.id, liveSessionId, hostProjectId]);
   const conversationAvailable = Boolean(liveSessionId) || historicalConversationAvailable;
 
   // Quick-access pills, highest priority collapses LAST. The title is reserved only
@@ -407,7 +401,7 @@ export function TaskDetailHeader({
             <div data-pill-id="conversation" className="flex-shrink-0">
               <HeaderActionButton
                 icon={MessageSquare}
-                onClick={() => void openTaskConversation(task.id)}
+                onClick={() => void openTaskConversation(task.id, hostProjectId || null)}
                 disabled={!conversationAvailable}
                 title={conversationAvailable ? 'View conversation' : 'No conversation history for this task yet'}
                 ariaLabel="View conversation"
@@ -477,11 +471,8 @@ export function TaskDetailHeader({
           )}
         </KebabMenu>
 
-        {/* Divider + Tile layout + Pop out (tiled only) + Maximize + Close */}
+        {/* Divider + Pop out (tiled only) + Maximize + Close */}
         <div className="w-px h-5 bg-surface-hover flex-shrink-0" />
-        {onApplyTilePreset && (
-          <WindowLayoutMenu onApply={onApplyTilePreset} canTileMultiple={canTileMultiple ?? false} />
-        )}
         {onUndock && (
           <button
             onClick={onUndock}
@@ -579,12 +570,13 @@ function TaskDetailKebabItems({
   const [showMoveSubmenu, setShowMoveSubmenu] = useState(false);
   const [showCommandsSubmenu, setShowCommandsSubmenu] = useState(false);
   const [linkingPr, setLinkingPr] = useState(false);
+  const { projectId: hostProjectId } = useTaskDetailHost();
 
   const handleLinkPr = async () => {
     if (linkingPr) return;
     setLinkingPr(true);
     try {
-      const result = await window.electronAPI.tasks.resolvePr(task.id, useProjectStore.getState().currentProject?.id ?? null);
+      const result = await window.electronAPI.tasks.resolvePr(task.id, hostProjectId || null);
       if (result.reason === 'resolver-unavailable') {
         useToastStore.getState().addToast({
           message: 'GitHub CLI not found - install gh and run gh auth login to link PRs',
@@ -641,7 +633,7 @@ function TaskDetailKebabItems({
       <KebabMenuItem
         icon={<MessageSquare size={14} />}
         label="View conversation"
-        onClick={() => { closeAll(); void openTaskConversation(task.id); }}
+        onClick={() => { closeAll(); void openTaskConversation(task.id, hostProjectId || null); }}
         disabled={!conversationAvailable}
         data-testid="view-conversation-btn"
       />
@@ -709,10 +701,11 @@ function TaskDetailKebabItems({
           label={isSessionActive ? 'Pause session' : 'Resume session'}
           onClick={() => { closeAll(); onToggle(); }}
           disabled={toggling}
+          data-testid="toggle-session-btn"
         />
       )}
 
-      {/* Commands -- searchable flyout (shares CommandSearchList with the header
+      {/* Commands - searchable flyout (shares CommandSearchList with the header
           pill). Hover to open / leave to close, like Move to: the flyout is a DOM
           child of this container, so moving the pointer INTO it (to type in the
           search) stays within the container and keeps it open; the search input
@@ -749,7 +742,7 @@ function TaskDetailKebabItems({
         </div>
       )}
 
-      {/* Move to -- flyout submenu */}
+      {/* Move to - flyout submenu */}
       {moveTargets.length > 0 && (
         <div
           ref={moveFlyoutTriggerRef}
@@ -830,7 +823,7 @@ function TaskDetailKebabItems({
         />
       )}
 
-      {/* Delete -- always available */}
+      {/* Delete - always available */}
       <KebabMenuItem
         icon={<Trash2 size={14} />}
         label="Delete"

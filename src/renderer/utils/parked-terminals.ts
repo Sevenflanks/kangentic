@@ -19,7 +19,14 @@
  *
  * This mirrors the board-drag gate in session-update-coalescer.ts: a module
  * predicate plus a notify-listener set, with reset-on-HMR being harmless.
+ *
+ * Parking is NOT the only way a session stops receiving bytes: main also gates
+ * on its focused set, which a session can leave without ever being parked. That
+ * strictly wider edge lives in `focused-terminals.ts`; the two are deliberately
+ * separate because only parking carries the byte-dropping side effect.
  */
+
+import { traceTerminalRenderer } from './terminal-grid-registry';
 
 // Preserved across HMR (Pattern A, mirroring terminal-capture-registry.ts and
 // useTerminal.ts's savedScrollPositions). A components-only Fast Refresh does
@@ -27,14 +34,10 @@
 // so resetting these registries would orphan every already-registered reveal
 // listener in the discarded module instance - the parked terminal would then
 // never get its scrollback catch-up on reveal. Preserve the live Set/Map.
-// @ts-expect-error -- Vite handles import.meta.hot; tsc's "module": "commonjs" doesn't support it
 const parkedSessionIds: Set<string> = import.meta.hot?.data?.parkedSessionIds ?? new Set<string>();
-// @ts-expect-error -- Vite handles import.meta.hot
 const revealListenersBySession: Map<string, Set<() => void>> = import.meta.hot?.data?.revealListenersBySession ?? new Map();
 
-// @ts-expect-error -- Vite handles import.meta.hot
 if (import.meta.hot) {
-  // @ts-expect-error -- Vite handles import.meta.hot
   import.meta.hot.dispose((data: Record<string, unknown>) => {
     data.parkedSessionIds = parkedSessionIds;
     data.revealListenersBySession = revealListenersBySession;
@@ -56,6 +59,13 @@ export function syncParkedTerminals(parked: ReadonlySet<string>): void {
   for (const sessionId of parkedSessionIds) {
     if (!parked.has(sessionId)) revealed.push(sessionId);
   }
+  // Traced on BOTH edges. A park silently starts dropping inbound bytes and a
+  // reveal silently issues a replay, so without these the merged timeline shows
+  // a replay with no cause and a gap in the byte stream with no explanation.
+  for (const sessionId of parked) {
+    if (!parkedSessionIds.has(sessionId)) traceTerminalRenderer(sessionId, 'terminal-park');
+  }
+  for (const sessionId of revealed) traceTerminalRenderer(sessionId, 'terminal-reveal');
 
   parkedSessionIds.clear();
   for (const sessionId of parked) parkedSessionIds.add(sessionId);

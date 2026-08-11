@@ -29,12 +29,9 @@ export interface DiffLineChangeLike {
   modifiedStartLineNumber: number;
 }
 
-// @ts-expect-error -- Vite handles import.meta.hot; tsc's "module": "commonjs" doesn't support it
 const savedDiffScrollPositions: Map<string, DiffScrollPosition> = import.meta.hot?.data?.savedDiffScrollPositions ?? new Map<string, DiffScrollPosition>();
 
-// @ts-expect-error -- Vite handles import.meta.hot
 if (import.meta.hot) {
-  // @ts-expect-error -- Vite handles import.meta.hot
   import.meta.hot.dispose((data: Record<string, unknown>) => {
     data.savedDiffScrollPositions = savedDiffScrollPositions;
   });

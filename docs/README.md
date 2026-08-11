@@ -46,3 +46,11 @@ Kangentic is a cross-platform desktop Kanban for AI coding agents. Drag tasks be
 - [Deployment](deployment.md) -- Local Windows installer build, legal resources, update guard, QA
 - [Developer Guide](developer-guide.md) -- Setup, build system, testing, conventions
 - [Local Windows Installer QA](release-checklist.md) -- Local EXE verification, legal hashes, launch safety, no-publication checks
+- [Release Smoke Checklist](release-checklist.md) -- Manual real-LLM validation gate run against draft builds before publish
+
+### Historical
+
+Point-in-time findings documents. Kept for the reasoning they record; not maintained as
+evergreen references.
+
+- [Transcript Pipeline Audit](transcript-pipeline-audit.md) (2026-06-12) - Hardening the session-transcript pipeline for cross-agent consumption: per-adapter `parseTranscript`, Claude parser fidelity fixes, verified against real session files

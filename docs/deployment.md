@@ -18,7 +18,6 @@ npm run dev
 ## 建立本機 Windows Installer
 
 在 Windows 上執行：
-
 ```bash
 npm run make:win
 ```

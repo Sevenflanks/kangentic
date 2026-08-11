@@ -17,6 +17,7 @@ import { ModelEffortPicker } from './ModelEffortPicker';
 import { ProfilePicker } from './ProfilePicker';
 import { ElapsedTime } from './ElapsedTime';
 import { ToolBreakdownPopover } from './ToolBreakdownPopover';
+import { pill, pillForProvenance } from './context-bar-pill';
 
 interface ContextBarProps {
   sessionId: string;
@@ -29,7 +30,6 @@ function parseAgentVersion(version: string | null | undefined): string | null {
   return version?.replace(/\s*\(.*\)/, '') || null;
 }
 
-const pill = 'px-2 py-0.5 rounded bg-surface-raised whitespace-nowrap select-none';
 // `[transform:translateZ(0)]` promotes the footer to its own compositing layer.
 // Without it, a freshly-spawned tiled window's frame composites such that the bar's
 // text-only pills (shell / version / cost / tokens) lay out correctly but Chromium
@@ -38,6 +38,17 @@ const pill = 'px-2 py-0.5 rounded bg-surface-raised whitespace-nowrap select-non
 // the pills render from the first frame. The bar's popovers (model / effort picker,
 // token breakdown) BODY-PORTAL with `strategy: 'fixed'`, so they escape this layer's
 // stacking context / hit-test clip rather than overflowing it.
+//
+// Every root using this class also carries `data-no-dismiss`. In the bottom panel the bar is a
+// SIBLING of the terminal pane, so it is outside both the pane wrapper's marker and `.xterm`;
+// without its own marker a click on the bar's padding, its inter-pill gaps, or any text-only
+// pill (shell, version, cost, tokens, elapsed, the "Starting agent..." spinner) is dead space
+// inside the board's dismiss layer and would close an open task-detail window instead - which
+// also releases that window's session claim and re-creates the xterm. None of those pills has a
+// pointer cursor, so the cursor heuristic in `useClickOutsideToClose.ts` cannot exclude them.
+// The picker triggers are unaffected: the marker opts out of light dismiss, never of their own
+// clicks. Harmless in the task-detail and command-terminal hosts, which are already excluded
+// wholesale by `data-window-layer-root`.
 const containerClass = 'min-h-8 bg-surface/80 border-t border-edge flex flex-wrap items-center px-3 py-1.5 gap-x-2 gap-y-2 text-xs flex-shrink-0 [transform:translateZ(0)]';
 
 function formatResetTime(epochSeconds: number): string {
@@ -91,6 +102,13 @@ function RateLimitBar({ limitWindow }: { limitWindow: RateLimitWindow }) {
           100%, so nothing overflows horizontally and the track still reads as a
           pill. */}
       <span className="relative flex-1 min-w-[40px] h-1.5 bg-surface-hover rounded-full">
+        {/* This one stays on `width` on purpose, unlike the context fill above and
+            ContextUsageFooter's. The `minWidth: 2px` floor below keeps a barely
+            started window visible, and that is a width-space idea with no
+            scale-space equivalent short of measuring the track and dividing - a
+            layout read on every render, to remove a transition that fires when a
+            rate-limit window ticks, which is minutes apart rather than per token.
+            The composited-transform rewrite is not worth that trade here. */}
         <span
           className="block h-full rounded-full transition-[width,background-color] duration-300"
           style={{
@@ -232,6 +250,7 @@ export function ContextBar({ sessionId, agentFallback = null }: ContextBarProps)
           className={containerClass}
           data-testid="usage-bar"
           data-live-telemetry="unsupported"
+          data-no-dismiss
         >
           <span
             className={`${pill} text-fg-muted`}
@@ -247,6 +266,7 @@ export function ContextBar({ sessionId, agentFallback = null }: ContextBarProps)
       <div
         className={containerClass}
         data-testid="usage-bar"
+        data-no-dismiss
       >
         <span className={`${pill} text-fg-muted flex items-center gap-1.5`}>
           <Loader2 size={12} className="animate-spin" />
@@ -267,6 +287,11 @@ export function ContextBar({ sessionId, agentFallback = null }: ContextBarProps)
   // the inject closure does not depend on closure narrowing of `usage`.
   const liveModelId = usage.model.id;
   const liveEffort = usage.model.effort || null;
+  // Whether a real telemetry snapshot has arrived, as opposed to the spawn-time
+  // seed that fills in the model name from the `--model` flag before the agent
+  // has said anything. Without this the model pill reads as confirmed from the
+  // moment the session starts.
+  const telemetryLanded = usage.model.reportedByAgent === true;
   const isTransientSession = session?.transient === true;
   const transientAgent = !task && isTransientSession ? taskAgent : null;
   const handleTransientInject = (patch: { model?: string | null; effort?: string | null }) => {
@@ -335,6 +360,7 @@ export function ContextBar({ sessionId, agentFallback = null }: ContextBarProps)
     <div
       className={containerClass}
       data-testid="usage-bar"
+      data-no-dismiss
     >
       {/* First in the row: the profile determines the agent/model/effort to its
           right. Task-scoped only - the transient Command Terminal variant below
@@ -363,6 +389,7 @@ export function ContextBar({ sessionId, agentFallback = null }: ContextBarProps)
              picker falls through to task/swimlane overrides. The CLI never
              emits "" today, but matches the original ContextBar semantics. */
           liveEffort={liveEffort}
+          telemetryLanded={telemetryLanded}
           mode="live"
         />
       ) : transientAgent ? (
@@ -372,13 +399,25 @@ export function ContextBar({ sessionId, agentFallback = null }: ContextBarProps)
           liveModelName={modelName}
           liveModelId={liveModelId}
           liveEffort={liveEffort}
+          telemetryLanded={telemetryLanded}
           mode="live"
         />
       ) : (
+        /* No task row and no known transient agent: no picker, but the same two
+           values, so they declare provenance the same way. Effort here is read
+           straight off the snapshot, hence always live when present; the model
+           name can still be the spawn-time seed. */
         <>
-          <span className={`${pill} text-fg-muted`}>{modelName}</span>
+          <span
+            className={`${pillForProvenance(telemetryLanded)} text-fg-muted`}
+            data-model-source={telemetryLanded ? 'live' : 'configured'}
+          >
+            {modelName}
+          </span>
           {usage.model.effort && (
-            <span className={`${pill} text-fg-faint`}>{usage.model.effort}</span>
+            <span className={`${pill} text-fg-faint`} data-effort-source="live">
+              {usage.model.effort}
+            </span>
           )}
         </>
       )}
@@ -483,10 +522,17 @@ export function ContextBar({ sessionId, agentFallback = null }: ContextBarProps)
                   {fractionLabel}
                 </span>
               )}
+              {/* Scaled on X rather than width-animated: `transform` is composited,
+                  `width` costs layout and paint on every frame of the 300ms. Keep
+                  `transform` in the transition list - naming `width` here would
+                  leave the bar drawing at the right size but never animating, and
+                  no test asserts motion. See ContextUsageFooter.tsx, which carries
+                  the same treatment for the board and monitor cards. */}
               <div className="flex-1 h-1.5 bg-surface-hover rounded-full overflow-hidden" title={barTooltip}>
                 <div
-                  className="h-full rounded-full transition-[width,background-color] duration-300"
-                  style={{ width: `${Math.min(pct, 100)}%`, backgroundColor: progressColor }}
+                  className="h-full w-full origin-left rounded-full transition-[transform,background-color] duration-300"
+                  data-percent={Math.min(pct, 100)}
+                  style={{ transform: `scaleX(${Math.min(pct, 100) / 100})`, backgroundColor: progressColor }}
                 />
               </div>
               <span ref={pctRef} className="tabular-nums text-fg-faint whitespace-nowrap transition-colors duration-300" title={`${100 - pct}% remaining`}>{pct}%{!showFraction && ' context'}</span>

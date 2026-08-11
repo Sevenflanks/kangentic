@@ -22,6 +22,7 @@
 import { useEffect, useRef } from 'react';
 import type { Project, SessionEvent } from '../../shared/types';
 import { useBoardStore } from '../stores/board-store';
+import { EMPTY_LANE_PINS } from '../stores/board-store/lane-pins';
 import { useBacklogStore } from '../stores/backlog-store';
 import { useConfigStore } from '../stores/config-store';
 import { useSessionStore, cancelSync } from '../stores/session-store';
@@ -33,6 +34,7 @@ import {
   getProjectSnapshot,
 } from '../stores/project-cache';
 import { restoreWorkspaceForProject } from '../window-manager/persistence/restore-workspace';
+import { captureRetainedTasks, pruneRetainedTasks, planWindowRetention } from '../window-manager/bridge/retained-task-snapshots';
 import { useWindowStore } from '../window-manager/store/window-store';
 
 export function useProjectSwitchEffect(currentProject: Project | null): void {
@@ -95,6 +97,31 @@ export function useProjectSwitchEffect(currentProject: Project | null): void {
           closeWindow(managedWindow.id);
         }
       }
+
+      // Retain the outgoing project's task-detail windows that host an OPEN
+      // Browser pane. An Electron <webview> guest dies the moment its DOM node
+      // is unmounted, so this is the only way an agent in a backgrounded project
+      // can keep driving its own pane. Everything else still closes: retention
+      // is bounded to a surface the user deliberately opened, and a retained
+      // window drops its terminal, so the standing cost is one composited
+      // zero-opacity webview per pane and nothing else.
+      // `retainAnchors` and `snapshotTaskIds` are deliberately different sets:
+      // only THIS project's windows may be newly retained, but every already-
+      // retained window's frozen row must survive the prune. See
+      // `planWindowRetention` for why collapsing them breaks retention.
+      const { retainAnchors, snapshotTaskIds } = planWindowRetention(
+        Object.values(useWindowStore.getState().windows),
+        useSessionStore.getState().browserOpenTasks,
+      );
+      // Freeze the rows these windows will render from: the board store is
+      // project-scoped and is about to stop holding them. Only the outgoing
+      // project's own rows are present here, so an already-retained window's
+      // snapshot is carried by the prune set rather than re-captured.
+      captureRetainedTasks(
+        useBoardStore.getState().tasks.filter((candidate) => snapshotTaskIds.has(candidate.id)),
+      );
+      pruneRetainedTasks(snapshotTaskIds);
+      useWindowStore.getState().retainWindows(previousProjectId, retainAnchors);
 
       const boardState = useBoardStore.getState();
       const backlogState = useBacklogStore.getState();
@@ -164,6 +191,14 @@ export function useProjectSwitchEffect(currentProject: Project | null): void {
           archivedTotalCount: snapshot.board.archivedTotalCount,
           archivedFullyLoaded: snapshot.board.archivedFullyLoaded,
           shortcuts: snapshot.board.shortcuts,
+          // A lane pin is transient in-flight state for THIS project's board and
+          // must never survive a switch. The cold path self-heals (loadBoard's
+          // reconcile sees the pinned task absent from the new project's
+          // payload and drops it), but this is a direct setState, not a payload
+          // application, so it needs the explicit clear - and clearing on both
+          // branches makes "pins never cross a project" a statable invariant
+          // rather than an incidental one.
+          lanePins: EMPTY_LANE_PINS,
           hydrated: true,
           loading: false,
         });
@@ -256,7 +291,14 @@ export function useProjectSwitchEffect(currentProject: Project | null): void {
         // the old archive visible nor make this project's first loadBoard
         // fetch the full archive. archiveViewers is intentionally NOT reset:
         // it is refcounted by live component mount/unmount, not by switches.
-        useBoardStore.setState({ archivedTasks: [], archivedTotalCount: 0, archivedFullyLoaded: false });
+        // `lanePins` is cleared here as well as on the warm branch above, so
+        // "a pin never crosses a project" holds by construction rather than by
+        // relying on loadBoard()'s reconcile happening to find the pinned task
+        // absent from the new project's payload.
+        useBoardStore.setState({
+          archivedTasks: [], archivedTotalCount: 0, archivedFullyLoaded: false,
+          lanePins: EMPTY_LANE_PINS,
+        });
         const coldLoads = Promise.all([
           useBoardStore.getState().loadBoard(),
           useBacklogStore.getState().loadBacklog(),
@@ -373,7 +415,10 @@ export function useProjectSwitchEffect(currentProject: Project | null): void {
       // leaving the previous project's totals on screen. No-ops when closed.
       useUsageDashboardStore.getState().onProjectSwitched();
     } else {
-      useBoardStore.setState({ tasks: [], swimlanes: [], archivedTasks: [], archivedTotalCount: 0, archivedFullyLoaded: false });
+      useBoardStore.setState({
+        tasks: [], swimlanes: [], archivedTasks: [], archivedTotalCount: 0, archivedFullyLoaded: false,
+        lanePins: EMPTY_LANE_PINS,
+      });
       useSessionStore.setState({
         activeSessionId: null,
         dialogSessionIds: [],

@@ -2,12 +2,13 @@ const PROCESS_START = performance.now();
 
 import { app, BrowserWindow, clipboard, Menu, nativeImage, powerMonitor, session, shell } from 'electron';
 import path from 'node:path';
+import fs from 'node:fs';
 import { registerAllIpc, getSessionManager, getTerminalSubmitScheduler, getBoardConfigManager, getCurrentProjectId, getOptionalIpcContext, openProjectByPath, deleteProjectFromIndex, pruneStaleWorktreeProjects, activateAllProjects, getLastOpenedProject } from './ipc/register-all';
 import { installDiagnostics } from './diagnostics/install';
 import { startEventLoopLagMonitor } from './diagnostics/event-loop-lag';
 // Dev-only (dropped from prod via __KANGENTIC_DEV__ dead-code elimination).
 import { createPreviewClone, fillPreviewClone, registerEphemeralProjectDevIpc } from '../devtools/main/ephemeral-projects';
-import { resolvePreviewTaskTitle } from '../devtools/main/preview-task-title';
+import { resolvePreviewTaskLabel } from '../devtools/main/preview-task-title';
 import { registerSeedGitChangesDevIpc } from '../devtools/main/seed-git-changes';
 import { registerSeedEmbeddingBacklogDevIpc } from '../devtools/main/seed-embedding-backlog';
 import { registerSeedLargeConversationDevIpc } from '../devtools/main/seed-large-conversation';
@@ -25,6 +26,25 @@ const windowConfigManager = new ConfigManager();
 import { initAnalytics, trackEvent, sanitizeErrorMessage, shouldEmitHeartbeat, setAnalyticsClientId } from './analytics/analytics';
 import { resolveClientId } from './analytics/client-id';
 import { PATHS } from './config/paths';
+// Whether this launch found an existing global config.json. Read at module
+// scope, before anything can call ConfigManager.save(): this is the only
+// reliable way to tell a fresh install from an upgrade, since on an existing
+// machine the file is there but simply lacks any newly-added key, and after the
+// first save() the two cases are indistinguishable. Consumed by the What's New
+// seed in app.whenReady(). An instance flag on ConfigManager would not do -
+// this file's manager and the lazily-built one in ipc/register-all.ts would
+// disagree depending on which happened to load first.
+//
+// Placement is readability only. esbuild bundles every imported module's
+// top-level code ABOVE this file's own statements, so sitting here rather than
+// beside windowConfigManager changes nothing about when this runs. The real
+// invariant is that no module in the import graph writes PATHS.configFile at
+// module scope: ConfigManager.save() is its only writer, and every call site is
+// inside a function. Adding a module-scope config write anywhere upstream would
+// break this silently, wherever this line sits. Note that load() counts as such
+// a write on a fresh install - its windowLightDismiss migration saves the
+// one-shot marker there - so a module-scope load() breaks this too.
+const configFileExistedAtLaunch = fs.existsSync(PATHS.configFile);
 import { initStartupTimer, mark, phase, endPhase, finishStartupTimer } from './startup-timer';
 import { resolveBackgroundColor, resolveIconPath, resolveWindowBounds, resolveRendererIndexPath } from './window-utils';
 import { popOutWindowManager } from './pop-out/pop-out-window-manager';
@@ -41,6 +61,7 @@ import { MIN_ZOOM, MAX_ZOOM } from '../shared/zoom-steps';
 import { defaultDeveloperFlag, type DeveloperFlagKey } from '../shared/developer-flag-defaults';
 import { createExternalWindowOpenHandler } from './window-open-policy';
 import { initUpdater, updateUpdaterWindow, stopUpdaterTimers } from './updater';
+import { initAnnouncements, updateAnnouncementsWindow, stopAnnouncementTimers } from './announcements';
 
 initStartupTimer(PROCESS_START);
 mark('process_start');
@@ -196,10 +217,12 @@ const appLaunchTime = Date.now();
 const isEphemeral = process.argv.includes('--ephemeral');
 const isE2ETest = process.env.NODE_ENV === 'test';
 
-// Dev-only: the original task's title for a `/preview` window, resolved once from
-// the real parent project DB (the preview clones never contain it). Surfaced to the
-// renderer via additionalArguments so the title bar can identify the task both clones
-// belong to. Memoized; null outside dev-preview or when resolution misses (graceful).
+// Dev-only: the original task's label (`#<id> - <title>`) for a `/preview` window,
+// resolved once from the real parent project DB (the preview clones never contain it).
+// Surfaced to the renderer via additionalArguments so the title bar can identify the task
+// both clones belong to, and reused verbatim as the OS window title so the taskbar
+// thumbnail says the same thing. Memoized; null outside dev-preview or when resolution
+// misses (graceful).
 let cachedPreviewTaskTitle: string | null | undefined;
 function getPreviewTaskTitle(): string | null {
   if (cachedPreviewTaskTitle === undefined) {
@@ -213,7 +236,7 @@ function getPreviewTaskTitle(): string | null {
       ? [getCwdArg(), process.cwd(), app.getAppPath()]
       : [];
     cachedPreviewTaskTitle = worktreeCandidates.reduce<string | null>(
-      (resolved, candidate) => resolved ?? (candidate ? resolvePreviewTaskTitle(candidate) : null),
+      (resolved, candidate) => resolved ?? (candidate ? resolvePreviewTaskLabel(candidate) : null),
       null,
     );
   }
@@ -317,7 +340,11 @@ app.on('web-contents-created', (_event, contents) => {
     // the only listener, and the main window's in-app pane is unmounted while popped out).
     const hostWindow = BrowserWindow.fromWebContents(contents.hostWebContents ?? contents);
     if (hostWindow && !hostWindow.isDestroyed()) {
-      hostWindow.webContents.send(IPC.BROWSER_ZOOM_CHANGED, clampedFactor);
+      // Carry the guest's own id: one window can host SEVERAL Browser panes (a
+      // second task's window, or a pane retained for a backgrounded project), and
+      // a factor-only broadcast makes every one of them adopt a zoom the user
+      // applied to just one.
+      hostWindow.webContents.send(IPC.BROWSER_ZOOM_CHANGED, clampedFactor, contents.id);
     }
   });
 
@@ -531,11 +558,22 @@ const createWindow = () => {
     if (boundsTimer) clearTimeout(boundsTimer);
     boundsTimer = setTimeout(() => {
       if (!mainWindow || mainWindow.isDestroyed() || mainWindow.isMinimized()) return;
+      // Prefer the app-canonical manager, exactly as the pop-out bounds writer
+      // below does. ConfigManager.save() deep-merges into its OWN cached config
+      // and rewrites the whole file, and windowConfigManager's cache is populated
+      // at startup for resolveWindowBounds. Saving bounds through it therefore
+      // writes a snapshot that predates every setting the renderer has written
+      // since (through context.configManager), silently reverting them on the
+      // next window move or resize. Caught because it clobbered
+      // lastWhatsNewShownVersion, which made the What's New dialog reopen on a
+      // later launch, but the same clobber applied to any setting changed after
+      // launch.
+      const boundsConfigManager = getOptionalIpcContext()?.configManager ?? windowConfigManager;
       if (mainWindow.isMaximized()) {
-        windowConfigManager.save({ windowMaximized: true });
+        boundsConfigManager.save({ windowMaximized: true });
       } else {
         const bounds = mainWindow.getBounds();
-        windowConfigManager.save({ windowBounds: bounds, windowMaximized: false });
+        boundsConfigManager.save({ windowBounds: bounds, windowMaximized: false });
       }
     }, 500);
   };
@@ -745,7 +783,22 @@ const createWindow = () => {
     if (cwd && mainWindow) {
       const worktreeMatch = cwd.replace(/\\/g, '/').match(/\.kangentic\/worktrees\/([^/]+)/);
       if (worktreeMatch) {
-        mainWindow.setTitle(`Kangentic - ${worktreeMatch[1]}`);
+        // A preview window gets the task's own `#<id> - <title>` label, with no
+        // app-name prefix: Windows already groups these thumbnails under
+        // Kangentic, so repeating it only pushed the part that identifies the
+        // window past the edge of the thumbnail. The number alone was not enough
+        // either - it still meant scanning the board to learn which task it was.
+        // Same string the title-bar pill renders, so the two cannot drift.
+        //
+        // Outside preview (or when resolution missed), keep the app-name form:
+        // there the title is the only thing distinguishing a worktree run from
+        // the main window. Current worktree folders are the task's display_id;
+        // folders created before that scheme keep their `<slug>-<shortId>` name,
+        // so prefix the numeric form to stop it reading as a window index.
+        const folderName = worktreeMatch[1];
+        const folderLabel = /^\d+$/.test(folderName) ? `#${folderName}` : folderName;
+        const previewLabel = getPreviewTaskTitle();
+        mainWindow.setTitle(previewLabel ?? `Kangentic - ${folderLabel}`);
       }
     }
 
@@ -816,6 +869,19 @@ app.whenReady().then(async () => {
   // Must run before createWindow() which triggers session recovery.
   ensureSpawnHelperPermissions();
 
+  // On a fresh install, record the running version as already having shown its
+  // "What's New" notes. A first-time user has not upgraded from anything, so
+  // showing them what changed is meaningless, and it would stack on the
+  // onboarding walkthrough that opens on this same boot. An existing install
+  // keeps the merged '' default and correctly sees the notes after it upgrades.
+  //
+  // Must run before createWindow(): a direct save() does not broadcast
+  // CONFIG_CHANGED (only the config:set handler does), so seeding after the
+  // renderer has fetched config would never reach it.
+  if (!configFileExistedAtLaunch) {
+    windowConfigManager.save({ lastWhatsNewShownVersion: app.getVersion() });
+  }
+
   // Start the in-process MCP HTTP server BEFORE createWindow so the URL
   // is available when projects.ts writes per-project mcp-config.json
   // and command-builder writes per-session mcp.json. Bound to 127.0.0.1
@@ -884,6 +950,7 @@ app.whenReady().then(async () => {
 
   createWindow();
   initUpdater(mainWindow!);
+  initAnnouncements(mainWindow!);
 
   // Windows has no powerMonitor 'shutdown' event (Linux/macOS only). An OS
   // shutdown/restart/log-off there is signaled via this BrowserWindow event
@@ -997,6 +1064,7 @@ app.on('activate', () => {
   if (BrowserWindow.getAllWindows().length === 0) {
     createWindow();
     updateUpdaterWindow(mainWindow!);
+    updateAnnouncementsWindow(mainWindow!);
   }
 });
 
@@ -1045,6 +1113,7 @@ function getShutdownDependencies() {
     getCurrentProjectId,
     deleteProjectFromIndex,
     stopUpdaterTimers,
+    stopAnnouncementTimers,
     clearPendingTimers: () => {
       if (activateAllProjectsTimer) {
         clearTimeout(activateAllProjectsTimer);

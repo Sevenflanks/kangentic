@@ -11,6 +11,7 @@ import {
   browserPaneRegistry,
   type ResolveTargetSelector,
 } from '../../browser/browser-pane-registry';
+import { openPaneForCallerTask, closePanes } from '../../browser/browser-pane-opener';
 import type { ResolvedBrowserAutomationConfig } from '../../browser/browser-automation-config';
 import {
   clickAtCenterOfSelector,
@@ -44,12 +45,18 @@ import { READ_ONLY_ANNOTATIONS, MUTATING_ANNOTATIONS } from './annotations';
  * global automation policy, resolves the target pane, attaches CDP, and shapes
  * a `{ kind, detail }` error envelope. Capability tiers: observe (screenshot,
  * query, console, wait), interact (click/type/keypress/drag), navigate, eval.
+ *
+ * Every target is scoped to the connection's own project (the `<projectId>`
+ * segment of the MCP URL). This family deliberately takes NO `project`
+ * argument and is deliberately NOT handed the `RequestResolver`, so "there is
+ * no path to another project's pane" is a type-level guarantee rather than a
+ * convention. See `.claude/rules/browser-automation-driver.md`.
  */
 
 const SESSION_DESC =
-  'Optional Kangentic sessionId of the task whose Browser pane to target. Omit to use the single open pane (errors if more than one is open). Use kangentic_browser_list_panes to discover panes.';
+  "Optional Kangentic sessionId of the task whose Browser pane to target. Must name a pane in your own project; a pane in another project is refused. Omit to use your own task's pane, or the single pane open in your project. Use kangentic_browser_list_panes to discover panes.";
 const TASK_DESC =
-  'Optional Kangentic taskId whose Browser pane to target. An alternative to sessionId. Omit to use the single open pane.';
+  "Optional Kangentic taskId whose Browser pane to target. An alternative to sessionId, and must likewise be a task in your own project. Omit to use your own task's pane, or the single pane open in your project.";
 
 const TARGET_SHAPE = {
   sessionId: z.string().optional().describe(SESSION_DESC),
@@ -62,12 +69,40 @@ type ClickOutcome =
   | { ok: true; dispatched?: { x: number; y: number } }
   | { error: 'selector-not-found' | 'coord-mapping-failed' | 'missing-target' };
 
-function selectorFrom(args: TargetArgs): ResolveTargetSelector {
-  return { sessionId: args.sessionId, taskId: args.taskId };
-}
-
 /** Reads the live automation policy once per call so a Settings flip applies immediately. */
 export type AutomationConfigReader = () => ResolvedBrowserAutomationConfig;
+
+/**
+ * The `SessionManager` lookup these tools need to find the caller's own task.
+ * Declared narrowly here rather than imported from `steering-tools.ts` so the
+ * browser family carries no dependency on the steering family; `SessionManager`
+ * satisfies it structurally.
+ */
+export interface BrowserSessionLookup {
+  getSessionTaskId(sessionId: string): string | undefined;
+}
+
+export interface BrowserToolDependencies {
+  /**
+   * The project this connection is bound to, from the MCP URL path. Always
+   * present: `buildContext(projectId)` 404s an unknown project before any tool
+   * is registered.
+   */
+  projectId: string;
+  /**
+   * The caller's session id, from the MCP URL path
+   * (`/mcp/<projectId>/<callerSessionId>`). Undefined for a human-driven
+   * client, the two-segment `.kangentic/mcp-config.json` URL, and Command
+   * Terminal sessions. Never required: it only sharpens the implicit default.
+   */
+  callerSessionId?: string;
+  /**
+   * Session lookup used to map `callerSessionId` to the caller's own task.
+   * Null before the IPC context exists (the MCP server starts ahead of
+   * `createWindow`), which degrades the default rather than refusing.
+   */
+  sessions?: BrowserSessionLookup | null;
+}
 
 function sleep(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -81,7 +116,30 @@ function clampNumber(value: number | undefined, defaultValue: number, max: numbe
 export function registerBrowserTools(
   server: McpServer,
   getAutomationConfig: AutomationConfigReader,
+  dependencies: BrowserToolDependencies,
 ): void {
+  const { projectId, callerSessionId, sessions } = dependencies;
+
+  // Resolved ONCE per request, not per tool call: the McpServer is rebuilt for
+  // every HTTP request, so this closure can never go stale. A missing lookup or
+  // an unknown session leaves it undefined, which degrades the implicit default
+  // to "the single pane in my project" rather than refusing.
+  const callerTaskId =
+    callerSessionId && sessions ? sessions.getSessionTaskId(callerSessionId) : undefined;
+
+  // Caller scope is stamped here, not taken from tool arguments, so no tool can
+  // opt out of it. This is the single point that scopes the 13 tools driving
+  // through `drive()` below. The two lifecycle tools (open_pane / close_pane)
+  // build their own equivalent selector in `browser-pane-opener.ts`, from the
+  // same caller identity - see .claude/rules/browser-automation-driver.md.
+  const selectorFrom = (args: TargetArgs): ResolveTargetSelector => ({
+    sessionId: args.sessionId,
+    taskId: args.taskId,
+    projectId,
+    callerSessionId,
+    callerTaskId,
+  });
+
   // Helper: run a capability-gated CDP operation against the target pane.
   const drive = <Result>(
     capability: BrowserCapability,
@@ -99,22 +157,109 @@ export function registerBrowserTools(
     'kangentic_browser_list_panes',
     {
       description:
-        'List the embedded Browser panes currently open across tasks, with their sessionId, taskId, current URL, and whether the pane is alive / debugger-attached. Use this to discover a sessionId/taskId to pass to the other kangentic_browser_* tools, or to confirm the user has a dev server loaded. Returns an empty list when no pane is open.',
-      inputSchema: z.object({}),
+        'List the embedded Browser panes open in your project, with their sessionId, taskId, current URL, and whether the pane is alive / debugger-attached. Use this to discover a sessionId/taskId to pass to the other kangentic_browser_* tools, or to confirm the user has a dev server loaded. Panes in other projects are excluded by default and cannot be driven from this connection; pass includeOtherProjects to see them too. Returns an empty list when no pane is open.',
+      inputSchema: z.object({
+        includeOtherProjects: z
+          .boolean()
+          .optional()
+          .describe(
+            'Also list Browser panes in other projects. They are listed for visibility only and cannot be driven from this connection. Default false.',
+          ),
+      }),
       annotations: READ_ONLY_ANNOTATIONS,
     },
-    async () => {
+    async (args: { includeOtherProjects?: boolean }) => {
       const config = getAutomationConfig();
-      const panes = browserPaneRegistry.list();
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify({ automationEnabled: config.enabled, panes }, null, 2),
-          },
-        ],
-        structuredContent: { automationEnabled: config.enabled, items: panes },
+      const scoped = browserPaneRegistry.listForProject(projectId);
+      // `driveable` tracks `sameProject` today and is reported separately so a
+      // future liveness or policy gate has somewhere to live without the agent
+      // having to re-derive what it may act on.
+      const panes = (args.includeOtherProjects ? browserPaneRegistry.list() : scoped.panes).map(
+        (pane) => ({
+          ...pane,
+          sameProject: pane.projectId === projectId,
+          driveable: pane.projectId === projectId,
+        }),
+      );
+      const payload = {
+        automationEnabled: config.enabled,
+        projectId,
+        panes,
+        otherProjectPaneCount: scoped.otherProjectPaneCount,
+        unknownProjectPaneCount: scoped.unknownProjectPaneCount,
       };
+      return {
+        content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }],
+        structuredContent: { ...payload, items: panes },
+      };
+    },
+  );
+
+  // ── Lifecycle (open / close a pane) ───────────────────────────────────
+  server.registerTool(
+    'kangentic_browser_open_pane',
+    {
+      description:
+        "Open the embedded Browser pane for YOUR OWN task and load a URL, so you can then drive it with the other kangentic_browser_* tools. Use this instead of asking the user to open the Browser pill. Opens the task's detail window if it is not already open. Returns the pane once it is registered and driveable, so the very next call can act on it. Only ever targets your own task; there is no way to open a pane for another task or project. Calling it again with a different url navigates the existing pane rather than reopening it.",
+      inputSchema: z.object({
+        url: z
+          .string()
+          .optional()
+          .describe(
+            "Absolute http(s) URL to load, e.g. http://localhost:5173. Omit to reuse the task's saved Browser URL, or the project default. If neither exists, pass one - a pane with no URL registers nothing and cannot be driven.",
+          ),
+      }),
+      annotations: MUTATING_ANNOTATIONS,
+    },
+    async ({ url }) => {
+      const result = await openPaneForCallerTask({
+        projectId,
+        callerSessionId,
+        callerTaskId,
+        url,
+        // Opening always loads a URL, so this is a navigation-tier action:
+        // "Allow navigation" off in Settings disables this tool too.
+        capability: 'navigate',
+        config: getAutomationConfig(),
+      });
+      return driverToolResult(result);
+    },
+  );
+
+  server.registerTool(
+    'kangentic_browser_close_pane',
+    {
+      description:
+        "Close embedded Browser panes, putting them away exactly as the user's Browser pill does. The task's detail window stays open. With no arguments this closes your own task's pane; pass all to close every pane in your project. Panes in other projects are left alone and reported as a count unless you pass includeOtherProjects. The response lists the panes actually closed, so a partial close is never reported as complete.",
+      inputSchema: z.object({
+        ...TARGET_SHAPE,
+        all: z
+          .boolean()
+          .optional()
+          .describe(
+            'Close every pane in scope instead of a single target. Use this for "close all browsers". Takes precedence over sessionId and taskId, which are ignored when this is set.',
+          ),
+        includeOtherProjects: z
+          .boolean()
+          .optional()
+          .describe(
+            'Also close Browser panes belonging to other projects. Off by default, because another project may have an agent mid-verification in its pane. Only pass this when the user asked for every browser everywhere.',
+          ),
+      }),
+      annotations: MUTATING_ANNOTATIONS,
+    },
+    async ({ sessionId, taskId, all, includeOtherProjects }) => {
+      const result = await closePanes({
+        projectId,
+        callerSessionId,
+        callerTaskId,
+        sessionId,
+        taskId,
+        all,
+        includeOtherProjects,
+        config: getAutomationConfig(),
+      });
+      return driverToolResult(result);
     },
   );
 

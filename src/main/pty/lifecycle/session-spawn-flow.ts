@@ -278,6 +278,8 @@ export async function performSpawn(
     exitCode: null,
     resuming: input.resuming ?? false,
     transient: input.transient ?? false,
+    commandTerminalSlot: input.commandTerminalSlot ?? null,
+    commandTerminalBranch: input.commandTerminalBranch ?? null,
     isolatedSwimlaneId: input.isolatedSwimlaneId,
     exitSequence: input.exitSequence ?? ['\x03'],
     agentParser: input.agentParser,
@@ -574,7 +576,9 @@ export async function performSpawn(
   // subscriber that snapshotted this session while it was still queued
   // reported the pending/default dims; this closes that gap the same way
   // a live resize does (read-stream forwards it as a terminal-resize event).
-  context.emit('pty-resize', id, spawnCols, spawnRows);
+  // The 'spawn' origin lets a mounted xterm treat a respawn under it like any
+  // desktop reshape: re-assertable if the spawn grid disagrees with its fit.
+  context.emit('pty-resize', id, spawnCols, spawnRows, 'spawn');
 
   // After a brief delay, write any Windows cwd fixup (so the session lands
   // in the real project directory) and then the initial command. The fixup

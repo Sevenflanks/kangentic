@@ -2,6 +2,7 @@ import * as fs from 'node:fs';
 import * as http from 'node:http';
 import * as path from 'node:path';
 import { app, type BrowserWindow } from 'electron';
+import { Terminal } from '@xterm/headless';
 import {
   clickAtCenterOfSelector,
   dispatchKeyEvent,
@@ -41,6 +42,8 @@ import { getProcessMetrics } from '../../main/diagnostics/process-metrics';
 import { getEventLoopLagReport } from '../../main/diagnostics/event-loop-lag';
 import { ROTATED_FILE_SUFFIX } from '../../main/diagnostics/async-file-queue';
 import type { SessionManager } from '../../main/pty/session-manager';
+import { readTerminalTrace } from '../../main/pty/terminal-trace';
+import { detailOwnerRegistry } from '../../main/ipc/handlers/task-detail-ownership';
 
 /**
  * Localhost-only HTTP inspection bridge. Bound to a random port via
@@ -155,6 +158,14 @@ async function handleRequest(
 
   if (route === 'GET /pty-pipeline') {
     return respondPtyPipeline(options, response);
+  }
+
+  if (route === 'GET /terminal-state') {
+    return respondTerminalState(options, response);
+  }
+
+  if (route === 'GET /terminal-forensics') {
+    return respondTerminalForensics(options, url, response);
   }
 
   if (route === 'GET /logs') {
@@ -309,7 +320,7 @@ async function handlePostRequest(
         response,
         403,
         'eval-disabled',
-        'Settings → Developer → Allow Eval is off.',
+        'Settings → Developer → Allow Unsafe Operations is off (gates kangentic_devtools_eval; the agent browser has its own Allow Eval under Agent Browser).',
       );
     }
     return respondEval(window, body, response);
@@ -321,7 +332,7 @@ async function handlePostRequest(
         response,
         403,
         'eval-disabled',
-        'Settings → Developer → Allow Eval is off (gates session-event injection).',
+        'Settings → Developer → Allow Unsafe Operations is off (gates session-event injection).',
       );
     }
     return respondInjectSessionEvent(options, body, response);
@@ -555,6 +566,270 @@ function respondPtyPipeline(
 // Renderer state (Runtime.evaluate'd window globals)
 // ---------------------------------------------------------------------------
 
+/**
+ * Terminal state: every layer's idea of a terminal's size, joined into one
+ * answer, plus the invariants that follow from comparing them.
+ *
+ * This exists because the interesting terminal failures live in the GAP between
+ * the processes. Main knows the PTY's grid; the renderer knows its xterm's grid;
+ * neither compares them, and when they drift nothing recovers (xterm re-sends
+ * dimensions only when its own size changes, so a mismatch has no path back and
+ * the terminal stays wrapped or clipped until resized by hand). Diagnosing it
+ * from one side meant reading `.xterm-screen` pixel widths off screenshots.
+ *
+ * Deliberately one route rather than several narrow ones: new terminal
+ * diagnostics extend this payload instead of adding endpoints and tools.
+ */
+async function respondTerminalState(
+  options: InspectionServerOptions,
+  response: http.ServerResponse,
+): Promise<void> {
+  const sessionManager = options.getSessionManager();
+  if (!sessionManager) {
+    return respondError(response, 503, 'no-session-manager', 'Session manager is not available.');
+  }
+  const window = options.getMainWindow();
+  if (!window) {
+    return respondError(response, 503, 'no-main-window', 'Main window is not available yet.');
+  }
+
+  const main = sessionManager.getTerminalDimensions();
+  const evaluated = await runtimeEvaluate(
+    window,
+    `(() => {
+      const readGrids = window.__kangenticTerminalGrids;
+      const readTrace = window.__kangenticTerminalTrace;
+      if (typeof readGrids !== 'function') return null;
+      try {
+        return {
+          grids: readGrids(),
+          trace: typeof readTrace === 'function' ? readTrace() : [],
+        };
+      } catch (error) { return { error: String(error) }; }
+    })()`,
+  );
+  if (evaluated.error) {
+    return respondError(response, 500, 'evaluate-failed', evaluated.error);
+  }
+  const evaluatedValue = (evaluated.value ?? {}) as { grids?: unknown; trace?: unknown };
+  const grids = Array.isArray(evaluatedValue.grids) ? evaluatedValue.grids : [];
+  const rendererTrace = Array.isArray(evaluatedValue.trace) ? evaluatedValue.trace : [];
+
+  // Join on sessionId and derive the comparisons that matter. `ptyMatchesGrid`
+  // false with `gridOverflowPx` 0 is the unrecoverable divergence: the renderer's
+  // fit agrees with its container, so xterm will never re-send, so the PTY stays
+  // at the wrong width forever.
+  const terminals = grids.map((grid) => {
+    const row = grid as Record<string, unknown>;
+    const sessionId = typeof row.sessionId === 'string' ? row.sessionId : null;
+    const mainRow = sessionId ? main.find((candidate) => candidate.sessionId === sessionId) : undefined;
+    const gridCols = typeof row.cols === 'number' ? row.cols : null;
+    return {
+      ...row,
+      pty: mainRow ?? null,
+      ptyMatchesGrid:
+        mainRow && gridCols !== null && mainRow.ptyCols !== null ? mainRow.ptyCols === gridCols : null,
+      colsDrift:
+        mainRow && gridCols !== null && mainRow.ptyCols !== null ? mainRow.ptyCols - gridCols : null,
+    };
+  });
+
+  respondJson(response, 200, {
+    ts: new Date().toISOString(),
+    terminals,
+    // Sessions main knows about that no mounted xterm is showing. Expected for a
+    // background session; suspicious for one the user is looking at.
+    unmountedSessions: main
+      .filter((row) => !grids.some((grid) => (grid as Record<string, unknown>).sessionId === row.sessionId))
+      .map((row) => row),
+    pipeline: sessionManager.getPipelineStats(),
+    // Both processes' lifecycle events on ONE timeline. The terminal bugs worth
+    // debugging are orderings - which of resize / repaint / sample / replay-write
+    // happened first - and that is only visible merged.
+    trace: [...readTerminalTrace(), ...rendererTrace]
+      .sort((first, second) => {
+        const firstTs = (first as { ts?: number }).ts ?? 0;
+        const secondTs = (second as { ts?: number }).ts ?? 0;
+        return firstTs - secondTs;
+      }),
+  });
+}
+
+/** Bytes of raw ring returned by default, and the ceiling a caller may ask for. */
+const FORENSIC_RAW_TAIL_BYTES = 48 * 1024;
+const FORENSIC_RAW_TAIL_MAX_BYTES = 256 * 1024;
+
+/**
+ * Render control bytes readable so a tool result can be reasoned about as text.
+ * ESC becomes a literal `\x1b` rather than being stripped, because the whole
+ * point of reading the raw ring is to see the sequences.
+ */
+function escapeControlBytes(raw: string): string {
+  return raw.replace(/[\x00-\x1f\x7f]/g, (character) => {
+    if (character === '\n') return '\\n';
+    if (character === '\r') return '\\r';
+    if (character === '\t') return '\\t';
+    if (character === '\x1b') return '\\x1b';
+    return `\\x${character.charCodeAt(0).toString(16).padStart(2, '0')}`;
+  });
+}
+
+/**
+ * Session-scoped terminal forensics: the renderer's grid, main's parsed grid,
+ * and the raw bytes that fed both, row by row and side by side.
+ *
+ * This exists for one question that `/terminal-state` structurally cannot
+ * answer. That route reports HOW MANY rows have content (`nonEmptyLines`), which
+ * is enough for "the grid collapsed" but not for "rows 17 through 27 are blank
+ * and everything around them is correct". Diagnosing a hole needs to know WHICH
+ * rows, in all three layers at once:
+ *
+ * - rows absent from the raw ring: the agent never sent them (upstream).
+ * - rows in the ring and in main's parsed grid but not the renderer's xterm:
+ *   lost between the two, in the IPC / queue / write path.
+ * - rows present in both grids while the pixels are blank: a paint bug, which a
+ *   same-instant screenshot of `.xterm-screen` confirms.
+ *
+ * A separate route rather than more fields on `/terminal-state`, despite that
+ * route's own "extend this payload" note: the note is about always-on summary
+ * fields, and this payload is per-row text plus a byte dump for ONE session.
+ * `/terminal-state` already returns well over 100KB for a busy machine, and
+ * folding this in would break it for every caller that just wants dimensions.
+ */
+async function respondTerminalForensics(
+  options: InspectionServerOptions,
+  url: URL,
+  response: http.ServerResponse,
+): Promise<void> {
+  const sessionManager = options.getSessionManager();
+  if (!sessionManager) {
+    return respondError(response, 503, 'no-session-manager', 'Session manager is not available.');
+  }
+  const window = options.getMainWindow();
+  if (!window) {
+    return respondError(response, 503, 'no-main-window', 'Main window is not available yet.');
+  }
+  const sessionId = url.searchParams.get('sessionId');
+  if (!sessionId) {
+    return respondError(response, 400, 'missing-session-id', 'sessionId is required.');
+  }
+  const rawTailBytes = clampLimit(
+    url.searchParams.get('rawTailBytes'),
+    FORENSIC_RAW_TAIL_BYTES,
+    FORENSIC_RAW_TAIL_MAX_BYTES,
+  );
+
+  const dimensions = sessionManager.getTerminalDimensions()
+    .find((row) => row.sessionId === sessionId) ?? null;
+
+  // Main's parsed grid, reconstructed by replaying its own serialized frame
+  // through a throwaway parser. Going through the public getSerializedFrame
+  // keeps this out of PtyBufferManager's internals, at one known cost: that
+  // frame is a bare serialize with no tail fold, so it can trail the newest
+  // chunk by a macrotask. Harmless when the TUI is idle (the state worth
+  // capturing), but a capture taken MID-STREAM can show a legitimate
+  // main-vs-renderer difference that is not loss. `serializedAt` is stamped so
+  // that ambiguity is visible rather than assumed away.
+  let mainGrid: { rows: string[]; error?: string } = { rows: [] };
+  let serializedFrameBytes = 0;
+  try {
+    const frame = await sessionManager.getSerializedFrame(sessionId);
+    serializedFrameBytes = frame.length;
+    mainGrid = {
+      rows: await renderFrameToRows(
+        frame,
+        dimensions?.ptyCols ?? 80,
+        dimensions?.ptyRows ?? 24,
+      ),
+    };
+  } catch (error) {
+    mainGrid = { rows: [], error: String(error) };
+  }
+
+  const evaluated = await runtimeEvaluate(
+    window,
+    `(() => {
+      const readRows = window.__kangenticTerminalGridRows;
+      if (typeof readRows !== 'function') return null;
+      try { return { dumps: readRows(${JSON.stringify(sessionId)}) }; }
+      catch (error) { return { error: String(error) }; }
+    })()`,
+  );
+  if (evaluated.error) {
+    return respondError(response, 500, 'evaluate-failed', evaluated.error);
+  }
+  const evaluatedValue = (evaluated.value ?? {}) as { dumps?: unknown };
+  const rendererGrids = Array.isArray(evaluatedValue.dumps) ? evaluatedValue.dumps : [];
+
+  const raw = sessionManager.getRawScrollback(sessionId);
+  const tail = sliceTailOnCharacterBoundary(raw, rawTailBytes);
+
+  respondJson(response, 200, {
+    ts: new Date().toISOString(),
+    sessionId,
+    pty: dimensions,
+    /** One entry per mounted xterm showing this session (normally one). */
+    rendererGrids,
+    mainGrid: { ...mainGrid, serializedFrameBytes },
+    raw: {
+      totalBytes: raw.length,
+      tailBytes: tail.length,
+      /** Control bytes escaped; search this for a missing row's text. */
+      tail: escapeControlBytes(tail),
+    },
+    trace: readTerminalTrace(sessionId),
+  });
+}
+
+/**
+ * Take the last `length` UTF-16 units of `raw`, nudged forward off a split
+ * surrogate pair.
+ *
+ * A plain `slice(-n)` can land between the halves of an astral character (an
+ * emoji in agent output is the realistic case), and a lone surrogate does not
+ * survive the JSON response: it degrades to U+FFFD, which reads as corruption in
+ * the one capture that is supposed to be trustworthy. Dropping the orphaned half
+ * costs one character and keeps the tail honest.
+ */
+function sliceTailOnCharacterBoundary(raw: string, length: number): string {
+  if (raw.length <= length) return raw;
+  let start = raw.length - length;
+  const code = raw.charCodeAt(start);
+  // A low surrogate here means its high half is the character before `start`.
+  if (code >= 0xdc00 && code <= 0xdfff) start += 1;
+  return raw.slice(start);
+}
+
+/**
+ * Re-parse a serialized frame into plain viewport rows.
+ *
+ * A throwaway headless parser rather than a regex over the escape stream: the
+ * frame positions cells with absolute and relative cursor moves, so the only
+ * faithful way to learn what row N holds is to let a real VT parser lay it out,
+ * which is exactly what both the renderer and main already do with these bytes.
+ */
+async function renderFrameToRows(frame: string, cols: number, rows: number): Promise<string[]> {
+  const terminal = new Terminal({
+    cols: Math.max(1, cols),
+    rows: Math.max(1, rows),
+    allowProposedApi: true,
+  });
+  try {
+    await new Promise<void>((resolve) => {
+      terminal.write(frame, () => resolve());
+    });
+    const buffer = terminal.buffer.active;
+    const dumped: string[] = [];
+    for (let offset = 0; offset < terminal.rows; offset++) {
+      const line = buffer.getLine(buffer.viewportY + offset);
+      dumped.push(line ? line.translateToString(true).replace(/\s+$/, '') : '');
+    }
+    return dumped;
+  } finally {
+    terminal.dispose();
+  }
+}
+
 async function respondRendererState(
   options: InspectionServerOptions,
   response: http.ServerResponse,
@@ -606,6 +881,19 @@ async function respondStoreState(
   if (!store) {
     return respondError(response, 400, 'missing-store', 'store query parameter is required.');
   }
+
+  // MAIN-side namespaces, answered without touching the renderer.
+  //
+  // Not every piece of state a bug lives in is a Zustand store. Task-detail
+  // ownership is arbitrated in main and was observable ONLY by calling
+  // `resolveOpen` through its IPC handler - which focuses a window and can mount
+  // one, so looking at it changed it. Exposed through this same abstract reader
+  // (rather than a new tool) so `store_state` stays the one way to read state by
+  // name.
+  if (store === 'detailOwners') {
+    return respondJson(response, 200, { store, value: detailOwnerRegistry.snapshot() });
+  }
+
   const requestedPath = url.searchParams.get('path') ?? '';
   const window = options.getMainWindow();
   if (!window) {
@@ -1350,7 +1638,7 @@ async function respondPtyInput(
         response,
         403,
         'eval-disabled',
-        'Raw `bytes` form requires Settings → Developer → Allow Eval.',
+        'Raw `bytes` form requires Settings → Developer → Allow Unsafe Operations.',
       );
     }
     toWrite = Buffer.from(params.bytes, 'base64').toString('utf-8');

@@ -9,6 +9,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import type { SerializedWorkspace } from '../../src/shared/types';
 
 let tmpDir: string;
 let configPath: string;
@@ -508,6 +509,172 @@ describe('Config Manager -- terminal.scrollbackLines global migration', () => {
   });
 });
 
+describe('Config Manager -- windowLightDismiss `single` to `focused` default migration', () => {
+  // The default flipped from 'single' to 'focused' when click-outside close became a
+  // denylist. save() writes the whole merged blob and load() lets a persisted value
+  // beat the default, so the new default reaches fresh installs only - every existing
+  // install has a literal "windowLightDismiss": "single" on disk and would keep it.
+  // That is not cosmetic: 'single' resolves to no target once a second window is open,
+  // so click-outside close silently does nothing there.
+
+  it("rewrites a persisted 'single' to 'focused' and records the marker on disk", async () => {
+    fs.writeFileSync(configPath, JSON.stringify({ windowLightDismiss: 'single' }));
+
+    const cm = await createConfigManager();
+    const config = cm.load();
+
+    expect(config.windowLightDismiss).toBe('focused');
+    expect(config.hasMigratedWindowLightDismissDefault).toBe(true);
+
+    const raw = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    expect(raw.windowLightDismiss).toBe('focused');
+    expect(raw.hasMigratedWindowLightDismissDefault).toBe(true);
+  });
+
+  it("leaves a deliberate 'single' alone once the marker is set", async () => {
+    // The whole point of the marker: a stored 'single' from before the flip and one the
+    // user picked afterwards serialize identically, so only the marker separates them.
+    fs.writeFileSync(configPath, JSON.stringify({
+      windowLightDismiss: 'single',
+      hasMigratedWindowLightDismissDefault: true,
+    }));
+
+    const cm = await createConfigManager();
+    const config = cm.load();
+
+    expect(config.windowLightDismiss).toBe('single');
+    // Reading the marker back is what makes this test falsifiable. Without it the
+    // assertion above passes trivially on a build that has no migration at all.
+    expect(config.hasMigratedWindowLightDismissDefault).toBe(true);
+
+    const raw = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    expect(raw.windowLightDismiss).toBe('single');
+  });
+
+  it("does not re-migrate a 'single' re-picked after the first load", async () => {
+    // End to end through the same manager: migrate, then write 'single' back the way
+    // the settings dropdown does, then load again. Red if the marker were keyed off the
+    // parsed file rather than persisted, or if save() dropped it.
+    fs.writeFileSync(configPath, JSON.stringify({ windowLightDismiss: 'single' }));
+
+    const cm = await createConfigManager();
+    expect(cm.load().windowLightDismiss).toBe('focused');
+    cm.save({ windowLightDismiss: 'single' });
+
+    vi.resetModules();
+    const cmAfterRestart = await createConfigManager();
+
+    expect(cmAfterRestart.load().windowLightDismiss).toBe('single');
+  });
+
+  // it.each rather than a loop inside one it(), so a failure names the policy that
+  // failed instead of only a line number. 'focused' is in the list because a value
+  // that merely matches the new default still has to survive as an explicit choice.
+  it.each(['off', 'all', 'focused'] as const)("does not touch a persisted '%s'", async (policy) => {
+    fs.writeFileSync(configPath, JSON.stringify({ windowLightDismiss: policy }));
+
+    const cm = await createConfigManager();
+    const config = cm.load();
+
+    expect(config.windowLightDismiss).toBe(policy);
+    expect(config.hasMigratedWindowLightDismissDefault).toBe(true);
+  });
+
+  it("sets the marker on a fresh install without changing windowLightDismiss", async () => {
+    // Not a no-op: the marker flips and is WRITTEN, creating config.json during load()
+    // where no migration used to write one. That eager write is the deliberate design
+    // (it stops the block re-evaluating on every launch), so pin it - re-gating the
+    // migration on `parsed` would leave the in-memory assertions green and this red.
+    expect(fs.existsSync(configPath)).toBe(false);
+
+    const cm = await createConfigManager();
+    const config = cm.load();
+
+    expect(config.windowLightDismiss).toBe('focused');
+    expect(config.hasMigratedWindowLightDismissDefault).toBe(true);
+
+    expect(fs.existsSync(configPath)).toBe(true);
+    const raw = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    expect(raw.hasMigratedWindowLightDismissDefault).toBe(true);
+  });
+
+  it('leaves an unparseable config file on disk instead of overwriting it with defaults', async () => {
+    // The migration is the only one in load() not gated on `parsed`, so it is the only
+    // one that reaches the catch branch - where save() would rewrite the whole blob and
+    // destroy a file the user could still hand-repair. The session runs on defaults
+    // either way; what must not happen is the file being replaced.
+    const corruptContents = '{ "windowLightDismiss": "single", }';
+    fs.writeFileSync(configPath, corruptContents);
+
+    const cm = await createConfigManager();
+    const config = cm.load();
+
+    expect(config.hasMigratedWindowLightDismissDefault).toBe(true);
+    expect(fs.readFileSync(configPath, 'utf-8')).toBe(corruptContents);
+  });
+
+  it('still migrates on the next launch after an unparseable file is repaired', async () => {
+    // The deferred write must not cost the migration: skipping save() leaves the marker
+    // false on disk, so the rewrite is simply owed to the following launch.
+    fs.writeFileSync(configPath, '{ "windowLightDismiss": "single", }');
+    (await createConfigManager()).load();
+
+    vi.resetModules();
+    fs.writeFileSync(configPath, JSON.stringify({ windowLightDismiss: 'single' }));
+    const cmAfterRepair = await createConfigManager();
+
+    expect(cmAfterRepair.load().windowLightDismiss).toBe('focused');
+  });
+});
+
+describe('Config Manager -- load() parse-validity guard', () => {
+  // JSON.parse can succeed on content that is valid JSON but not a usable config
+  // object: `null`, an array, or a bare primitive (number/string/boolean). None of
+  // those throw during JSON.parse, so without a validity check they fall through as
+  // if the file had been read successfully.
+  //
+  // This guard is co-located with (but not owned by) the windowLightDismiss migration
+  // above: that migration is what turns the gap destructive, by being the first block
+  // in load() not gated on `parsed` - deepMergeConfig(DEFAULT_CONFIG, []) silently
+  // returns a bare-defaults copy with no error, so the windowLightDismiss migration's
+  // unconditional save() persists that over the file's actual (non-object) contents.
+  // A bare number/string/boolean is worse and pre-dates this migration entirely:
+  // `parsed && 'claude' in parsed` (the claude.* -> agent.* migration, unchanged by
+  // this diff) throws a TypeError on a primitive, since `in` requires an object
+  // operand, crashing load() outright on main today.
+  //
+  // Keep this describe block even if the windowLightDismiss migration above is later
+  // retired (see its "Retirable" doc comment in shared/types.ts) - the parse-validity
+  // guard remains needed for the pre-existing claude.* migration's `in` check.
+  it.each(['[]', '123', '"just a string"', 'true'])(
+    'leaves valid-but-non-object config JSON %s on disk instead of overwriting it with defaults',
+    async (nonObjectJson) => {
+      fs.writeFileSync(configPath, nonObjectJson);
+
+      const cm = await createConfigManager();
+      cm.load();
+
+      expect(fs.readFileSync(configPath, 'utf-8')).toBe(nonObjectJson);
+    },
+  );
+
+  it.each(['123', '"just a string"', 'true'])(
+    'does not throw when config JSON is a bare primitive: %s',
+    async (primitiveJson) => {
+      // Pre-existing hazard, not introduced by this diff: on main, `parsed && 'claude'
+      // in parsed` throws a TypeError for a primitive `parsed`, so load() crashes
+      // outright rather than falling back to defaults. `[]` is excluded here because
+      // `'claude' in []` does not throw (arrays are objects) - it silently returns
+      // false, which is the "no crash, but destructive on disk" case pinned above.
+      fs.writeFileSync(configPath, primitiveJson);
+
+      const cm = await createConfigManager();
+
+      expect(() => cm.load()).not.toThrow();
+    },
+  );
+});
+
 describe('Config Manager -- terminal.colors replace semantics', () => {
   it('removing a slot key from a later save() actually clears it, not deep-merges it back', async () => {
     const cm = await createConfigManager();
@@ -540,5 +707,275 @@ describe('Config Manager -- terminal.colors replace semantics', () => {
 
     const raw = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
     expect(raw.terminal.colors).toEqual({});
+  });
+});
+
+describe('Config Manager -- monitorWorkspace replace semantics', () => {
+  // 'monitorWorkspace' is a CONFIG_DICTIONARY_PATHS entry (config-manager.ts) for the
+  // same reason as its sibling 'commandTerminalWorkspace' above: the renderer always
+  // writes the FULL SerializedWorkspace blob (config-store.ts's saveMonitorWorkspace /
+  // flushMonitorWorkspace), so save() must REPLACE the stored blob wholesale rather
+  // than deep-merge it - otherwise a detail window closed in one save could reappear
+  // after a later, unrelated save merges the stale entry back in.
+
+  it('set({ monitorWorkspace: null }) REPLACES the previous blob, not deep-merges it', async () => {
+    // Mirrors the commandTerminalWorkspace null-write test above for structural
+    // consistency, and null-write IS a real code path (all windows closed). But
+    // unlike the tileTree-collapse test below, this assertion does NOT by itself pin
+    // 'monitorWorkspace' in CONFIG_DICTIONARY_PATHS: deepMerge's null branch
+    // (`value !== null` failing) assigns `null` directly regardless of
+    // dictionaryPaths membership, so this passes even with the entry removed. The
+    // regression guard for the array-shrink hole is the next test.
+    const initialWorkspace: SerializedWorkspace = {
+      version: 1,
+      windows: [
+        {
+          taskId: 'proj-a:task-1',
+          kind: 'task-detail',
+          title: 'Fix the thing',
+          geometry: { x: 0.1, y: 0.1, w: 0.5, h: 0.5 },
+          restoreGeometry: null,
+          state: 'floating',
+        },
+      ],
+      tileTree: null,
+      tileTreeRect: { x: 0, y: 0, w: 1, h: 1 },
+      focusedTaskId: 'proj-a:task-1',
+    };
+
+    const cm = await createConfigManager();
+    cm.save({ monitorWorkspace: initialWorkspace });
+    const afterFirstWrite = cm.load();
+    expect(afterFirstWrite.monitorWorkspace).not.toBeNull();
+    expect(afterFirstWrite.monitorWorkspace?.windows).toHaveLength(1);
+
+    cm.save({ monitorWorkspace: null });
+    const afterNullWrite = cm.load();
+    expect(afterNullWrite.monitorWorkspace).toBeNull();
+
+    const raw = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    expect(raw.monitorWorkspace).toBeNull();
+  });
+
+  it('closing a tiled monitor window collapses windows AND tileTree on save, not merges the stale split back in', async () => {
+    // This is the assertion that actually pins 'monitorWorkspace' in
+    // CONFIG_DICTIONARY_PATHS. A plain windows-array shrink alone does NOT: deepMerge
+    // always assigns an array value wholesale (its recursion guard requires
+    // `!Array.isArray(value)`), so `windows: []` replaces correctly whether or not
+    // 'monitorWorkspace' is a dictionary path - confirmed empirically against the
+    // real deepMerge, both with and without the entry present. tileTree IS the
+    // discriminator: it is a plain object (SerializedTileNode), so it's reached by
+    // the recursive merge path. Collapsing a two-pane 'split' down to a single
+    // 'leaf' would, under merge semantics, leak the old split's
+    // direction/children/sizes onto the new leaf - the persisted layout would still
+    // describe the closed window's tiling, which is exactly the "closed details keep
+    // reappearing" failure the CONFIG_DICTIONARY_PATHS comment describes.
+    const twoWindowSplit: SerializedWorkspace = {
+      version: 1,
+      windows: [
+        {
+          taskId: 'proj-a:task-1',
+          kind: 'task-detail',
+          title: 'Fix the thing',
+          geometry: { x: 0, y: 0, w: 0.5, h: 1 },
+          restoreGeometry: null,
+          state: 'tiled',
+        },
+        {
+          taskId: 'proj-a:task-2',
+          kind: 'task-detail',
+          title: 'Also fix this',
+          geometry: { x: 0.5, y: 0, w: 0.5, h: 1 },
+          restoreGeometry: null,
+          state: 'tiled',
+        },
+      ],
+      tileTree: {
+        kind: 'split',
+        direction: 'horizontal',
+        children: [
+          { kind: 'leaf', taskId: 'proj-a:task-1' },
+          { kind: 'leaf', taskId: 'proj-a:task-2' },
+        ],
+        sizes: [0.5, 0.5],
+      },
+      tileTreeRect: { x: 0, y: 0, w: 1, h: 1 },
+      focusedTaskId: 'proj-a:task-2',
+    };
+    const oneWindowLeaf: SerializedWorkspace = {
+      version: 1,
+      windows: [
+        {
+          taskId: 'proj-a:task-1',
+          kind: 'task-detail',
+          title: 'Fix the thing',
+          geometry: { x: 0, y: 0, w: 1, h: 1 },
+          restoreGeometry: null,
+          state: 'tiled',
+        },
+      ],
+      tileTree: { kind: 'leaf', taskId: 'proj-a:task-1' },
+      tileTreeRect: { x: 0, y: 0, w: 1, h: 1 },
+      focusedTaskId: 'proj-a:task-1',
+    };
+
+    const cm = await createConfigManager();
+    cm.save({ monitorWorkspace: twoWindowSplit });
+    const afterFirstWrite = cm.load();
+    expect(afterFirstWrite.monitorWorkspace?.windows).toHaveLength(2);
+
+    cm.save({ monitorWorkspace: oneWindowLeaf });
+    const afterSecondWrite = cm.load();
+
+    // Red: removing 'monitorWorkspace' from CONFIG_DICTIONARY_PATHS makes this
+    // deep-merge instead. windows still shrinks to 1 (arrays always replace), but
+    // tileTree would merge the leaf's own two keys into the OLD split object,
+    // leaving 'direction' / 'children' / 'sizes' behind from the closed window's split.
+    expect(afterSecondWrite.monitorWorkspace?.windows).toHaveLength(1);
+    expect(afterSecondWrite.monitorWorkspace?.tileTree).toEqual({ kind: 'leaf', taskId: 'proj-a:task-1' });
+
+    const raw = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    expect(raw.monitorWorkspace.windows).toHaveLength(1);
+    expect(raw.monitorWorkspace.tileTree).toEqual({ kind: 'leaf', taskId: 'proj-a:task-1' });
+  });
+
+  it('writing a new monitorWorkspace blob REPLACES stale sub-fields rather than merging them in', async () => {
+    // Mirrors the commandTerminalWorkspace stale-sub-field test above: an extra key
+    // present in an earlier blob but absent from a later one must not survive.
+    const firstBlob = {
+      version: 1,
+      windows: [],
+      tileTree: null,
+      tileTreeRect: { x: 0, y: 0, w: 1, h: 1 },
+      focusedTaskId: 'proj-a:task-old',
+      // Extra key not in SerializedWorkspace - simulates a field that will be absent
+      // from the next write.
+      _staleKey: 'should-be-gone',
+    };
+    const secondBlob = {
+      version: 1,
+      windows: [],
+      tileTree: null,
+      tileTreeRect: { x: 0, y: 0, w: 1, h: 1 },
+      focusedTaskId: 'proj-a:task-new',
+      // _staleKey intentionally absent - in merge semantics it would survive from
+      // the first blob; in replace semantics it is gone.
+    };
+
+    const cm = await createConfigManager();
+    // Use a cast to bypass TypeScript's strict-shape check for the test-extra key.
+    cm.save({ monitorWorkspace: firstBlob as Parameters<typeof cm.save>[0]['monitorWorkspace'] });
+    cm.save({ monitorWorkspace: secondBlob as Parameters<typeof cm.save>[0]['monitorWorkspace'] });
+
+    const raw = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    // Replace semantics: the stale key from the first blob must not survive.
+    expect(raw.monitorWorkspace._staleKey).toBeUndefined();
+    // The new focusedTaskId must reflect the second write.
+    expect(raw.monitorWorkspace.focusedTaskId).toBe('proj-a:task-new');
+  });
+});
+
+describe('Config Manager -- divergent-cache clobber across instances (characterization)', () => {
+  // Characterizes a footgun that shipped live: src/main/index.ts keeps a
+  // module-scope `windowConfigManager` whose cache is populated at startup (by
+  // resolveWindowBounds), separate from the ipc-context ConfigManager that
+  // config:set writes through. ConfigManager.save() always deep-merges into its
+  // OWN cached config and rewrites the WHOLE file, so a save() through the
+  // stale-cached instance silently reverts every field written through the
+  // other instance since that cache was populated.
+  //
+  // This bit the debounced window-bounds writer specifically: it used to always
+  // save() through windowConfigManager, so any renderer-driven config write
+  // made after launch (an update to lastWhatsNewShownVersion, in the observed
+  // incident) was reverted back to its pre-launch value on the next window
+  // move or resize. The fix (src/main/index.ts) makes that call site prefer
+  // `getOptionalIpcContext()?.configManager ?? windowConfigManager` - the SAME
+  // pattern the pop-out bounds writer already used - so it merges into the
+  // fresher, IPC-authoritative cache instead.
+  //
+  // The fresh-install seed a few lines above that same call site
+  // (`windowConfigManager.save({ lastWhatsNewShownVersion: app.getVersion() })`
+  // in app.whenReady()) is NOT a case of this hazard: it runs before
+  // createWindow(), before any IPC context exists and before anything else has
+  // written config, so there is no fresher cache yet to clobber.
+  //
+  // This test does NOT exercise src/main/index.ts (a startup file the unit
+  // tier cannot import) and does NOT guard the call-site fix itself - reverting
+  // that fix leaves this test green, since it only characterizes
+  // ConfigManager's own save()/load() contract. Its value is narrower: it names
+  // the hazard for whoever next adds a THIRD long-lived ConfigManager instance,
+  // or "simplifies" an existing one back to a single shared save() call.
+  it("a stale-cached instance's save() reverts a field written by a fresher instance in the meantime", async () => {
+    const staleCached = await createConfigManager();
+    // Populate this instance's cache now, before the other instance writes
+    // anything - mirrors windowConfigManager reading config at startup.
+    staleCached.load();
+
+    const { ConfigManager } = await import('../../src/main/config/config-manager');
+    const fresher = new ConfigManager();
+    fresher.save({ lastWhatsNewShownVersion: '0.32.0' });
+
+    // The fresher instance's write landed on disk.
+    let raw = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    expect(raw.lastWhatsNewShownVersion).toBe('0.32.0');
+
+    // An unrelated save through the stale-cached instance (standing in for the
+    // debounced window-bounds writer) merges its partial update into ITS OWN
+    // outdated cache and rewrites the whole file, so the write succeeds but
+    // reverts lastWhatsNewShownVersion back to the default it saw at load time.
+    staleCached.save({ windowBounds: { x: 0, y: 0, width: 800, height: 600 } });
+
+    raw = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    // Red if ConfigManager ever stopped caching per-instance (e.g. a shared
+    // module-level cache): this would then read '0.32.0' instead.
+    expect(raw.lastWhatsNewShownVersion).toBe('');
+    // The stale-cached instance's own write still succeeds - this is a silent
+    // clobber, not a failed write, which is what makes it dangerous.
+    expect(raw.windowBounds).toEqual({ x: 0, y: 0, width: 800, height: 600 });
+  });
+});
+
+describe('Config Manager -- monitor deep-merge (NOT a CONFIG_DICTIONARY_PATHS entry)', () => {
+  // 'monitor' is deliberately absent from CONFIG_DICTIONARY_PATHS: it is a typed
+  // MonitorView struct (layout/groupBy/sort/liveOnly/projectFilter/stateFilter/
+  // textFilter), not a renderer-authoritative dictionary, so a partial write must
+  // MERGE and preserve the other six keys. These tests guard both directions of
+  // that contract: an on-disk config missing 'monitor' entirely must still populate
+  // every key from DEFAULT_CONFIG.monitor (a renderer reading `.layout` off
+  // `undefined` would crash), and a partial on-disk 'monitor' block must merge in
+  // the rest of the defaults rather than replace the whole struct.
+
+  it('loads with monitor populated from DEFAULT_CONFIG.monitor when the on-disk config has no monitor key at all', async () => {
+    fs.writeFileSync(configPath, JSON.stringify({ theme: 'dark' }));
+
+    const cm = await createConfigManager();
+    const config = cm.load();
+    const { DEFAULT_CONFIG } = await import('../../src/shared/types');
+
+    expect(config.monitor).toEqual(DEFAULT_CONFIG.monitor);
+    expect(config.monitor.layout).toBe('cards');
+  });
+
+  it('a partial on-disk monitor override merges rather than replaces, preserving the other MonitorView keys', async () => {
+    fs.writeFileSync(configPath, JSON.stringify({
+      monitor: { layout: 'rows' },
+    }));
+
+    const cm = await createConfigManager();
+    const config = cm.load();
+
+    // The explicit override survives.
+    expect(config.monitor.layout).toBe('rows');
+    // Every other MonitorView key is preserved from DEFAULT_CONFIG.monitor, not
+    // dropped. Red if 'monitor' were ever added to CONFIG_DICTIONARY_PATHS (or
+    // deepMergeConfig's own narrower dictionaryPaths list): a partial write would
+    // then replace the whole struct, and these would come back undefined/empty in
+    // a way that doesn't match the defaults below.
+    expect(config.monitor.groupBy).toBe('project');
+    expect(config.monitor.sort).toBe('longest-running');
+    expect(config.monitor.liveOnly).toBe(false);
+    expect(config.monitor.projectFilter).toEqual([]);
+    expect(config.monitor.stateFilter).toEqual([]);
+    expect(config.monitor.textFilter).toBe('');
   });
 });

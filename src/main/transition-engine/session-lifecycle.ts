@@ -91,10 +91,18 @@ export function promoteRecord(
  * reports its real session ID (from status.json for Claude, from hooks for
  * Gemini/Codex). Updates the DB record so the ID can be used for --resume.
  *
- * Two scenarios:
+ * Three scenarios:
  * 1. Fresh capture: agent_session_id was null (Codex/Gemini), now captured.
  * 2. Stale recovery: agent_session_id was pre-specified (Claude) but the
  *    agent created a different session (--resume failed silently).
+ * 3. Mid-session fork: the agent moved the live conversation to a NEW id
+ *    (Claude /clear forks to a fresh session id) and its status file
+ *    re-reported it. Same branch as scenario 2, and repeatable: each fork
+ *    lands another update against the same record. Note the metrics
+ *    consequence: lifetime token rollups partition by
+ *    COALESCE(agent_session_id, id), so this record's lineage key follows the
+ *    fork and any pre-fork leg is accounted to the new lineage (accepted; the
+ *    pre-fork context is what the user chose to discard).
  */
 export function recoverStaleSessionId(
   sessionRepo: SessionRepository,

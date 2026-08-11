@@ -258,17 +258,14 @@ const createBacklogStore = () => create<BacklogState>(backlogStoreInitializer);
 // not a React Fast Refresh boundary. Pin the instance in `import.meta.hot.data`
 // so a Fast Refresh that re-evaluates this module cannot strand a second store
 // instance while the mounted backlog view stays subscribed to the first.
-// @ts-expect-error -- Vite handles import.meta.hot; tsc's "module": "commonjs" doesn't support it
 const preservedBacklogStore: ReturnType<typeof createBacklogStore> | undefined = import.meta.hot?.data?.backlogStore;
 
 export const useBacklogStore = preservedBacklogStore ?? createBacklogStore();
 
-// @ts-expect-error -- Vite handles import.meta.hot; tsc's "module": "commonjs" doesn't support it
 if (import.meta.hot) {
-  // @ts-expect-error -- Vite handles import.meta.hot
   import.meta.hot.data.backlogStore = useBacklogStore;
   // Editing this module's OWN code would leave the pinned instance running stale
   // closures; force a clean full reload instead (rare; prod drops this block).
-  // @ts-expect-error -- Vite handles import.meta.hot
-  import.meta.hot.accept(() => import.meta.hot.invalidate());
+  const hot = import.meta.hot;
+  import.meta.hot.accept(() => hot.invalidate());
 }

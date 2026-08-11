@@ -53,8 +53,26 @@ const PROMPT_OPTIONS_RETRY_MS = 400;
  */
 const USAGE_COALESCE_MS = 2000;
 
-function subscriptionKeyFor(sessionId: string): string {
+export function subscriptionKeyFor(sessionId: string): string {
   return `stream:${sessionId}`;
+}
+
+/**
+ * Marker key present ONLY while a subscription with `terminal: true` is live.
+ * `stream:<id>` alone cannot answer "is a phone watching this TERMINAL":
+ * the phone holds list-only stream subscriptions for EVERY live session the
+ * moment it connects (its activity feed), and gating the resting park on the
+ * bare stream key made the park fire for all of them - sessions no phone
+ * terminal ever opened were reshaped to the resting grid, and every later
+ * panel reveal replayed them at the wrong geometry (the mis-wrapped-panel
+ * defect, observed live 2026-08-02). The teardown registered under
+ * `stream:<id>` removes this marker, so every release path (replace,
+ * unsubscribe, exit, transport drop, dispose) clears both together.
+ */
+export const TERMINAL_STREAM_KEY_PREFIX = 'stream-terminal:';
+
+export function terminalStreamKeyFor(sessionId: string): string {
+  return `${TERMINAL_STREAM_KEY_PREFIX}${sessionId}`;
 }
 
 /**
@@ -308,7 +326,16 @@ function subscribeReadStream(
     context.sessionManager.off('exit', onExit);
     if (terminalFlushTimer) clearTimeout(terminalFlushTimer);
     if (usageFlushTimer) clearTimeout(usageFlushTimer);
+    // The terminal marker lives and dies with THIS subscription: a list-only
+    // re-subscribe replaces this teardown, which runs it, which drops the
+    // marker before the new registration decides whether to re-add it.
+    subscriptions.remove(terminalStreamKeyFor(sessionId));
   });
+  if (wantsTerminal) {
+    subscriptions.set(terminalStreamKeyFor(sessionId), () => {
+      // Marker only - the real teardown lives under subscriptionKeyFor.
+    });
+  }
 
   // Seed the sync state WITHOUT emitting: the phone bootstraps its view
   // with a transcript-window request right after subscribing (tail first,
@@ -382,7 +409,40 @@ export async function handleReadStream(
   // field in this response, and it was being sent once per live session on
   // every cold start.
   const wantsTerminal = payload.terminal !== false;
-  const scrollback = wantsTerminal ? await context.sessionManager.getSerializedFrame(payload.sessionId) : '';
+  // A terminal-wanting subscribe IS the mobile interest the resting park
+  // exists for: park an unheld session NOW, before the frame below is
+  // serialized, so the phone's one seed already carries the resting grid
+  // instead of the strip the last desktop surface left (plus a second
+  // reflow-and-reseed when the debounced park fired later).
+  if (wantsTerminal) {
+    context.sessionManager.parkRestingGridForMobileSubscriber(payload.sessionId);
+    // The marker goes up BEFORE the awaited serialize below: resize()'s
+    // floor refusal consults it, and without it a desktop fit landing inside
+    // the settle window (20-400ms) could reshape the grid back under the
+    // phone so the one seed carried exactly the sliver the park removed.
+    // subscribeReadStream re-registers the same key, which is replace-safe.
+    subscriptions.set(terminalStreamKeyFor(payload.sessionId), () => {
+      // Marker only - see subscribeReadStream.
+    });
+  }
+  let scrollback = '';
+  if (wantsTerminal) {
+    try {
+      scrollback = await context.sessionManager.getSerializedFrame(payload.sessionId);
+    } catch (serializeError) {
+      subscriptions.remove(terminalStreamKeyFor(payload.sessionId));
+      throw serializeError;
+    }
+    // The session can exit DURING that await. Registering the subscription
+    // then would be post-mortem: its own onExit teardown never fires (the
+    // exit already happened), so the listeners and the marker above would
+    // leak until the device disconnects - and the dead id would ride the
+    // terminal-streamed set into the renderer indefinitely.
+    if (!context.sessionManager.getSession(payload.sessionId)) {
+      subscriptions.remove(terminalStreamKeyFor(payload.sessionId));
+      return { type: 'capability-response', requestId: request.requestId, ok: false, error: `No such session: ${payload.sessionId}` };
+    }
+  }
   const activityState = context.sessionManager.getActivityCache()[payload.sessionId] ?? null;
   const activityReason = context.sessionManager.getActivityReason(payload.sessionId);
   const usage = context.sessionManager.getUsageCache()[payload.sessionId] ?? null;

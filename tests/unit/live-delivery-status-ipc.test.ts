@@ -44,7 +44,10 @@ vi.mock('../../src/main/transition-engine/terminal-submit-scheduler', () => ({
   },
 }));
 vi.mock('../../src/main/pty/session-manager', () => ({
-  SessionManager: class extends EventEmitter {},
+  SessionManager: class extends EventEmitter {
+    getUsageCache(): Record<string, never> { return {}; }
+    listSessions(): never[] { return []; }
+  },
 }));
 vi.mock('../../src/main/pty/paste-engine', () => ({ createPasteEngine: vi.fn(() => ({})) }));
 vi.mock('../../src/main/pty/terminal-submit', () => ({ TerminalSubmit: class {} }));
@@ -64,7 +67,14 @@ vi.mock('../../src/main/mobile-bridge/mobile-bridge-service', () => ({
     reconcile(): void {}
   },
 }));
-vi.mock('../../src/main/mobile-bridge/board-event-bus', () => ({ BoardEventBus: class {} }));
+vi.mock('../../src/main/mobile-bridge/board-event-bus', () => ({
+  BoardEventBus: class extends EventEmitter {
+    onBoardChanged(listener: (event: unknown) => void): () => void {
+      this.on('board-changed', listener);
+      return () => this.off('board-changed', listener);
+    }
+  },
+}));
 vi.mock('../../src/main/retrieval/retrieval-service', () => ({
   retrievalService: { attach: vi.fn() },
 }));

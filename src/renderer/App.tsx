@@ -10,12 +10,18 @@ import { useMobileStore } from './stores/mobile-store';
 import { useSessionStore } from './stores/session-store';
 import { useBacklogStore } from './stores/backlog-store';
 import { useToastStore } from './stores/toast-store';
+import { useUpdaterStore } from './stores/updater-store';
+import { useAnnouncementsStore } from './stores/announcements-store';
 import { useUsageDashboardStore } from './stores/usage-dashboard-store';
+import { useMonitorStore } from './stores/monitor-store';
 import { usePopOutStore } from './stores/pop-out-store';
+import { useDictationStore } from './stores/dictation-store';
 import { useProjectSwitchEffect } from './hooks/useProjectSwitchEffect';
 import { useAgentDrivenInvalidation } from './hooks/useAgentDrivenInvalidation';
+import { useWhatsNewOnLaunch } from './hooks/useWhatsNewOnLaunch';
 import { invalidateProject } from './stores/project-cache';
 import { resolveAutoFocusTarget } from './utils/auto-focus';
+import { derivePanelSessions } from './utils/panel-sessions';
 import { COMMAND_TERMINAL_NOTIFICATION_TASK_ID } from '../shared/notification-constants';
 import { bumpHmrGeneration } from './utils/hmr-generation';
 import { clearSnapPreviewDom } from './window-manager';
@@ -47,6 +53,11 @@ export function App() {
   const upsertSession = useSessionStore((s) => s.upsertSession);
   const updateSessionStatus = useSessionStore((s) => s.updateSessionStatus);
   const updateActivity = useSessionStore((s) => s.updateActivity);
+
+  // Shows the running version's release notes once, on the first launch after
+  // the version changes. Self-gating on its own config marker; waits for
+  // loadAppVersion() and loadConfig() below to settle before deciding.
+  useWhatsNewOnLaunch();
 
   useEffect(() => {
     if (!currentProjectId) {
@@ -93,6 +104,9 @@ export function App() {
         const allProjectIds = useProjectStore.getState().projects.map((project) => project.id);
         updateConfig({ onboardedProjectIds: allProjectIds });
       }
+      // Seed the monitor's persisted view once config is on hand, so reopening it
+      // (or relaunching the app) restores the layout/grouping/filters as left.
+      useMonitorStore.getState().hydrateView(config.monitor);
     });
 
     // Measure after first paint via requestAnimationFrame
@@ -129,15 +143,14 @@ export function App() {
 
     // Listen for auto-update downloaded notification
     const cleanupUpdateListener = window.electronAPI.updater?.onUpdateDownloaded((info) => {
-      useToastStore.getState().addToast({
-        message: `Version ${info.version} is ready to install`,
-        variant: 'info',
-        duration: 0, // persistent -- user must act or dismiss
-        action: {
-          label: 'Restart to update',
-          onClick: () => window.electronAPI.updater.installUpdate(),
-        },
-      });
+      useUpdaterStore.getState().receiveUpdate(info);
+    });
+
+    // Announcements: hydrate the active list (the first poll may have landed
+    // before this renderer mounted), then stay live via the changed push.
+    void useAnnouncementsStore.getState().loadActive();
+    const cleanupAnnouncementsChanged = window.electronAPI.announcements?.onChanged((active) => {
+      useAnnouncementsStore.getState().receiveActive(active);
     });
 
     return () => {
@@ -146,6 +159,7 @@ export function App() {
       cleanupPathMissing?.();
       cleanupPopOutChanged?.();
       cleanupUpdateListener?.();
+      cleanupAnnouncementsChanged?.();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps -- mount-only bootstrap: every callee is a stable Zustand action or an IPC listener registered exactly once
   }, []);
@@ -197,8 +211,31 @@ export function App() {
         // mid-drag. Wrapped whole so the (currently side-effect-free) write and
         // auto-name scheduling stay in arrival order with the other handlers.
         enqueueSessionUpdate(() => {
+          // Mid-session conversation fork (e.g. Claude /clear): the live
+          // session's agent id is null until first capture (that flip stays
+          // quiet), so a non-null -> DIFFERENT non-null flip on a running
+          // session is exactly a fork. The comparison runs synchronously in
+          // this push handler and syncSessions never re-enters it, so an HMR
+          // resync cannot replay the toast.
+          const previousSession = useSessionStore.getState().sessions
+            .find((existingSession) => existingSession.id === sessionId);
+          const forkedConversation =
+            session.status === 'running'
+            && !session.transient
+            && previousSession?.agentSessionId != null
+            && session.agentSessionId != null
+            && previousSession.agentSessionId !== session.agentSessionId;
           upsertSession(session);
           scheduleAutoNameSuggestion(session);
+          if (forkedConversation
+            && session.projectId === useProjectStore.getState().currentProject?.id) {
+            const forkTask = useBoardStore.getState().tasks.find((boardTask) => boardTask.id === session.taskId);
+            const forkLabel = forkTask ? `"${forkTask.title}"` : sessionId.slice(0, 8);
+            useToastStore.getState().addToast({
+              message: `Conversation for ${forkLabel} moved to a new session (e.g. /clear). Resume will follow the new conversation.`,
+              variant: 'info',
+            });
+          }
         });
       }));
     }
@@ -463,6 +500,23 @@ export function App() {
       }));
     }
 
+    // Agent monitor: snapshot pushes for the DB-resident half of a row (a session
+    // spawned or exited, an agent retitled or moved a task). Live activity does
+    // NOT come through here - it rides the unbuffered SESSION_ACTIVITY push above
+    // and is patched onto rows in place.
+    const monitorApi = window.electronAPI?.monitor;
+    if (monitorApi?.onChanged) {
+      cleanups.push(monitorApi.onChanged((snapshot) => {
+        // Applied unconditionally, not gated on the monitor being open. Main
+        // only pushes while SOME renderer is subscribed (monitor:subscribe), so
+        // with every monitor closed nothing arrives here at all; when the
+        // pop-out is the subscriber, applying the broadcast keeps this window's
+        // cache warm too. Reopen freshness does not depend on this: attach()
+        // seeds from the snapshot the subscription handshake returns.
+        useMonitorStore.getState().applySnapshot(snapshot);
+      }));
+    }
+
     // Session activity state (thinking/idle)
     // ALWAYS update activity (sidebar badges need cross-project data),
     // but only run auto-focus for current project.
@@ -474,6 +528,11 @@ export function App() {
         // one thunk preserves that read-after-write.
         enqueueSessionUpdate(() => {
           updateActivity(sessionId, state, reason);
+
+          // Patch the monitor's matching row in place. This is why the monitor
+          // needs no polling: SESSION_ACTIVITY is already unbuffered and
+          // cross-project, so a state change reaches the row with no round trip.
+          useMonitorStore.getState().applyActivity(sessionId, state, reason ?? null);
 
           const activeProjectId = useProjectStore.getState().currentProject?.id;
           const isCurrentProject = !projectId || !activeProjectId || projectId === activeProjectId;
@@ -490,7 +549,15 @@ export function App() {
               sessionId,
               newState: state,
               currentActiveSessionId: sessionStore.activeSessionId,
-              dialogSessionIds: sessionStore.dialogSessionIds,
+              // Both owner sources, not just this renderer's windows: a detail hosted in
+              // the detached monitor has no tab here either, and making it the active tab
+              // is how the panel ends up selecting a session it renders nothing for.
+              ownedSessionIds: derivePanelSessions({
+                sessions: sessionStore.sessions,
+                currentProjectId: activeProjectId ?? null,
+                dialogSessionIds: sessionStore.dialogSessionIds,
+                remoteDetailTaskIds: sessionStore.remoteDetailTaskIds,
+              }).owned,
               sessionActivity: sessionStore.sessionActivity,
               sessions: projectSessions,
             });
@@ -563,6 +630,13 @@ export function App() {
             .catch(() => {});
           return;
         }
+        // The Command Terminal layer is top-layered over the board, so opening a
+        // task detail underneath it leaves the user looking at a terminal they did
+        // not ask for. A cross-project click closes the layer anyway (close-on-
+        // project-switch); this covers the same-project case. Every PTY stays alive.
+        // Also the path the DETACHED monitor takes: its row click routes through
+        // main and re-emits here, so pop-out and in-app behave identically.
+        useSessionStore.getState().requestHideCommandBar();
         if (taskId && alreadyActive) {
           useSessionStore.getState().setDetailTaskId(taskId);
         } else {
@@ -624,6 +698,63 @@ export function App() {
       cleanups.push(tasks.onSpawnProgress((taskId, label) => {
         enqueueSessionUpdate(() => {
           useSessionStore.getState().setSpawnProgress(taskId, label);
+        });
+      }));
+    }
+
+    // The task was created / promoted / unarchived, but its agent could not
+    // start because another task's agent is live in the same checkout. Those
+    // paths deliberately keep the task, so without this the result is
+    // indistinguishable from a healthy spawn. Current project only: the message
+    // names a task the user cannot see from another project.
+    if (tasks?.onSpawnBlocked) {
+      cleanups.push(tasks.onSpawnBlocked((_taskId, taskTitle, message, blockedProjectId) => {
+        const activeProjectId = useProjectStore.getState().currentProject?.id;
+        if (blockedProjectId && blockedProjectId !== activeProjectId) return;
+        useToastStore.getState().addToast({
+          // Deliberately verb-free about how the task got here. This same event
+          // fires from create, promote, unarchive and MCP auto-spawn, and only
+          // the first of those created anything - "was created" would be a lie
+          // on three of the four paths.
+          message: `"${taskTitle}" did not start its agent. ${message}`,
+          variant: 'warning',
+          duration: 12000,
+        });
+      }));
+    }
+
+    // A column's auto_command finished delivering. Main only pushes the
+    // outcomes worth acting on (see `shouldNotify` in auto-command-outcome.ts),
+    // so anything arriving here is either a real failure or a success that
+    // took something from the user without asking. Current project only: the
+    // message names a task the user cannot see from another project.
+    if (tasks?.onAutoCommandResult) {
+      cleanups.push(tasks.onAutoCommandResult((result) => {
+        const activeProjectId = useProjectStore.getState().currentProject?.id;
+        if (result.projectId && result.projectId !== activeProjectId) return;
+
+        if (result.state === 'failed') {
+          useToastStore.getState().addToast({
+            message: `"${result.taskTitle}" did not run ${result.command}. ${result.reason ?? ''}`.trim(),
+            variant: 'warning',
+            duration: 12000,
+          });
+          return;
+        }
+
+        // Delivered, but it cost the user something. Quote the discarded draft
+        // verbatim so it can be copied back out of the toast: clearing typed
+        // text is defensible, losing it silently is not.
+        const notes: string[] = [];
+        if (result.discardedDraft) notes.push(`Your unsent text was cleared: "${result.discardedDraft}"`);
+        else if (result.interruptedTurn) notes.push('The agent was interrupted mid-task.');
+        if (result.escalated) notes.push('The session was restarted to deliver it.');
+        if (notes.length === 0) return;
+
+        useToastStore.getState().addToast({
+          message: `"${result.taskTitle}" ran ${result.command}. ${notes.join(' ')}`,
+          variant: 'info',
+          duration: 12000,
         });
       }));
     }
@@ -703,9 +834,7 @@ export function App() {
 //
 // Order matters: projects first (restores currentProject), then config/board
 // (which depend on having a current project), then sessions last.
-// @ts-expect-error -- Vite handles import.meta.hot; tsc's "module": "commonjs" doesn't support it
 if (import.meta.hot) {
-  // @ts-expect-error Vite HMR API not typed under commonjs module resolution
   import.meta.hot.on('vite:afterUpdate', () => {
     // Force every <DndContext> to remount with a fresh dnd-kit manager.
     // After Fast Refresh, the surviving DndContext keeps its internal monitor
@@ -762,8 +891,15 @@ if (import.meta.hot) {
     // Usage dashboard Pattern B: refetch the composite payload from
     // main-process truth (no-ops while the dashboard is closed).
     useUsageDashboardStore.getState().loadDashboardStats();
+    // Agent monitor Pattern B: refetch the cross-project snapshot from
+    // main-process truth (no-ops while the monitor is closed).
+    if (useMonitorStore.getState().monitorOpen) {
+      void useMonitorStore.getState().loadSnapshot();
+    }
     // Pop-out windows Pattern B: re-hydrate which surfaces are currently detached.
     usePopOutStore.getState().loadOpen();
+    // Announcements Pattern B: re-pull the active list from main-process truth.
+    void useAnnouncementsStore.getState().loadActive();
     useSessionStore.getState().syncSessions().then((applied) => {
       if (!applied) return;
 
@@ -782,7 +918,6 @@ if (import.meta.hot) {
 }
 
 // Dev-only: expose Zustand stores for UI test automation (Playwright page.evaluate).
-// @ts-expect-error -- Vite defines import.meta.env; tsc doesn't support it
 if (import.meta.env.DEV) {
   (window as unknown as Record<string, unknown>).__zustandStores = {
     board: useBoardStore,
@@ -794,5 +929,7 @@ if (import.meta.env.DEV) {
     commandWindow: commandWindowManager.store,
     usageDashboard: useUsageDashboardStore,
     popOut: usePopOutStore,
+    dictation: useDictationStore,
+    announcements: useAnnouncementsStore,
   };
 }

@@ -1,5 +1,5 @@
 import { v4 as uuidv4 } from 'uuid';
-import { SwimlaneRepository } from '../../db/repositories/swimlane-repository';
+import { SwimlaneRepository, deleteSwimlaneRowWithReferences } from '../../db/repositories/swimlane-repository';
 import { ActionRepository } from '../../db/repositories/action-repository';
 import { getProjectDb } from '../../db/database';
 import type { BoardConfig, SwimlaneRole } from '../../../shared/types';
@@ -126,8 +126,18 @@ export function applyBoardConfigToDb(
           is_archived: isDone ? true : (isTodo ? false : (columnConfig.archived ?? existing.is_archived)),
           is_ghost: false,
           permission_mode: (isTodo || isDone) ? null : (columnConfig.permissionMode ?? existing.permission_mode),
+          // KNOWN GAP: this write does NOT reconcile the tasks already in the
+          // column the way SWIMLANE_UPDATE and the profile writer do (see
+          // reconcileAutoSpawnChange), so a `git pull` that flips `autoSpawn`
+          // still needs a restart to take effect. Deliberate: this path runs off
+          // the kangentic.json file watcher for whichever project changed on
+          // disk, which is often not the focused one, making an automatic spawn
+          // from here materially riskier than one from a deliberate user edit.
           auto_spawn: (isTodo || isDone) ? false : (columnConfig.autoSpawn ?? existing.auto_spawn),
           auto_command: columnConfig.autoCommand ?? existing.auto_command,
+          // Mirrors auto_command's lack of an (isTodo || isDone) guard: the two
+          // travel together, and a mode without its command is inert anyway.
+          auto_command_mode: columnConfig.autoCommandMode ?? existing.auto_command_mode,
           agent_override: (isTodo || isDone) ? null : (columnConfig.agentOverride ?? existing.agent_override),
           model_override: (isTodo || isDone) ? null : (columnConfig.modelOverride ?? existing.model_override),
           effort_override: (isTodo || isDone) ? null : (columnConfig.effortOverride ?? existing.effort_override),
@@ -148,6 +158,7 @@ export function applyBoardConfigToDb(
           permission_mode: (isTodo || isDone) ? null : (columnConfig.permissionMode ?? null),
           auto_spawn: (isTodo || isDone) ? false : (columnConfig.autoSpawn ?? true),
           auto_command: columnConfig.autoCommand ?? null,
+          auto_command_mode: columnConfig.autoCommandMode ?? 'immediate',
           agent_override: (isTodo || isDone) ? null : (columnConfig.agentOverride ?? null),
           model_override: (isTodo || isDone) ? null : (columnConfig.modelOverride ?? null),
           effort_override: (isTodo || isDone) ? null : (columnConfig.effortOverride ?? null),
@@ -171,9 +182,9 @@ export function applyBoardConfigToDb(
         if (taskCount.c > 0) {
           swimlaneRepo.setGhost(existing.id, true);
         } else {
-          db.prepare('DELETE FROM swimlane_transitions WHERE from_swimlane_id = ? OR to_swimlane_id = ?').run(existing.id, existing.id);
-          db.prepare('UPDATE swimlanes SET plan_exit_target_id = NULL WHERE plan_exit_target_id = ?').run(existing.id);
-          db.prepare('DELETE FROM swimlanes WHERE id = ?').run(existing.id);
+          // Bypasses swimlaneRepo.delete() on purpose: that refuses role-bearing
+          // lanes, and the config is allowed to drop one.
+          deleteSwimlaneRowWithReferences(db, existing.id);
         }
       }
     }

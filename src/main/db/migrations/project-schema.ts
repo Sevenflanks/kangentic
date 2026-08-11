@@ -2,6 +2,7 @@ import type Database from 'better-sqlite3';
 import { v4 as uuidv4 } from 'uuid';
 import { seedDefaultSwimlanes, seedDefaultActions } from './default-data';
 import { migrateSpawnAgentConfig } from './spawn-agent-config-migration';
+import { worktreeFolderFromPath } from '../../../shared/worktree-folder';
 
 export function runProjectMigrations(db: Database.Database): void {
   db.exec(`
@@ -16,6 +17,7 @@ export function runProjectMigrations(db: Database.Database): void {
       permission_mode TEXT DEFAULT NULL,
       auto_spawn INTEGER NOT NULL DEFAULT 1,
       auto_command TEXT DEFAULT NULL,
+      auto_command_mode TEXT NOT NULL DEFAULT 'immediate',
       created_at TEXT NOT NULL
     );
 
@@ -504,6 +506,52 @@ export function runProjectMigrations(db: Database.Database): void {
     });
     backfillTransaction();
     db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_display_id ON tasks(display_id)');
+  }
+
+  // Migration: monotonic display_id high-water mark.
+  //
+  // display_id used to be allocated as MAX(display_id) + 1, but `delete()` is a
+  // hard DELETE, so removing the highest-numbered task handed its number to the
+  // next one created. Since a task's worktree directory is now named after its
+  // display_id, a recycled number could adopt a leftover directory belonging to
+  // the deleted task. The counter only ever moves forward.
+  db.exec('CREATE TABLE IF NOT EXISTS project_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)');
+  db.exec(`INSERT OR IGNORE INTO project_meta (key, value)
+    SELECT 'display_id_high_water', CAST(COALESCE(MAX(display_id), 0) AS TEXT) FROM tasks`);
+
+  // Migration: add worktree_folder - the write-once directory name for a task's
+  // worktree. Backfilled ONLY from worktree_path, which is unambiguous.
+  //
+  // Deliberately NOT backfilled from sessions.cwd here. runProjectMigrations
+  // receives only the database handle; the project path lives in the global DB,
+  // so this migration has no anchor to tell a task's own worktree cwd apart from
+  // a project that is itself registered AT a worktree path (an opened worktree,
+  // or a /preview ephemeral project). In that case a task that never had a
+  // worktree has a session cwd equal to the project root, which already contains
+  // the marker, and a bare marker search would write a permanently wrong value
+  // into a write-once column. That recovery happens at use time instead, where
+  // the project path is available - see recoverLegacyWorktreeFolder.
+  const hasWorktreeFolderColumn = (db.pragma('table_info(tasks)') as Array<{ name: string }>)
+    .some((col) => col.name === 'worktree_folder');
+  if (!hasWorktreeFolderColumn) {
+    // ALTER + backfill run in ONE transaction because the guard above tests only
+    // for the column's existence. A crash between the two would leave the column
+    // present and the guard satisfied, so the backfill would never run again -
+    // and the column is write-once, so a task whose worktree_path is later nulled
+    // by a Done move would lose its folder name permanently. Same reasoning, and
+    // the same shape, as the run_mode migration further down this file.
+    const addWorktreeFolderTransaction = db.transaction(() => {
+      db.exec('ALTER TABLE tasks ADD COLUMN worktree_folder TEXT DEFAULT NULL');
+      const tasksWithWorktree = db
+        .prepare('SELECT id, worktree_path FROM tasks WHERE worktree_path IS NOT NULL')
+        .all() as Array<{ id: string; worktree_path: string }>;
+      const updateWorktreeFolder = db.prepare('UPDATE tasks SET worktree_folder = ? WHERE id = ?');
+      for (const task of tasksWithWorktree) {
+        const folderName = worktreeFolderFromPath(task.worktree_path);
+        if (folderName) updateWorktreeFolder.run(folderName, task.id);
+      }
+    });
+    addWorktreeFolderTransaction();
   }
 
   // --- Add labels and priority columns to tasks ---
@@ -1183,6 +1231,47 @@ export function runProjectMigrations(db: Database.Database): void {
             OR effort_override IS NOT NULL OR permission_mode IS NOT NULL)`);
     });
     addRunModeTransaction();
+  }
+
+  // Migration: add auto_command_mode to swimlanes. Controls WHEN a column's
+  // auto_command fires: 'immediate' (inject on arrival, interrupting a live
+  // turn) or 'deferred' (hold until the current turn genuinely finishes).
+  // Defaults to 'immediate', which is exactly the behavior every existing
+  // column already had, so no backfill is needed.
+  const hasAutoCommandMode = (db.pragma('table_info(swimlanes)') as Array<{ name: string }>)
+    .some((column) => column.name === 'auto_command_mode');
+  if (!hasAutoCommandMode) {
+    db.exec("ALTER TABLE swimlanes ADD COLUMN auto_command_mode TEXT NOT NULL DEFAULT 'immediate'");
+  }
+
+  // Migration: record the outcome of a task's most recent auto_command
+  // injection, so a failure is observable instead of being a console warning
+  // nobody sees. Written by the injection reporter; read by the renderer to
+  // raise a notice.
+  //
+  // `auto_command_state` is one of 'confirmed' | 'unconfirmed' | 'escalated' |
+  // 'failed' | 'cancelled' (the `AutoCommandState` union). `unconfirmed` is NOT
+  // a failure: most agents expose no transcript verifier at all, so their
+  // deliveries can only ever land there, and conflating the two would make the
+  // field meaningless off Claude.
+  //
+  // These columns are the durable audit trail, queryable after the fact. They
+  // are NOT the renderer's read path: the `task:autoCommandResult` notice is
+  // built from the in-memory report at push time (see `auto-command-outcome.ts`,
+  // "two sinks"), so nothing reads these back to raise it.
+  const taskInjectionColumns = (db.pragma('table_info(tasks)') as Array<{ name: string }>)
+    .map((column) => column.name);
+  if (!taskInjectionColumns.includes('auto_command_state')) {
+    db.exec('ALTER TABLE tasks ADD COLUMN auto_command_state TEXT DEFAULT NULL');
+  }
+  if (!taskInjectionColumns.includes('auto_command_text')) {
+    db.exec('ALTER TABLE tasks ADD COLUMN auto_command_text TEXT DEFAULT NULL');
+  }
+  if (!taskInjectionColumns.includes('auto_command_error')) {
+    db.exec('ALTER TABLE tasks ADD COLUMN auto_command_error TEXT DEFAULT NULL');
+  }
+  if (!taskInjectionColumns.includes('auto_command_at')) {
+    db.exec('ALTER TABLE tasks ADD COLUMN auto_command_at TEXT DEFAULT NULL');
   }
 
   // Seed default swimlanes if empty (must run after all ALTER TABLE migrations)

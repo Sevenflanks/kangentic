@@ -18,21 +18,17 @@ import type {
  * avoid. Both loaders are guarded, so neither reads as protected merely by
  * sitting next to one that is.
  *
- * Preserved across HMR (Pattern A), matching moveGeneration in
+ * Preserved across HMR (Pattern A), matching moveGenerations in
  * board-store/task-slice.ts: it keeps the counters monotonic across a dev
  * session rather than resetting to 0 on every Fast Refresh. It does NOT protect
  * a reply already in flight when the module is replaced - that reply's own
  * staleness check closes over the OLD module's binding, whatever this one seeds
  * itself with.
  */
-// @ts-expect-error -- Vite handles import.meta.hot; tsc's "module": "commonjs" doesn't support it
 let latestDevicesRequestId: number = import.meta.hot?.data?.latestDevicesRequestId ?? 0;
-// @ts-expect-error -- Vite handles import.meta.hot
 let latestStatusRequestId: number = import.meta.hot?.data?.latestStatusRequestId ?? 0;
 
-// @ts-expect-error -- Vite handles import.meta.hot
 if (import.meta.hot) {
-  // @ts-expect-error -- Vite handles import.meta.hot
   import.meta.hot.dispose((data: Record<string, unknown>) => {
     data.latestDevicesRequestId = latestDevicesRequestId;
     data.latestStatusRequestId = latestStatusRequestId;

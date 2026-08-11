@@ -133,6 +133,11 @@ export function registerTransientSessionHandlers(context: IpcContext): void {
       statusOutputPath,
       eventsOutputPath,
       transient: true,
+      commandTerminalSlot: input.slot ?? null,
+      // The RESOLVED branch, not `input.branch`: the checkout above falls back to
+      // whatever is actually checked out when the requested branch cannot be
+      // switched to, and the monitor must report where the terminal really is.
+      commandTerminalBranch: branch,
       agentParser: adapter,
       agentName: adapter.name,
       exitSequence,
@@ -204,7 +209,16 @@ export function registerTransientSessionHandlers(context: IpcContext): void {
       // cannot be used; schedule without one, mirroring the auto_command path.
       // The scheduler keys its coalesce/cancel map by the first argument, so
       // we pass the sessionId there as well as the PTY target.
-      context.terminalSubmitScheduler.scheduleKeystrokes(input.sessionId, input.sessionId, sequence, {});
+      // A Command Terminal has no task row, so there is nothing to persist an
+      // outcome against and no escalation target: its delivery is inherently
+      // `unconfirmed`. It still inherits the handshake chain and clear policy,
+      // because those live in `submitKeystrokes` rather than here.
+      context.terminalSubmitScheduler.scheduleKeystrokes(
+        input.sessionId,
+        input.sessionId,
+        sequence.map((text) => ({ text, verify: 'none' as const })),
+        {},
+      );
       return { ok: true, injected: true };
     },
   );

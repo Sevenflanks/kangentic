@@ -43,8 +43,14 @@
   // a call log so tests can assert the prompt payload that would have been
   // shipped to the agent.
   let browserUrls = {};
+  // Which project each task URL was saved against, so a test can assert a
+  // popped-out or backgrounded pane wrote to its OWN project's sidecar.
+  let browserUrlProjects = {};
   let browserCaptureCalls = [];
   let browserPaneCalls = [];
+  let browserZoomSubscribers = [];
+  let browserPaneOpenSubscribers = [];
+  let browserPaneCloseSubscribers = [];
   // Pop-out engine call log: open/close/focus invocations, so a test can
   // assert the title-bar / surface-header trigger called the right verb
   // (e.g. focus() instead of toggling the in-app overlay) without a real
@@ -161,12 +167,37 @@
     hotkeyOverrides: {},
     workspaceByProject: {},
     commandTerminalWorkspace: null,
+    monitorWorkspace: null,
+    // Mirrors DEFAULT_CONFIG.monitor. Required on AppConfig, and this file is .js
+    // so tsc cannot catch its absence; without it a UI test has no way to seed a
+    // persisted Agent Monitor view the way it can for every other config field.
+    monitor: {
+      layout: 'cards',
+      groupBy: 'project',
+      sort: 'longest-running',
+      liveOnly: false,
+      projectFilter: [],
+      stateFilter: [],
+      textFilter: '',
+    },
     hasCompletedFirstRun: true,
     lastSeenReleaseNotesVersion: '',
+    // Matches the mocked app.getVersion() below, so WhatsNewDialog stays closed
+    // by default. An empty marker would not match and would auto-open a
+    // `fixed inset-0` backdrop over every spec in the tier. Like
+    // hasCompletedFirstRun above, the mock models an ESTABLISHED install; a spec
+    // that wants the dialog seeds a different version via __mockPreConfigure.
+    lastWhatsNewShownVersion: '0.1.0',
     skipDeleteConfirm: false,
     skipBoardConfigConfirm: false,
     autoFocusIdleSession: false,
-    windowLightDismiss: 'single',
+    // Mirrors DEFAULT_CONFIG.windowLightDismiss in src/shared/types.ts. This is an
+    // independent literal, so a change there does not turn this red on its own - keep
+    // them in step or every UI test silently runs under the wrong policy.
+    windowLightDismiss: 'focused',
+    // true, because the mock models an established install (like hasCompletedFirstRun
+    // above) that has already crossed the single -> focused default flip.
+    hasMigratedWindowLightDismissDefault: true,
     autoNameAskedTaskIds: [],
     autoNameRateLimitPerHour: 60,
     restoreWindowPosition: true,
@@ -301,13 +332,13 @@
   }
 
   var DEFAULT_SWIMLANES = [
-    { name: 'To Do', description: null, role: 'todo', color: '#6b7280', icon: 'layers', is_archived: false, is_ghost: false, permission_mode: null, auto_spawn: false, auto_command: null, plan_exit_target_id: null, agent_override: null, model_override: null, effort_override: null, handoff_context: false, session_target: 'main', session_spawn_strategy: 'create_or_resume' },
-    { name: 'Planning', description: null, role: null, color: '#8b5cf6', icon: 'map', is_archived: false, is_ghost: false, permission_mode: 'plan', auto_spawn: true, auto_command: null, plan_exit_target_id: '__executing__', agent_override: null, model_override: null, effort_override: null, handoff_context: false, session_target: 'main', session_spawn_strategy: 'create_or_resume' },
-    { name: 'Executing', description: null, role: null, color: '#3b82f6', icon: 'square-terminal', is_archived: false, is_ghost: false, permission_mode: null, auto_spawn: true, auto_command: null, plan_exit_target_id: null, agent_override: null, model_override: null, effort_override: null, handoff_context: false, session_target: 'main', session_spawn_strategy: 'create_or_resume' },
-    { name: 'Code Review', description: null, role: null, color: '#f59e0b', icon: 'code', is_archived: false, is_ghost: false, permission_mode: null, auto_spawn: true, auto_command: null, plan_exit_target_id: null, agent_override: null, model_override: null, effort_override: null, handoff_context: false, session_target: 'main', session_spawn_strategy: 'create_or_resume' },
-    { name: 'Tests', description: null, role: null, color: '#06b6d4', icon: 'flask-conical', is_archived: false, is_ghost: false, permission_mode: null, auto_spawn: true, auto_command: null, plan_exit_target_id: null, agent_override: null, model_override: null, effort_override: null, handoff_context: false, session_target: 'main', session_spawn_strategy: 'create_or_resume' },
-    { name: 'Ship It', description: null, role: null, color: '#F97316', icon: 'sailboat', is_archived: false, is_ghost: false, permission_mode: null, auto_spawn: true, auto_command: null, plan_exit_target_id: null, agent_override: null, model_override: null, effort_override: null, handoff_context: false, session_target: 'main', session_spawn_strategy: 'create_or_resume' },
-    { name: 'Done', description: null, role: 'done', color: '#10b981', icon: 'circle-check-big', is_archived: true, is_ghost: false, permission_mode: null, auto_spawn: false, auto_command: null, plan_exit_target_id: null, agent_override: null, model_override: null, effort_override: null, handoff_context: false, session_target: 'main', session_spawn_strategy: 'create_or_resume' },
+    { name: 'To Do', description: null, role: 'todo', color: '#6b7280', icon: 'layers', is_archived: false, is_ghost: false, permission_mode: null, auto_spawn: false, auto_command: null, auto_command_mode: 'immediate', plan_exit_target_id: null, agent_override: null, model_override: null, effort_override: null, handoff_context: false, session_target: 'main', session_spawn_strategy: 'create_or_resume' },
+    { name: 'Planning', description: null, role: null, color: '#8b5cf6', icon: 'map', is_archived: false, is_ghost: false, permission_mode: 'plan', auto_spawn: true, auto_command: null, auto_command_mode: 'immediate', plan_exit_target_id: '__executing__', agent_override: null, model_override: null, effort_override: null, handoff_context: false, session_target: 'main', session_spawn_strategy: 'create_or_resume' },
+    { name: 'Executing', description: null, role: null, color: '#3b82f6', icon: 'square-terminal', is_archived: false, is_ghost: false, permission_mode: null, auto_spawn: true, auto_command: null, auto_command_mode: 'immediate', plan_exit_target_id: null, agent_override: null, model_override: null, effort_override: null, handoff_context: false, session_target: 'main', session_spawn_strategy: 'create_or_resume' },
+    { name: 'Code Review', description: null, role: null, color: '#f59e0b', icon: 'code', is_archived: false, is_ghost: false, permission_mode: null, auto_spawn: true, auto_command: null, auto_command_mode: 'immediate', plan_exit_target_id: null, agent_override: null, model_override: null, effort_override: null, handoff_context: false, session_target: 'main', session_spawn_strategy: 'create_or_resume' },
+    { name: 'Tests', description: null, role: null, color: '#06b6d4', icon: 'flask-conical', is_archived: false, is_ghost: false, permission_mode: null, auto_spawn: true, auto_command: null, auto_command_mode: 'immediate', plan_exit_target_id: null, agent_override: null, model_override: null, effort_override: null, handoff_context: false, session_target: 'main', session_spawn_strategy: 'create_or_resume' },
+    { name: 'Ship It', description: null, role: null, color: '#F97316', icon: 'sailboat', is_archived: false, is_ghost: false, permission_mode: null, auto_spawn: true, auto_command: null, auto_command_mode: 'immediate', plan_exit_target_id: null, agent_override: null, model_override: null, effort_override: null, handoff_context: false, session_target: 'main', session_spawn_strategy: 'create_or_resume' },
+    { name: 'Done', description: null, role: 'done', color: '#10b981', icon: 'circle-check-big', is_archived: true, is_ghost: false, permission_mode: null, auto_spawn: false, auto_command: null, auto_command_mode: 'immediate', plan_exit_target_id: null, agent_override: null, model_override: null, effort_override: null, handoff_context: false, session_target: 'main', session_spawn_strategy: 'create_or_resume' },
   ];
 
   var MOCK_PROJECT_ENTRIES = [
@@ -349,6 +380,28 @@
   //   - window.__mockDefaultAgentOverride: default_agent for the next project created
   //     via projects.create() or projects.openByPath(); cleared after first use
   //     (used by agent-tab-auth-warning.spec.ts to seed projects with kimi/opencode/etc.)
+  // Release-notes modal test hooks: installed eagerly here (not lazily inside
+  // updater.onUpdateDownloaded) so `__mockFireUpdateDownloaded` exists even
+  // before any renderer subscriber has registered. A spec that calls it too
+  // early throws loudly instead of silently no-op'ing into a confusing
+  // "dialog never appeared" failure.
+  window.__mockUpdateDownloadedListeners = [];
+  window.__mockFireUpdateDownloaded = function (info) {
+    var listeners = window.__mockUpdateDownloadedListeners.slice();
+    listeners.forEach(function (fn) { fn(info); });
+  };
+
+  // Announcements test hooks: installed eagerly for the same reason as the
+  // update-downloaded hooks above. `__mockFireAnnouncementsChanged(active)`
+  // also updates `__mockActiveAnnouncements` so a later
+  // announcements.getActive() (e.g. an HMR resync) returns the same list.
+  window.__mockActiveAnnouncements = [];
+  window.__mockAnnouncementsChangedListeners = [];
+  window.__mockFireAnnouncementsChanged = function (active) {
+    window.__mockActiveAnnouncements = active;
+    var listeners = window.__mockAnnouncementsChangedListeners.slice();
+    listeners.forEach(function (fn) { fn(active); });
+  };
   // Notification-click test hook (App.tsx's `notifications.onClicked` handler,
   // including the isCommandTerminal branch). Installed eagerly for the same
   // reason as the update-downloaded hooks above. Unlike that hook, this one
@@ -718,7 +771,22 @@
         var visible = tasks.filter(function (t) {
           return !t.projectId || t.projectId === currentProjectId;
         });
-        return withAttachmentCounts(visible);
+        // withAttachmentCounts copies each row (Object.assign), so this payload
+        // is a genuine snapshot of the board AT CALL TIME and cannot be mutated
+        // by a later move.
+        var payload = withAttachmentCounts(visible);
+        // Test hook: hold THIS call's response until __mockReleaseTaskList().
+        // Snapshot-at-call-time is the load-bearing property. The stale-reload
+        // bug IS a payload computed before a write and delivered after it, so a
+        // hold that recomputed lazily on release would report the post-write
+        // board and pass vacuously against the buggy code.
+        if (window.__mockHoldNextTaskList) {
+          window.__mockHoldNextTaskList = false;
+          return new Promise(function (resolve) {
+            window.__mockReleaseTaskList = function () { resolve(payload); };
+          });
+        }
+        return payload;
       },
       create: async function (input) {
         // Test hook: count create IPC calls so specs can verify a double-submit
@@ -754,6 +822,7 @@
           agent: null,
           session_id: null,
           worktree_path: null,
+          worktree_folder: null,
           branch_name: input.customBranchName || null,
           pr_number: null,
           pr_url: null,
@@ -1015,6 +1084,44 @@
       },
       onAutoMoved: function () {
         return noop;
+      },
+      onSpawnBlocked: function (callback) {
+        // Tests fire this via window.__mockFireTaskSpawnBlocked(taskId, title, message, projectId).
+        if (!window.__mockTaskSpawnBlockedListeners) window.__mockTaskSpawnBlockedListeners = [];
+        window.__mockTaskSpawnBlockedListeners.push(callback);
+        if (!window.__mockFireTaskSpawnBlocked) {
+          window.__mockFireTaskSpawnBlocked = function (taskId, taskTitle, message, projectId) {
+            var listeners = (window.__mockTaskSpawnBlockedListeners || []).slice();
+            listeners.forEach(function (listener) { listener(taskId, taskTitle, message, projectId); });
+          };
+        }
+        // A REAL unsubscribe, matching the preload bridge. App.tsx pushes this
+        // onto its cleanups array, so returning a noop would leave the unmounted
+        // component's handler registered and fire a duplicate toast after any
+        // remount, HMR update or project switch.
+        return function () {
+          var listeners = window.__mockTaskSpawnBlockedListeners || [];
+          var index = listeners.indexOf(callback);
+          if (index !== -1) listeners.splice(index, 1);
+        };
+      },
+      onAutoCommandResult: function (callback) {
+        // Tests fire this via window.__mockFireAutoCommandResult(notice), where
+        // `notice` is an AutoCommandResultNotice.
+        if (!window.__mockAutoCommandResultListeners) window.__mockAutoCommandResultListeners = [];
+        window.__mockAutoCommandResultListeners.push(callback);
+        if (!window.__mockFireAutoCommandResult) {
+          window.__mockFireAutoCommandResult = function (notice) {
+            var listeners = (window.__mockAutoCommandResultListeners || []).slice();
+            listeners.forEach(function (listener) { listener(notice); });
+          };
+        }
+        // A REAL unsubscribe, for the same reason onSpawnBlocked returns one.
+        return function () {
+          var listeners = window.__mockAutoCommandResultListeners || [];
+          var index = listeners.indexOf(callback);
+          if (index !== -1) listeners.splice(index, 1);
+        };
       },
       onCreatedByAgent: function (callback) {
         // Tests can fire this via window.__mockFireTaskCreatedByAgent(taskId, title, column, projectId).
@@ -1323,6 +1430,7 @@
           permission_mode: input.permission_mode || null,
           auto_spawn: (input.auto_spawn !== undefined && input.auto_spawn !== null) ? input.auto_spawn : true,
           auto_command: input.auto_command || null,
+          auto_command_mode: input.auto_command_mode || 'immediate',
           plan_exit_target_id: input.plan_exit_target_id || null,
           agent_override: input.agent_override || null,
           model_override: input.model_override || null,
@@ -1347,9 +1455,39 @@
         throw new Error('Swimlane not found: ' + input.id);
       },
       delete: async function (id) {
+        var doomed = swimlanes.find(function (s) {
+          return s.id === id;
+        });
         swimlanes = swimlanes.filter(function (s) {
           return s.id !== id;
         });
+        // Mirror the real handler's side effect: SWIMLANE_DELETE also prunes the
+        // deleted column out of the Board Profiles (entries keyed by its uuid, and
+        // any planExitTarget naming it). Without this the mock and production
+        // diverge in BEHAVIOR, not just storage, so a spec asserting on
+        // getBoardProfiles() after a delete would answer the wrong question.
+        // Deliberately re-implemented rather than importing the shared pruner:
+        // this file is plain JS evaluated in the page, with no bundler.
+        if (doomed) {
+          var doomedName = String(doomed.name || '').trim().toLowerCase();
+          mockBoardProfiles = mockBoardProfiles.map(function (profile) {
+            var nextColumns = {};
+            Object.keys(profile.columns || {}).forEach(function (swimlaneId) {
+              if (swimlaneId === id) return;
+              var entry = profile.columns[swimlaneId];
+              if (entry && typeof entry === 'object'
+                && typeof entry.planExitTarget === 'string'
+                && entry.planExitTarget.trim().toLowerCase() === doomedName) {
+                var rest = Object.assign({}, entry);
+                delete rest.planExitTarget;
+                nextColumns[swimlaneId] = rest;
+                return;
+              }
+              nextColumns[swimlaneId] = entry;
+            });
+            return Object.assign({}, profile, { columns: nextColumns });
+          });
+        }
       },
       reorder: async function (ids) {
         ids.forEach(function (id, i) {
@@ -1455,11 +1593,11 @@
     },
 
     sessions: {
-      spawn: async function () {
+      spawn: async function (_input, _projectId) {
         throw new Error('Mock: session spawn not available in UI tests');
       },
       kill: async function () {},
-      suspend: async function (taskId) {
+      suspend: async function (taskId, _projectId) {
         var session = sessions.find(function (s) { return s.taskId === taskId; });
         if (session) {
           session.status = 'suspended';
@@ -1470,11 +1608,11 @@
           task.updated_at = now();
         }
       },
-      resume: async function (taskId, resumePrompt) {
+      resume: async function (taskId, resumePrompt, projectId) {
         var newSession = {
           id: uuid(),
           taskId: taskId,
-          projectId: currentProjectId || '',
+          projectId: projectId || currentProjectId || '',
           pid: Math.floor(Math.random() * 10000),
           status: 'running',
           shell: 'bash',
@@ -1495,7 +1633,7 @@
         }
         return newSession;
       },
-      reset: async function (taskId) {
+      reset: async function (taskId, _projectId) {
         sessions = sessions.filter(function (s) { return s.taskId !== taskId; });
         var task = tasks.find(function (t) { return t.id === taskId; });
         if (task) {
@@ -1507,7 +1645,7 @@
       // session whose taskId matches IF its status is 'running' or 'queued'
       // (the "live registry" view), else null. Tests can override via
       // window.electronAPI.sessions.reconcile = ... to exercise drift cases.
-      reconcile: async function (taskId) {
+      reconcile: async function (taskId, _projectId) {
         var live = sessions.find(function (s) {
           return s.taskId === taskId && (s.status === 'running' || s.status === 'queued');
         });
@@ -1530,12 +1668,34 @@
       __resizeCalls: [],
       resize: async function (sessionId, cols, rows) {
         window.electronAPI.sessions.__resizeCalls.push({ sessionId: sessionId, cols: cols, rows: rows });
-        return { colsChanged: false };
+        // Tests can force the result (e.g. { colsChanged: false, refused: true }
+        // to exercise the width-drift refusal hold) via window.__mockResizeResult.
+        return window.__mockResizeResult || { colsChanged: false };
       },
       list: async function () {
         return sessions;
       },
-      getScrollback: async function () {
+      // Per-session replay delay, in ms, via window.__mockScrollbackDelayMs
+      // keyed by session id. Real main deliberately waits 150-400ms here while
+      // the agent TUI's repaint settles (see pty-buffer-manager.ts), and that
+      // wait is what makes the ORDER in which two concurrently mounting
+      // terminals finish replaying nondeterministic. Without a way to control
+      // that order a spec cannot reproduce the arrival-focus race at all.
+      // Every call is logged to window.__mockScrollbackCalls as
+      // { sessionId, delay }, so a spec can prove AFTER the fact that a replay
+      // it meant to delay actually took the delayed path. That matters because
+      // the assertions a delay enables ("the late terminal did not steal
+      // focus") all still pass if the delay silently stops applying - a renamed
+      // session id, a changed mock - leaving the race unexercised and the spec
+      // vacuously green. Checking the log is deterministic; watching for the
+      // transient replay veil to prove the same thing is not, and fails on CI.
+      getScrollback: async function (sessionId) {
+        var delay = (window.__mockScrollbackDelayMs || {})[sessionId] || 0;
+        window.__mockScrollbackCalls = window.__mockScrollbackCalls || [];
+        window.__mockScrollbackCalls.push({ sessionId: sessionId, delay: delay });
+        if (delay > 0) {
+          await new Promise(function (resolve) { setTimeout(resolve, delay); });
+        }
         return '';
       },
       getFirstOutput: async function () {
@@ -1550,9 +1710,9 @@
         if (!window.__mockDataListeners) window.__mockDataListeners = [];
         window.__mockDataListeners.push(callback);
         if (!window.__mockFireSessionData) {
-          window.__mockFireSessionData = function (sessionId, data) {
+          window.__mockFireSessionData = function (sessionId, data, projectId) {
             var listeners = (window.__mockDataListeners || []).slice();
-            for (var i = 0; i < listeners.length; i++) { listeners[i](sessionId, data); }
+            for (var i = 0; i < listeners.length; i++) { listeners[i](sessionId, data, projectId); }
           };
         }
         return function () {
@@ -1564,14 +1724,31 @@
       ackData: function () {
         // No-op in the headless mock: backpressure pause/resume has no PTY here.
       },
+      onPtyResized: function (callback) {
+        // Tests can fire the width-drift echo via
+        // window.__mockFirePtyResized(sessionId, cols, rows, origin).
+        if (!window.__mockPtyResizedListeners) window.__mockPtyResizedListeners = [];
+        window.__mockPtyResizedListeners.push(callback);
+        if (!window.__mockFirePtyResized) {
+          window.__mockFirePtyResized = function (sessionId, cols, rows, origin) {
+            var listeners = (window.__mockPtyResizedListeners || []).slice();
+            for (var i = 0; i < listeners.length; i++) { listeners[i](sessionId, cols, rows, origin || 'desktop'); }
+          };
+        }
+        return function () {
+          var listeners = window.__mockPtyResizedListeners || [];
+          var idx = listeners.indexOf(callback);
+          if (idx >= 0) listeners.splice(idx, 1);
+        };
+      },
       onFirstOutput: function (callback) {
         // Tests can fire this via window.__mockFireFirstOutput(sessionId).
         if (!window.__mockFirstOutputListeners) window.__mockFirstOutputListeners = [];
         window.__mockFirstOutputListeners.push(callback);
         if (!window.__mockFireFirstOutput) {
-          window.__mockFireFirstOutput = function (sessionId) {
+          window.__mockFireFirstOutput = function (sessionId, projectId) {
             var listeners = (window.__mockFirstOutputListeners || []).slice();
-            for (var i = 0; i < listeners.length; i++) { listeners[i](sessionId); }
+            for (var i = 0; i < listeners.length; i++) { listeners[i](sessionId, projectId); }
           };
         }
         return function () {
@@ -1602,9 +1779,9 @@
         if (!window.__mockStatusListeners) window.__mockStatusListeners = [];
         window.__mockStatusListeners.push(callback);
         if (!window.__mockFireStatus) {
-          window.__mockFireStatus = function (sessionId, session) {
+          window.__mockFireStatus = function (sessionId, session, projectId) {
             var listeners = (window.__mockStatusListeners || []).slice();
-            for (var i = 0; i < listeners.length; i++) { listeners[i](sessionId, session); }
+            for (var i = 0; i < listeners.length; i++) { listeners[i](sessionId, session, projectId); }
           };
         }
         return function () {
@@ -1723,6 +1900,13 @@
       __setFocusedCalls: [],
       setFocused: async function (sessionIds) {
         window.electronAPI.sessions.__setFocusedCalls.push(sessionIds.slice());
+      },
+      // Which sessions have an xterm mounted, published by every terminal's
+      // mount effect (terminal-mount-registry). Same call-log shape as
+      // setFocused above.
+      __setMountedCalls: [],
+      setMounted: async function (sessionIds) {
+        window.electronAPI.sessions.__setMountedCalls.push(sessionIds.slice());
       },
       __notifyUserInterruptCalls: [],
       notifyUserInterrupt: async function (sessionId) {
@@ -2006,6 +2190,10 @@
         if (partial && Object.prototype.hasOwnProperty.call(partial, 'commandTerminalWorkspace')) {
           config.commandTerminalWorkspace = partial.commandTerminalWorkspace;
         }
+        // monitorWorkspace is the same kind of blob, for the Agent Monitor's detail layer.
+        if (partial && Object.prototype.hasOwnProperty.call(partial, 'monitorWorkspace')) {
+          config.monitorWorkspace = partial.monitorWorkspace;
+        }
         // terminal.colors is a nested dictionary-style map (CONFIG_DICTIONARY_PATHS:
         // 'terminal.colors'): the real save REPLACES it wholesale so resetting a
         // single color slot (deleting its key) actually takes effect.
@@ -2025,6 +2213,9 @@
         }
         if (partial && Object.prototype.hasOwnProperty.call(partial, 'commandTerminalWorkspace')) {
           config.commandTerminalWorkspace = partial.commandTerminalWorkspace;
+        }
+        if (partial && Object.prototype.hasOwnProperty.call(partial, 'monitorWorkspace')) {
+          config.monitorWorkspace = partial.monitorWorkspace;
         }
         if (partial && partial.terminal && Object.prototype.hasOwnProperty.call(partial.terminal, 'colors')) {
           config.terminal.colors = Object.assign({}, partial.terminal.colors);
@@ -2274,6 +2465,108 @@
     handoffs: {
       list: async function (_taskId) {
         return [];
+      },
+    },
+
+    // Task-detail ownership. There is exactly ONE renderer under test, so a
+    // handover always resolves to "open here"; what this mock genuinely exercises
+    // is the never-open-twice rule and the derived syncOwned / releaseAllFor
+    // lifecycle (there is no claim/release pair - see
+    // .claude/rules/derived-detail-ownership.md). `__owners` is exposed so a spec
+    // can assert ownership directly.
+    taskDetailOwnership: {
+      // key -> { host }. Mirrors main's DetailOwnerRegistry closely enough to
+      // exercise the real rule: the requester wins, and the previous holder is
+      // told to close. `__owners` is exposed so a spec can assert ownership.
+      __owners: {},
+      requestOpen: function (projectId, taskId, host) {
+        var key = projectId + ':' + taskId;
+        var owners = window.electronAPI.taskDetailOwnership.__owners;
+        var existing = owners[key] || null;
+        if (existing && existing.host === host) {
+          return Promise.resolve({
+            kind: 'focused-existing',
+            owner: { webContentsId: 1, host: host },
+          });
+        }
+        if (existing) {
+          var closers = (window.__mockDetailCloseHereListeners || []).slice();
+          for (var c = 0; c < closers.length; c++) closers[c](projectId, taskId, existing.host);
+        }
+        var listeners = (window.__mockDetailOpenHereListeners || []).slice();
+        for (var i = 0; i < listeners.length; i++) listeners[i](projectId, taskId, host);
+        return Promise.resolve({
+          kind: 'open-here',
+          owner: { webContentsId: 1, host: host },
+          closedElsewhere: existing,
+        });
+      },
+      // Ownership is DERIVED: a host reports the COMPLETE set of details it has
+      // mounted and main reconciles to match, so a lost message cannot strand a
+      // claim. Mirrors `DetailOwnerRegistry.syncOwned`, including the two asymmetric
+      // halves that make a handover converge in either order:
+      //   - remove only keys THIS host owns (a stale report cannot erase the new
+      //     owner's key);
+      //   - an add may displace another host, which is then told to close.
+      // Single renderer here, so the host alone is the scope.
+      syncOwned: function (host, entries) {
+        var owners = window.electronAPI.taskDetailOwnership.__owners;
+        var reported = {};
+        var index;
+        for (index = 0; index < entries.length; index++) {
+          reported[entries[index].projectId + ':' + entries[index].taskId] = true;
+        }
+
+        var key;
+        for (key in owners) {
+          if (!Object.prototype.hasOwnProperty.call(owners, key)) continue;
+          if (owners[key].host !== host) continue;
+          if (reported[key]) continue;
+          delete owners[key];
+        }
+
+        for (index = 0; index < entries.length; index++) {
+          var entry = entries[index];
+          key = entry.projectId + ':' + entry.taskId;
+          var previous = owners[key] || null;
+          if (previous && previous.host === host) continue;
+          owners[key] = { webContentsId: 1, host: host };
+          if (!previous) continue;
+          var closers = (window.__mockDetailCloseHereListeners || []).slice();
+          for (var c = 0; c < closers.length; c++) {
+            closers[c](entry.projectId, entry.taskId, previous.host);
+          }
+        }
+      },
+      onOpenHere: function (callback) {
+        if (!window.__mockDetailOpenHereListeners) window.__mockDetailOpenHereListeners = [];
+        window.__mockDetailOpenHereListeners.push(callback);
+        return function () {
+          var listeners = window.__mockDetailOpenHereListeners || [];
+          var index = listeners.indexOf(callback);
+          if (index >= 0) listeners.splice(index, 1);
+        };
+      },
+      onCloseHere: function (callback) {
+        if (!window.__mockDetailCloseHereListeners) window.__mockDetailCloseHereListeners = [];
+        window.__mockDetailCloseHereListeners.push(callback);
+        return function () {
+          var listeners = window.__mockDetailCloseHereListeners || [];
+          var index = listeners.indexOf(callback);
+          if (index >= 0) listeners.splice(index, 1);
+        };
+      },
+      // Details held by ANOTHER renderer. The mock is a single renderer, so real
+      // ownership here is never remote; a test simulates a detached monitor via
+      // window.__mockSetRemoteDetailOwners([{ projectId, taskId }]).
+      onRemoteOwnersChanged: function (callback) {
+        if (!window.__mockDetailRemoteOwnerListeners) window.__mockDetailRemoteOwnerListeners = [];
+        window.__mockDetailRemoteOwnerListeners.push(callback);
+        return function () {
+          var listeners = window.__mockDetailRemoteOwnerListeners || [];
+          var index = listeners.indexOf(callback);
+          if (index >= 0) listeners.splice(index, 1);
+        };
       },
     },
 
@@ -2594,6 +2887,7 @@
             agent: null,
             session_id: null,
             worktree_path: null,
+            worktree_folder: null,
             branch_name: null,
             pr_number: null,
             pr_url: null,
@@ -2910,6 +3204,7 @@
       var pairingConfirmedListeners = [];
       var pairingEndedListeners = [];
       var stateChangedListeners = [];
+      var terminalStreamsListeners = [];
       var mockDeviceCounter = 0;
 
       // Mirrors packages/protocol/src/capabilities/verbs.ts's CAPABILITY_VERBS -
@@ -2937,6 +3232,14 @@
         };
         window.__mockFireMobileStateChanged = function () {
           stateChangedListeners.forEach(function (listener) { listener(); });
+        };
+        // Drives the panel-suspension sync (useMobileTerminalStreamsSync):
+        // the sessions a phone streams the TERMINAL of, whose bottom-panel
+        // tab is dropped. Also seeds getTerminalStreams below, matching
+        // production where the push and the invoke read the same registry.
+        window.__mockFireMobileTerminalStreamsChanged = function (sessionIds) {
+          window.__mockMobileTerminalStreams = sessionIds;
+          terminalStreamsListeners.forEach(function (listener) { listener(sessionIds); });
         };
         window.__mockCompleteMobilePairing = function (displayName) {
           mockDeviceCounter += 1;
@@ -3024,6 +3327,10 @@
         },
         // Tests can set window.__mockTestRelay = function (relayUrl) { ... }
         // to control the "Test connection" result; default is a reachable stub.
+        // The default deliberately reports NEITHER a version nor a latency, so
+        // it exercises the bare-verdict path a relay that answers /healthz with
+        // {"status":"ok"} produces; a test wanting the fuller pill supplies both
+        // through __mockTestRelay.
         testRelay: async function (relayUrl) {
           if (typeof window !== 'undefined' && typeof window.__mockTestRelay === 'function') {
             return window.__mockTestRelay(relayUrl);
@@ -3058,6 +3365,16 @@
             if (index >= 0) stateChangedListeners.splice(index, 1);
           };
         },
+        getTerminalStreams: async function () {
+          return (typeof window !== 'undefined' && window.__mockMobileTerminalStreams) || [];
+        },
+        onTerminalStreamsChanged: function (callback) {
+          terminalStreamsListeners.push(callback);
+          return function () {
+            var index = terminalStreamsListeners.indexOf(callback);
+            if (index >= 0) terminalStreamsListeners.splice(index, 1);
+          };
+        },
       };
     })(),
 
@@ -3077,8 +3394,42 @@
 
     updater: {
       checkForUpdate: async function () {},
-      installUpdate: async function () {},
-      onUpdateDownloaded: function () { return noop; },
+      installUpdate: async function () {
+        // Record calls so UI tests can assert "Restart to update" wired
+        // through to the IPC layer.
+        if (!window.__mockInstallUpdateCalls) window.__mockInstallUpdateCalls = [];
+        window.__mockInstallUpdateCalls.push(true);
+      },
+      onUpdateDownloaded: function (callback) {
+        // Tests can fire the update-downloaded push via
+        // `window.__mockFireUpdateDownloaded({ version, releaseNotes })`. The
+        // listener array and the fire hook itself are installed eagerly at
+        // mock-bootstrap time (see top of file), not lazily here.
+        window.__mockUpdateDownloadedListeners.push(callback);
+        return function () {
+          var listeners = window.__mockUpdateDownloadedListeners || [];
+          var idx = listeners.indexOf(callback);
+          if (idx >= 0) listeners.splice(idx, 1);
+        };
+      },
+    },
+
+    announcements: {
+      getActive: async function () {
+        return window.__mockActiveAnnouncements || [];
+      },
+      onChanged: function (callback) {
+        // Tests fire the changed push via
+        // `window.__mockFireAnnouncementsChanged([announcement, ...])`. The
+        // listener array and the fire hook itself are installed eagerly at
+        // mock-bootstrap time (see top of file), not lazily here.
+        window.__mockAnnouncementsChangedListeners.push(callback);
+        return function () {
+          var listeners = window.__mockAnnouncementsChangedListeners || [];
+          var idx = listeners.indexOf(callback);
+          if (idx >= 0) listeners.splice(idx, 1);
+        };
+      },
     },
 
     notifications: {
@@ -3112,6 +3463,116 @@
       listOpen: function () { return Promise.resolve([]); },
       onChanged: function (/* callback(openInstanceKeys) */) { return noop; },
       descriptor: null,
+    },
+
+    // Agent Monitor. Machine-global: no projectId, by design.
+    // Seed rows from a spec with:
+    //   window.__mockMonitorRows = [ { sessionId: 's1', projectId: 'p1', ... } ];
+    // and push an update with window.__mockFireMonitorChanged(rows).
+    monitor: {
+      getSnapshot: function () {
+        return Promise.resolve({
+          rows: window.__mockMonitorRows || [],
+          generatedAt: '2026-01-01T00:00:00.000Z',
+        });
+      },
+      // Subscription handshake (monitor:subscribe / monitor:unsubscribe). The
+      // mock has no push pipeline to gate, so subscribe just returns the same
+      // seeded snapshot getSnapshot serves; the call log lets a spec assert the
+      // monitor registered/unregistered itself.
+      __subscribeCalls: 0,
+      __unsubscribeCalls: 0,
+      subscribe: function () {
+        window.electronAPI.monitor.__subscribeCalls += 1;
+        return window.electronAPI.monitor.getSnapshot();
+      },
+      unsubscribe: function () {
+        window.electronAPI.monitor.__unsubscribeCalls += 1;
+        return Promise.resolve();
+      },
+      // Call log for assertions: the detached monitor routes clicks through here.
+      __revealCalls: [],
+      revealTask: function (projectId, taskId) {
+        window.electronAPI.monitor.__revealCalls.push({ projectId: projectId, taskId: taskId });
+        return Promise.resolve();
+      },
+      // The project-scoped half of a task detail, for a host that is not that
+      // project's board. Resolves from the SAME seeded state the rest of the mock
+      // uses, so a monitor-hosted detail sees exactly what the board would - a
+      // spec cannot accidentally prove the surface works against invented data.
+      // Call log for test assertions (mirrors __subscribeCalls): pins that a
+      // detail refetches on a real snapshot change but NOT on every activity tick.
+      __getTaskDetailCalls: 0,
+      getTaskDetail: function (projectId, taskId) {
+        window.electronAPI.monitor.__getTaskDetailCalls += 1;
+        var project = null;
+        for (var p = 0; p < projects.length; p++) {
+          if (projects[p].id === projectId) { project = projects[p]; break; }
+        }
+        var task = null;
+        for (var t = 0; t < tasks.length; t++) {
+          if (tasks[t].id === taskId) { task = tasks[t]; break; }
+        }
+        if (!project || !task) return Promise.resolve(null);
+        return Promise.resolve({
+          task: task,
+          projectId: projectId,
+          projectName: project.name,
+          projectPath: project.path,
+          defaultAgent: project.default_agent || null,
+          swimlanes: swimlanes.slice(),
+          // Matches boardConfig.getShortcuts() above, so the monitor-hosted
+          // detail and the board-hosted one agree on custom shortcuts.
+          shortcuts: [],
+          config: {
+            labelColors: (config.backlog && config.backlog.labelColors) || {},
+            defaultBaseBranch: config.git.defaultBaseBranch,
+            worktreesEnabled: config.git.worktreesEnabled,
+            browserEnabled: !(config.browser && config.browser.enabled === false),
+          },
+        });
+      },
+      onChanged: function (callback) {
+        if (!window.__mockMonitorChangedListeners) window.__mockMonitorChangedListeners = [];
+        window.__mockMonitorChangedListeners.push(callback);
+        if (!window.__mockFireMonitorChanged) {
+          window.__mockFireMonitorChanged = function (rows) {
+            window.__mockMonitorRows = rows;
+            var snapshot = { rows: rows, generatedAt: new Date().toISOString() };
+            var listeners = (window.__mockMonitorChangedListeners || []).slice();
+            for (var i = 0; i < listeners.length; i++) { listeners[i](snapshot); }
+          };
+        }
+        return function () {
+          var listeners = window.__mockMonitorChangedListeners || [];
+          var index = listeners.indexOf(callback);
+          if (index >= 0) listeners.splice(index, 1);
+        };
+      },
+      // Live output peek. Subscribe-gated in production, so the call log lets a
+      // spec assert that a mounted monitor subscribes and an unmounted one stops
+      // (the property that keeps main from watching PTY output for nobody).
+      __peekSubscribeCalls: [],
+      setPeekSubscribed: function (subscribed) {
+        window.electronAPI.monitor.__peekSubscribeCalls.push(subscribed);
+        return Promise.resolve();
+      },
+      // Push peeks from a spec with window.__mockFireMonitorPeek({ 's1': ['line'] }).
+      onPeek: function (callback) {
+        if (!window.__mockMonitorPeekListeners) window.__mockMonitorPeekListeners = [];
+        window.__mockMonitorPeekListeners.push(callback);
+        if (!window.__mockFireMonitorPeek) {
+          window.__mockFireMonitorPeek = function (peeks) {
+            var listeners = (window.__mockMonitorPeekListeners || []).slice();
+            for (var i = 0; i < listeners.length; i++) { listeners[i](peeks); }
+          };
+        }
+        return function () {
+          var listeners = window.__mockMonitorPeekListeners || [];
+          var index = listeners.indexOf(callback);
+          if (index >= 0) listeners.splice(index, 1);
+        };
+      },
     },
 
     clipboard: {
@@ -3206,8 +3667,12 @@
         browserCaptureCalls.push(input);
         return { filePath: '/mock/captures/capture-' + Date.now() + '.png' };
       },
-      getUrls: async function (taskId) {
-        var currentProject = projects.find(function (p) { return p.id === currentProjectId; });
+      // projectId is the TASK's project (a popped-out pane outlives a project
+      // switch). The mock resolves the project default from it, falling back to
+      // the current project the way resolveProjectContext does in main.
+      getUrls: async function (taskId, projectId) {
+        var lookupId = projectId || currentProjectId;
+        var currentProject = projects.find(function (p) { return p.id === lookupId; });
         var overrides = currentProject ? projectConfigs[currentProject.path] : null;
         // Empty string means "no project default" -- mirrors useBrowserUrl's
         // `||` fallthrough and BrowserTab's documented sentinel for cleared
@@ -3219,10 +3684,12 @@
           taskOverride: browserUrls[taskId] || null,
         };
       },
-      setTaskUrl: async function (taskId, url) {
+      setTaskUrl: async function (taskId, url, projectId) {
+        browserUrlProjects[taskId] = projectId || currentProjectId;
         browserUrls[taskId] = url;
       },
-      clearTaskUrl: async function (taskId) {
+      clearTaskUrl: async function (taskId, _projectId) {
+        delete browserUrlProjects[taskId];
         delete browserUrls[taskId];
       },
       // Stub for the Clear Browser Data action in the Browser settings tab.
@@ -3235,7 +3702,34 @@
       // Ctrl+wheel zoom is applied in the main process and broadcast back.
       // The UI tier has no main process, so the mock just registers the
       // callback and returns a no-op unsubscribe.
-      onZoomChanged: function (_callback) { return function () { /* no-op */ }; },
+      // Records subscribers so a test can fire a zoom broadcast at ONE pane and
+      // assert the others ignore it (the payload carries the guest's id because
+      // a window can host several panes).
+      onZoomChanged: function (callback) {
+        browserZoomSubscribers.push(callback);
+        return function () {
+          const index = browserZoomSubscribers.indexOf(callback);
+          if (index >= 0) browserZoomSubscribers.splice(index, 1);
+        };
+      },
+      // Main -> renderer pane open/close pushes, behind the
+      // kangentic_browser_open_pane / _close_pane MCP tools. The UI tier has no
+      // main process, so a test drives them through the emit helpers below
+      // (window.__mockBrowser.emitPaneOpenRequest(projectId, taskId)).
+      onPaneOpenRequest: function (callback) {
+        browserPaneOpenSubscribers.push(callback);
+        return function () {
+          const index = browserPaneOpenSubscribers.indexOf(callback);
+          if (index >= 0) browserPaneOpenSubscribers.splice(index, 1);
+        };
+      },
+      onPaneCloseRequest: function (callback) {
+        browserPaneCloseSubscribers.push(callback);
+        return function () {
+          const index = browserPaneCloseSubscribers.indexOf(callback);
+          if (index >= 0) browserPaneCloseSubscribers.splice(index, 1);
+        };
+      },
     },
 
     // Platform string. Defaults to 'win32' (matches the most common dev
@@ -3260,8 +3754,15 @@
   window.__mockBrowser = {
     reset: function () {
       browserUrls = {};
+      browserUrlProjects = {};
       browserCaptureCalls = [];
       browserPaneCalls = [];
+      browserZoomSubscribers = [];
+      // NOT reset: the pane open/close subscribers are registered once by
+      // useBrowserPaneRequestBridge at app mount, long before a test calls
+      // reset(). Clearing them here would silently unsubscribe the bridge and
+      // every emitted push would land nowhere. (The zoom subscribers above are
+      // per-pane, so they re-register when a pane remounts.)
       // Also drop any project-level browser default that the empty-state
       // submit path auto-seeded via saveForProject -- otherwise the next
       // test's BrowserPane.useBrowserUrl resolves an effectiveUrl from the
@@ -3282,6 +3783,28 @@
     seedTaskUrl: function (taskId, url) {
       browserUrls[taskId] = url;
     },
+    /** The project a task URL was last saved against (null if never saved). */
+    getTaskUrlProject: function (taskId) {
+      return browserUrlProjects[taskId] || null;
+    },
+    /** Fire the main-process zoom broadcast at a specific guest. */
+    emitZoomChanged: function (factor, webContentsId) {
+      browserZoomSubscribers.slice().forEach(function (callback) {
+        callback(factor, webContentsId);
+      });
+    },
+    /** Fire main's "open this task's Browser pane" push (kangentic_browser_open_pane). */
+    emitPaneOpenRequest: function (projectId, taskId) {
+      browserPaneOpenSubscribers.slice().forEach(function (callback) {
+        callback(projectId, taskId);
+      });
+    },
+    /** Fire main's "close these Browser panes" push (kangentic_browser_close_pane). */
+    emitPaneCloseRequest: function (projectId, taskIds) {
+      browserPaneCloseSubscribers.slice().forEach(function (callback) {
+        callback(projectId, taskIds);
+      });
+    },
   };
 
   /**
@@ -3292,6 +3815,18 @@
    * shape the real popOut:changed push delivers. This hook is only for
    * asserting which verb a trigger (title-bar button, PopOutButton) called.
    */
+  /**
+   * Test hook: simulate a task detail being hosted in a DIFFERENT renderer (the
+   * detached Agent Monitor). Real main filters this per recipient and pushes it;
+   * the mock is one renderer, so a test drives it directly.
+   *
+   * Pass `[{ projectId, taskId }]` to claim, `[]` to hand it back.
+   */
+  window.__mockSetRemoteDetailOwners = function (owners) {
+    var listeners = (window.__mockDetailRemoteOwnerListeners || []).slice();
+    for (var i = 0; i < listeners.length; i++) listeners[i](owners);
+  };
+
   window.__mockPopOut = {
     reset: function () {
       popOutCalls = [];
@@ -3324,6 +3859,11 @@
       summaryCache: summaryCache,
       compatibilityRequirementsByProject: compatibilityRequirementsByProject,
       projectConfigs: projectConfigs,
+      // The GLOBAL app config object, mutable in place. Seeds a starting value for a
+      // key the renderer reads back (e.g. a persisted window layout blob). Safe to
+      // mutate here because set()/setSync() only reassign `config` later, and get()
+      // returns whatever the current reference holds.
+      config: config,
       uuid: uuid,
       now: now,
       DEFAULT_SWIMLANES: DEFAULT_SWIMLANES,

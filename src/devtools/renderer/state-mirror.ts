@@ -1,12 +1,15 @@
+import { useAnnouncementsStore } from '../../renderer/stores/announcements-store';
 import { useBacklogStore } from '../../renderer/stores/backlog-store';
 import { useBoardStore } from '../../renderer/stores/board-store';
 import { useConfigStore } from '../../renderer/stores/config-store';
 import { useDictationStore } from '../../renderer/stores/dictation-store';
 import { useMobileStore } from '../../renderer/stores/mobile-store';
+import { useMonitorStore } from '../../renderer/stores/monitor-store';
 import { usePopOutStore } from '../../renderer/stores/pop-out-store';
 import { useProjectStore } from '../../renderer/stores/project-store';
 import { useSessionStore } from '../../renderer/stores/session-store';
 import { useToastStore } from '../../renderer/stores/toast-store';
+import { useUpdaterStore } from '../../renderer/stores/updater-store';
 import { useUsageDashboardStore } from '../../renderer/stores/usage-dashboard-store';
 import type { RendererStateSnapshot, StoreStateResult } from '../shared/types';
 import { readStoreStateFrom, type ReadableStore } from './store-state';
@@ -65,17 +68,20 @@ export function buildPreviewSnapshot(): RendererStateSnapshot {
  * fails CI instead of silently being unreadable.
  */
 const PREVIEW_STORES: Record<string, ReadableStore> = {
+  announcements: useAnnouncementsStore,
   backlog: useBacklogStore,
   board: useBoardStore,
   config: useConfigStore,
   dictation: useDictationStore,
   mobile: useMobileStore,
+  monitor: useMonitorStore,
   // Quoted because the file stem is kebab-case (pop-out-store.ts); the
   // completeness test matches the key to the filename stem.
   'pop-out': usePopOutStore,
   project: useProjectStore,
   session: useSessionStore,
   toast: useToastStore,
+  updater: useUpdaterStore,
   // Quoted because the file stem is kebab-case (usage-dashboard-store.ts);
   // the completeness test matches the key to the filename stem.
   'usage-dashboard': useUsageDashboardStore,

@@ -1,7 +1,54 @@
-import type { Project, SessionRecord, Swimlane, Task } from '../../shared/types';
-import { DEFAULT_LIVE_SUBMISSION_POLICY, type AgentAdapter, type LiveSubmissionPolicy } from '../agent/agent-adapter';
+import type { Project, SessionRecord, SessionUsage, Swimlane, Task } from '../../shared/types';
+import {
+  DEFAULT_LIVE_SUBMISSION_POLICY,
+  type AgentAdapter,
+  type LiveSubmissionPolicy,
+} from '../agent/agent-adapter';
 import type { SessionRepository } from '../db/repositories/session-repository';
-import type { CommandVerifier } from './terminal-submit-scheduler';
+import type { CommandVerifier, InjectionCommand, InjectionVerifyMode } from './terminal-submit-scheduler';
+
+/**
+ * The effort the AGENT itself reports it is running at, or null when it reports
+ * none (a model with no effort levels, an agent with no live telemetry, or a
+ * session that has not reported yet).
+ *
+ * `applied_effort` records what Kangentic ASKED for at spawn, resume, or a live
+ * switch. An `/effort` the user types straight into the terminal never reaches
+ * it, so on its own it goes stale and a later column move diffs against a value
+ * the session stopped running at. Claude Code documents its reported level as
+ * the one in force "after any silent downgrade for the selected model", making
+ * it the closest thing to ground truth available.
+ *
+ * Type-only dependency on the usage cache shape, so this module stays free of a
+ * runtime SessionManager import.
+ */
+export function resolveLiveEffort(
+  usageCacheReader: { getUsageCache(): Record<string, SessionUsage> },
+  sessionId: string | null | undefined,
+): string | null {
+  if (!sessionId) return null;
+  // `model` is required on the type, but several adapters build sparse usage via
+  // an `as unknown as SessionUsage` cast, so guard it rather than trust the type.
+  return usageCacheReader.getUsageCache()[sessionId]?.model?.effort ?? null;
+}
+
+/**
+ * Ground truth for "what effort is this session running at", used as the SOURCE
+ * side of a column-transition delta.
+ *
+ * Order: a per-task pin wins (the ContextBar contract - the session was spawned
+ * or switched to the pin, so source = target = pin and no slash fires), then
+ * what the agent reports, then what we last asked for. Keeping the pin ahead of
+ * live also preserves the protection a NULL `applied_effort` relies on for
+ * records that predate applied-settings recording.
+ */
+export function resolveSourceEffort(input: {
+  taskEffortOverride: string | null | undefined;
+  liveEffort: string | null | undefined;
+  appliedEffort: string | null | undefined;
+}): string | null {
+  return input.taskEffortOverride ?? input.liveEffort ?? input.appliedEffort ?? null;
+}
 
 /**
  * Per-agent translation of a column-level model/effort change (and an
@@ -30,7 +77,7 @@ import type { CommandVerifier } from './terminal-submit-scheduler';
  *
  * Returns null when there is nothing to inject (no settings delta, no
  * auto_command). Callers pass the result straight to
- * `terminalSubmitScheduler.scheduleKeystrokes(task.id, sessionId, plan.sequence, { verifier: plan.verifier, verifiedPrefixLength: plan.verifiedPrefixLength })`.
+ * `terminalSubmitScheduler.scheduleKeystrokes(task.id, sessionId, plan.sequence, { verifier: plan.verifier })`.
  */
 export interface InjectionPlanInput {
   adapter: AgentAdapter | undefined;
@@ -55,20 +102,28 @@ export interface InjectionPlanInput {
   autoCommand?: string;
   /** Explicit live PTY record. `undefined` retains the legacy latest-record lookup. */
   sessionRecord?: SessionRecord | null;
+  /**
+   * Effort the agent itself reports it is running at (`resolveLiveEffort`), or
+   * null/omitted when it reports none. Resolved by the caller rather than read
+   * here so this module needs no SessionManager at runtime and stays unit
+   * testable with plain values. Omitting it reproduces the previous behaviour
+   * exactly (source falls back to the session record).
+   */
+  liveEffort?: string | null;
 }
 
 export interface InjectionPlan {
-  sequence: string[];
-  verifier: CommandVerifier | null;
   /**
-   * Number of leading commands in `sequence` that are safe to verify against
-   * the agent's transcript. This covers the deterministic adapter-emitted
-   * writes (`/effort Y` from `getInjectionSequence`) but excludes any trailing
-   * user-supplied auto_command, because the verifier cannot tell a `/`-prefixed
-   * user command from a settings command and would risk dropping the user's
-   * intended action after retry exhaustion.
-   */
+   * The commands to deliver, each carrying how its delivery may be confirmed.
+   *
+   * Per-command modes own verification semantics. `verifiedPrefixLength`
+   * remains only as a split boundary for the OpenCode native-idle path, which
+   * sends deterministic settings first and the trailing auto_command later.
+  */
+  sequence: InjectionCommand[];
+  /** Number of leading adapter-setting commands before the optional auto_command. */
   verifiedPrefixLength: number;
+  verifier: CommandVerifier | null;
   /**
    * Set when the destination has a CONCRETE model different from the session's
    * running model. A model change is never applied as a live `/model` swap on an
@@ -91,10 +146,18 @@ export interface InjectionPlan {
 }
 
 export function prepareInjectionPlan(input: InjectionPlanInput): InjectionPlan | null {
-  const { adapter, sessionRepo, task, toLane, autoCommand, project, sessionRecord } = input;
+  const {
+    adapter,
+    sessionRepo,
+    task,
+    toLane,
+    autoCommand,
+    project,
+    sessionRecord,
+    liveEffort,
+  } = input;
 
-  // SOURCE is the model/effort the live session is ACTUALLY running at, read
-  // from the session record (`applied_model` / `applied_effort`), NOT the
+  // SOURCE is the model/effort the live session is ACTUALLY running at, NOT the
   // leaving column's config. The leaving column disagrees after an in-flight
   // ContextBar switch or a kangentic.json column-config edit, which is what
   // produced the spurious `/effort` injection. A per-task override still wins:
@@ -102,6 +165,13 @@ export function prepareInjectionPlan(input: InjectionPlanInput): InjectionPlan |
   // slash fires for that field (preserving the ContextBar contract). When no
   // record exists (unit stubs, a session predating this column) the applied
   // value is null, i.e. "agent default".
+  //
+  // For EFFORT the source now prefers what the agent reports over what we asked
+  // for (`resolveSourceEffort`). The record alone cannot see an `/effort` the
+  // user typed into the terminal, so it goes stale: with applied=high, a manual
+  // switch to medium, and a destination column requiring high, source and target
+  // both read high, no slash fires, and the session silently keeps running at
+  // medium in a column that requires high.
   //
   // The project-default tier is read on BOTH sides: without it, a task moving
   // between two override-less columns on a project with a default_model set
@@ -111,9 +181,20 @@ export function prepareInjectionPlan(input: InjectionPlanInput): InjectionPlan |
   const record = sessionRecord !== undefined
     ? sessionRecord
     : sessionRepo?.getLatestForTask(task.id) ?? null;
+  // MODEL is deliberately NOT sourced from live telemetry. The agent reports a
+  // canonical id (`claude-opus-4-8`) while `applied_model` / `model_override` /
+  // `default_model` hold whatever flag string the user configured (`opus`), so
+  // comparing across those id spaces would read "changed" on almost every move,
+  // and `needsRestartForModel` below turns that into a suspend + `--resume` PTY
+  // restart per column transition. Effort has no such split: both sides draw
+  // from the adapter's discovered `effortLevels` vocabulary.
   const sourceModel = task.model_override ?? record?.applied_model ?? null;
   const targetModel = task.model_override ?? toLane?.model_override ?? project?.default_model ?? null;
-  const sourceEffort = task.effort_override ?? record?.applied_effort ?? null;
+  const sourceEffort = resolveSourceEffort({
+    taskEffortOverride: task.effort_override,
+    liveEffort,
+    appliedEffort: record?.applied_effort,
+  });
   const targetEffort = task.effort_override ?? toLane?.effort_override ?? project?.default_effort ?? null;
 
   const modelChanged = targetModel !== sourceModel;
@@ -141,10 +222,19 @@ export function prepareInjectionPlan(input: InjectionPlanInput): InjectionPlan |
     effortChanged,
   }) ?? [];
 
+  // Adapter-emitted settings writes are verified strictly: we know the exact
+  // invocation we asked for, so a combined-args entry must read as a miss and
+  // retry. The user's auto_command is verified as "exactly this text was
+  // submitted", which holds whether or not it is a registered slash command.
+  const sequence: InjectionCommand[] = settingsSequence.map((text) => ({
+    text,
+    verify: 'command-match' as const,
+  }));
+
   const trimmedAutoCommand = autoCommand?.trim() ?? '';
-  const sequence = trimmedAutoCommand
-    ? [...settingsSequence, trimmedAutoCommand]
-    : settingsSequence;
+  if (trimmedAutoCommand) {
+    sequence.push({ text: trimmedAutoCommand, verify: 'submitted' });
+  }
 
   // Return null only when there is nothing to do at all: no live writes AND no
   // restart needed. A model-only change has an empty sequence but must still
@@ -169,8 +259,8 @@ export function prepareInjectionPlan(input: InjectionPlanInput): InjectionPlan |
 
   return {
     sequence,
-    verifier,
     verifiedPrefixLength: settingsSequence.length,
+    verifier,
     needsRestartForModel,
     ...(hasApplied ? { appliedSettings } : {}),
     ...(trimmedAutoCommand
@@ -199,6 +289,14 @@ export function prepareInjectionPlan(input: InjectionPlanInput): InjectionPlan |
  * (e.g. `prepareInjectionPlan` reading it for the delta source) pass it through
  * to avoid a second query. Omit it to read fresh.
  */
+/**
+ * How long a resolved session record is reused before the verifier re-reads it.
+ * See the comment at the re-resolve site: this exists to keep a synchronous
+ * SQLite call out of a 40Hz poll loop without losing mid-burst `/clear`
+ * detection.
+ */
+const RECORD_RERESOLVE_TTL_MS = 250;
+
 export function buildCommandInjectionVerifier(
   adapter: AgentAdapter,
   sessionRepo: SessionRepository,
@@ -209,14 +307,74 @@ export function buildCommandInjectionVerifier(
   const submissionVerifier = adapter.getSubmissionVerifier('command-injection');
   if (!submissionVerifier) return null;
   const record = prefetchedRecord !== undefined ? prefetchedRecord : sessionRepo.getLatestForTask(taskId);
-  if (!record?.agent_session_id || !record.cwd) return null;
-  const agentSessionId = record.agent_session_id;
-  const cwd = record.cwd;
-  return async (command: string, sentAt: number) => submissionVerifier({
-    type: 'command-injection',
-    text: command,
-    agentSessionId,
-    cwd,
-    sentAt,
-  });
+  // A record is required (there is nothing to re-resolve against without one),
+  // but its agent_session_id is NOT. A fresh spawn has no captured id yet, and
+  // returning null here would leave fresh-spawn auto_commands permanently
+  // unverifiable - the exact delivery path that most needed the check, since
+  // it is the one that runs without a leading clear. Delivery is deferred
+  // until the CLI comes alive, and the id is resolved on every poll below, so
+  // by the time verification actually runs the id is there.
+  if (!record) return null;
+  const recordId = record.id;
+  const capturedAgentSessionId = record.agent_session_id;
+  const capturedCwd = record.cwd;
+  let resolvedRecord: SessionRecord | null = record;
+  let resolvedAt = 0;
+  return async (command: string, sentAt: number, mode: InjectionVerifyMode) => {
+    // `none` never reaches a verifier (submitKeystrokes skips the call), but
+    // guard anyway so an unverifiable command can never be reported confirmed.
+    if (mode === 'none') return false;
+    // Re-resolve the agent session id from the SAME record (by primary key,
+    // never latest-for-task, which could shadow an isolated session's row): a
+    // /clear mid-burst forks the live conversation to a new id (persisted by
+    // the live status-file reconcile), and the slash entries being verified
+    // land in the NEW transcript. Polling only the plan-build-time id would
+    // never confirm, so the burst would spend its whole retry budget pressing
+    // Enter into a session whose evidence is being written somewhere else.
+    //
+    // Re-resolved on a TTL rather than on every poll. `findByAnyId` calls
+    // `db.prepare` inline, so better-sqlite3 recompiles the SQL each time, and
+    // better-sqlite3 is synchronous - at a 25ms poll cadence that is 40 blocking
+    // DB round trips per second per in-flight burst, on the same thread that
+    // services IPC. It buys nothing at that rate: the thing it watches for is a
+    // human typing /clear. The TTL stays well inside one retry attempt
+    // (VERIFY_WINDOW_MS is 400ms, and there are 5 attempts), so a fork is still
+    // picked up within the same attempt that follows it.
+    const now = Date.now();
+    if (now - resolvedAt >= RECORD_RERESOLVE_TTL_MS) {
+      resolvedRecord = sessionRepo.findByAnyId(recordId) ?? null;
+      resolvedAt = now;
+    }
+    const currentRecord = resolvedRecord;
+    const currentAgentSessionId = currentRecord?.agent_session_id ?? capturedAgentSessionId;
+    const currentCwd = currentRecord?.cwd ?? capturedCwd;
+    // Still no captured id/cwd: the transcript we would scan does not exist
+    // yet, so this poll simply has no answer. Reporting "not confirmed" lets
+    // the caller keep retrying rather than treating it as a hard failure.
+    if (!currentAgentSessionId || !currentCwd) return false;
+    const verifiedInCurrent = await submissionVerifier({
+      type: 'command-injection',
+      text: command,
+      agentSessionId: currentAgentSessionId,
+      cwd: currentCwd,
+      sentAt,
+      mode,
+    });
+    if (verifiedInCurrent || currentAgentSessionId === capturedAgentSessionId) {
+      return verifiedInCurrent;
+    }
+    // The id changed mid-burst: also accept a match under the id captured at
+    // plan-build time - the command may have landed in the pre-fork
+    // transcript an instant before the fork. Skipped when nothing was captured
+    // (fresh spawn), where there is no earlier transcript to fall back to.
+    if (!capturedAgentSessionId || !capturedCwd) return false;
+    return submissionVerifier({
+      type: 'command-injection',
+      text: command,
+      agentSessionId: capturedAgentSessionId,
+      cwd: capturedCwd,
+      sentAt,
+      mode,
+    });
+  };
 }

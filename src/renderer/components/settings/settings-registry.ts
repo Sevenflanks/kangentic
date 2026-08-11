@@ -107,7 +107,7 @@ export const SETTINGS_REGISTRY: SettingDefinition[] = [
   { id: 'git.prRefreshIntervalMinutes', tabId: 'git', label: 'Auto-refresh PRs', description: 'How often to refresh linked PR state in the background', scope: 'project', keywords: ['pull request', 'pr', 'refresh', 'poll', 'merged', 'sync', 'stale'] },
 
   // ── Browser ──
-  { id: 'browser.enabled', tabId: 'browser', label: 'Enable Browser Pane', description: 'Show the Browser pill in task detail headers. Disable for security-sensitive projects that should not embed external sites.', scope: 'project', keywords: ['webview', 'embedded', 'preview', 'disable', 'security'] },
+  { id: 'browser.enabled', tabId: 'browser', label: 'Enable Browser Pane', description: 'Show the Browser pill in task detail headers, and let agents open the pane themselves. Disable for security-sensitive projects that should not embed external sites.', scope: 'project', keywords: ['webview', 'embedded', 'preview', 'disable', 'security', 'agent'] },
   { id: 'browser.defaultUrl', tabId: 'browser', label: 'Default URL', description: 'Project default URL when a task has no per-task override. Auto-saved when you first navigate the Browser pane.', scope: 'project', keywords: ['webview', 'preview', 'localhost', 'dev server', 'url'] },
   { id: 'browser.clearStorage', tabId: 'browser', label: 'Clear Browser Data', description: 'Wipe cookies, localStorage, IndexedDB, service workers, and HTTP/auth caches for the embedded browser. Saved URLs are kept.', scope: 'global', keywords: ['cookies', 'cache', 'reset', 'logout', 'sign out', 'storage', 'privacy', 'wipe'] },
 
@@ -132,11 +132,12 @@ export const SETTINGS_REGISTRY: SettingDefinition[] = [
   { id: 'agent.idleTimeoutMinutes', tabId: 'behavior', label: 'Idle Timeout (minutes)', description: 'Auto-suspend sessions after this many minutes idle. 0 to disable.', scope: 'global', section: 'Sessions', keywords: ['suspend', 'minutes'] },
 
   // ── Behavior > Windows ──
-  { id: 'windowLightDismiss', tabId: 'behavior', label: 'Close on Outside Click', description: 'Click empty space outside a task window to dismiss it. The agent keeps running and reattaches when you reopen the task.', scope: 'global', section: 'Windows', keywords: ['dismiss', 'click outside', 'window', 'peek', 'close', 'light dismiss', 'task window'] },
+  { id: 'windowLightDismiss', tabId: 'behavior', label: 'Close on Outside Click', description: 'Click empty space outside a task window to close it. Controls, task cards, and running terminals still act on the first click. The agent keeps running and reattaches when you reopen the task.', scope: 'global', section: 'Windows', keywords: ['dismiss', 'click outside', 'window', 'peek', 'close', 'light dismiss', 'task window'] },
   { id: 'restoreWindowPosition', tabId: 'behavior', label: 'Restore Window Position', description: 'Remember window size and position between launches', scope: 'global', section: 'Windows', keywords: ['size', 'bounds', 'remember'] },
 
   // ── Notifications > Events ──
   { id: 'notifications.onAgentIdle', tabId: 'notifications', label: 'Agent Idle', description: 'When an agent needs attention on a non-visible project', scope: 'global', section: 'Events', keywords: ['desktop', 'toast', 'alert'] },
+  { id: 'notifications.onAgentCrash', tabId: 'notifications', label: 'Agent Crash', description: 'When an agent session ends unexpectedly. Desktop alerts on error exits only; toasts cover clean exits too.', scope: 'global', section: 'Events', keywords: ['desktop', 'toast', 'alert', 'crash', 'exit', 'failed', 'ended'] },
   { id: 'notifications.onPlanComplete', tabId: 'notifications', label: 'Plan Complete', description: 'When a plan finishes and the task auto-moves', scope: 'global', section: 'Events', keywords: ['desktop', 'toast', 'alert'] },
   { id: 'notifications.onSpawnStalled', tabId: 'notifications', label: 'Spawn Stalled', description: 'When a task spawn waits too long on the git queue while preparing', scope: 'global', section: 'Events', keywords: ['desktop', 'toast', 'alert', 'queue', 'fetching', 'worktree', 'preparing'] },
 
@@ -167,18 +168,23 @@ export const SETTINGS_REGISTRY: SettingDefinition[] = [
   { id: 'developer.activityDebugOverlay', tabId: 'developer', label: 'Activity Engine Debug Overlay', description: 'Show a floating panel with live activity-engine state for every running session. Useful for diagnosing spinner / idle bugs.', scope: 'global', keywords: ['debug', 'overlay', 'diagnostic', 'engine', 'activity', 'thinking', 'idle', 'subagent', 'background', 'shell', 'reason'] },
 
   // ── Mobile Devices ──
-  // Dev-only until the mobile app launches: compiled out of production
-  // builds (with the tab in AppSettingsPanel and the service gate in
-  // register-all.ts / system.ts) so the bridge cannot leak into a release.
-  ...(__KANGENTIC_DEV__
-    ? ([
-        { id: 'mobileBridge.enabled', tabId: 'mobile', label: 'Mobile Bridge', description: 'Let a paired phone connect to this desktop through an end-to-end encrypted relay.', scope: 'global', keywords: ['mobile', 'phone', 'companion', 'pair', 'pairing', 'qr', 'relay', 'bridge', 'remote'] },
-        { id: 'mobileBridge.relayMode', tabId: 'mobile', label: 'Relay', description: 'Where this desktop connects for mobile pairing. The relay only ever sees encrypted traffic.', scope: 'global', keywords: ['relay', 'server', 'hosted', 'local', 'custom', 'self-host', 'cloud', 'mobile', 'kangentic cloud'] },
-        { id: 'mobileBridge.relayUrl', tabId: 'mobile', label: 'Custom Relay Address', description: 'The self-hosted relay to dial when Relay above is set to Custom Relay.', scope: 'global', keywords: ['relay', 'server', 'url', 'address', 'self-host', 'websocket', 'mobile', 'custom'] },
-        { id: 'mobileBridge.pairing', tabId: 'mobile', label: 'Pair a Device', description: 'Scan a QR code with the Kangentic mobile app to pair a new phone.', scope: 'global', keywords: ['pair', 'pairing', 'qr', 'scan', 'phone', 'mobile', 'sas', 'code'] },
-        { id: 'mobileBridge.devices', tabId: 'mobile', label: 'Paired Devices', description: 'Phones paired to this desktop, identified by key fingerprint. Rename or revoke a device here.', scope: 'global', keywords: ['paired', 'devices', 'phone', 'revoke', 'rename', 'fingerprint', 'mobile'] },
-      ] satisfies SettingDefinition[])
-    : []),
+  { id: 'mobileBridge.enabled', tabId: 'mobile', label: 'Mobile Bridge', description: 'Let a paired phone connect to this desktop through an end-to-end encrypted relay.', scope: 'global', keywords: ['mobile', 'phone', 'companion', 'pair', 'pairing', 'qr', 'relay', 'bridge', 'remote'] },
+  // 'cloud' and 'kangentic cloud' are deliberate back-compat aliases, not
+  // stray cruft: the hosted preset was labelled "Kangentic Cloud" until it was
+  // renamed to "Kangentic Relay", and settings search indexes registry fields
+  // only (never the rendered <option> text), so these keywords are the only
+  // thing that still finds this row for a user searching from muscle memory.
+  { id: 'mobileBridge.relayMode', tabId: 'mobile', label: 'Relay', description: 'Where this desktop connects for mobile pairing. The relay forwards encrypted traffic and never holds your keys.', scope: 'global', keywords: ['relay', 'server', 'hosted', 'local', 'custom', 'self-host', 'official', 'mobile', 'kangentic relay', 'cloud', 'kangentic cloud'] },
+  // Search-index only: this row has no SettingRow of its own. The relay address
+  // is an unlabelled field inside the Relay section (the picker directly above it
+  // says which relay it addresses), so this entry exists to put "websocket",
+  // "self-host", and "address" into the index. MobileDevicesTab's RELAY_SEARCH_IDS
+  // lists it beside mobileBridge.relayMode, and a match on either reveals the
+  // whole section. Do not go looking for its settingProps() call site.
+  { id: 'mobileBridge.relayUrl', tabId: 'mobile', label: 'Custom Relay Address', description: 'The self-hosted relay to dial when Relay above is set to Custom Relay.', scope: 'global', keywords: ['relay', 'server', 'url', 'address', 'self-host', 'websocket', 'mobile', 'custom'] },
+  { id: 'mobileBridge.pairing', tabId: 'mobile', label: 'Pair a Device', description: 'Scan a QR code with the Kangentic mobile app to pair a new phone.', scope: 'global', keywords: ['pair', 'pairing', 'qr', 'scan', 'phone', 'mobile', 'sas', 'code'] },
+  { id: 'mobileBridge.devices', tabId: 'mobile', label: 'Paired Devices', description: 'Phones paired to this desktop, identified by key fingerprint. Rename or revoke a device here.', scope: 'global', keywords: ['paired', 'devices', 'phone', 'revoke', 'rename', 'fingerprint', 'mobile'] },
+  { id: 'mobileBridge.getApp', tabId: 'mobile', label: 'Kangentic Mobile', description: 'The phone companion app for checking on agents, answering prompts, and reviewing diffs. Links out to its docs, where the install instructions live.', scope: 'global', keywords: ['install', 'download', 'get the app', 'app', 'mobile', 'phone', 'android', 'ios', 'docs', 'play', 'store'] },
 ];
 
 /** Lookup by ID for O(1) access. */

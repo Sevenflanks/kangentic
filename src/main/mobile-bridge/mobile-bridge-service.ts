@@ -2,7 +2,7 @@ import { EventEmitter } from 'node:events';
 import {
   bytesToHex,
   capabilitySetFromArray,
-  CAPABILITY_VERBS,
+  derivePairingSlotId,
   deriveSessionSlotId,
   encodePairingQrPayload,
   PROTOCOL_VERSION,
@@ -30,6 +30,8 @@ import { BridgeSession } from './session/bridge-session';
 import { SubscriptionRegistry } from './session/subscription-registry';
 import { CapabilityRouter } from './capability-router';
 import { registerCapabilityHandlers } from './handlers';
+import { terminalStreamKeyFor, TERMINAL_STREAM_KEY_PREFIX } from './handlers/read-stream';
+import { sizeGuardKeyFor } from './handlers/terminal-size-guard';
 import { SessionLifecycleBoardFeed } from './session-lifecycle-feed';
 import { PushRegistrationStore } from './push/push-registration-store';
 import { PushNotifier } from './push/push-notifier';
@@ -96,15 +98,15 @@ export class MobileBridgeService extends EventEmitter {
    * the renderer's live watch on the same worktree (and vice versa).
    */
   private readonly diffWatcher = new DiffWatcher();
-  /** Dev-only instant pairing for the mobile dev rig; every call site is __KANGENTIC_DEV__-gated so packaged builds drop it. */
-  private readonly devQuickPair = new DevQuickPair({
-    getIdentity: () => this.ensureIdentity(),
-    getRelayUrl: () => this.config.relayUrl,
-    onRosterChanged: () => {
-      void this.syncSessions();
-      this.emitStateChanged();
-    },
-  });
+  /**
+   * Dev-only instant pairing for the mobile dev rig. `null` in a production
+   * build: constructed only inside `if (__KANGENTIC_DEV__)` in the
+   * constructor below, not as an unconditional field initializer, because an
+   * unconditional `new DevQuickPair(...)` here would still run (and keep the
+   * module reachable, defeating dead-code elimination) in every build - the
+   * gate has to wrap the CONSTRUCTION, not just the later reconcile() call.
+   */
+  private readonly devQuickPair: DevQuickPair | null;
   private ipcContext: IpcContext | null = null;
   /** Feeds session lifecycle edges onto the board-changed bus so phones' board views track spawn/queue/suspend/exit. */
   private sessionLifecycleFeed: SessionLifecycleBoardFeed | null = null;
@@ -128,11 +130,23 @@ export class MobileBridgeService extends EventEmitter {
    */
   private lastEmittedConnectionSignature: string | null = null;
   private relayStateEmitTimer: ReturnType<typeof setTimeout> | null = null;
+  private terminalStreamsEmitScheduled = false;
+  private lastEmittedTerminalStreamsSignature = '';
   private disposed = false;
 
   constructor(config: MobileBridgeConfig) {
     super();
     this.config = config;
+    this.devQuickPair = __KANGENTIC_DEV__
+      ? new DevQuickPair({
+          getIdentity: () => this.ensureIdentity(),
+          getRelayUrl: () => this.config.relayUrl,
+          onRosterChanged: () => {
+            void this.syncSessions();
+            this.emitStateChanged();
+          },
+        })
+      : null;
   }
 
   /**
@@ -141,10 +155,29 @@ export class MobileBridgeService extends EventEmitter {
    * the context for syncSessions() to use. Called once from register-all.ts
    * after IpcContext is assembled - IpcContext does not exist yet at this
    * service's construction time, so it cannot be a constructor argument.
-   * Registers handlers exactly once; never call this more than once.
+   * Registers handlers exactly once; never call this more than once. Signed
+   * per-device grants are an authorization boundary: only explicit
+   * setDeviceCapabilities() or a new pairing may change them.
    */
   attachContext(context: IpcContext): void {
     this.ipcContext = context;
+    // The resting park's two questions (see MobileTerminalProbe), answered
+    // from the per-device subscription registries the guard and read-stream
+    // handlers already maintain through every release path (explicit release,
+    // transport drop, revoke, shutdown). A desktop that never pairs never
+    // constructs this service's transports or registries, and a session
+    // manager with no probe never parks - the unpaired desktop is untouched
+    // by the whole mobile terminal feature.
+    context.sessionManager.setMobileTerminalProbe({
+      isSizeHeld: (sessionId) => this.anyDeviceSubscriptionHas(sizeGuardKeyFor(sessionId)),
+      // TERMINAL-wanting subscriptions only, never the bare stream key: the
+      // phone holds a list-only stream subscription for EVERY live session
+      // whenever it is connected (its activity feed), and answering from
+      // `stream:<id>` made the park fire for all of them - which reshaped
+      // sessions no phone terminal ever opened and garbled their later panel
+      // reveals (observed live 2026-08-02).
+      hasStreamSubscriber: (sessionId) => this.anyDeviceSubscriptionHas(terminalStreamKeyFor(sessionId)),
+    });
     registerCapabilityHandlers(this.capabilityRouter, {
       context,
       diffWatcher: this.diffWatcher,
@@ -206,41 +239,60 @@ export class MobileBridgeService extends EventEmitter {
       onStall: (taskId) => this.pushNotifier?.notifyTaskStalled(taskId),
     });
     this.spawnStallWatcher.start();
-    // Runs exactly once, before the first reconcile()'s syncSessions() opens
-    // any BridgeSession - see the method's own doc comment for why this
-    // cannot be a plain roster field mutation.
-    this.migrateDevicesToFullCapabilityGrant();
-  }
-
-  /**
-   * One-shot upgrade for devices paired before pairing granted the full
-   * verb set: capabilities live inside the Ed25519-signed roster payload
-   * (roster-store.ts), so mutating them without re-signing would fail
-   * verifyRosterEntry and silently drop the device from the roster on the
-   * next load. Routing through the public setDeviceCapabilities (which
-   * re-signs) is what makes this safe, and it also updates any
-   * already-open BridgeSession's live capability set - though at
-   * attachContext() time no session has opened yet, so in practice this
-   * only rewrites the on-disk roster before syncSessions() reads it.
-   */
-  private migrateDevicesToFullCapabilityGrant(): void {
-    const identity = this.tryLoadIdentity();
-    if (!identity) return;
-    const fullGrant = new Set<CapabilityVerb>(CAPABILITY_VERBS);
-    for (const device of loadRoster(identity).devices) {
-      const currentGrant = new Set(device.capabilities);
-      const hasFullGrant = currentGrant.size === fullGrant.size && CAPABILITY_VERBS.every((verb) => currentGrant.has(verb));
-      if (!hasFullGrant) this.setDeviceCapabilities(device.deviceId, [...CAPABILITY_VERBS]);
-    }
   }
 
   private getOrCreateSubscriptions(deviceId: string): SubscriptionRegistry {
     let subscriptions = this.subscriptionsByDevice.get(deviceId);
     if (!subscriptions) {
-      subscriptions = new SubscriptionRegistry();
+      subscriptions = new SubscriptionRegistry(() => this.scheduleTerminalStreamsEmit());
       this.subscriptionsByDevice.set(deviceId, subscriptions);
     }
     return subscriptions;
+  }
+
+  /** Whether ANY paired device currently holds a subscription under this key. */
+  private anyDeviceSubscriptionHas(key: string): boolean {
+    for (const subscriptions of this.subscriptionsByDevice.values()) {
+      if (subscriptions.has(key)) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Sessions with a live terminal-WANTING stream subscription on any device -
+   * the sessions a phone is actually watching the terminal of, not merely
+   * listing in its feed. The renderer suspends the bottom panel's terminal
+   * for these (the resting park owns their grid; a panel xterm fitting them
+   * to its strip is what produced both the phone's sliver view and the
+   * mis-wrapped panel), so it needs to know the set and every change to it.
+   */
+  terminalStreamedSessionIds(): string[] {
+    const sessionIds = new Set<string>();
+    for (const subscriptions of this.subscriptionsByDevice.values()) {
+      for (const key of subscriptions.keys()) {
+        if (key.startsWith(TERMINAL_STREAM_KEY_PREFIX)) sessionIds.add(key.slice(TERMINAL_STREAM_KEY_PREFIX.length));
+      }
+    }
+    return [...sessionIds].sort();
+  }
+
+  /**
+   * Coalesced per microtask (a re-subscribe fires remove + add back to back;
+   * a device drop clears many keys at once) and deduplicated against the
+   * last emitted value, so listeners only ever see actual changes.
+   */
+  private scheduleTerminalStreamsEmit(): void {
+    if (this.terminalStreamsEmitScheduled || this.disposed) return;
+    this.terminalStreamsEmitScheduled = true;
+    queueMicrotask(() => {
+      this.terminalStreamsEmitScheduled = false;
+      if (this.disposed) return;
+      const sessionIds = this.terminalStreamedSessionIds();
+      const signature = sessionIds.join(',');
+      if (signature === this.lastEmittedTerminalStreamsSignature) return;
+      this.lastEmittedTerminalStreamsSignature = signature;
+      this.emit('terminalStreamsChanged', sessionIds);
+    });
   }
 
   /** Applies effective config. Called from register-all.ts at startup and from applyRuntimeConfig on every config:set. */
@@ -252,7 +304,7 @@ export class MobileBridgeService extends EventEmitter {
       // config.relayUrl is always resolved (see src/shared/relay.ts's
       // resolveRelayUrl at both reconcile() call sites) and therefore never
       // '', so there is no longer a meaningful empty-URL case to gate on here.
-      this.devQuickPair.reconcile(config.enabled && isGenuineEncryptionAvailable());
+      this.devQuickPair?.reconcile(config.enabled && isGenuineEncryptionAvailable());
     }
     if (!config.enabled && wasEnabled) {
       this.cancelPairing('Mobile bridge disabled');
@@ -380,6 +432,17 @@ export class MobileBridgeService extends EventEmitter {
       // the connection; the phone re-arms live subscriptions with fresh
       // read-* requests once reconnected, rather than this side guessing
       // what to re-push.
+      this.subscriptionsByDevice.get(deviceId)?.dispose();
+      this.subscriptionsByDevice.delete(deviceId);
+    });
+    session.on('peerAbsent', () => {
+      // The SILENT departure (backgrounding, lost network, OS kill) sends no
+      // Final frame, so 'remoteClosed' never fires for it - yet the phone's
+      // subscriptions are just as dead. Without this, the stream-terminal
+      // marker outlived the phone: the resting park stayed armed and the
+      // bottom panel's tab stayed dropped for a device the desktop itself
+      // showed as offline, healing only when the phone happened to return.
+      // Same recovery contract as 'remoteClosed': re-arm on reconnect.
       this.subscriptionsByDevice.get(deviceId)?.dispose();
       this.subscriptionsByDevice.delete(deviceId);
     });
@@ -596,7 +659,9 @@ export class MobileBridgeService extends EventEmitter {
     const token = pairingService.mintToken();
     this.activePairing = pairingService;
 
-    const slotId = bytesToHex(token.token);
+    // Derived, never the token itself: the slot travels in cleartext in the
+    // relay URL, and the token is the Noise PSK. See derivePairingSlotId().
+    const slotId = derivePairingSlotId(token.token);
     const transport = createTransport({ relayUrl: this.config.relayUrl, slotId });
 
     pairingService.on('sas', (payload: { sas: ShortAuthenticationString; phoneStaticPublicKeyHex: string }) => {
@@ -684,7 +749,7 @@ export class MobileBridgeService extends EventEmitter {
       clearTimeout(this.relayStateEmitTimer);
       this.relayStateEmitTimer = null;
     }
-    this.devQuickPair.stop();
+    this.devQuickPair?.stop();
     this.sessionLifecycleFeed?.dispose();
     this.sessionLifecycleFeed = null;
     this.pushNotifier?.dispose();

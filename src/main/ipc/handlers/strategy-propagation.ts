@@ -1,9 +1,10 @@
 import { SessionRepository } from '../../db/repositories/session-repository';
 import { getProjectDb } from '../../db/database';
 import { agentRegistry } from '../../agent/agent-registry';
-import { prepareInjectionPlan } from '../../transition-engine/injection-plan';
+import { prepareInjectionPlan, resolveLiveEffort } from '../../transition-engine/injection-plan';
 import { applyProfileToLane, findTaskProfile } from '../../transition-engine/column-strategy';
 import { restartSessionForSettingsChange } from './session-reconcile';
+import { reconcileAutoSpawnChange } from './auto-spawn-reconcile';
 import { getProjectRepos } from '../helpers';
 import { withTaskLock } from '../task-lifecycle-lock';
 import { IPC } from '../../../shared/ipc-channels';
@@ -47,20 +48,59 @@ export interface StrategyChange {
  * A MODEL change restarts the session (suspend + `--resume --model`) rather than
  * live-injecting `/model`, matching the column-transition and ContextBar paths.
  * An EFFORT change still swaps live.
+ *
+ * An `auto_spawn` change is reconciled here too, via `reconcileAutoSpawnChange`.
+ * That one cannot ride the loop below: the loop bails on `!task.session_id`, so
+ * it can only ever inject into or restart an EXISTING session, never create one.
+ *
+ * `projectId` is a required parameter rather than a read of
+ * `context.currentProjectId` because the reconcile spawns and suspends. A
+ * mis-targeted keystroke injection is cosmetic; a mis-targeted spawn is not.
+ * Required, not optional, so a future caller cannot silently fall back to
+ * ambient state.
  */
 export function propagateStrategyToLiveSessions(
   context: IpcContext,
   label: string,
   changes: StrategyChange[],
+  projectId: string | null,
 ): void {
   if (changes.length === 0) return;
 
-  const projectId = context.currentProjectId;
-  const projectPath = context.currentProjectPath;
+  reconcileAutoSpawnChange(context, projectId, label, changes);
+
   const sessionRepo = projectId ? new SessionRepository(getProjectDb(projectId)) : null;
   const project = projectId ? context.projectRepo.getById(projectId) : null;
+  // Tied to the resolved project rather than read from ambient state, so the
+  // restart below cannot target a different project's checkout than the one the
+  // records were loaded from.
+  const projectPath = project?.path ?? null;
+  // `getUsageCache()` rebuilds a plain object from the app-wide session map on
+  // every call, so reading it per task would be O(tasks x live sessions across
+  // ALL open projects). Nothing mutates it inside this synchronous loop, so one
+  // snapshot serves the whole pass.
+  const usageCacheSnapshot = context.sessionManager.getUsageCache();
+  const usageCacheReader = { getUsageCache: () => usageCacheSnapshot };
 
   for (const { task, before, after, sourceName } of changes) {
+    const liveSubmissionConfigurationChanged = !!before && (
+      before.auto_spawn !== after?.auto_spawn
+      || before.auto_command !== after?.auto_command
+      || before.agent_override !== after?.agent_override
+      || before.session_target !== after?.session_target
+      || before.session_spawn_strategy !== after?.session_spawn_strategy
+      || before.model_override !== after?.model_override
+      || before.effort_override !== after?.effort_override
+    );
+    if (!liveSubmissionConfigurationChanged) continue;
+
+    if (!task.session_id) continue;
+    const session = context.sessionManager.getSession(task.session_id);
+    if (!session || session.status !== 'running') continue;
+
+    // A strategy edit invalidates queued bytes but must not re-run auto_command.
+    context.terminalSubmitScheduler.cancel(task.id);
+
     // Re-saving at a value the task already resolves to must inject nothing.
     // Gating here (not on each session's recorded `applied_*`) also protects
     // sessions whose `applied_*` is stale - e.g. NULL on a record predating
@@ -71,14 +111,21 @@ export function propagateStrategyToLiveSessions(
     );
     if (!overridesChanged) continue;
 
-    if (!task.session_id) continue;
-    const session = context.sessionManager.getSession(task.session_id);
-    if (!session || session.status !== 'running') continue;
-
     const adapter = task.agent ? agentRegistry.get(task.agent) : undefined;
     // No auto_command propagation on a settings edit - the intent is "change
     // settings", not "re-run any auto trigger".
-    const plan = prepareInjectionPlan({ adapter, sessionRepo, task, toLane: after, project });
+    // Same source of truth as a column move, so the two paths cannot disagree
+    // about what the session is running at. Also drops a redundant injection:
+    // editing a column from low to high on a session the user already switched
+    // to high by hand currently re-injects `/effort high` for nothing.
+    const plan = prepareInjectionPlan({
+      adapter,
+      sessionRepo,
+      task,
+      toLane: after,
+      project,
+      liveEffort: resolveLiveEffort(usageCacheReader, task.session_id),
+    });
     if (!plan) continue;
 
     if (plan.needsRestartForModel) {
@@ -116,7 +163,6 @@ export function propagateStrategyToLiveSessions(
 
     context.terminalSubmitScheduler.scheduleKeystrokes(task.id, task.session_id, plan.sequence, {
       verifier: plan.verifier,
-      verifiedPrefixLength: plan.verifiedPrefixLength,
     });
     // Record the new running value so a later column move does not re-inject.
     if (plan.appliedSettings && sessionRepo) {
@@ -130,6 +176,41 @@ export function propagateStrategyToLiveSessions(
 }
 
 /**
+ * Build the per-task before/after for a COLUMN edit, folding each task's Board
+ * Profile over both sides.
+ *
+ * Shared by every column writer (the `SWIMLANE_UPDATE` handler and the MCP
+ * `update_column` tool) so they cannot disagree about what changed for a task.
+ * The MCP path used to propagate nothing at all, not even model/effort.
+ */
+export function buildColumnStrategyChanges(input: {
+  context: IpcContext;
+  projectId: string | null;
+  /** Undefined when the row could not be re-read; treated the same as null. */
+  before: Swimlane | null | undefined;
+  after: Swimlane;
+}): StrategyChange[] {
+  // Bail rather than let `getProjectRepos` fall back to the ambient project.
+  // With no resolved project there is nothing to propagate OR reconcile, and an
+  // ambient fallback here would be the exact mis-targeting the explicit
+  // projectId exists to prevent.
+  if (!input.projectId) return [];
+  const { swimlanes, tasks } = getProjectRepos(input.context, input.projectId);
+  const boardProfiles = input.context.boardConfigManager.getBoardProfiles();
+  const laneList = swimlanes.list();
+
+  return tasks.list(input.after.id).map((task) => {
+    const profile = findTaskProfile({ profiles: boardProfiles, profileId: task.profile_id, taskId: task.id });
+    return {
+      task,
+      before: applyProfileToLane(input.before, profile, laneList),
+      after: applyProfileToLane(input.after, profile, laneList),
+      sourceName: input.after.name,
+    };
+  });
+}
+
+/**
  * Push a Board Profile rewrite into the live sessions of the tasks riding it.
  *
  * Shared by both profile writers - the Board Manager's save
@@ -139,13 +220,23 @@ export function propagateStrategyToLiveSessions(
  *
  * Only profile-riding tasks are considered: a task on Default resolves to its
  * column's own settings, which a profile write cannot change.
+ *
+ * `auto_spawn` is profile-scoped too, so a profile that flips it reconciles the
+ * same way a column edit does - which is exactly what this shared chokepoint
+ * exists to guarantee.
  */
 export function propagateBoardProfileChange(
   context: IpcContext,
   previousProfiles: ReadonlyArray<BoardProfile>,
   nextProfiles: ReadonlyArray<BoardProfile>,
+  projectId: string | null,
 ): void {
-  const { swimlanes, tasks } = getProjectRepos(context);
+  // Bail rather than let `getProjectRepos` fall back to the ambient project,
+  // exactly as `buildColumnStrategyChanges` does: this path now reconciles
+  // auto_spawn, so an ambient fallback could spawn or suspend against a project
+  // whose profiles were never edited.
+  if (!projectId) return;
+  const { swimlanes, tasks } = getProjectRepos(context, projectId);
   const laneList = swimlanes.list();
   const laneById = new Map(laneList.map((lane) => [lane.id, lane]));
 
@@ -165,5 +256,6 @@ export function propagateBoardProfileChange(
           sourceName: afterProfile?.name ?? beforeProfile?.name ?? 'profile',
         };
       }),
+    projectId,
   );
 }

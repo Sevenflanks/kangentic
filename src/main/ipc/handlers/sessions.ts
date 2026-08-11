@@ -1,4 +1,4 @@
-import { ipcMain } from 'electron';
+import { ipcMain, webContents } from 'electron';
 import { IPC } from '../../../shared/ipc-channels';
 import { withTaskLock } from '../task-lifecycle-lock';
 import { SessionRepository } from '../../db/repositories/session-repository';
@@ -19,7 +19,7 @@ import { markRecordExited, markRecordSuspended, promoteRecord, recoverStaleSessi
 import { isShuttingDown } from '../../shutdown-state';
 import { applySuspendDbWrites, reconcileTaskSessionRef } from './session-reconcile';
 import { abortInFlightResume, registerResumeController, releaseResumeController } from './session-resume-controllers';
-import type { Session, TaskResolvePrResult } from '../../../shared/types';
+import type { PtyResizeOrigin, Session, TaskResolvePrResult } from '../../../shared/types';
 import type { IpcContext } from '../ipc-context';
 import { isAbortError } from '../../../shared/abort-utils';
 import { broadcast } from '../../pop-out/window-broadcast';
@@ -34,6 +34,10 @@ const sessionStartTimes = new Map<string, number>();
 const sessionSpawnAnalyticsFired = new Set<string>();
 
 export function registerSessionHandlers(context: IpcContext): void {
+  /** Renderers whose focus-set teardown is already wired, so repeated
+   *  SESSION_SET_FOCUSED calls do not stack duplicate listeners. */
+  const focusTeardownWatched = new Set<number>();
+
   // === Sessions ===
   ipcMain.handle(IPC.SESSION_SPAWN, (_, input, projectId?: string | null) => {
     const resolvedProjectId = projectId ?? context.currentProjectId;
@@ -49,6 +53,9 @@ export function registerSessionHandlers(context: IpcContext): void {
     if (!taskId) return context.sessionManager.kill(id);
     return withTaskLock(taskId, async () => context.sessionManager.kill(id));
   });
+  // Renderer keystrokes are the primary source of user-typed prompt text, so
+  // they use the input coordinator that preserves prompt drafts against an
+  // injected auto_command.
   ipcMain.handle(IPC.SESSION_WRITE, (_, id, data) => context.sessionManager.writeUserInput(id, data));
   ipcMain.handle(IPC.SESSION_WRITE_FOCUS_REPORT, (_, id, data: unknown, projectId: string | null) => {
     if (!projectId) throw new Error('Focus report project id is required');
@@ -310,11 +317,41 @@ export function registerSessionHandlers(context: IpcContext): void {
 
   // Set which sessions are visible in the renderer (terminal panel + command bar overlay).
   // Background sessions stop emitting data IPC (accumulate in scrollback only).
-  ipcMain.handle(IPC.SESSION_SET_FOCUSED, (_, sessionIds: string[]) => {
-    context.sessionManager.setFocusedSessions(sessionIds);
+  /**
+   * A renderer that goes away must not keep sessions pinned as focused (main
+   * keeps emitting their data to a window that no longer exists) nor as
+   * mounted (main would keep treating their grids as held). One watcher per
+   * renderer clears both sets.
+   */
+  const watchRendererTeardown = (sender: Electron.WebContents): void => {
+    if (focusTeardownWatched.has(sender.id)) return;
+    focusTeardownWatched.add(sender.id);
+    const forget = (): void => {
+      context.sessionManager.clearFocusedSessionsFor(sender.id);
+      focusTeardownWatched.delete(sender.id);
+    };
+    sender.once('destroyed', forget);
+    sender.once('render-process-gone', forget);
+  };
+
+  ipcMain.handle(IPC.SESSION_SET_FOCUSED, (event, sessionIds: string[]) => {
+    // Keyed by the SENDING renderer: the detached Agent Monitor publishes its own
+    // visible set, and a single shared set would have the two clobber each other.
+    context.sessionManager.setFocusedSessions(sessionIds, event.sender.id);
+    watchRendererTeardown(event.sender);
     // Immediately flush any buffered usage/events so the newly focused
     // sessions' data is up-to-date without waiting for the 2s timer.
     flushBackgroundBuffer();
+  });
+
+  // Set which sessions this renderer has an xterm MOUNTED for. Broader than
+  // the focused set: a parked terminal is unfocused but still holds a grid,
+  // and main must not reshape a PTY something is still rendering at its own
+  // size (xterm re-sends dimensions only when its OWN size changes, so the
+  // mismatch would have no path back).
+  ipcMain.handle(IPC.SESSION_SET_MOUNTED, (event, sessionIds: string[]) => {
+    context.sessionManager.setMountedSessions(sessionIds, event.sender.id);
+    watchRendererTeardown(event.sender);
   });
 
   // User pressed Ctrl+C in the terminal. Renderer already sent \x03 to
@@ -364,18 +401,55 @@ export function registerSessionHandlers(context: IpcContext): void {
 
   // Forward PTY events to renderer (guard against destroyed window during shutdown)
   // Each event includes the session's projectId so the renderer can filter by project.
-  context.sessionManager.on('data', (sessionId: string, data: string) => {
-    if (!context.mainWindow.isDestroyed()) {
-      const projectId = context.sessionManager.getSessionProjectId(sessionId);
-      context.mainWindow.webContents.send(IPC.SESSION_DATA, sessionId, data, projectId);
+  /**
+   * Send to exactly the renderers that have this session VISIBLE, using the
+   * per-renderer focus map as a routing table.
+   *
+   * Previously this was a blanket send to the main window, which is wrong once a
+   * second renderer (the detached Agent Monitor) can host a terminal: its bytes
+   * would go to a window that is not showing them. Routing is also strictly less
+   * IPC than before - the main window no longer receives data for sessions it has
+   * no terminal for.
+   *
+   * Falls back to the main window when the map is empty, which is the pre-focus
+   * boot window and any headless caller that never published a set.
+   */
+  const sendToFocusedRenderers = (channel: string, sessionId: string, ...args: unknown[]): void => {
+    const rendererIds = context.sessionManager.getRenderersFocusedOn(sessionId);
+    if (rendererIds.length === 0) {
+      if (!context.mainWindow.isDestroyed()) {
+        context.mainWindow.webContents.send(channel, sessionId, ...args);
+      }
+      return;
     }
+    for (const rendererId of rendererIds) {
+      const target = webContents.fromId(rendererId);
+      if (target && !target.isDestroyed()) target.send(channel, sessionId, ...args);
+    }
+  };
+
+  context.sessionManager.on('data', (sessionId: string, data: string) => {
+    const projectId = context.sessionManager.getSessionProjectId(sessionId);
+    sendToFocusedRenderers(IPC.SESSION_DATA, sessionId, data, projectId);
   });
 
+  // Fires only when the PTY's dims actually changed (SessionManager.resize
+  // short-circuits no-ops before the emit). Broadcast rather than focus-routed:
+  // the mounted owner xterm this echo exists for can be mid-mount (registered
+  // in the mounted set only a microtask later), and a missed echo during that
+  // window is exactly the divergence with no recovery path. Echoes are rare,
+  // so fanning a few no-op sends is the cheaper failure mode.
+  context.sessionManager.on(
+    'pty-resize',
+    (sessionId: string, cols: number, rows: number, origin: PtyResizeOrigin = 'desktop') => {
+      if (context.mainWindow.isDestroyed()) return;
+      broadcast(context.mainWindow, IPC.SESSION_PTY_RESIZED, sessionId, cols, rows, origin);
+    },
+  );
+
   context.sessionManager.on('first-output', (sessionId: string) => {
-    if (!context.mainWindow.isDestroyed()) {
-      const projectId = context.sessionManager.getSessionProjectId(sessionId);
-      context.mainWindow.webContents.send(IPC.SESSION_FIRST_OUTPUT, sessionId, projectId);
-    }
+    const projectId = context.sessionManager.getSessionProjectId(sessionId);
+    sendToFocusedRenderers(IPC.SESSION_FIRST_OUTPUT, sessionId, projectId);
   });
 
   context.sessionManager.on('usage', (sessionId: string, data: unknown) => {

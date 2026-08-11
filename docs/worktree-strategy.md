@@ -18,10 +18,59 @@ differs from the effective default (`computeAutoBranchName` in `src/shared/slugi
 
 Examples: `fix-auth-bug-a1b2c3d4` (base equals the effective default); `release-2.0/fix-auth-bug-a1b2c3d4` (an explicit per-task base that differs from it).
 
-Worktree directory: `<project>/.kangentic/worktrees/{slug}-{taskId8}/` - always flat, even when the
-branch name is namespaced (the namespace prefix never reaches the folder name).
+Custom branch names (set per-task) are used as the branch verbatim.
 
-Custom branch names (set per-task) use the custom name as the branch, with a slugified folder name: `{slugifiedCustom}-{taskId8}/`.
+### Worktree Directory Naming
+
+Worktree directory: `<project>/.kangentic/worktrees/{display_id}/` - always flat, and named for the
+task's `display_id` (the `#N` shown on its card), independent of the branch.
+
+The directory used to be `{slug}-{taskId8}`. Kangentic's own contribution to the path was therefore
+about 49 characters (`\.kangentic\worktrees\` plus a folder name of up to 28), with the
+title-derived slug as the larger and unbounded half. The numeric name takes that to about 24: the
+`\.kangentic\worktrees\` prefix remains, and only the folder name shrank. It is also strictly more
+stable, because the old name was derived from the task title, so renaming a task changed the folder
+it would be recreated in.
+
+How much that matters in practice is measured in
+[cross-platform.md](cross-platform.md#windows-max_path-is-mostly-not-the-wall-people-expect), which
+also records why there is no path-length warning and no configurable worktree root. In short: a
+shorter root does help a native Windows toolchain, but it can never be a guarantee, because
+Kangentic controls neither the project's own location nor how deep a build runs beneath it. The
+naming change is worth making on its own merits (stability, see below); treat the path saving as a
+bonus rather than a fix.
+
+#### The folder is chosen once and never changes
+
+`tasks.worktree_folder` records the directory name for the life of the task.
+
+- Non-null: used verbatim. This covers every worktree created before the numeric scheme, which
+  keeps its legacy `{slug}-{taskId8}` name. Nothing on disk is ever renamed or relocated.
+- Null: the folder is `String(display_id)`, and the caller persists it via
+  `TaskRepository.recordWorktree`, which writes path, branch and folder in one transaction.
+- Invariant: whenever `worktree_path` is non-null,
+  `path.basename(worktree_path) === worktree_folder`.
+
+This is load-bearing rather than cosmetic. Moving a task to Done nulls `worktree_path`, so moving it
+back out is a **fresh creation**. If it landed at a different path, the agent's transcript would be
+orphaned (Claude keys it by a slug of the cwd, so `--resume` reports "No conversation found") and
+the worktree's browser cookie jar would be dropped (`browserPartitionForWorktree` hashes the path).
+
+For a task that predates the column and has already been through Done, both `worktree_path` and
+`worktree_folder` are null. `TaskRepository.recoverLegacyWorktreeFolder` recovers the original name
+from the task's most recent `sessions.cwd`, accepting it only when it is a **direct child of that
+project's own worktrees root**. The anchor matters: Kangentic can be opened *at* a worktree path, so
+a project root can itself contain `.kangentic/worktrees/`, and a bare marker search would hand a
+task that never had a worktree the enclosing worktree's name - permanently, since the column is
+write-once. The migration deliberately does not attempt this, because it receives only the database
+handle and has no project path to anchor against.
+
+Parsers that read a folder name (the `/preview` title resolver, the window title, `get_current_task`)
+accept both the numeric and the legacy shape.
+
+Numeric folders are unique per project, not globally: everything here is project-scoped (per-project
+database, per-project worktrees directory). `display_id` never recycles, so a deleted task's number
+is never handed to a new task that could then adopt its leftover directory.
 
 ### Base Branch Resolution
 
@@ -92,6 +141,25 @@ This guard lives inside `WorktreeManager.ensureWorktree` (via `resolveWorktreeBa
 `ensureWorktree`) gets the identical no-commits fallback. `ensureTaskBranchCheckout` keeps its own
 separate no-commits guard, since it does not go through `WorktreeManager.ensureWorktree`.
 
+#### Sharing one checkout is guarded, not prevented
+
+Every task that does not get a worktree runs in the same directory, the project path. Kangentic does
+not stop two agents from working there at once, but it does refuse to **change the branch** under a
+live one: `ensureTaskBranchCheckout` throws `BranchCheckoutBlockedError` when another task has a
+running or queued session whose `cwd` is that directory.
+
+The check lives in that function rather than in a caller, deliberately. It previously sat in
+`task-move.ts` keyed on `task.base_branch`, while the decision to check out is keyed on
+`usesCustomBranch || base_branch`, so a task with a custom branch and no base branch checked out with
+the guard never running. Co-locating the guard with the checkout makes that class of drift
+impossible, and running it inside the per-project git queue (which already wraps the checkout) makes
+the probe atomic against every other checkout on the project without adding a third lock.
+
+Where the error goes depends on the entry point, exactly as worktree failures do. A task **move**
+surfaces it as a toast. Create, promote, unarchive and MCP auto-spawn deliberately keep the task and
+skip only the spawn, so they emit `task:spawnBlocked` and the renderer toasts it, naming the blocking
+task. Without that push, "created and silently not spawned" looked identical to success.
+
 ### When worktree creation fails with a written error
 
 Two distinct failure modes raise an actionable `Error` rather than falling back silently. Where
@@ -143,7 +211,7 @@ Both name what failed and what to do about it, rather than surfacing git's raw e
 
 ### Windows Long Paths
 
-On Windows, projects with deeply nested file paths (e.g. .NET migrations, `node_modules` trees) can exceed the default 260-character path limit when checked out into a worktree under `.kangentic/worktrees/<slug>/`. This causes `git worktree add` and subsequent git operations to fail with "Filename too long" errors.
+On Windows, projects with deeply nested file paths (e.g. .NET migrations, `node_modules` trees) can exceed the default 260-character path limit when checked out into a worktree under `.kangentic/worktrees/<n>/`. This causes `git worktree add` and subsequent git operations to fail with "Filename too long" errors.
 
 Kangentic enables `core.longpaths` in two places:
 
@@ -151,6 +219,13 @@ Kangentic enables `core.longpaths` in two places:
 2. **Worktree local config** - after creation, `git config core.longpaths true` is set in the worktree's local config so all subsequent operations (sparse-checkout, agent commits, merges) also use extended-length paths.
 
 This setting uses the `\\?\` extended-length path prefix on Windows. macOS and Linux have 1024-4096 byte `PATH_MAX` limits and are unaffected - the setting is only applied on `process.platform === 'win32'`.
+
+`core.longpaths` covers git itself. Node and the JVM handle long paths on their own (measurement:
+1,958 files past MAX_PATH in a real worktree, with `npm install` and Gradle both succeeding), so the
+toolchains that run inside a worktree are largely unaffected too. See
+[cross-platform.md](cross-platform.md#windows-max_path-is-mostly-not-the-wall-people-expect) for the
+measurements and for the one limit that does bind, which is CMake's own object-path policy rather
+than the operating system.
 
 ## node_modules Linking and the Post-Worktree Script
 
@@ -258,6 +333,11 @@ Task moved between active columns (e.g., Planning → Code Review)
   → Otherwise, the same-track, same-agent, same-model live session stays live and injects
     supported auto_command and effort changes; an unsupported concrete effort target can
     respawn, while permission-only changes or no setting delta stay live
+  → Session stays alive; an auto_command on the target is injected as keystrokes
+    (timing per the column's auto_command_mode: immediate or deferred)
+  → Only a permission-mode change, or a model/effort change the agent cannot
+    swap live, forces suspend + respawn - and then the auto_command rides along
+    as the resume prompt instead of being typed
 
 Task moved to Done
   → Confirmation dialog ONLY when the worktree has uncommitted files or unpushed

@@ -152,7 +152,7 @@ export function PrioritiesPopover() {
         onClick={() => setOpen(!open)}
         className={`flex items-center gap-1.5 px-3 py-1.5 text-sm border rounded transition-colors ${
           open
-            ? 'text-fg border-accent/50 bg-surface-hover/40'
+            ? 'text-fg border-accent/50 bg-surface-control/40'
             : 'text-fg-muted hover:text-fg border-edge/50 hover:bg-surface-hover/40'
         }`}
         data-testid="manage-priorities-btn"
@@ -293,7 +293,12 @@ function PriorityRow({
       className="flex items-center gap-2.5 h-9 px-1.5 rounded hover:bg-surface-hover/30"
     >
       {!isLocked ? (
-        <div {...attributes} {...listeners} className="cursor-grab text-fg-disabled hover:text-fg-muted flex-shrink-0">
+        // `data-no-dismiss`: this popover renders IN FLOW inside the board toolbar, which the
+        // board layer owns for light dismiss. `cursor-grab` is not `pointer`, so the cursor
+        // heuristic cannot exclude the handle, and it lights up on hover. Protected locally
+        // rather than leaning on the enclosing OverlayPopover's `data-dismissable-layer`, so
+        // the guarantee does not depend on an ancestor two components away.
+        <div {...attributes} {...listeners} data-no-dismiss className="cursor-grab text-fg-disabled hover:text-fg-muted flex-shrink-0">
           <GripVertical size={13} />
         </div>
       ) : (
@@ -315,7 +320,7 @@ function PriorityRow({
           ) : (
             <Pill
               size="sm"
-              className="bg-surface-hover/60 font-medium cursor-pointer"
+              className="bg-surface-control/60 font-medium cursor-pointer"
               style={{ color }}
             >
               {label}
@@ -344,7 +349,7 @@ function PriorityRow({
               if (event.key === 'Enter') saveEdit();
               if (event.key === 'Escape') setEditing(false);
             }}
-            className="bg-surface border border-edge-input rounded px-2 py-0.5 text-sm text-fg focus:outline-none focus:border-accent w-full"
+            className="bg-surface-control border border-edge-input rounded px-2 py-0.5 text-sm text-fg focus:outline-none focus:border-accent w-full"
           />
         </div>
       )}

@@ -29,7 +29,6 @@ import { useSessionStore } from '../stores/session-store';
 import { useToastStore } from '../stores/toast-store';
 import { isPlaceholderTitle } from './placeholder-title';
 
-// @ts-expect-error -- Vite handles import.meta.hot
 const preservedAutoName = import.meta.hot?.data?.autoNameState as
   | { askedTaskIds: string[]; labeledTransientIds: string[] }
   | undefined;
@@ -173,9 +172,7 @@ export function cancelAutoNameTimersAndClear(): void {
 // HMR persistence: clear pending timers on dispose, save the in-memory sets so a
 // hot reload doesn't double-fire. Vitest provides no `import.meta.hot`, so this
 // block is a no-op under unit tests.
-// @ts-expect-error -- Vite handles import.meta.hot
 if (import.meta.hot) {
-  // @ts-expect-error -- Vite handles import.meta.hot
   import.meta.hot.dispose((data: Record<string, unknown>) => {
     for (const timer of autoNameTimers.values()) clearTimeout(timer);
     autoNameTimers.clear();

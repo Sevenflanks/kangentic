@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  Layers, Sliders, Bot, Zap, History,
+  Layers, Sliders, Bot, Repeat, Zap, Clock, Plus,
   RotateCcw, Palette, ChevronRight, X,
 } from 'lucide-react';
 import { HexColorPicker } from 'react-colorful';
@@ -21,6 +21,10 @@ import { Pill } from '../Pill';
 import { ICON_REGISTRY, ROLE_DEFAULTS, getUsedIcons } from '../../utils/swimlane-icons';
 import { Select } from '../settings/shared';
 import { ToggleCard } from '../ToggleCard';
+import { SegmentedControl, type SegmentedControlOption } from '../SegmentedControl';
+import { SETTING_LABEL_CLASS, SETTING_DESCRIPTION_CLASS } from '../SettingText';
+import { OverlayPopover } from '../OverlayPopover';
+import { usePopoverPosition } from '../../hooks/usePopoverPosition';
 import { useAgentCapabilityResolution } from '../../hooks/useAgentCapabilityResolution';
 import { useModelContextWindows, useModelDisplayNames } from '../../hooks/useKnownModels';
 import { useKeybinding } from '../../hooks/useKeybinding';
@@ -36,6 +40,7 @@ import {
   type PermissionMode,
   type SessionTarget,
   type SessionSpawnStrategy,
+  type AutoCommandMode,
   type SwimlaneCreateInput,
   type SwimlaneUpdateInput,
   type BoardProfile,
@@ -44,6 +49,7 @@ import {
 import { ProfileBar } from './board-manager/ProfileBar';
 import { ProfileNameDialog } from './board-manager/ProfileNameDialog';
 import { TASK_TEMPLATE_VARS } from '../../../shared/task-template-vars';
+import { pruneProfileReferencesForColumn } from '../../../shared/board-profile-references';
 
 /** Sentinel entity id keying this dialog's maximize flag in the session store. */
 const BOARD_MANAGER_ENTITY_ID = 'board-manager-dialog';
@@ -57,19 +63,24 @@ const PRESET_COLORS = [
 const DEFAULT_COLOR = '#3b82f6';
 const NEW_DRAFT_PREFIX = 'new:';
 
-type SectionId = 'general' | 'agent' | 'auto' | 'handoff';
+type SectionId = 'general' | 'agent' | 'auto';
 
+/**
+ * Handoff is deliberately NOT a section. It was one row - a single toggle - so
+ * it cost a sticky heading, a rule, and a section's worth of vertical space to
+ * present one boolean. It now sits at the end of Automation, which is what it
+ * is: something that happens on its own when a task enters the column.
+ *
+ * `Repeat` rather than `Zap` for Automation: the lightning bolt is the glyph for
+ * "run immediately" on the timing control INSIDE this section, and a section
+ * heading that repeats one of its own options' icons reads as if the section is
+ * about that option.
+ */
 const SECTIONS: { id: SectionId; label: string; icon: typeof Sliders }[] = [
   { id: 'general', label: 'General', icon: Sliders },
   { id: 'agent', label: 'Agent', icon: Bot },
-  { id: 'auto', label: 'Automation', icon: Zap },
-  { id: 'handoff', label: 'Handoff', icon: History },
+  { id: 'auto', label: 'Automation', icon: Repeat },
 ];
-
-// Sourced from TASK_TEMPLATE_VARS (shared/task-template-vars.ts) - the same
-// declaration the auto-command resolver and the docs-parity test read, so the
-// chips can never drift from what the interpolation actually substitutes.
-const TEMPLATE_VARIABLES = TASK_TEMPLATE_VARS.map((templateVar) => templateVar.chip);
 
 // ────────────────────────────────────────────────────────────────────────
 // Pure helpers (exported for unit tests)
@@ -90,6 +101,7 @@ const PROFILE_FIELD_MAP = [
   ['effort_override', 'effortOverride'],
   ['permission_mode', 'permissionMode'],
   ['auto_command', 'autoCommand'],
+  ['auto_command_mode', 'autoCommandMode'],
   ['auto_spawn', 'autoSpawn'],
   ['handoff_context', 'handoffContext'],
   ['session_target', 'sessionTarget'],
@@ -176,6 +188,15 @@ export function carryUnmappedEntryKeys(existing: BoardProfileEntry | undefined):
   return carried as BoardProfileEntry;
 }
 
+/**
+ * Shared empty set backing the three predicates' optional `pendingDeleteIds`
+ * argument, so the default is one allocation rather than a fresh set per call.
+ * Every call site inside this component passes the real set explicitly, so no
+ * `useMemo` dependency array relies on this identity today; the default exists
+ * for the exported predicates' other callers and their tests.
+ */
+const EMPTY_ID_SET: ReadonlySet<string> = new Set<string>();
+
 export function isDirty(draft: Swimlane, original: Swimlane | undefined): boolean {
   if (!original) return true;
   return JSON.stringify(draft) !== JSON.stringify(original);
@@ -210,8 +231,16 @@ export function reconcileLaneOrder(
   previousOrder: string[],
   swimlanes: Swimlane[],
   hasLocalReorder: boolean,
+  pendingDeleteIds: ReadonlySet<string> = EMPTY_ID_SET,
 ): string[] {
-  const sorted = [...swimlanes].sort((a, b) => a.position - b.position).map((lane) => lane.id);
+  // Staged deletions are filtered out of the STORE snapshot, not just the
+  // previous order: a column pending deletion is still in `swimlanes` (nothing
+  // has been persisted yet), so both branches below would otherwise re-insert
+  // it on the next store update and silently undo the removal.
+  const sorted = [...swimlanes]
+    .filter((lane) => !pendingDeleteIds.has(lane.id))
+    .sort((a, b) => a.position - b.position)
+    .map((lane) => lane.id);
   if (!hasLocalReorder) {
     const newIds = previousOrder.filter((id) => id.startsWith(NEW_DRAFT_PREFIX));
     if (newIds.length === 0) return sorted;
@@ -244,10 +273,18 @@ export function reconcileLaneOrder(
  * state). Unsaved `new:` drafts are ignored. Shared by `isOrderChanged` (the
  * dirty gate) and the footer's affected-column summary so the two never drift.
  */
-export function getReorderedColumnIds(laneOrder: string[], originals: Record<string, Swimlane>): Set<string> {
+export function getReorderedColumnIds(
+  laneOrder: string[],
+  originals: Record<string, Swimlane>,
+  pendingDeleteIds: ReadonlySet<string> = EMPTY_ID_SET,
+): Set<string> {
   const moved = new Set<string>();
   const persistedOrder = laneOrder.filter((id) => !isNewDraftId(id));
+  // Staged deletions are dropped from the baseline too, so the length check
+  // below still lines up and a genuine reorder is still detected while a delete
+  // is pending. Without this the bailout swallows both.
   const originalOrder = Object.values(originals)
+    .filter((lane) => !pendingDeleteIds.has(lane.id))
     .sort((a, b) => a.position - b.position)
     .map((lane) => lane.id);
   if (persistedOrder.length !== originalOrder.length) return moved;
@@ -263,8 +300,12 @@ export function getReorderedColumnIds(laneOrder: string[], originals: Record<str
  * handled by the create-then-reorder path on save). Gates the reorder IPC call
  * in handleSave and the footer's modified-column summary.
  */
-export function isOrderChanged(laneOrder: string[], originals: Record<string, Swimlane>): boolean {
-  return getReorderedColumnIds(laneOrder, originals).size > 0;
+export function isOrderChanged(
+  laneOrder: string[],
+  originals: Record<string, Swimlane>,
+  pendingDeleteIds: ReadonlySet<string> = EMPTY_ID_SET,
+): boolean {
+  return getReorderedColumnIds(laneOrder, originals, pendingDeleteIds).size > 0;
 }
 
 export function buildUpdateInput(draft: Swimlane, original: Swimlane): SwimlaneUpdateInput {
@@ -279,6 +320,7 @@ export function buildUpdateInput(draft: Swimlane, original: Swimlane): SwimlaneU
     permission_mode: isTodoOrDone ? undefined : draft.permission_mode,
     auto_spawn: isTodoOrDone ? undefined : draft.auto_spawn,
     auto_command: isTodoOrDone ? undefined : (draft.auto_command?.trim() || null),
+    auto_command_mode: isTodoOrDone ? undefined : draft.auto_command_mode,
     plan_exit_target_id: isPlanMode ? (draft.plan_exit_target_id || null) : undefined,
     agent_override: isTodoOrDone ? undefined : (draft.agent_override || null),
     model_override: isTodoOrDone ? undefined : (draft.model_override?.trim() || null),
@@ -299,6 +341,7 @@ export function buildCreateInput(draft: Swimlane): SwimlaneCreateInput {
     permission_mode: draft.permission_mode,
     auto_spawn: draft.auto_spawn,
     auto_command: draft.auto_command?.trim() || null,
+    auto_command_mode: draft.auto_command_mode,
     plan_exit_target_id: isPlanMode ? (draft.plan_exit_target_id || null) : undefined,
     agent_override: draft.agent_override || null,
     model_override: draft.model_override?.trim() || null,
@@ -324,6 +367,7 @@ function makeNewDraft(): Swimlane {
     permission_mode: null,
     auto_spawn: false,
     auto_command: '',
+    auto_command_mode: 'immediate',
     plan_exit_target_id: null,
     agent_override: null,
     model_override: null,
@@ -353,11 +397,14 @@ function SettingField({ label, description, hint, children, className = '' }: {
   return (
     <div className={`flex flex-col h-full ${className}`}>
       <div className="flex items-center justify-between gap-2">
-        <label className="text-sm font-medium text-fg-secondary">{label}</label>
+        {/* Raw classes rather than <SettingText>: this row right-aligns `hint`
+            (the Reset control) against the LABEL line, a layout the shared
+            component does not own. The values still come from one place. */}
+        <label className={SETTING_LABEL_CLASS}>{label}</label>
         {hint}
       </div>
       {description && (
-        <p className="text-xs text-fg-faint mt-0.5">{description}</p>
+        <p className={`${SETTING_DESCRIPTION_CLASS} mt-0.5`}>{description}</p>
       )}
       <div className={description ? 'mt-auto pt-1.5' : 'mt-1.5'}>{children}</div>
     </div>
@@ -394,7 +441,10 @@ function SectionHeading({ section }: { section: typeof SECTIONS[number] }) {
       data-testid={`board-manager-section-${section.id}`}
       className="sticky top-0 z-10 -mx-7 mt-3 px-7 pt-3 pb-2 bg-surface-raised border-t border-edge/50 flex items-center gap-2 first:mt-0 first:border-t-0"
     >
-      <SectionIcon size={13} strokeWidth={1.75} className="text-fg-faint" />
+      {/* 15, not 13: at 13 these glyphs lose their interior detail against the
+          12px uppercase label beside them. The label's cap height is unchanged,
+          so the row's height does not move. */}
+      <SectionIcon size={15} strokeWidth={1.75} className="text-fg-faint" />
       <span className="text-xs font-semibold uppercase tracking-wider text-fg-faint">{section.label}</span>
     </div>
   );
@@ -402,7 +452,103 @@ function SectionHeading({ section }: { section: typeof SECTIONS[number] }) {
 
 /** One-line inline explanation shown in place of a section's fields when it does not apply. */
 function DisabledSectionNotice({ reason }: { reason: string }) {
-  return <p className="text-xs text-fg-faint pt-3 pb-1 max-w-2xl">{reason}</p>;
+  return <p className={`${SETTING_DESCRIPTION_CLASS} pt-3 pb-1 max-w-2xl`}>{reason}</p>;
+}
+
+/**
+ * The auto-command's template-variable inserter.
+ *
+ * This replaced a row of ten always-on `{{chip}}` buttons. Ten monospace tokens
+ * are a wall of syntax the user has to read past to reach the field they
+ * actually came for, and their names alone do not say what they resolve to -
+ * `{{task_xml}}` and `{{description}}` are not self-explanatory. One pill opens
+ * a list that can afford to carry each variable's meaning.
+ *
+ * Portal + `strategy: 'fixed'` is not optional: the board manager's detail form
+ * is a scroll container, so an in-flow menu is clipped to it (see
+ * `.claude/rules/popover-escapes-clipping.md`). The outside-click handler checks
+ * BOTH refs for the same reason - once portaled, a click inside the menu is
+ * "outside" the trigger's subtree.
+ */
+function TemplateVariablePicker({ onInsert }: { onInsert: (variable: string) => void }) {
+  const [open, setOpen] = useState(false);
+  const buttonRef = useRef<HTMLButtonElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+
+  const { style } = usePopoverPosition(
+    buttonRef as React.RefObject<HTMLElement>,
+    menuRef as React.RefObject<HTMLElement>,
+    open,
+    { mode: 'dropdown', strategy: 'fixed' },
+  );
+
+  useEffect(() => {
+    if (!open) return;
+    const handlePointerDown = (event: MouseEvent) => {
+      const target = event.target as Node;
+      if (buttonRef.current?.contains(target) || menuRef.current?.contains(target)) return;
+      setOpen(false);
+    };
+    const handleKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.stopPropagation();
+        setOpen(false);
+        buttonRef.current?.focus();
+      }
+    };
+    document.addEventListener('mousedown', handlePointerDown, true);
+    document.addEventListener('keydown', handleKey, true);
+    return () => {
+      document.removeEventListener('mousedown', handlePointerDown, true);
+      document.removeEventListener('keydown', handleKey, true);
+    };
+  }, [open]);
+
+  return (
+    <>
+      <button
+        ref={buttonRef}
+        type="button"
+        onClick={() => setOpen((current) => !current)}
+        aria-expanded={open}
+        data-testid="template-variable-trigger"
+        className="inline-flex cursor-pointer items-center gap-1 rounded border border-edge/40 bg-surface-control/40 px-2 py-1 text-xs text-fg-muted transition-colors hover:border-edge hover:text-fg focus:outline-none focus-visible:border-accent"
+      >
+        <Plus size={13} />
+        Template variable
+      </button>
+
+      <OverlayPopover
+        open={open}
+        popoverRef={menuRef}
+        style={style}
+        portal
+        className="fixed z-[2147483646] w-80 overflow-hidden rounded-lg border border-edge bg-surface shadow-xl"
+        data-testid="template-variable-menu"
+      >
+        <div className="max-h-72 overflow-y-auto py-1">
+          {TASK_TEMPLATE_VARS.map((templateVar) => (
+            <button
+              key={templateVar.name}
+              type="button"
+              onClick={() => {
+                onInsert(templateVar.chip);
+                setOpen(false);
+              }}
+              className="flex w-full cursor-pointer flex-col gap-0.5 px-3 py-1.5 text-left transition-colors hover:bg-surface-hover focus:outline-none focus-visible:bg-surface-hover"
+            >
+              <span className="font-mono text-xs text-fg">{templateVar.chip}</span>
+              {/* Clamped: a couple of these descriptions are written for the docs
+                  tables and run long. The full text stays available on hover. */}
+              <span className="line-clamp-1 text-[11px] text-fg-faint" title={templateVar.description}>
+                {templateVar.description}
+              </span>
+            </button>
+          ))}
+        </div>
+      </OverlayPopover>
+    </>
+  );
 }
 
 /**
@@ -434,11 +580,11 @@ function DetailIdentityHeader({ draft, position, total, profileName }: {
       )}
       <span className="text-sm font-semibold text-fg truncate">{draft.name || 'Untitled'}</span>
       {draft.role && (
-        <Pill size="sm" className="bg-surface-hover/60 text-fg-faint flex-shrink-0">
+        <Pill size="sm" className="bg-surface-control/60 text-fg-faint flex-shrink-0">
           {draft.role === 'todo' ? 'To Do' : 'Done'}
         </Pill>
       )}
-      <Pill size="sm" className="bg-surface-hover/60 text-fg-faint flex-shrink-0">{position} of {total}</Pill>
+      <Pill size="sm" className="bg-surface-control/60 text-fg-faint flex-shrink-0">{position} of {total}</Pill>
       {profileName && (
         <Pill
           size="sm"
@@ -457,13 +603,35 @@ function DetailIdentityHeader({ draft, position, total, profileName }: {
 // Main dialog
 // ────────────────────────────────────────────────────────────────────────
 
-const DIALOG_SELECT_CLASS = 'w-full appearance-none bg-surface-hover border border-edge-input rounded pl-3 pr-10 py-1.5 text-sm text-fg focus:outline-none focus:border-accent';
+const DIALOG_SELECT_CLASS = 'w-full appearance-none bg-surface-control border border-edge-input rounded pl-3 pr-10 py-1.5 text-sm text-fg-tertiary focus:outline-none focus:border-accent';
 
 // Responsive two-column form grid. Driven by a container query on the scroll
 // region (`@container`), so it lays out by the DETAIL PANE's width, not the
 // viewport: two columns when the pane is wide enough (maximized, even on a small
 // monitor), one column when it is narrow (windowed). Columns auto-size via 1fr.
 // Short single-line controls pair up; full-width fields carry `SECTION_FULL_SPAN`.
+/**
+ * Module scope, not an inline literal at the call site: `SegmentedControl` keys
+ * its measuring effect on `options`, and this dialog re-renders on every
+ * keystroke in any field, so a fresh array each render would tear down and
+ * rebuild the control's ResizeObserver (and force a synchronous layout read)
+ * on every character typed. The options are fully static, so one instance does.
+ */
+const AUTO_COMMAND_MODE_OPTIONS: SegmentedControlOption<AutoCommandMode>[] = [
+  {
+    value: 'immediate',
+    label: 'Run immediately',
+    icon: <Zap size={14} />,
+    testId: 'auto-command-mode-immediate',
+  },
+  {
+    value: 'deferred',
+    label: 'Wait for current turn',
+    icon: <Clock size={14} />,
+    testId: 'auto-command-mode-deferred',
+  },
+];
+
 const SECTION_GRID_CLASS = 'grid grid-cols-1 @[720px]:grid-cols-2 gap-x-6 gap-y-3 max-w-4xl pt-2';
 const SECTION_FULL_SPAN = '@[720px]:col-span-2';
 
@@ -552,6 +720,13 @@ export function BoardManagerDialog({ initialColumnId, seedNewDraft, addDraftRequ
   const [newDraftIds, setNewDraftIds] = useState<Set<string>>(initialState.newDraftIds);
   const [laneOrder, setLaneOrder] = useState<string[]>(initialState.laneOrder);
   const [activeId, setActiveId] = useState<string>(initialState.activeId);
+  // Persisted columns the user removed but has not saved yet. Deletion used to
+  // fire its IPC immediately, which made it the one structural edit in this
+  // dialog that Save and Cancel did not govern - the form never went dirty, and
+  // Cancel could not undo it. Staging it here puts it on the same footing as an
+  // add, a reorder, or any field edit. Their `originals` entries are KEPT so the
+  // save path can still name them and a discard restores them for free.
+  const [pendingDeleteIds, setPendingDeleteIds] = useState<Set<string>>(() => new Set<string>());
 
   // Set once the user drags a rail row. Tells the store-sync effect to preserve
   // the local order instead of re-sorting from store positions. Never cleared
@@ -582,8 +757,10 @@ export function BoardManagerDialog({ initialColumnId, seedNewDraft, addDraftRequ
   // store-sync effect runs (effects fire in declaration order).
   const originalsRef = useRef(originals);
   const draftsRef = useRef(drafts);
+  const pendingDeleteIdsRef = useRef(pendingDeleteIds);
   useEffect(() => { originalsRef.current = originals; });
   useEffect(() => { draftsRef.current = drafts; });
+  useEffect(() => { pendingDeleteIdsRef.current = pendingDeleteIds; });
 
   // ── Sync from store ────────────────────────────────────────────────
   // When the store updates (other UI edits a column, or a column is created
@@ -598,6 +775,7 @@ export function BoardManagerDialog({ initialColumnId, seedNewDraft, addDraftRequ
   useEffect(() => {
     const previousOriginals = originalsRef.current;
     const previousDrafts = draftsRef.current;
+    const stagedDeletes = pendingDeleteIdsRef.current;
 
     const nextOriginals: Record<string, Swimlane> = {};
     for (const lane of swimlanes) nextOriginals[lane.id] = lane;
@@ -605,6 +783,10 @@ export function BoardManagerDialog({ initialColumnId, seedNewDraft, addDraftRequ
 
     const nextDrafts: Record<string, Swimlane> = { ...previousDrafts };
     for (const lane of swimlanes) {
+      // A staged delete removed this lane's draft, but the row is still in the
+      // store (nothing is persisted until Save), so `!previousDraft` below would
+      // read as "never seen" and re-add it, resurrecting the removal.
+      if (stagedDeletes.has(lane.id)) continue;
       const previousDraft = previousDrafts[lane.id];
       const wasDirty = previousDraft ? isDirty(previousDraft, previousOriginals[lane.id]) : false;
       if (!previousDraft || !wasDirty) {
@@ -618,7 +800,7 @@ export function BoardManagerDialog({ initialColumnId, seedNewDraft, addDraftRequ
     }
     setDrafts(nextDrafts);
 
-    setLaneOrder((previousOrder) => reconcileLaneOrder(previousOrder, swimlanes, hasLocalReorderRef.current));
+    setLaneOrder((previousOrder) => reconcileLaneOrder(previousOrder, swimlanes, hasLocalReorderRef.current, stagedDeletes));
   }, [swimlanes]);
 
   // ── Refresh agent capabilities ─────────────────────────────────────
@@ -725,20 +907,27 @@ export function BoardManagerDialog({ initialColumnId, seedNewDraft, addDraftRequ
   // custom column even with Auto-spawn off; only its dependent fields hide.)
   const sessionsRunHere = !isTodoOrDone && draft?.auto_spawn === true;
 
+  // Gates the timing control. Trimmed, so a field holding only whitespace is
+  // still "no command" - the injection plan treats it that way too.
+  const hasAutoCommandDraft = Boolean(draft?.auto_command?.trim());
+
   const isOverview = activeId === ALL_COLUMNS_ID;
 
   const dirtyIds = useMemo(
     () => laneOrder.filter((id) => newDraftIds.has(id) || isDirty(drafts[id], originals[id])),
     [drafts, originals, laneOrder, newDraftIds],
   );
-  const orderDirty = useMemo(() => isOrderChanged(laneOrder, originals), [laneOrder, originals]);
+  const orderDirty = useMemo(
+    () => isOrderChanged(laneOrder, originals, pendingDeleteIds),
+    [laneOrder, originals, pendingDeleteIds],
+  );
   // Whole-object compare, matching how column dirtiness is tracked. Covers
   // create, rename, duplicate, delete, and any per-column delta edit in one go.
   const profilesDirty = useMemo(
     () => JSON.stringify(profileDrafts) !== JSON.stringify(profileOriginals),
     [profileDrafts, profileOriginals],
   );
-  const hasDirty = dirtyIds.length > 0 || orderDirty || profilesDirty;
+  const hasDirty = dirtyIds.length > 0 || orderDirty || profilesDirty || pendingDeleteIds.size > 0;
 
   // Rows for the left rail. The inline override hints (agent / isolated) are
   // suppressed for role-pinned To Do / Done columns, where they never apply.
@@ -885,6 +1074,32 @@ export function BoardManagerDialog({ initialColumnId, seedNewDraft, addDraftRequ
     });
   }, [activeId, activeProfileId, drafts]);
 
+  /**
+   * Insert a `{{variable}}` at the auto-command textarea's cursor, restoring the
+   * caret after it. The rAF is load-bearing: `updateDraft` re-renders the
+   * controlled textarea, and setting the selection before that paint lands puts
+   * the caret back at the end of the old value.
+   */
+  const insertTemplateVariable = useCallback((variable: string) => {
+    const node = autoCommandRef.current;
+    const current = draft?.auto_command ?? '';
+    if (!node) {
+      updateDraft((row) => ({ ...row, auto_command: current + variable }));
+      return;
+    }
+    const start = node.selectionStart ?? current.length;
+    const end = node.selectionEnd ?? current.length;
+    updateDraft((row) => ({
+      ...row,
+      auto_command: current.slice(0, start) + variable + current.slice(end),
+    }));
+    window.requestAnimationFrame(() => {
+      node.focus();
+      const cursor = start + variable.length;
+      node.setSelectionRange(cursor, cursor);
+    });
+  }, [draft?.auto_command, updateDraft]);
+
   // ── Save / cancel / delete ────────────────────────────────────────
   const requestCancel = useCallback(() => {
     if (saving) return;
@@ -928,7 +1143,7 @@ export function BoardManagerDialog({ initialColumnId, seedNewDraft, addDraftRequ
     // `profileDrafts`, never in `drafts`, so a profile-only change leaves the
     // three column checks false. Without it this early return closed the dialog
     // before the profile write below ever ran, silently discarding the edit.
-    if (creates.length === 0 && updates.length === 0 && !orderDirty && !profilesDirty) {
+    if (creates.length === 0 && updates.length === 0 && !orderDirty && !profilesDirty && pendingDeleteIds.size === 0) {
       onClose();
       return;
     }
@@ -942,7 +1157,55 @@ export function BoardManagerDialog({ initialColumnId, seedNewDraft, addDraftRequ
     // contains the migrated temp id.
     let savedUpdates = 0;
     let savedCreates = 0;
+    let savedDeletes = 0;
     let firstError: Error | null = null;
+    // The profile list the trailing whole-array write will send. Tracked as a
+    // local, not read off `profileDrafts`, because the delete loop below prunes
+    // it and a setState is not visible to this same closure.
+    let profilesToSave = profileDrafts;
+
+    // Deletes run FIRST, and before the reorder below, so the final order we
+    // send contains only ids the DB still has. Each id that succeeds leaves
+    // `pendingDeleteIds`; ones that fail stay staged so the user can fix the
+    // cause (a task moved in behind them) and re-save just those.
+    for (const id of pendingDeleteIds) {
+      const deletedColumnName = originals[id]?.name ?? 'column';
+      try {
+        await deleteSwimlane(id);
+        setPendingDeleteIds((previous) => {
+          if (!previous.has(id)) return previous;
+          const next = new Set(previous);
+          next.delete(id);
+          return next;
+        });
+        setOriginals((previous) => {
+          const next = { ...previous };
+          delete next[id];
+          return next;
+        });
+        // The main process prunes the ON-DISK profiles as part of the delete,
+        // but `profileDrafts` is a mount-time snapshot that gets written back
+        // WHOLE below. Without pruning it too, saving a delete together with any
+        // profile edit re-writes the stale entry straight over that pruning and
+        // the dangling reference survives. The local drives this save; the two
+        // setStates keep the dialog honest if a later step fails and it stays
+        // open for a retry.
+        const prune = (list: BoardProfile[]) => pruneProfileReferencesForColumn(
+          list,
+          { columnId: id, columnName: deletedColumnName },
+        ).profiles;
+        profilesToSave = prune(profilesToSave);
+        setProfileDrafts(prune);
+        setProfileOriginals(prune);
+        savedDeletes += 1;
+      } catch (error) {
+        if (!firstError) {
+          firstError = error instanceof Error
+            ? new Error(`Could not delete "${deletedColumnName}": ${error.message}`)
+            : new Error(`Could not delete "${deletedColumnName}"`);
+        }
+      }
+    }
 
     // Updates run in parallel; we materialise each result into local state
     // regardless of which other updates fail, via Promise.allSettled. We
@@ -1026,7 +1289,15 @@ export function BoardManagerDialog({ initialColumnId, seedNewDraft, addDraftRequ
     // to reorder, but only for ids that exist in the DB now. Temp ids of creates
     // that failed (or were skipped after a failure above) are filtered out so we
     // don't ask the IPC to reorder ids it has never seen.
-    if (savedCreates > 0 || orderDirty) {
+    // `savedDeletes` is in the gate so a delete-only save still renumbers: the
+    // survivors would otherwise keep their old positions and read 0,1,3,4.
+    //
+    // This still runs when a delete FAILED above, and `finalOrder` omits that
+    // lane (staging pulled it from laneOrder), so the lane keeps a stale
+    // position. Left alone deliberately: render sorts by position, the next
+    // successful save or config apply renumbers everything by index, and the
+    // dialog stays open on the error path with the delete still staged.
+    if (savedCreates > 0 || savedDeletes > 0 || orderDirty) {
       try {
         const finalOrder = laneOrder
           .map((id) => idMap.get(id) ?? id)
@@ -1040,8 +1311,9 @@ export function BoardManagerDialog({ initialColumnId, seedNewDraft, addDraftRequ
     }
 
     if (firstError) {
-      const partialNote = (savedUpdates + savedCreates) > 0
-        ? ` (saved ${savedUpdates + savedCreates} column${(savedUpdates + savedCreates) > 1 ? 's' : ''} before failing)`
+      const savedTotal = savedUpdates + savedCreates + savedDeletes;
+      const partialNote = savedTotal > 0
+        ? ` (saved ${savedTotal} column${savedTotal > 1 ? 's' : ''} before failing)`
         : '';
       useToastStore.getState().addToast({
         message: `${firstError.message}${partialNote}`,
@@ -1057,14 +1329,19 @@ export function BoardManagerDialog({ initialColumnId, seedNewDraft, addDraftRequ
     // DB representation, so this array IS the source of truth. A hand-written
     // profile the user never touched round-trips unchanged, and one keyed to a
     // column this machine does not have is preserved rather than dropped.
+    // `profilesToSave` rather than `profileDrafts`: a staged column delete prunes
+    // that column out of the list above, and this whole-array write would
+    // otherwise restore it. When nothing here is dirty we do not write at all,
+    // which is correct - the delete path already pruned the on-disk copy.
     if (profilesDirty) {
-      await saveBoardProfiles(profileDrafts);
-      setProfileOriginals(structuredClone(profileDrafts) as BoardProfile[]);
+      await saveBoardProfiles(profilesToSave);
+      setProfileOriginals(structuredClone(profilesToSave) as BoardProfile[]);
     }
 
     const parts: string[] = [];
     if (savedUpdates > 0) parts.push(`Saved ${savedUpdates} column${savedUpdates > 1 ? 's' : ''}`);
     if (savedCreates > 0) parts.push(`created ${savedCreates} column${savedCreates > 1 ? 's' : ''}`);
+    if (savedDeletes > 0) parts.push(`${parts.length === 0 ? 'Deleted' : 'deleted'} ${savedDeletes} column${savedDeletes > 1 ? 's' : ''}`);
     if (orderDirty) parts.push(parts.length === 0 ? 'Updated column order' : 'updated column order');
     if (profilesDirty) parts.push(parts.length === 0 ? 'Saved profiles' : 'saved profiles');
     useToastStore.getState().addToast({
@@ -1072,7 +1349,7 @@ export function BoardManagerDialog({ initialColumnId, seedNewDraft, addDraftRequ
       variant: 'info',
     });
     onClose();
-  }, [saving, laneOrder, drafts, originals, newDraftIds, orderDirty, profilesDirty, profileDrafts, saveBoardProfiles, updateSwimlane, createSwimlane, reorderSwimlanes, onClose]);
+  }, [saving, laneOrder, drafts, originals, newDraftIds, pendingDeleteIds, orderDirty, profilesDirty, profileDrafts, saveBoardProfiles, updateSwimlane, createSwimlane, deleteSwimlane, reorderSwimlanes, onClose]);
 
   // Cmd/Ctrl+S to save, via the central keybinding registry. Document-level,
   // bubble phase, preventDefault only - matching the original listener.
@@ -1149,40 +1426,32 @@ export function BoardManagerDialog({ initialColumnId, seedNewDraft, addDraftRequ
     removeDraftLocally(activeId);
   }, [isNewDraft, activeId, removeDraftLocally]);
 
-  const handleDeletePersisted = useCallback(async () => {
+  // Stages the removal; the IPC runs in handleSave alongside the creates and
+  // updates. The task-count guard stays here so the refusal is immediate rather
+  // than surfacing minutes later at save time; the repository re-checks it, so
+  // this is feedback, not the authority. `originals[id]` is deliberately left in
+  // place - the save path reads the name from it, and Cancel restores the column
+  // by simply dropping the staged id.
+  const handleDeletePersisted = useCallback(() => {
     setConfirmDeleteId(null);
     const id = activeId;
     if (!id || newDraftIds.has(id)) return;
+    const name = drafts[id]?.name ?? 'column';
     const taskCount = tasks.filter((task) => task.swimlane_id === id).length;
     if (taskCount > 0) {
-      const name = drafts[id]?.name ?? 'column';
       useToastStore.getState().addToast({
         message: `Cannot delete "${name}". Move or delete all ${taskCount} task${taskCount > 1 ? 's' : ''} first.`,
         variant: 'error',
       });
       return;
     }
-    try {
-      const name = drafts[id]?.name ?? 'column';
-      await deleteSwimlane(id);
-      useToastStore.getState().addToast({
-        message: `Deleted column "${name}"`,
-        variant: 'info',
-      });
-      removeDraftLocally(id);
-      // Drop the original entry too.
-      setOriginals((previous) => {
-        const next = { ...previous };
-        delete next[id];
-        return next;
-      });
-    } catch (error) {
-      useToastStore.getState().addToast({
-        message: error instanceof Error ? error.message : 'Failed to delete column',
-        variant: 'error',
-      });
-    }
-  }, [activeId, newDraftIds, tasks, drafts, deleteSwimlane, removeDraftLocally]);
+    removeDraftLocally(id);
+    setPendingDeleteIds((previous) => new Set(previous).add(id));
+    useToastStore.getState().addToast({
+      message: `"${name}" will be removed when you save.`,
+      variant: 'info',
+    });
+  }, [activeId, newDraftIds, tasks, drafts, removeDraftLocally]);
 
   // ── Rendering ─────────────────────────────────────────────────────
   if (!isOverview && !draft) {
@@ -1191,10 +1460,12 @@ export function BoardManagerDialog({ initialColumnId, seedNewDraft, addDraftRequ
   }
 
   // A single count of affected columns: those with field edits or a pending
-  // create, plus any whose position changed from a reorder. The user just wants
-  // "how many columns will change", not an order-vs-options breakdown.
+  // create, plus any whose position changed from a reorder, plus any staged for
+  // deletion. The user just wants "how many columns will change", not an
+  // order-vs-options breakdown.
   const affectedIds = new Set(dirtyIds);
-  for (const movedId of getReorderedColumnIds(laneOrder, originals)) affectedIds.add(movedId);
+  for (const movedId of getReorderedColumnIds(laneOrder, originals, pendingDeleteIds)) affectedIds.add(movedId);
+  for (const deletedId of pendingDeleteIds) affectedIds.add(deletedId);
   const affectedCount = affectedIds.size;
   const dirtySummary = affectedCount > 0 ? `${affectedCount} column${affectedCount === 1 ? '' : 's'} modified` : '';
 
@@ -1342,7 +1613,7 @@ export function BoardManagerDialog({ initialColumnId, seedNewDraft, addDraftRequ
                     onChange={(event) => updateDraft((current) => ({ ...current, name: event.target.value }))}
                     onKeyDown={(event) => { if (event.key === 'Enter') void handleSave(); }}
                     data-testid="board-manager-name"
-                    className="w-full bg-surface-hover border border-edge-input rounded px-3 py-1.5 text-sm text-fg placeholder-fg-faint focus:outline-none focus:border-accent"
+                    className="w-full bg-surface-control border border-edge-input rounded px-3 py-1.5 text-sm text-fg-tertiary placeholder-fg-muted focus:outline-none focus:border-accent"
                   />
                 </SettingField>
 
@@ -1358,7 +1629,7 @@ export function BoardManagerDialog({ initialColumnId, seedNewDraft, addDraftRequ
                     rows={1}
                     maxLength={1000}
                     data-testid="board-manager-description"
-                    className="w-full bg-surface-hover border border-edge-input rounded px-3 py-1.5 text-sm text-fg placeholder-fg-faint focus:outline-none focus:border-accent resize-y"
+                    className="w-full bg-surface-control border border-edge-input rounded px-3 py-1.5 text-sm text-fg-tertiary placeholder-fg-muted focus:outline-none focus:border-accent resize-y"
                   />
                 </SettingField>
 
@@ -1395,7 +1666,7 @@ export function BoardManagerDialog({ initialColumnId, seedNewDraft, addDraftRequ
                         !PRESET_COLORS.includes(draft.color.toLowerCase())
                           ? 'border-white/60 scale-110'
                           : showCustomPicker
-                            ? 'border-white/60 bg-surface-hover'
+                            ? 'border-white/60 bg-surface-control'
                             : 'border-edge-input hover:border-fg-muted bg-surface'
                       }`}
                       style={!PRESET_COLORS.includes(draft.color.toLowerCase()) ? { backgroundColor: draft.color } : undefined}
@@ -1429,7 +1700,7 @@ export function BoardManagerDialog({ initialColumnId, seedNewDraft, addDraftRequ
                           if (!/^#[0-9a-fA-F]{6}$/.test(hexInput)) setHexInput(draft.color);
                         }}
                         aria-label="Hex color value"
-                        className="w-full bg-surface-hover border border-edge-input rounded px-3 py-1.5 text-sm text-fg font-mono focus:outline-none focus:border-accent"
+                        className="w-full bg-surface-control border border-edge-input rounded px-3 py-1.5 text-sm text-fg-tertiary font-mono focus:outline-none focus:border-accent"
                         placeholder="#000000"
                         maxLength={7}
                       />
@@ -1445,7 +1716,7 @@ export function BoardManagerDialog({ initialColumnId, seedNewDraft, addDraftRequ
                     onClick={() => setShowIconPicker(true)}
                     data-testid="board-manager-icon"
                     aria-label={`Choose icon${draft.icon ? `: ${draft.icon}` : ''}`}
-                    className="w-full flex items-center gap-2.5 bg-surface-hover border border-edge-input hover:border-fg-faint rounded px-3 py-1.5 transition-colors group"
+                    className="w-full flex items-center gap-2.5 bg-surface-control border border-edge-input hover:border-fg-faint rounded px-3 py-1.5 transition-colors group"
                   >
                     <div className="flex-shrink-0">
                       {(() => {
@@ -1497,7 +1768,6 @@ export function BoardManagerDialog({ initialColumnId, seedNewDraft, addDraftRequ
                   {draft.auto_spawn && (<>
                   <SettingField
                     label="Agent"
-                    description="Which agent CLI to run for sessions in this column."
                     hint={draft.agent_override ? (
                       <ResetHint
                         title="Reset to project setting"
@@ -1539,7 +1809,6 @@ export function BoardManagerDialog({ initialColumnId, seedNewDraft, addDraftRequ
                   {supportsModelOverride && (
                     <SettingField
                       label="Model"
-                      description="Override the model for sessions spawned here."
                       hint={draft.model_override ? (
                         <ResetHint
                           title={projectDefaultModelLabel ? 'Reset to project default' : 'Reset to agent default'}
@@ -1566,7 +1835,6 @@ export function BoardManagerDialog({ initialColumnId, seedNewDraft, addDraftRequ
                   {effortLevels.length > 0 && (
                     <SettingField
                       label="Effort"
-                      description="Reasoning effort budget. Higher costs more tokens."
                       hint={draft.effort_override ? (
                         <ResetHint
                           title={projectDefaultEffort ? 'Reset to project default' : 'Reset to agent default'}
@@ -1587,7 +1855,6 @@ export function BoardManagerDialog({ initialColumnId, seedNewDraft, addDraftRequ
 
                   <SettingField
                     label="Permissions"
-                    description="How the agent handles tool approvals in this column."
                     hint={draft.permission_mode ? (
                       <ResetHint
                         title="Reset to project setting"
@@ -1637,10 +1904,20 @@ export function BoardManagerDialog({ initialColumnId, seedNewDraft, addDraftRequ
               <SectionHeading section={SECTIONS[2]} />
               {sessionsRunHere ? (
                 <div className={SECTION_GRID_CLASS}>
-                    <SettingField
-                      label="Session"
-                      description="Share the task's main session, or run a separate isolated one for this column."
-                    >
+                    {/* Leads the section, following the order a column is actually
+                        configured: what the agent ARRIVES with (prior context),
+                        then which session it runs in, then what it is told to do. */}
+                    <div className={SECTION_FULL_SPAN}>
+                      <ToggleCard
+                          label="Receive context from prior agent"
+                        description="On cross-agent moves into this column, hand the previous agent's conversation to the new one."
+                        checked={draft.handoff_context}
+                        onChange={(next) => updateDraft((current) => ({ ...current, handoff_context: next }))}
+                        info={'When a task enters this column and the assigned agent differs from the one that ran in the previous column, Kangentic injects the previous session\'s transcript as the first message, so the new agent continues with full context instead of starting from the task description alone.\n\nSame-agent moves (e.g. Claude to Claude) resume natively via the agent\'s own session id and ignore this setting.'}
+                      />
+                    </div>
+
+                    <SettingField label="Session">
                       <Select
                         value={draft.session_target ?? 'main'}
                         onChange={(event) => {
@@ -1670,10 +1947,7 @@ export function BoardManagerDialog({ initialColumnId, seedNewDraft, addDraftRequ
                       </Select>
                     </SettingField>
 
-                    <SettingField
-                      label="On enter"
-                      description="Resume the session or start fresh."
-                    >
+                    <SettingField label="On enter">
                       <Select
                         value={draft.session_spawn_strategy ?? 'create_or_resume'}
                         onChange={(event) => updateDraft((current) => ({
@@ -1690,7 +1964,7 @@ export function BoardManagerDialog({ initialColumnId, seedNewDraft, addDraftRequ
                     </SettingField>
 
                 <SettingField label="Auto-command" className={SECTION_FULL_SPAN}>
-                <p className="text-xs text-fg-faint -mt-2 mb-2">
+                <p className={`${SETTING_DESCRIPTION_CLASS} -mt-2 mb-2`}>
                   Runs in the agent on startup, the moment a task enters this column. Supports template variables.
                 </p>
                 <textarea
@@ -1700,54 +1974,44 @@ export function BoardManagerDialog({ initialColumnId, seedNewDraft, addDraftRequ
                   rows={1}
                   placeholder="/review {{title}}"
                   data-testid="auto-command-input"
-                  className="w-full bg-surface-hover border border-edge-input rounded px-3 py-1.5 text-sm text-fg font-mono placeholder-fg-faint focus:outline-none focus:border-accent resize-y"
+                  className="w-full bg-surface-control border border-edge-input rounded px-3 py-1.5 text-sm text-fg-tertiary font-mono placeholder-fg-muted focus:outline-none focus:border-accent resize-y"
                 />
-                <div className="mt-2 flex flex-wrap gap-1.5">
-                  {TEMPLATE_VARIABLES.map((variable) => (
-                    <button
-                      key={variable}
-                      type="button"
-                      onClick={() => {
-                        const node = autoCommandRef.current;
-                        const current = draft.auto_command ?? '';
-                        if (node) {
-                          const start = node.selectionStart ?? current.length;
-                          const end = node.selectionEnd ?? current.length;
-                          const next = current.slice(0, start) + variable + current.slice(end);
-                          updateDraft((row) => ({ ...row, auto_command: next }));
-                          window.requestAnimationFrame(() => {
-                            node.focus();
-                            const cursor = start + variable.length;
-                            node.setSelectionRange(cursor, cursor);
-                          });
-                        } else {
-                          updateDraft((row) => ({ ...row, auto_command: current + variable }));
-                        }
-                      }}
-                      className="text-[11px] font-mono px-1.5 py-0.5 rounded bg-surface-hover/40 text-fg-muted hover:text-fg border border-edge/40 hover:border-edge transition-colors"
-                    >
-                      {variable}
-                    </button>
-                  ))}
+                {/* The field's own footer row: what you can PUT in the command
+                    on the left, WHEN it runs on the right. Timing was a separate
+                    labelled field below, which read as a sibling setting when it
+                    is really part of this one - it modifies this command and
+                    means nothing without it. In the field's footer the
+                    relationship needs no explaining, and the two option labels
+                    say what the old "Timing" label plus its description did.
+
+                    Disabled rather than hidden when there is no command: hiding
+                    it made the form jump on the first keystroke, and left no
+                    trace that the setting exists at all. */}
+                <div className="mt-2 flex flex-wrap items-center justify-between gap-2">
+                  <TemplateVariablePicker onInsert={insertTemplateVariable} />
+                  {/* `title` on the WRAPPER, not the control: a disabled button
+                      does not fire the mouse events a tooltip needs. */}
+                  <span
+                    title={hasAutoCommandDraft
+                      ? 'Whether the command interrupts the agent or waits for it to finish what it is doing.'
+                      : 'Set an auto-command to choose when it runs.'}
+                  >
+                    <SegmentedControl
+                      ariaLabel="Auto-command timing"
+                      testId="auto-command-mode"
+                      disabled={!hasAutoCommandDraft}
+                      value={draft.auto_command_mode}
+                      onChange={(next: AutoCommandMode) => updateDraft((current) => ({
+                        ...current,
+                        auto_command_mode: next,
+                      }))}
+                      options={AUTO_COMMAND_MODE_OPTIONS}
+                    />
+                  </span>
                 </div>
                 </SettingField>
                 </div>
               ) : <DisabledSectionNotice reason={disabledReasonFor('Automation')} />}
-
-              <SectionHeading section={SECTIONS[3]} />
-              {sessionsRunHere ? (
-                <div className={SECTION_GRID_CLASS}>
-                  <div className={SECTION_FULL_SPAN}>
-                    <ToggleCard
-                      label="Receive context from prior agent"
-                      description="On cross-agent moves into this column, hand the previous agent's conversation to the new one."
-                      checked={draft.handoff_context}
-                      onChange={(next) => updateDraft((current) => ({ ...current, handoff_context: next }))}
-                      info={'When a task enters this column and the assigned agent differs from the one that ran in the previous column, Kangentic injects the previous session\'s transcript as the first message, so the new agent continues with full context instead of starting from the task description alone.\n\nSame-agent moves (e.g. Claude to Claude) resume natively via the agent\'s own session id and ignore this setting.'}
-                    />
-                  </div>
-                </div>
-              ) : <DisabledSectionNotice reason={disabledReasonFor('Handoff')} />}
             </div>
           </div>
         )}
@@ -1814,7 +2078,7 @@ export function BoardManagerDialog({ initialColumnId, seedNewDraft, addDraftRequ
           </>}
           confirmLabel="Delete"
           variant="danger"
-          onConfirm={() => void handleDeletePersisted()}
+          onConfirm={handleDeletePersisted}
           onCancel={() => setConfirmDeleteId(null)}
         />
       )}
@@ -1840,9 +2104,31 @@ export function BoardManagerDialog({ initialColumnId, seedNewDraft, addDraftRequ
                   </ul>
                 </>
               )}
+              {pendingDeleteIds.size > 0 && (
+                <>
+                  <p>{dirtyIds.length > 0 ? 'These columns are staged for removal and will be kept:' : 'These columns are staged for removal. Discarding keeps them:'}</p>
+                  <ul className="space-y-1" data-testid="board-manager-staged-removals">
+                    {[...pendingDeleteIds].map((id) => (
+                      <li key={id} className="flex items-baseline gap-2">
+                        <span className="text-fg-faint">•</span>
+                        <span className="font-medium text-fg-secondary">{originals[id]?.name?.trim() || 'Untitled column'}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </>
+              )}
               {orderDirty && (
                 <p className="text-fg-secondary">
                   {dirtyIds.length > 0 ? 'Column order changes will also be discarded.' : 'Your column order changes will be discarded.'}
+                </p>
+              )}
+              {/* Profile edits live in profileDrafts, never in `drafts`, so without
+                  this line a profile-only cancel showed an empty confirm body. */}
+              {profilesDirty && (
+                <p className="text-fg-secondary">
+                  {dirtyIds.length > 0 || pendingDeleteIds.size > 0 || orderDirty
+                    ? 'Board Profile changes will also be discarded.'
+                    : 'Your Board Profile changes will be discarded.'}
                 </p>
               )}
             </div>

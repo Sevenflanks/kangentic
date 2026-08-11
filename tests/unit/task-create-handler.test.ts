@@ -148,6 +148,7 @@ vi.mock('../../src/main/ipc/helpers', () => ({
   getProjectRepos: (...args: unknown[]) => mockGetProjectRepos(...args),
   ensureTaskWorktree: (...args: unknown[]) => mockEnsureTaskWorktree(...args),
   ensureTaskBranchCheckout: (...args: unknown[]) => mockEnsureTaskBranchCheckout(...args),
+  notifyBranchCheckoutBlocked: () => {},
   createTransitionEngine: (...args: unknown[]) => mockCreateTransitionEngine(...args),
   cleanupTaskResources: (...args: unknown[]) => mockCleanupTaskResources(...args),
   spawnAgent: (...args: unknown[]) => mockSpawnAgent(...args),
@@ -166,7 +167,6 @@ vi.mock('../../src/main/agent/shared', async () => {
 });
 
 vi.mock('../../src/main/ipc/handlers/task-move', () => ({
-  guardActiveNonWorktreeSessions: vi.fn(),
   handleTaskMove: vi.fn(async () => {}),
 }));
 

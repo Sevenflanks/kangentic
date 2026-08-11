@@ -7,6 +7,12 @@ import { SwimlaneRepository } from '../../db/repositories/swimlane-repository';
 import { readFileAsAttachment } from '../../db/repositories/attachment-utils';
 import { resolveColumn } from './column-resolver';
 import { resolveTask } from './task-resolver';
+import {
+  clampSlot,
+  computeIdsWithTaskAtSlot,
+  computeReorderedIds,
+  resolveRawPosition,
+} from './task-ordering';
 import { handleCreateBacklogTask, BACKLOG_DESCRIPTION_MAX_LENGTH } from './backlog-commands';
 import { resolveProfileSelector } from './profile-commands';
 import { linkPRForTask } from '../../pr/pr-linking';
@@ -112,6 +118,36 @@ export function computeUpdatedDescription(
 function prNumberFromUrl(prUrl: string): number | null {
   const prNumberMatch = prUrl.match(/\/pull\/(\d+)/);
   return prNumberMatch ? parseInt(prNumberMatch[1], 10) : null;
+}
+
+/**
+ * Resolve a just-written PR link so its state lands immediately, instead of
+ * waiting for the background sweep or the next auto-link trigger (both non-force,
+ * so both are subject to the 60s per-task throttle - exactly the window a
+ * PR-creating flow lands in). Without this, `create_task` / `update_task` leave
+ * `pr_state` null and the board card shows a bare PR pill with no state chip.
+ *
+ * Fire-and-forget: `linkPRForTask` takes the task lock itself, and its `onLinked`
+ * routes through `context.onTaskUpdated`, which pushes TASK_UPDATED_BY_AGENT and
+ * a board-changed event (see `mcp-project-context.ts`), so the card repaints
+ * without the tool call awaiting a `gh` round-trip. `preserveLinkOnNotFound`
+ * because a resolve fired BY a link write must never undo that write; an
+ * explicit `link_pr` deliberately does not set it.
+ */
+function scheduleLinkTimeResolve(
+  taskId: string,
+  taskRepo: TaskRepository,
+  context: CommandContext,
+): void {
+  void linkPRForTask(taskId, {
+    tasks: taskRepo,
+    projectPath: context.getProjectPath(),
+    force: true,
+    preserveLinkOnNotFound: true,
+    onLinked: (linked) => context.onTaskUpdated(linked),
+  }).catch((error) => {
+    console.error(`[pr-linking] link-time resolve failed for task ${taskId.slice(0, 8)}:`, error);
+  });
 }
 
 export const handleCreateTask: CommandHandler = async (
@@ -232,9 +268,10 @@ export const handleCreateTask: CommandHandler = async (
   // see the ladder comment in pr-linking.ts). Applied as a follow-up update
   // rather than through TaskCreateInput on purpose: `TaskRepository.create`
   // always writes the three PR columns null, and keeping that invariant means
-  // the create path has exactly one shape. pr_state stays null and the next
-  // resolve fills it in.
+  // the create path has exactly one shape. pr_state stays null here and the
+  // link-time resolve fired after `onTaskCreated` below fills it in.
   let createdTask = task;
+  let linksPR = false;
   if (prUrl !== null || prNumber !== null) {
     // An explicit prNumber wins; otherwise derive it from the URL, so a caller
     // passing prUrl alone still lands on Tier 1 instead of producing a row that
@@ -245,6 +282,7 @@ export const handleCreateTask: CommandHandler = async (
       ...(prUrl !== null ? { pr_url: String(prUrl) } : {}),
       ...(linkedPrNumber !== null ? { pr_number: linkedPrNumber } : {}),
     });
+    linksPR = (prUrl !== null && String(prUrl).trim() !== '') || Number.isFinite(linkedPrNumber);
   }
 
   // Persist label colors to config if any were provided
@@ -278,6 +316,7 @@ export const handleCreateTask: CommandHandler = async (
 
   try {
     const autoCommandOutcome = await context.onTaskAutoSpawn(createdTask, targetSwimlane.id);
+    if (linksPR) scheduleLinkTimeResolve(createdTask.id, taskRepo, context);
     return {
       success: true,
       data: withAutoCommandOutcome(createdTaskData, autoCommandOutcome),
@@ -286,6 +325,7 @@ export const handleCreateTask: CommandHandler = async (
   } catch {
     // Task 已持久化且已通知 board；這裡只轉換 startup rejection，不能擴大到前面的失敗邊界。
     const warning = 'Task was created, but the agent could not be started. The task remains on the board.';
+    if (linksPR) scheduleLinkTimeResolve(createdTask.id, taskRepo, context);
     return {
       success: true,
       data: { ...createdTaskData, warning },
@@ -303,8 +343,13 @@ export const handleUpdateTask: CommandHandler = (
   const newDescription = params.description as string | null;
   const newDescriptionEdits = (params.descriptionEdits ?? null) as DescriptionEdit[] | null;
   const newAppendDescription = (params.appendDescription ?? null) as string | null;
-  const newPrUrl = params.prUrl as string | null;
-  const newPrNumber = params.prNumber as number | null;
+  // Normalized to null so an omitted key reads the same as the explicit `null`
+  // the MCP tool layer forwards, matching handleCreateTask. Without it a caller
+  // that passes neither key (a direct handler call, or a mobile-bridge payload
+  // that omits them) writes the literal string 'undefined' into pr_url and NaN
+  // into pr_number, since `undefined !== null` passes the gates below.
+  const newPrUrl = (params.prUrl as string | null | undefined) ?? null;
+  const newPrNumber = (params.prNumber as number | null | undefined) ?? null;
   const newAgent = params.agent as string | null;
   const newPriority = params.priority as number | null;
   const newLabels = params.labels as string[] | null;
@@ -375,7 +420,7 @@ export const handleUpdateTask: CommandHandler = (
   // three fields must always agree (the linker writes them atomically), and a
   // stale terminal `merged`/`closed` would otherwise short-circuit every
   // non-force resolve, freezing the task on a PR it no longer points at. The
-  // next resolve refills it.
+  // link-time resolve fired after `onTaskUpdated` below refills it.
   if (newPrUrl !== null || newPrNumber !== null) updates.pr_state = null;
   if (newAgent !== null) updates.agent = newAgent;
   if (newPriority !== null) updates.priority = Number(newPriority);
@@ -441,6 +486,18 @@ export const handleUpdateTask: CommandHandler = (
   }
 
   context.onTaskUpdated(updated);
+
+  // Gated on what THIS call wrote, not on the post-write row: `updated` falls
+  // back to the untouched task when nothing scalar changed, so reading its
+  // fields would make a title-only edit on an already-linked task re-resolve.
+  // The trim also rejects an empty prUrl, which the `!== null` gate above lets
+  // through, and `isFinite` rejects the NaN a non-numeric `prNumber` produces
+  // (the mobile bridge hands raw wire params to the handler, unlike the MCP
+  // tool layer, whose zod schema has already validated a positive int).
+  const linkedUrl = typeof updates.pr_url === 'string' ? updates.pr_url.trim() : '';
+  if (linkedUrl !== '' || Number.isFinite(updates.pr_number)) {
+    scheduleLinkTimeResolve(updated.id, taskRepo, context);
+  }
 
   const changedFields: string[] = [];
   if (newTitle !== null) changedFields.push('title');
@@ -557,6 +614,25 @@ export const handleLinkPr: CommandHandler = async (
   }
 };
 
+/**
+ * Parse the optional `position` argument shared by `move_task`. Returns null
+ * when omitted, so the caller keeps its existing append placement, and mirrors
+ * `handleCreateColumn`'s rejection wording for a bad value.
+ */
+function parseSlotParam(value: unknown): { slot: number } | { error: string } | null {
+  if (value === undefined || value === null) return null;
+  // Not `Number(value)`: that coerces '', [], and '   ' to 0 and `true` to 1,
+  // so a junk argument would silently become a real slot instead of an error.
+  // The MCP schema already guarantees a number here, but the dev-only devtools
+  // proxy forwards raw JSON straight into `commandHandlers` and does not.
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
+    return {
+      error: `Invalid position "${String(value)}". Provide a whole number >= 0, or omit it to place the task at the end of the column.`,
+    };
+  }
+  return { slot: value };
+}
+
 export const handleMoveTask: CommandHandler = async (
   params: Record<string, unknown>,
   context: CommandContext,
@@ -569,6 +645,11 @@ export const handleMoveTask: CommandHandler = async (
   }
   if (!columnName) {
     return { success: false, error: 'column is required' };
+  }
+
+  const parsedSlot = parseSlotParam(params.position);
+  if (parsedSlot && 'error' in parsedSlot) {
+    return { success: false, error: parsedSlot.error };
   }
 
   const db = context.getProjectDb();
@@ -585,20 +666,73 @@ export const handleMoveTask: CommandHandler = async (
   const { swimlane: targetSwimlane } = resolution;
 
   if (task.swimlane_id === targetSwimlane.id) {
+    // Already here, and no slot named: the long-standing no-op.
+    if (!parsedSlot) {
+      return {
+        success: true,
+        message: `Task "${task.title}" is already in ${targetSwimlane.name}.`,
+        data: withAutoCommandOutcome({
+          id: task.id,
+          displayId: task.display_id,
+          column: targetSwimlane.name,
+        }, { kind: 'not-applicable' }),
+      };
+    }
+
+    // Already here WITH a slot: a reposition, and deliberately not routed
+    // through `onTaskMove`. `handleTaskMove` aborts any in-flight move for this
+    // task before it takes the lock, so an agent nudging a card inside To Do
+    // would kill a user's concurrent cross-column drag of that same card along
+    // with the spawn it was about to run. Nothing is lost by bypassing it:
+    // `handleTaskMove` returns for a same-lane move before every one of its
+    // lifecycle branches, so a within-column drag already spawns nothing,
+    // suspends nothing, and runs no transition action. Only the WRITE differs,
+    // and deliberately - `handleTaskMove` reaches `move()`, a sparse two-shift
+    // update, where this path does a dense, gap-healing, position-only rewrite.
+    const laneIds = taskRepo.list(targetSwimlane.id).map((laneTask) => laneTask.id);
+    // An ARCHIVED task still reports the column it was archived from, and Done
+    // resolves by name via includeArchivedDone - but `list()` filters archived
+    // rows out, so the task has no slot to take. Reject instead of renumbering
+    // the live cards around a card that is not on the board and then reporting a
+    // position it does not have.
+    if (!laneIds.includes(task.id)) {
+      return {
+        success: false,
+        error: `Task "${task.title}" (#${task.display_id}) is archived, so it has no position in ${targetSwimlane.name}.`,
+      };
+    }
+    // Slot is evaluated against the column WITHOUT this task, so the last legal
+    // slot is one less than the column's length.
+    const slot = clampSlot(parsedSlot.slot, laneIds.length - 1);
+    const orderedIds = computeIdsWithTaskAtSlot(laneIds, task.id, slot);
+    taskRepo.reorderWithinSwimlane(targetSwimlane.id, orderedIds);
+    context.onTasksReordered(targetSwimlane, orderedIds);
+
     return {
       success: true,
-      message: `Task "${task.title}" is already in ${targetSwimlane.name}.`,
-      data: withAutoCommandOutcome({
-        id: task.id,
-        displayId: task.display_id,
-        column: targetSwimlane.name,
-      }, { kind: 'not-applicable' }),
+      message: `Moved "${task.title}" (#${task.display_id}) to position ${slot} of ${targetSwimlane.name}.`,
+      data: {
+        ...withAutoCommandOutcome({
+          id: task.id,
+          displayId: task.display_id,
+          column: targetSwimlane.name,
+        }, { kind: 'not-applicable' }),
+        position: slot,
+      },
     };
   }
 
-  // Position at end of target column
+  // Cross-column. The task is not in the target lane yet, so its length is a
+  // legal (appending) slot. An ordinal has to be translated into a RAW position
+  // before it reaches the repository: the two diverge as soon as archiving has
+  // left the lane's positions gapped. See `resolveRawPosition`.
   const targetTasks = taskRepo.list(targetSwimlane.id);
-  const targetPosition = targetTasks.length;
+  const slot = parsedSlot ? clampSlot(parsedSlot.slot, targetTasks.length) : targetTasks.length;
+  const targetPosition = resolveRawPosition(
+    targetTasks.map((laneTask) => laneTask.position),
+    slot,
+    taskRepo.nextPositionInSwimlane(targetSwimlane.id),
+  );
 
   const result = await context.onTaskMove({
     taskId: task.id,
@@ -606,14 +740,111 @@ export const handleMoveTask: CommandHandler = async (
     targetPosition,
   });
 
+  const placement = parsedSlot ? ` at position ${slot}` : '';
   return {
     success: true,
-    message: `Moving "${task.title}" (#${task.display_id}) to ${targetSwimlane.name}.`,
-    data: withAutoCommandOutcome({
-      id: task.id,
-      displayId: task.display_id,
-      column: targetSwimlane.name,
-    }, result.autoCommand),
+    message: `Moving "${task.title}" (#${task.display_id}) to ${targetSwimlane.name}${placement}.`,
+    data: {
+      ...withAutoCommandOutcome({
+        id: task.id,
+        displayId: task.display_id,
+        column: targetSwimlane.name,
+      }, result.autoCommand),
+      position: slot,
+    },
+  };
+};
+
+/** Cap on how many tasks a reorder echoes back before truncating. */
+const REORDER_ECHO_LIMIT = 25;
+
+/**
+ * Re-sequence tasks within a single column.
+ *
+ * Presentation only: it never changes a task's column, session, or worktree,
+ * which is exactly why it does not go anywhere near `onTaskMove`. See
+ * `computeReorderedIds` for the prefix semantics and
+ * `TaskRepository.reorderWithinSwimlane` for why the write is a dense rewrite
+ * and why it is not under `withTaskLock`.
+ */
+export const handleReorderTasks: CommandHandler = (
+  params: Record<string, unknown>,
+  context: CommandContext,
+): CommandResponse => {
+  const columnName = params.column as string | null;
+  const requestedIdParams = params.taskIds;
+
+  if (!columnName) {
+    return { success: false, error: 'column is required' };
+  }
+  if (!Array.isArray(requestedIdParams) || requestedIdParams.length === 0) {
+    return { success: false, error: 'taskIds is required and must list at least one task.' };
+  }
+
+  const db = context.getProjectDb();
+  const taskRepo = new TaskRepository(db);
+
+  const resolution = resolveColumn(db, columnName, 'todo', { includeArchivedDone: true });
+  if ('error' in resolution) {
+    return { success: false, error: resolution.error };
+  }
+  const { swimlane } = resolution;
+
+  const laneTasks = taskRepo.list(swimlane.id);
+  const laneIds = laneTasks.map((laneTask) => laneTask.id);
+  const laneTaskById = new Map(laneTasks.map((laneTask) => [laneTask.id, laneTask]));
+
+  const requestedIds: string[] = [];
+  const seenIds = new Set<string>();
+  for (const requestedIdParam of requestedIdParams) {
+    const idParam = String(requestedIdParam);
+    const requestedTask = resolveTask(taskRepo, idParam);
+    if (!requestedTask) {
+      return { success: false, error: `Task "${idParam}" not found` };
+    }
+    if (!laneTaskById.has(requestedTask.id)) {
+      if (requestedTask.swimlane_id === swimlane.id) {
+        return {
+          success: false,
+          error: `Task "${idParam}" (#${requestedTask.display_id}) is archived, so it has no position in ${swimlane.name}.`,
+        };
+      }
+      return {
+        success: false,
+        error: `Task "${idParam}" (#${requestedTask.display_id}) is not in ${swimlane.name}. Reordering never moves a task between columns - use kangentic_move_task for that.`,
+      };
+    }
+    if (seenIds.has(requestedTask.id)) {
+      return {
+        success: false,
+        error: `Task "${idParam}" (#${requestedTask.display_id}) is listed more than once in taskIds.`,
+      };
+    }
+    seenIds.add(requestedTask.id);
+    requestedIds.push(requestedTask.id);
+  }
+
+  const orderedIds = computeReorderedIds(laneIds, requestedIds);
+  taskRepo.reorderWithinSwimlane(swimlane.id, orderedIds);
+  context.onTasksReordered(swimlane, orderedIds);
+
+  const displayOrder = orderedIds.map((id) => `#${laneTaskById.get(id)!.display_id}`);
+  const echoed = displayOrder.slice(0, REORDER_ECHO_LIMIT).join(', ');
+  const overflowSuffix = displayOrder.length > REORDER_ECHO_LIMIT
+    ? `, and ${displayOrder.length - REORDER_ECHO_LIMIT} more`
+    : '';
+
+  return {
+    success: true,
+    message: `Reordered ${swimlane.name}. New order: ${echoed}${overflowSuffix}.`,
+    data: {
+      column: swimlane.name,
+      order: orderedIds.map((id, index) => ({
+        id,
+        displayId: laneTaskById.get(id)!.display_id,
+        position: index,
+      })),
+    },
   };
 };
 

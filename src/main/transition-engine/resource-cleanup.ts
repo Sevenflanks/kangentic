@@ -6,7 +6,7 @@ import { SessionRepository } from '../db/repositories/session-repository';
 import { TaskRepository } from '../db/repositories/task-repository';
 import { SwimlaneRepository } from '../db/repositories/swimlane-repository';
 import { SessionManager } from '../pty/session-manager';
-import { slugify } from '../../shared/slugify';
+import { candidateWorktreePathsFor, legacyAutoBranchNameFor } from '../git/task-worktree-folder';
 import { removeNodeModulesPath } from '../git/node-modules-link';
 import { removeWithRetry } from '../git/rm-with-retry';
 import { WorktreeManager, GitQueuePriority } from '../git/worktree-manager';
@@ -178,13 +178,17 @@ async function cleanBacklogTaskResources(
 
   for (const task of backlogTasks) {
     const shortId = task.id.slice(0, 8);
-    const expectedSlug = slugify(task.title) || 'task';
-    const expectedFolder = `${expectedSlug}-${shortId}`;
-    const expectedWorktreePath = path.join(projectPath, '.kangentic', 'worktrees', expectedFolder);
-    const expectedBranch = expectedFolder;
+    // A Backlog reset may already have cleared worktree_path, so probe every
+    // directory this task could own - the legacy title-derived name, its pinned
+    // folder, and the numeric name a fresh creation would choose.
+    const candidateWorktreePaths = candidateWorktreePathsFor(task, projectPath);
+    // Branches stay title-derived even though folders are numeric. Deriving this
+    // from the folder name (as it used to) would silently stop cleaning stale
+    // branches, inside a best-effort try/catch where nothing would report it.
+    const expectedBranch = legacyAutoBranchNameFor(task);
 
     const hasStaleDbFields = task.worktree_path || task.branch_name || task.session_id;
-    const hasStaleDirectory = fs.existsSync(task.worktree_path || expectedWorktreePath);
+    const hasStaleDirectory = candidateWorktreePaths.some((candidate) => fs.existsSync(candidate));
     const hasStaleBranch = task.branch_name || await branchExists(expectedBranch, projectPath);
 
     if (!hasStaleDbFields && !hasStaleDirectory && !hasStaleBranch) continue;
@@ -203,11 +207,7 @@ async function cleanBacklogTaskResources(
     sessionRepo.deleteByTaskId(task.id);
 
     // Remove worktree directories
-    const pathsToRemove = new Set<string>();
-    if (task.worktree_path) pathsToRemove.add(task.worktree_path);
-    pathsToRemove.add(expectedWorktreePath);
-
-    for (const worktreePath of pathsToRemove) {
+    for (const worktreePath of candidateWorktreePaths) {
       if (!fs.existsSync(worktreePath)) continue;
       await removeNodeModulesPath(path.join(worktreePath, 'node_modules'));
       await removeWorktreeDirectory(worktreePath, projectPath);
@@ -304,10 +304,28 @@ export async function retryFailedDoneCleanups(
       // Background best-effort: low priority so a user-initiated spawn jumps
       // ahead, and fail-fast so one stuck removal can't hold the queue for 15s.
       // A false return is logged below and deferred to the next project open.
-      const removed = await worktreeManager.withLock(
-        () => worktreeManager.removeWorktree(current.worktree_path!, { timeoutMs: 3000, removalProfile: 'fast' }),
-        { priority: GitQueuePriority.BACKGROUND, label: `retry-remove-worktree:${task.id.slice(0, 8)}` },
-      );
+      //
+      // removeWorktree has TWO failure modes, not one: it returns false when the
+      // directory is held, and it THROWS when the stored path is not a direct
+      // child of this project's worktrees root (assertRemovableWorktreePath).
+      // The throw must be caught per task. This loop is the only removeWorktree
+      // caller with no per-iteration guard, so an unhandled throw here would
+      // propagate out of withTaskLock and abandon every REMAINING Done task in
+      // the pass, not just the one with the bad row.
+      let removed = false;
+      try {
+        removed = await worktreeManager.withLock(
+          () => worktreeManager.removeWorktree(current.worktree_path!, { timeoutMs: 3000, removalProfile: 'fast' }),
+          { priority: GitQueuePriority.BACKGROUND, label: `retry-remove-worktree:${task.id.slice(0, 8)}` },
+        );
+      } catch (removalError) {
+        console.warn(
+          `[RESOURCE_CLEANUP] Retry pass refused to remove worktree for `
+          + `"${task.title}" (${task.id.slice(0, 8)}) at ${current.worktree_path}:`,
+          removalError,
+        );
+        return 'failed';
+      }
       if (!removed) {
         console.warn(
           `[RESOURCE_CLEANUP] Retry pass could not remove worktree for `

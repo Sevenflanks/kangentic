@@ -6,9 +6,10 @@ import { useConfigStore } from '../../stores/config-store';
 import { useSessionStore } from '../../stores/session-store';
 import { useBoardStore } from '../../stores/board-store';
 import { LaunchOverlay } from '../LaunchOverlay';
-import { getIsHmrReload } from '../../utils/hmr-flag';
 import { useTerminalOverlay } from '../../utils/task-progress';
 import { useTerminalRefit } from '../../hooks/useTerminalRefit';
+import { useDeferredTerminalInit } from '../../hooks/useDeferredTerminalInit';
+import { mayTakeArrivalFocus } from '../../utils/terminal-arrival-focus';
 
 const FIT_DELAY_MS = 100;
 
@@ -87,6 +88,10 @@ export function TerminalTab({ sessionId, taskId, active, releaseEscapeWhenPointe
   // an overlay hides the raw command line and suppressDataRef prevents
   // PTY output from accumulating in xterm behind the overlay.
   const [terminalReady, setTerminalReady] = useState(() => hasFirstOutput || hasUsage);
+  // The same predicate the state is seeded from, kept in a ref so the init effect's
+  // cleanup can consult it without re-running on every output/usage change.
+  const hasOutputRef = useRef(hasFirstOutput || hasUsage);
+  hasOutputRef.current = hasFirstOutput || hasUsage;
 
   // For an already-running session, terminalReady starts true so the
   // LaunchOverlay never shows - which used to leave the whole mount-time
@@ -97,6 +102,13 @@ export function TerminalTab({ sessionId, taskId, active, releaseEscapeWhenPointe
   // parked reveal) repaint in place and must not re-veil.
   const [replaySettled, setReplaySettled] = useState(false);
   const handleScrollbackSettled = useCallback(() => setReplaySettled(true), []);
+
+  // Arrival-focus policy for every programmatic focus this tab can produce. A
+  // TerminalTab mounts in the bottom panel AND in a task-detail window, and both
+  // pass `active` hardcoded true, so `active` carries no information about which
+  // surface the user is actually on - the arbiter answers that from user-intent
+  // state instead. See terminal-arrival-focus.ts.
+  const mayFocusOnArrival = useCallback(() => mayTakeArrivalFocus(sessionId), [sessionId]);
 
   const { terminalRef, initTerminal, fit, flushResize, focus, reloadScrollback, scrollbackPending, suppressDataRef } = useTerminal({
     sessionId,
@@ -110,6 +122,7 @@ export function TerminalTab({ sessionId, taskId, active, releaseEscapeWhenPointe
     pasteImageTemplate,
     backspaceSendsCtrlH: config.terminal.backspaceSendsCtrlH,
     onScrollbackSettled: handleScrollbackSettled,
+    mayTakeArrivalFocus: mayFocusOnArrival,
   });
 
   // Sync suppressDataRef with overlay state: suppress all PTY data while overlay is showing.
@@ -118,49 +131,43 @@ export function TerminalTab({ sessionId, taskId, active, releaseEscapeWhenPointe
   // Relative wrapper that hosts the xterm div and its overlays.
   const containerRef = useRef<HTMLDivElement>(null);
 
-  const initialized = useRef(false);
-
-  // Init terminal once the container has real pixel dimensions.
-  // The cleanup resets initialized so React StrictMode's
-  // mount→unmount→remount cycle re-creates the terminal properly.
-  useEffect(() => {
-    const el = terminalRef.current;
-    if (!el) return;
-
-    // Try to init immediately if container already has dimensions
-    const tryInit = () => {
-      if (initialized.current) return;
-      if (el.offsetWidth > 0 && el.offsetHeight > 0) {
-        initTerminal();
-        initialized.current = true;
-      }
-    };
-
-    tryInit();
-
-    // If container didn't have dimensions yet, watch for them
-    let observer: ResizeObserver | null = null;
-    if (!initialized.current) {
-      observer = new ResizeObserver(() => {
-        tryInit();
-        if (initialized.current) {
-          observer?.disconnect();
-        }
-      });
-      observer.observe(el);
-    }
-
-    return () => {
-      observer?.disconnect();
-      initialized.current = false;
-      // On HMR, don't reset terminalReady - the store still has firstOutput/usage
-      // data, so the shimmer overlay is unnecessary. Resetting it causes a visible
-      // single-frame flash before the overlay-lifting effect restores it.
-      if (!getIsHmrReload()) {
+  // Init deferred to a frame where no other terminal is being constructed,
+  // shared with CommandTerminalPane via useDeferredTerminalInit (see the hook
+  // for the pointer-stall, StrictMode one-terminal, and display:none
+  // rationales). The deferral is pixel-invisible here - the replay veil /
+  // LaunchOverlay cover the pane from the first frame, and the container div
+  // paints the terminal background either way.
+  //
+  // This is NOT the reverted drag-end deferral. A pane mounting on its own
+  // still inits on the very next frame, ahead of the active effect's
+  // FIT_DELAY_MS corrective fit. A pane mounting in a BURST does not: the
+  // shared queue in terminal-init-queue.ts runs one construction per frame,
+  // so the Nth pane inits N turns later and the 100ms corrective fit can fire
+  // first and no-op. That is safe rather than merely tolerated, because
+  // initTerminal's own fit is a pure function of the container's live geometry
+  // at the moment it runs (see useTerminal.ts), so a late init still fits
+  // correctly without needing this effect's window.
+  const { initializedRef: initialized } = useDeferredTerminalInit({
+    terminalRef,
+    initTerminal,
+    onCleanup: () => {
+      // Reset ONLY when the overlay would genuinely be wanted on the next mount, i.e.
+      // a session that has not produced anything yet. If the store still holds
+      // firstOutput/usage for this session, resetting re-shows "Starting agent..." for
+      // an agent that has been running for minutes, and the lifting effect then clears
+      // it a frame later - a visible flash.
+      //
+      // This was previously guarded on `getIsHmrReload()` alone, which named the right
+      // reason ("the store still has firstOutput/usage data") but only covered the HMR
+      // path. StrictMode's mount -> unmount -> remount runs this cleanup on EVERY dev
+      // open, which is the flash reported on opening an already-running task. Traced:
+      // seeded `ready true`, cleanup set it false, one render at false, then true
+      // again. Keying on the data itself covers both paths and matches the seed.
+      if (!hasOutputRef.current) {
         setTerminalReady(false);
       }
-    };
-  }, [initTerminal, terminalRef]);
+    },
+  });
 
   // Lift overlay when Claude Code's TUI activates the alternate screen buffer
   // (first-output) or when usage data arrives (fallback). No clear() needed:
@@ -187,7 +194,10 @@ export function TerminalTab({ sessionId, taskId, active, releaseEscapeWhenPointe
     if (terminalReady && !wasReady && initialized.current) {
       reloadScrollback();
     }
-  }, [terminalReady, reloadScrollback]);
+    // `initialized` is the stable ref returned by useDeferredTerminalInit -
+    // listed for exhaustive-deps (which cannot see through the hook), never
+    // a re-run trigger.
+  }, [terminalReady, reloadScrollback, initialized]);
 
   // If session exits (Ctrl+C, crash, etc.) before usage arrives, clear the overlay
   // so the terminal isn't stuck behind the shimmer indefinitely.
@@ -214,7 +224,11 @@ export function TerminalTab({ sessionId, taskId, active, releaseEscapeWhenPointe
       if (initialized.current && !scrollbackPending.current) {
         fit();
       }
-      if (initialized.current) {
+      // Arbitrated, not unconditional. On a SOLO mount this frame runs with
+      // `initialized` already true, so it focuses about one frame after mount -
+      // well before any replay settles. Gating only the replay would therefore
+      // leave the race intact, just decided earlier.
+      if (initialized.current && mayFocusOnArrival()) {
         focus();
       }
     });
@@ -232,7 +246,10 @@ export function TerminalTab({ sessionId, taskId, active, releaseEscapeWhenPointe
       cancelAnimationFrame(initRafId);
       clearTimeout(delayedFitId);
     };
-  }, [active, fit, focus, scrollbackPending]);
+    // `initialized` is the stable ref returned by useDeferredTerminalInit -
+    // listed for exhaustive-deps (which cannot see through the hook), never
+    // a re-run trigger.
+  }, [active, fit, focus, mayFocusOnArrival, scrollbackPending, initialized]);
 
   // Container refit while active: persistent gate-aware ResizeObserver plus the
   // terminal-panel-resize handling, shared with CommandTerminalWindow via
