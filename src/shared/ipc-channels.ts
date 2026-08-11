@@ -90,7 +90,7 @@ export const IPC = {
   SESSION_SPAWN: 'session:spawn',
   SESSION_KILL: 'session:kill',
   SESSION_WRITE: 'session:write',
-  SESSION_WRITE_FOCUS_REPORT: 'session:writeFocusReport',
+  SESSION_WRITE_TERMINAL_RESPONSE: 'session:writeTerminalResponse',
   SESSION_RESIZE: 'session:resize',
   SESSION_LIST: 'session:list',
   SESSION_GET_SCROLLBACK: 'session:getScrollback',
