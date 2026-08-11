@@ -116,14 +116,12 @@ Transient Command Terminal sessions bypass all of this (not task agents).
    - Determine CWD (worktree path or project path)
    - Pre-populate `~/.claude.json` trust for worktree paths
    - Check for previous suspended session (can resume?)
-   - If resuming: use existing `agent_session_id` with `--resume`, no prompt
-    - If fresh: generate an adapter-native `agent_session_id` only when the adapter accepts caller-supplied IDs, then include the prompt
-    - Generate a Kangentic PTY session ID and create `.kangentic/sessions/<ptySessionId>/`; this is also the `sessions.id` primary key and is distinct from `agent_session_id`
    - If resuming: reconcile the stored `agent_session_id` against the record's own `status.json` (see [Resume](#resume)), then use it with `--resume`, no prompt
-   - If fresh: generate new UUID for `agent_session_id`, use `--session-id`, include prompt
-   - Create session directory at `.kangentic/sessions/<agentSessionId>/`
+   - If fresh: native session ID ownership depends on the adapter. Caller-owned adapters generate the native ID before spawn and pass it to the CLI. Runtime-owned adapters, such as OpenCode, let the launched runtime create the ID and capture it after launch. Include the prompt according to the adapter's command contract.
+   - Generate a Kangentic PTY session ID, `ptySessionId`, and create `.kangentic/sessions/<ptySessionId>/`; this is also the `sessions.id` primary key and is distinct from `agent_session_id`
    - Build agent CLI command via `CommandBuilder`
    - Call `SessionManager.spawn()`
+   - Insert the session row using the live registry identity first, then the spawn DTO or prepared ID when the live identity is not available
 3. `SessionManager.spawn()`:
    - Check concurrency limit; queue if full (returns `queued` placeholder)
    - If under limit, call `doSpawn()`:
@@ -254,7 +252,7 @@ On project open (`src/main/transition-engine/session-startup/`):
 6. **Filter** -- skip tasks in non-auto-spawn columns (an interrupted-exited record there is CAS-upgraded to `suspended` for future resume, mirroring move-to-Done), skip user-paused sessions (`suspended_by = 'user'`), skip missing CWD, skip deleted/archived tasks. Skipped does NOT mean invisible: a record that ends up `suspended` in a non-auto-spawn **custom** column gets a `registerSuspendedPlaceholder` entry, because the renderer derives the Resume control and the card's click target from its in-memory session list, not the DB. Without one the task presents exactly like a To Do card (click opens the edit form, no Resume anywhere) even though `SESSION_RESUME` would happily resume it. To Do and Done are excluded by ROLE, not by the `auto_spawn` flag: both deliberately hide Resume, and a To Do card relies on having no session so it opens straight into the edit form.
 7. **Resume or respawn** (isolation-scoped via `getLatestForTaskByTypeAndIsolation`):
    - Suspended/orphaned/interrupted-exited with `agent_session_id` -- use `--resume` (attempts to restore conversation; the id is first reconciled against the record's own `status.json`, see [Resume](#resume))
-   - No session ID -- fresh `--session-id` with prompt from matching `spawn_agent` action
+   - No `agent_session_id` -- start a fresh adapter-specific spawn with the prompt from the matching `spawn_agent` action. Caller-owned adapters receive their native ID before spawn; runtime-owned adapters, such as OpenCode, report it after launch. There is no universal fresh `--session-id` assumption.
 8. **Reconcile** -- spawn fresh agents for tasks in auto_spawn columns with no session at all (skips user-paused tasks); fresh rows are tagged with the column's `isolated_swimlane_id`
 
 ## Isolated Sessions (Per-Column Session Model)
