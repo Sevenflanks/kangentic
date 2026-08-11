@@ -17,6 +17,7 @@
  * Env knobs:
  *   MOCK_OPENCODE_NO_HEADER=1  -> suppress the `session id:` header so tests
  *                                  can exercise the fromFilesystem fallback path.
+ *   MOCK_OPENCODE_LIVE_DELIVERY=1 -> accept trigger files for native-idle tests.
  *
  * Stays alive for 30 seconds to simulate a running session, then exits cleanly.
  * Prints cursor-hide ESC `\x1b[?25l` so detectFirstOutput() fires and the
@@ -52,6 +53,12 @@ const livePaths = liveDeliveryDir ? {
   launchMarkers: path.join(liveDeliveryDir, 'launch-count.txt'),
   inputCapture: path.join(liveDeliveryDir, 'input-capture.bin'),
 } : null;
+const terminalResponses = ['\x1b[I', '\x1b[O', '\x1b[?1;2c'];
+const terminalResponsePrefixes = terminalResponses
+  .flatMap((response) =>
+    Array.from({ length: response.length - 1 }, (_, index) => response.slice(0, index + 1)),
+  )
+  .sort((left, right) => right.length - left.length);
 
 if (livePaths) {
   fs.appendFileSync(livePaths.launchMarkers, 'launch\n', 'utf8');
@@ -260,6 +267,7 @@ process.on('SIGINT', () => { stop(); process.exit(0); });
 if (process.stdin.isTTY) process.stdin.setRawMode(true);
 if (livePaths) {
   let pendingInput = '';
+  let terminalResponseCarry = '';
   process.stdin.on('data', (chunk) => {
     const input = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     fs.appendFileSync(livePaths.inputCapture, input);
@@ -267,7 +275,17 @@ if (livePaths) {
       stop();
       process.exit(0);
     }
-    pendingInput += input.toString('utf8').replaceAll('\x1b', '');
+    let terminalInput = terminalResponses.reduce(
+      (remaining, response) => remaining.replaceAll(response, ''),
+      terminalResponseCarry + input.toString('utf8'),
+    );
+    terminalResponseCarry = '';
+    const terminalResponsePrefix = terminalResponsePrefixes.find((prefix) => terminalInput.endsWith(prefix));
+    if (terminalResponsePrefix) {
+      terminalResponseCarry = terminalResponsePrefix;
+      terminalInput = terminalInput.slice(0, -terminalResponsePrefix.length);
+    }
+    pendingInput += terminalInput.replaceAll('\x1b', '');
     const lines = pendingInput.split('\r');
     pendingInput = lines.pop() ?? '';
     for (const line of lines) {
