@@ -28,8 +28,12 @@ import {
   OpenCodeCommandBuilder,
 } from '../../src/main/agent/adapters/opencode';
 import { parseOpenCodeNativeBoundary } from '../../src/main/agent/adapters/opencode/native-boundary';
-import type { SpawnCommandOptions } from '../../src/main/agent/agent-adapter';
+import type { InitialPromptInput, SpawnCommandOptions } from '../../src/main/agent/agent-adapter';
 import type { PermissionMode } from '../../src/shared/types';
+
+const TUI_BOOTSTRAP_CONFIG_PATH_ENV = 'OPENCODE_TUI_CONFIG';
+const TUI_BOOTSTRAP_CONFIG_OWNER_ENV = 'KANGENTIC_OPENCODE_TUI_CONFIG_OWNER';
+type FreshInitialPromptInput = Extract<InitialPromptInput, { readonly resume: false }>;
 
 function makeOptions(overrides: Partial<SpawnCommandOptions> = {}): SpawnCommandOptions {
   return {
@@ -60,7 +64,7 @@ describe('OpenCode Adapter', () => {
     });
 
     it('owns initial prompt preparation without a special delivery mode', () => {
-      expect(adapter.initialPromptDelivery).toBeUndefined();
+      expect('initialPromptDelivery' in adapter).toBe(false);
       expect(adapter.prepareInitialPrompt).toBeTypeOf('function');
     });
 
@@ -581,7 +585,9 @@ describe('OpenCode Adapter', () => {
       fs.rmSync(projectDir, { recursive: true, force: true });
     });
 
-    function freshPreparationInput(overrides: Record<string, unknown> = {}) {
+    function freshPreparationInput(
+      overrides: Partial<FreshInitialPromptInput> = {},
+    ): FreshInitialPromptInput {
       return {
         prompt: 'adapter-owned prompt',
         sessionDirectory: projectDir,
@@ -650,16 +656,56 @@ describe('OpenCode Adapter', () => {
       );
     });
 
+    it('replaces a matching inherited private TUI config with the fresh preparation pair', () => {
+      const originalConfig = process.env[TUI_BOOTSTRAP_CONFIG_PATH_ENV];
+      const originalOwner = process.env[TUI_BOOTSTRAP_CONFIG_OWNER_ENV];
+      const inheritedConfigPath = path.join(projectDir, 'parent-opencode-tui-bootstrap.json');
+      process.env[TUI_BOOTSTRAP_CONFIG_PATH_ENV] = inheritedConfigPath;
+      process.env[TUI_BOOTSTRAP_CONFIG_OWNER_ENV] = inheritedConfigPath;
+      try {
+        const preparation = adapter.prepareInitialPrompt(freshPreparationInput());
+        const configPath = preparation.env?.[TUI_BOOTSTRAP_CONFIG_PATH_ENV];
+
+        expect(configPath).toBe(path.join(projectDir, 'opencode-tui-bootstrap.json'));
+        expect(preparation.env?.[TUI_BOOTSTRAP_CONFIG_OWNER_ENV]).toBe(configPath);
+      } finally {
+        if (originalConfig === undefined) delete process.env[TUI_BOOTSTRAP_CONFIG_PATH_ENV];
+        else process.env[TUI_BOOTSTRAP_CONFIG_PATH_ENV] = originalConfig;
+        if (originalOwner === undefined) delete process.env[TUI_BOOTSTRAP_CONFIG_OWNER_ENV];
+        else process.env[TUI_BOOTSTRAP_CONFIG_OWNER_ENV] = originalOwner;
+      }
+    });
+
+    it('fails closed when the inherited TUI config ownership marker mismatches', () => {
+      const originalConfig = process.env[TUI_BOOTSTRAP_CONFIG_PATH_ENV];
+      const originalOwner = process.env[TUI_BOOTSTRAP_CONFIG_OWNER_ENV];
+      process.env[TUI_BOOTSTRAP_CONFIG_PATH_ENV] = path.join(projectDir, 'parent-opencode-tui-bootstrap.json');
+      process.env[TUI_BOOTSTRAP_CONFIG_OWNER_ENV] = path.join(projectDir, 'other-opencode-tui-bootstrap.json');
+      try {
+        expect(() => adapter.prepareInitialPrompt(freshPreparationInput()))
+          .toThrow('OpenCode TUI bootstrap config is already set');
+      } finally {
+        if (originalConfig === undefined) delete process.env[TUI_BOOTSTRAP_CONFIG_PATH_ENV];
+        else process.env[TUI_BOOTSTRAP_CONFIG_PATH_ENV] = originalConfig;
+        if (originalOwner === undefined) delete process.env[TUI_BOOTSTRAP_CONFIG_OWNER_ENV];
+        else process.env[TUI_BOOTSTRAP_CONFIG_OWNER_ENV] = originalOwner;
+      }
+    });
+
     it('fails closed when a user-owned TUI config is already set', () => {
-      const originalConfig = process.env.OPENCODE_TUI_CONFIG;
-      process.env.OPENCODE_TUI_CONFIG = path.join(projectDir, 'user-tui-config.jsonc');
+      const originalConfig = process.env[TUI_BOOTSTRAP_CONFIG_PATH_ENV];
+      const originalOwner = process.env[TUI_BOOTSTRAP_CONFIG_OWNER_ENV];
+      process.env[TUI_BOOTSTRAP_CONFIG_PATH_ENV] = path.join(projectDir, 'user-tui-config.jsonc');
+      delete process.env[TUI_BOOTSTRAP_CONFIG_OWNER_ENV];
       try {
         expect(() => adapter.prepareInitialPrompt(freshPreparationInput()))
           .toThrow('OpenCode TUI bootstrap config is already set');
         expect(fs.existsSync(path.join(projectDir, 'opencode-initial-prompt.json'))).toBe(false);
       } finally {
-        if (originalConfig === undefined) delete process.env.OPENCODE_TUI_CONFIG;
-        else process.env.OPENCODE_TUI_CONFIG = originalConfig;
+        if (originalConfig === undefined) delete process.env[TUI_BOOTSTRAP_CONFIG_PATH_ENV];
+        else process.env[TUI_BOOTSTRAP_CONFIG_PATH_ENV] = originalConfig;
+        if (originalOwner === undefined) delete process.env[TUI_BOOTSTRAP_CONFIG_OWNER_ENV];
+        else process.env[TUI_BOOTSTRAP_CONFIG_OWNER_ENV] = originalOwner;
       }
     });
 
@@ -726,6 +772,7 @@ describe('OpenCode Adapter', () => {
         expect(disabledPreparation.env).toEqual({
           KANGENTIC_OPENCODE_TUI_INITIAL_PROMPT_PATH: expect.any(String),
           OPENCODE_TUI_CONFIG: expect.any(String),
+          KANGENTIC_OPENCODE_TUI_CONFIG_OWNER: expect.any(String),
         });
         expect(disabledMcpEnv).toBeNull();
       } finally {
