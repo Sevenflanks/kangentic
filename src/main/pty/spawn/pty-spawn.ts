@@ -89,12 +89,21 @@ const OPENCODE_CHILD_BOOTSTRAP_ENV_KEYS = new Set([
   'KANGENTIC_OPENCODE_INITIAL_PROMPT_PATH',
   'KANGENTIC_OPENCODE_TUI_INITIAL_PROMPT_PATH',
 ]);
+const TUI_BOOTSTRAP_CONFIG_PATH_ENV = 'OPENCODE_TUI_CONFIG';
+const TUI_BOOTSTRAP_CONFIG_OWNER_ENV = 'KANGENTIC_OPENCODE_TUI_CONFIG_OWNER';
 
 export function buildSpawnEnv(
   inputEnv: Record<string, string> | undefined,
   platform: NodeJS.Platform = process.platform,
 ): Record<string, string> {
   const ambientEnv = { ...process.env };
+  const ambientTuiConfigPath = ambientEnv[TUI_BOOTSTRAP_CONFIG_PATH_ENV];
+  const ambientTuiConfigOwner = ambientEnv[TUI_BOOTSTRAP_CONFIG_OWNER_ENV];
+  // owner 是 process-private 證據，一律移除；只有 exact pair 才能移除 config，避免覆寫使用者設定。
+  delete ambientEnv[TUI_BOOTSTRAP_CONFIG_OWNER_ENV];
+  if (ambientTuiConfigPath && ambientTuiConfigOwner === ambientTuiConfigPath) {
+    delete ambientEnv[TUI_BOOTSTRAP_CONFIG_PATH_ENV];
+  }
   for (const key of OPENCODE_CHILD_BOOTSTRAP_ENV_KEYS) {
     delete ambientEnv[key];
   }
