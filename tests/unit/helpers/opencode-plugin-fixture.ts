@@ -5,8 +5,19 @@ import { vi } from 'vitest';
 
 export const INITIAL_PROMPT_PATH_ENV = 'KANGENTIC_OPENCODE_INITIAL_PROMPT_PATH';
 export const TUI_INITIAL_PROMPT_PATH_ENV = 'KANGENTIC_OPENCODE_TUI_INITIAL_PROMPT_PATH';
+export const RESUME_SESSION_ID_ENV = 'KANGENTIC_OPENCODE_RESUME_SESSION_ID';
 export const TUI_CONFIG_PATH_ENV = 'OPENCODE_TUI_CONFIG';
 export const EVENTS_PATH_ENV = 'KANGENTIC_EVENTS_PATH';
+
+const BOOTSTRAP_ENV_KEYS = [
+  INITIAL_PROMPT_PATH_ENV,
+  TUI_INITIAL_PROMPT_PATH_ENV,
+  RESUME_SESSION_ID_ENV,
+  TUI_CONFIG_PATH_ENV,
+  EVENTS_PATH_ENV,
+] as const;
+
+type BootstrapEnvKey = (typeof BOOTSTRAP_ENV_KEYS)[number];
 
 export type Deferred<T> = {
   readonly promise: Promise<T>;
@@ -37,6 +48,25 @@ type InitialPromptPayload = {
 
 export function createOpenCodePluginFixture() {
   const temporaryDirectories: string[] = [];
+  const inheritedBootstrapEnvironment = new Map<BootstrapEnvKey, string | undefined>(
+    BOOTSTRAP_ENV_KEYS.map((key) => [key, process.env[key]] as const),
+  );
+
+  function clearBootstrapEnvironment(): void {
+    for (const key of BOOTSTRAP_ENV_KEYS) {
+      delete process.env[key];
+    }
+  }
+
+  function restoreBootstrapEnvironment(): void {
+    for (const key of BOOTSTRAP_ENV_KEYS) {
+      const inheritedValue = inheritedBootstrapEnvironment.get(key);
+      if (inheritedValue === undefined) delete process.env[key];
+      else process.env[key] = inheritedValue;
+    }
+  }
+
+  clearBootstrapEnvironment();
 
   function makeTemporaryDirectory(): string {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'kangentic-opencode-plugin-'));
@@ -98,15 +128,13 @@ export function createOpenCodePluginFixture() {
   }
 
   async function loadPlugin() {
+    clearBootstrapEnvironment();
     vi.resetModules();
     return import('../../../src/main/agent/adapters/opencode/plugin/kangentic-activity.mjs');
   }
 
   function cleanup(): void {
-    delete process.env[INITIAL_PROMPT_PATH_ENV];
-    delete process.env[TUI_INITIAL_PROMPT_PATH_ENV];
-    delete process.env[TUI_CONFIG_PATH_ENV];
-    delete process.env[EVENTS_PATH_ENV];
+    restoreBootstrapEnvironment();
     for (const directory of temporaryDirectories.splice(0)) {
       fs.rmSync(directory, { recursive: true, force: true });
     }
@@ -115,6 +143,7 @@ export function createOpenCodePluginFixture() {
   }
 
   return {
+    clearBootstrapEnvironment,
     cleanup,
     loadPlugin,
     makeRootClient,

@@ -48,6 +48,7 @@ const INITIAL_PROMPT_PAYLOAD_PATH_ENV = 'KANGENTIC_OPENCODE_INITIAL_PROMPT_PATH'
 const TUI_BOOTSTRAP_CONFIG_FILENAME = 'opencode-tui-bootstrap.json';
 const TUI_INITIAL_PROMPT_PATH_ENV = 'KANGENTIC_OPENCODE_TUI_INITIAL_PROMPT_PATH';
 const TUI_BOOTSTRAP_CONFIG_PATH_ENV = 'OPENCODE_TUI_CONFIG';
+const TUI_BOOTSTRAP_CONFIG_OWNER_ENV = 'KANGENTIC_OPENCODE_TUI_CONFIG_OWNER';
 const RUNTIME_DEFAULT_COMPATIBILITY_REQUIREMENT: AdapterCompatibilityRequirement = {
   acknowledgementId: 'opencode-runtime-default-v1',
   title: 'OpenCode runtime default',
@@ -348,7 +349,11 @@ export class OpenCodeAdapter implements AgentAdapter {
     if (input.executionTarget) {
       return { delivery: 'terminal-submit' };
     }
-    if (!input.resume && process.env[TUI_BOOTSTRAP_CONFIG_PATH_ENV]) {
+    const inheritedTuiConfigPath = process.env[TUI_BOOTSTRAP_CONFIG_PATH_ENV];
+    // 只有完全相同的 path marker 才能證明設定是上一層 Kangentic 產生的，避免覆寫使用者 TUI config。
+    if (!input.resume
+      && inheritedTuiConfigPath
+      && process.env[TUI_BOOTSTRAP_CONFIG_OWNER_ENV] !== inheritedTuiConfigPath) {
       throw new Error('OpenCode TUI bootstrap config is already set');
     }
     const sourcePath = path.join(input.sessionDirectory, INITIAL_PROMPT_PAYLOAD_FILENAME);
@@ -404,6 +409,7 @@ export class OpenCodeAdapter implements AgentAdapter {
           ? {
               [TUI_INITIAL_PROMPT_PATH_ENV]: sourcePath,
               [TUI_BOOTSTRAP_CONFIG_PATH_ENV]: tuiBootstrapConfigPath,
+              [TUI_BOOTSTRAP_CONFIG_OWNER_ENV]: tuiBootstrapConfigPath,
             }
           : { [INITIAL_PROMPT_PAYLOAD_PATH_ENV]: sourcePath }),
       },

@@ -15,6 +15,9 @@ import {
   FULL_REPAINT_ENV_KEY,
 } from '../../src/main/pty/spawn/pty-spawn';
 
+const TUI_BOOTSTRAP_CONFIG_PATH_ENV = 'OPENCODE_TUI_CONFIG';
+const TUI_BOOTSTRAP_CONFIG_OWNER_ENV = 'KANGENTIC_OPENCODE_TUI_CONFIG_OWNER';
+
 describe('resolveShellArgs', () => {
   it('splits WSL specs into exe + args', () => {
     expect(resolveShellArgs('wsl -d Ubuntu')).toEqual({ exe: 'wsl', args: ['-d', 'Ubuntu'] });
@@ -88,6 +91,109 @@ describe('buildSpawnEnv', () => {
   it('handles undefined input', () => {
     const env = buildSpawnEnv(undefined);
     expect(env.CLAUDECODE).toBeUndefined();
+  });
+});
+
+describe('buildSpawnEnv OpenCode child bootstrap isolation', () => {
+  const childBootstrapEnvKeys = [
+    'KANGENTIC_OPENCODE_RESUME_SESSION_ID',
+    'KANGENTIC_OPENCODE_INITIAL_PROMPT_PATH',
+    'KANGENTIC_OPENCODE_TUI_INITIAL_PROMPT_PATH',
+  ] as const;
+  const savedHostValues = new Map<string, string | undefined>();
+
+  beforeEach(() => {
+    for (const key of childBootstrapEnvKeys) {
+      savedHostValues.set(key, process.env[key]);
+      process.env[key] = `inherited-${key}`;
+    }
+  });
+
+  afterEach(() => {
+    for (const key of childBootstrapEnvKeys) {
+      const savedHostValue = savedHostValues.get(key);
+      if (savedHostValue === undefined) delete process.env[key];
+      else process.env[key] = savedHostValue;
+    }
+    savedHostValues.clear();
+  });
+
+  it('strips inherited OpenCode child bootstrap variables from a fresh spawn', () => {
+    const env = buildSpawnEnv(undefined);
+
+    for (const key of childBootstrapEnvKeys) {
+      expect(env[key]).toBeUndefined();
+    }
+  });
+
+  it('preserves explicit OpenCode child bootstrap variables for the current spawn', () => {
+    const inputEnv = {
+      KANGENTIC_OPENCODE_RESUME_SESSION_ID: 'current-resume-session',
+      KANGENTIC_OPENCODE_INITIAL_PROMPT_PATH: 'C:/current/initial-prompt.md',
+      KANGENTIC_OPENCODE_TUI_INITIAL_PROMPT_PATH: 'C:/current/tui-initial-prompt.md',
+    };
+
+    const env = buildSpawnEnv(inputEnv);
+
+    for (const [key, value] of Object.entries(inputEnv)) {
+      expect(env[key]).toBe(value);
+    }
+  });
+});
+
+describe('buildSpawnEnv OpenCode TUI config ownership', () => {
+  const savedHostValues = new Map<string, string | undefined>();
+
+  beforeEach(() => {
+    for (const key of [TUI_BOOTSTRAP_CONFIG_PATH_ENV, TUI_BOOTSTRAP_CONFIG_OWNER_ENV]) {
+      savedHostValues.set(key, process.env[key]);
+      delete process.env[key];
+    }
+  });
+
+  afterEach(() => {
+    for (const key of [TUI_BOOTSTRAP_CONFIG_PATH_ENV, TUI_BOOTSTRAP_CONFIG_OWNER_ENV]) {
+      const savedHostValue = savedHostValues.get(key);
+      if (savedHostValue === undefined) delete process.env[key];
+      else process.env[key] = savedHostValue;
+    }
+    savedHostValues.clear();
+  });
+
+  it('strips a matching ambient private TUI config pair', () => {
+    const inheritedConfigPath = 'C:/parent/opencode-tui-bootstrap.json';
+    process.env[TUI_BOOTSTRAP_CONFIG_PATH_ENV] = inheritedConfigPath;
+    process.env[TUI_BOOTSTRAP_CONFIG_OWNER_ENV] = inheritedConfigPath;
+
+    const env = buildSpawnEnv(undefined);
+
+    expect(env[TUI_BOOTSTRAP_CONFIG_PATH_ENV]).toBeUndefined();
+    expect(env[TUI_BOOTSTRAP_CONFIG_OWNER_ENV]).toBeUndefined();
+  });
+
+  it('preserves an ambient user TUI config without a matching ownership marker', () => {
+    process.env[TUI_BOOTSTRAP_CONFIG_PATH_ENV] = 'C:/user/opencode-tui.jsonc';
+    process.env[TUI_BOOTSTRAP_CONFIG_OWNER_ENV] = 'C:/different/opencode-tui-bootstrap.json';
+
+    const env = buildSpawnEnv(undefined);
+
+    expect(env[TUI_BOOTSTRAP_CONFIG_PATH_ENV]).toBe('C:/user/opencode-tui.jsonc');
+    expect(env[TUI_BOOTSTRAP_CONFIG_OWNER_ENV]).toBeUndefined();
+  });
+
+  it('preserves the explicit current-spawn private TUI config pair', () => {
+    const inheritedConfigPath = 'C:/parent/opencode-tui-bootstrap.json';
+    const currentConfigPath = 'C:/current/opencode-tui-bootstrap.json';
+    process.env[TUI_BOOTSTRAP_CONFIG_PATH_ENV] = inheritedConfigPath;
+    process.env[TUI_BOOTSTRAP_CONFIG_OWNER_ENV] = inheritedConfigPath;
+
+    const env = buildSpawnEnv({
+      [TUI_BOOTSTRAP_CONFIG_PATH_ENV]: currentConfigPath,
+      [TUI_BOOTSTRAP_CONFIG_OWNER_ENV]: currentConfigPath,
+    });
+
+    expect(env[TUI_BOOTSTRAP_CONFIG_PATH_ENV]).toBe(currentConfigPath);
+    expect(env[TUI_BOOTSTRAP_CONFIG_OWNER_ENV]).toBe(currentConfigPath);
   });
 });
 

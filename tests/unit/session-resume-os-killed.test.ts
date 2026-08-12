@@ -232,6 +232,7 @@ function makeSessionManager() {
     listSessions: vi.fn(() => []),
     registerSuspendedPlaceholder: vi.fn(),
     spawn: vi.fn(async (input: { id: string }) => ({ id: input.id })),
+    getSession: vi.fn(() => undefined),
     getShell: vi.fn(async () => '/bin/sh'),
     hasSessionForTask: vi.fn(() => false),
   };

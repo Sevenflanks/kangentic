@@ -36,6 +36,7 @@ const sessionRepoGetResumable = vi.fn(() => [] as SessionRecord[]);
 const sessionRepoGetOrphaned = vi.fn(() => [] as SessionRecord[]);
 const sessionRepoMarkAllRunningAsOrphaned = vi.fn();
 const sessionRepoMarkRunningAsOrphanedExcluding = vi.fn();
+const sessionRepoInsertMock = vi.fn();
 
 const taskRepoList = vi.fn(() => [] as Task[]);
 const taskRepoUpdateMock = vi.fn();
@@ -86,7 +87,7 @@ vi.mock('../../src/main/db/repositories/session-repository', () => {
     // history in these tests, so autoSpawnTasks derives hasSessionRecord=false.
     getLatestForTask = vi.fn(() => undefined);
     getUserPausedTaskIds = vi.fn(() => new Set<string>());
-    insert = vi.fn();
+    insert = (...args: unknown[]) => sessionRepoInsertMock(...args);
     updateAppliedSettings = vi.fn();
   }
   return { SessionRepository: FakeSessionRepository };
@@ -205,6 +206,7 @@ function makeSessionManager() {
     listSessions: vi.fn(() => []),
     registerSuspendedPlaceholder: vi.fn(),
     spawn: vi.fn(async () => ({ id: 'new-pty-session-1' })),
+    getSession: vi.fn(() => undefined),
     getShell: vi.fn(async () => '/bin/sh'),
     hasSessionForTask: vi.fn(() => false),
     getUserPausedTaskIds: vi.fn(() => new Set<string>()),
@@ -237,6 +239,7 @@ describe('resumeSuspendedSessions: isolation-aware dedup (step 3b)', () => {
     taskRepoList.mockClear();
     taskRepoList.mockReturnValue([]);
     taskRepoUpdateMock.mockClear();
+    sessionRepoInsertMock.mockClear();
     vi.mocked(prepareAgentSpawn).mockClear();
     swimlaneListMock.mockReturnValue([
       { id: 'lane-main', auto_spawn: true, session_target: 'main', session_spawn_strategy: 'create_or_resume' },
@@ -407,6 +410,7 @@ describe('resumeSuspendedSessions: spawn carries correct isolated_swimlane_id', 
     taskRepoList.mockClear();
     taskRepoList.mockReturnValue([]);
     taskRepoUpdateMock.mockClear();
+    sessionRepoInsertMock.mockClear();
     vi.mocked(prepareAgentSpawn).mockClear();
     swimlaneListMock.mockReturnValue([
       { id: 'lane-main', auto_spawn: true, session_target: 'main', session_spawn_strategy: 'create_or_resume' },
@@ -548,6 +552,47 @@ describe('resumeSuspendedSessions: spawn carries correct isolated_swimlane_id', 
     const spawnArg = (sessionManager.spawn as ReturnType<typeof vi.fn>).mock.calls[0][0];
     expect(spawnArg.resuming).toBe(true);
   });
+
+  it('persists the live registry ID when a recovery spawn returns a stale DTO', async () => {
+    // Given
+    const preparedAgentSessionId = 'prepared-resume-id';
+    const staleSpawnDtoId = 'stale-resume-dto-id';
+    const liveRegistryId = 'live-resume-registry-id';
+    const ptySessionId = 'recovered-pty-session-id';
+    const record = makeRecord({ id: 'record-resume', agent_session_id: preparedAgentSessionId });
+    sessionRepoGetResumable.mockReturnValue([record]);
+    taskRepoList.mockReturnValue([makeTask()]);
+    vi.mocked(prepareAgentSpawn).mockResolvedValue({
+      ok: true,
+      data: {
+        adapter: { name: 'opencode', sessionType: 'opencode_agent', getExitSequence: () => ['\x03'] } as never,
+        agent: 'opencode',
+        command: 'opencode resume',
+        cwd: '/project/cwd',
+        sessionRecordId: ptySessionId,
+        agentSessionId: preparedAgentSessionId,
+        permissionMode: 'default',
+        statusOutputPath: '/project/.kangentic/sessions/recovered/status.json',
+        eventsOutputPath: '/project/.kangentic/sessions/recovered/events.jsonl',
+        extraEnv: null,
+      },
+    });
+    const sessionManager = makeSessionManager();
+    sessionManager.spawn.mockResolvedValueOnce({ id: ptySessionId, agentSessionId: staleSpawnDtoId });
+    sessionManager.getSession.mockReturnValue({ agentSessionId: liveRegistryId });
+
+    // When
+    await resumeSuspendedSessions('proj-1', '/project', sessionManager as never, makeConfigManager(true) as never);
+
+    // Then
+    expect(sessionManager.getSession).toHaveBeenCalledWith(ptySessionId);
+    expect(sessionRepoInsertMock).toHaveBeenCalledWith(expect.objectContaining({
+      agent_session_id: liveRegistryId,
+    }));
+    expect(sessionManager.getSession.mock.invocationCallOrder[0]).toBeLessThan(
+      sessionRepoInsertMock.mock.invocationCallOrder[0],
+    );
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -559,6 +604,7 @@ describe('autoSpawnTasks: resolveIsolatedSwimlaneId(lane) passed into spawn', ()
     retireRecordMock.mockClear();
     taskRepoList.mockClear();
     taskRepoUpdateMock.mockClear();
+    sessionRepoInsertMock.mockClear();
     vi.mocked(prepareAgentSpawn).mockClear();
     swimlaneListMock.mockReturnValue([]);
   });
@@ -638,5 +684,47 @@ describe('autoSpawnTasks: resolveIsolatedSwimlaneId(lane) passed into spawn', ()
     expect(sessionManager.spawn).toHaveBeenCalledTimes(1);
     const spawnArg = (sessionManager.spawn as ReturnType<typeof vi.fn>).mock.calls[0][0];
     expect(spawnArg.isolatedSwimlaneId).toBe('lane-review');
+  });
+
+  it('persists the live registry ID when an auto-spawn returns a stale DTO', async () => {
+    // Given
+    const preparedAgentSessionId = 'prepared-auto-spawn-id';
+    const staleSpawnDtoId = 'stale-auto-spawn-dto-id';
+    const liveRegistryId = 'live-auto-spawn-registry-id';
+    const ptySessionId = 'auto-spawn-pty-session-id';
+    swimlaneListMock.mockReturnValue([
+      { id: 'lane-exec', auto_spawn: true, session_target: 'main', session_spawn_strategy: 'create_or_resume' },
+    ]);
+    taskRepoList.mockReturnValue([makeTask({ id: 'task-auto-spawn', swimlane_id: 'lane-exec' })]);
+    vi.mocked(prepareAgentSpawn).mockResolvedValue({
+      ok: true,
+      data: {
+        adapter: { name: 'opencode', sessionType: 'opencode_agent', getExitSequence: () => ['\x03'] } as never,
+        agent: 'opencode',
+        command: 'opencode run',
+        cwd: '/project/cwd',
+        sessionRecordId: ptySessionId,
+        agentSessionId: preparedAgentSessionId,
+        permissionMode: 'default',
+        statusOutputPath: '/project/.kangentic/sessions/auto-spawn/status.json',
+        eventsOutputPath: '/project/.kangentic/sessions/auto-spawn/events.jsonl',
+        extraEnv: null,
+      },
+    });
+    const sessionManager = makeSessionManager();
+    sessionManager.spawn.mockResolvedValueOnce({ id: ptySessionId, agentSessionId: staleSpawnDtoId });
+    sessionManager.getSession.mockReturnValue({ agentSessionId: liveRegistryId });
+
+    // When
+    await autoSpawnTasks('proj-1', '/project', sessionManager as never, makeConfigManager(true) as never);
+
+    // Then
+    expect(sessionManager.getSession).toHaveBeenCalledWith(ptySessionId);
+    expect(sessionRepoInsertMock).toHaveBeenCalledWith(expect.objectContaining({
+      agent_session_id: liveRegistryId,
+    }));
+    expect(sessionManager.getSession.mock.invocationCallOrder[0]).toBeLessThan(
+      sessionRepoInsertMock.mock.invocationCallOrder[0],
+    );
   });
 });

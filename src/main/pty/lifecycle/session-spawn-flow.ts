@@ -356,10 +356,10 @@ export async function performSpawn(
   // Why not call `usageTracker.notifyAgentSessionId` instead: that
   // path also fires the `agent-session-id` event which dispatches to
   // `recoverStaleSessionId(sessionRepo, ...)`. The DB record is
-  // inserted by the caller AFTER spawn() returns, so during the
-  // notify the latest session record is still the previous (retired)
-  // one. recoverStaleSessionId would then misattribute the new ID to
-  // the old record. Calling attach() directly skips that chain.
+  // inserted by the caller AFTER spawn() returns. During that window,
+  // the registry retains the pre-insert identity and every insert caller
+  // persists it; recovery deliberately ignores the row miss rather than
+  // mutating the previous task record. Calling attach() directly skips that chain.
   // sessionHistoryReader.attach is idempotent; a later capture
   // pathway firing the full notify chain is harmless.
   //

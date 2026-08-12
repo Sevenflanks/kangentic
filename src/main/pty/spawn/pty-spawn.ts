@@ -82,11 +82,32 @@ export function resolveShellArgs(shell: string): ShellInvocation {
  */
 export const FULL_REPAINT_ENV_KEY = 'CLAUDE_CODE_ALT_SCREEN_FULL_REPAINT';
 
+// Child-scoped OpenCode bootstrap values must not cross a nested Kangentic process
+// boundary, or a fresh child can consume its parent's native session or prompt state.
+const OPENCODE_CHILD_BOOTSTRAP_ENV_KEYS = new Set([
+  'KANGENTIC_OPENCODE_RESUME_SESSION_ID',
+  'KANGENTIC_OPENCODE_INITIAL_PROMPT_PATH',
+  'KANGENTIC_OPENCODE_TUI_INITIAL_PROMPT_PATH',
+]);
+const TUI_BOOTSTRAP_CONFIG_PATH_ENV = 'OPENCODE_TUI_CONFIG';
+const TUI_BOOTSTRAP_CONFIG_OWNER_ENV = 'KANGENTIC_OPENCODE_TUI_CONFIG_OWNER';
+
 export function buildSpawnEnv(
   inputEnv: Record<string, string> | undefined,
   platform: NodeJS.Platform = process.platform,
 ): Record<string, string> {
-  const merged = { ...process.env, ...inputEnv };
+  const ambientEnv = { ...process.env };
+  const ambientTuiConfigPath = ambientEnv[TUI_BOOTSTRAP_CONFIG_PATH_ENV];
+  const ambientTuiConfigOwner = ambientEnv[TUI_BOOTSTRAP_CONFIG_OWNER_ENV];
+  // owner 是 process-private 證據，一律移除；只有 exact pair 才能移除 config，避免覆寫使用者設定。
+  delete ambientEnv[TUI_BOOTSTRAP_CONFIG_OWNER_ENV];
+  if (ambientTuiConfigPath && ambientTuiConfigOwner === ambientTuiConfigPath) {
+    delete ambientEnv[TUI_BOOTSTRAP_CONFIG_PATH_ENV];
+  }
+  for (const key of OPENCODE_CHILD_BOOTSTRAP_ENV_KEYS) {
+    delete ambientEnv[key];
+  }
+  const merged = { ...ambientEnv, ...inputEnv };
   const result: Record<string, string> = {};
   for (const [key, value] of Object.entries(merged)) {
     if (value === undefined) continue;

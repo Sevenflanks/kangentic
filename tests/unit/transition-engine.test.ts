@@ -145,13 +145,14 @@ function makeAttachmentRepo() {
  * quoted prompt that would be passed to the shell.
  */
 function makeSessionManager() {
-  type SpawnCapture = Pick<SpawnSessionInput, 'id' | 'command' | 'env' | 'spawnCleanup'>;
+  type SpawnCapture = Pick<SpawnSessionInput, 'id' | 'command' | 'env' | 'spawnCleanup' | 'agentSessionId'>;
   const spawnedSessions: SpawnCapture[] = [];
   return {
     spawn: vi.fn(async (options: SpawnCapture) => {
       spawnedSessions.push(options);
       return { id: 'pty-session-1', status: 'running' };
     }),
+    getSession: vi.fn(() => undefined),
     getShell: vi.fn(async () => 'bash'),
     spawnedSessions,
   };
@@ -1602,6 +1603,45 @@ describe('TransitionEngine - resume-time agent-session-id reconcile wiring (exec
 
     expect(capturedSessionId).toBe(STORED_ID);
     expect(sessionRepo.updateAgentSessionId).not.toHaveBeenCalled();
+  });
+});
+
+describe('TransitionEngine - captured native session ID persistence', () => {
+  afterEach(() => {
+    mockAdapter.supportsCallerSessionId = true;
+  });
+
+  it('persists the live registry ID when a fresh non-caller-owned spawn returns a stale DTO', async () => {
+    // Given
+    const staleSpawnDtoId = 'ses_stale_spawn_dto';
+    const liveRegistryId = 'ses_live_registry';
+    const ptySessionId = 'pty-session-opencode-1';
+    mockAdapter.supportsCallerSessionId = false;
+    const sessionManager = makeSessionManager();
+    sessionManager.spawn.mockImplementationOnce(async (options) => {
+      sessionManager.spawnedSessions.push(options);
+      return { id: ptySessionId, status: 'running', agentSessionId: staleSpawnDtoId };
+    });
+    sessionManager.getSession.mockReturnValue({ agentSessionId: liveRegistryId });
+    const sessionRepo = makeSessionRepo();
+    const { engine } = makeEngine({ sessionManager, sessionRepo });
+
+    // When
+    await engine.executeTransition(
+      makeTask() as Parameters<typeof engine.executeTransition>[0],
+      'todo',
+      'doing',
+    );
+
+    // Then
+    expect(sessionManager.spawnedSessions[0]?.agentSessionId).toBeNull();
+    expect(sessionManager.getSession).toHaveBeenCalledWith(ptySessionId);
+    expect(sessionRepo.insert).toHaveBeenCalledWith(expect.objectContaining({
+      agent_session_id: liveRegistryId,
+    }));
+    expect(sessionManager.getSession.mock.invocationCallOrder[0]).toBeLessThan(
+      sessionRepo.insert.mock.invocationCallOrder[0],
+    );
   });
 });
 
