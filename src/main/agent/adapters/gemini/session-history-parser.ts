@@ -72,6 +72,7 @@ export class GeminiSessionHistoryParser {
     const startTimeCeilMs = spawnedAtMs + 30_000;
 
     const projectDirName = resolveGeminiProjectDirName(options.cwd);
+    if (!projectDirName) return null;
     const directory = path.join(os.homedir(), '.gemini', 'tmp', projectDirName, 'chats');
     // `.jsonl?` matches BOTH generations. Gemini 0.37 wrote one JSON object per
     // `.json` file; current builds write append-only `.jsonl`. An anchored
@@ -123,6 +124,7 @@ export class GeminiSessionHistoryParser {
     const { agentSessionId, cwd } = options;
 
     const projectDirName = resolveGeminiProjectDirName(cwd);
+    if (!projectDirName) return null;
     const directory = path.join(os.homedir(), '.gemini', 'tmp', projectDirName, 'chats');
 
     // Gemini 0.37 embeds only the FIRST 8 CHARS of the session UUID
@@ -275,21 +277,26 @@ export function computeGeminiProjectDirName(cwd: string): string {
 /**
  * Resolve the Gemini project slug for a cwd. The registry distinguishes
  * projects with identical basenames, so a matching entry remains authoritative
- * even while its chats directory is empty.
+ * even while its chats directory is empty. When an unmatched cwd's legacy
+ * basename is already claimed by another registry entry, do not scan it.
  */
-function resolveGeminiProjectDirName(cwd: string): string {
+function resolveGeminiProjectDirName(cwd: string): string | null {
   const registry = readGeminiProjectsRegistry();
+  if (!registry) return computeGeminiProjectDirName(cwd);
+
   const resolvedCwd = normalizeGeminiProjectPath(cwd);
   for (const [projectPath, slug] of Object.entries(registry)) {
     if (normalizeGeminiProjectPath(projectPath) === resolvedCwd) return slug;
   }
-  return computeGeminiProjectDirName(cwd);
+
+  const fallbackSlug = computeGeminiProjectDirName(cwd);
+  return Object.values(registry).includes(fallbackSlug) ? null : fallbackSlug;
 }
 
-function readGeminiProjectsRegistry(): Record<string, string> {
+function readGeminiProjectsRegistry(): Record<string, string> | null {
   try {
     const parsed: unknown = JSON.parse(fs.readFileSync(path.join(os.homedir(), '.gemini', 'projects.json'), 'utf-8'));
-    if (!isRecord(parsed) || !isRecord(parsed.projects)) return {};
+    if (!isRecord(parsed) || !isRecord(parsed.projects)) return null;
 
     const registry: Record<string, string> = {};
     for (const [projectPath, slug] of Object.entries(parsed.projects)) {
@@ -297,7 +304,7 @@ function readGeminiProjectsRegistry(): Record<string, string> {
     }
     return registry;
   } catch {
-    return {};
+    return null;
   }
 }
 

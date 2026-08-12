@@ -107,7 +107,7 @@ for every Gemini session after the cutover `locate()` found nothing and
 capture and all Gemini live telemetry. Both now test `/^session-.*\.jsonl?$/`. Pinned by
 `tests/unit/gemini-session-file-format.test.ts`; do not re-anchor either pattern.
 
-The `<projectSlug>` comes from the authoritative `~/.gemini/projects.json` cwd-to-slug mapping. Kangentic resolves both paths with `path.resolve`, compares case-insensitively only on Windows, and uses the registry slug even when its chat directory is empty. When the registry is missing, malformed, or has no cwd entry, it falls back to the **lowercased basename** of the cwd. The fallback was verified empirically against live Gemini directory listings:
+The `<projectSlug>` comes from the authoritative `~/.gemini/projects.json` cwd-to-slug mapping. Kangentic resolves both paths with `path.resolve`, compares case-insensitively only on Windows, and uses the registry slug even when its chat directory is empty. When the registry is missing or malformed, it falls back to the **lowercased basename** of the cwd. With a valid registry and no cwd entry, it still uses that fallback only when no registry entry already claims the same slug; a claimed slug fails closed rather than scanning another project's directory. The fallback was verified empirically against live Gemini directory listings:
 
 | cwd | Directory name |
 |---|---|
@@ -115,7 +115,7 @@ The `<projectSlug>` comes from the authoritative `~/.gemini/projects.json` cwd-t
 | `C:/Users/dev/Parent/MyProject` | `myproject` |
 | `<parent>/worktree-mixed-case-123` | `worktree-mixed-case-123` |
 
-The basename fallback can collide for two projects sharing a basename (e.g. two `app/` directories in different parent paths). A matching registry entry prevents that cross-project binding.
+The basename fallback can collide for two projects sharing a basename (e.g. two `app/` directories in different parent paths). A matching registry entry prevents that cross-project binding, and an unmatched cwd cannot scan a basename slug that a valid registry already assigns to another project.
 
 **Format**: two generations. `isFullRewrite: true` either way - the parser receives the whole file
 content on each change, and `collectGeminiMessages()` normalizes both into one `messages[]` array.

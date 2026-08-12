@@ -394,12 +394,68 @@ describe('GeminiSessionHistoryParser', () => {
       expect(located).toBe(expected);
     }
 
+    function writeValidRegistryWithProjectBClaimingFallback(): void {
+      fs.writeFileSync(
+        path.join(homeDir, '.gemini', 'projects.json'),
+        JSON.stringify({ projects: { [path.resolve(projectB)]: 'app' } }),
+      );
+    }
+
     it('falls back to the basename directory when the registry is malformed', async () => {
       await expectBasenameFallback('{ not json ');
     });
 
+    it('falls back to the basename directory when the registry is missing', async () => {
+      const sessionId = '88888888-aaaa-bbbb-cccc-dddddddddddd';
+      const expected = writeSessionFile('app', sessionId, new Date());
+      fs.rmSync(path.join(homeDir, '.gemini', 'projects.json'));
+
+      const located = await GeminiSessionHistoryParser.locate({ agentSessionId: sessionId, cwd: projectB });
+
+      expect(located).toBe(expected);
+    });
+
     it('falls back to the basename directory when the registry has no cwd match', async () => {
       await expectBasenameFallback(JSON.stringify({ projects: { [path.resolve(projectA)]: 'project-a' } }));
+    });
+
+    it('fails closed during capture when an unmatched cwd basename is claimed by another registry project', async () => {
+      const sessionId = '00001111-aaaa-bbbb-cccc-dddddddddddd';
+      const spawnedAt = new Date();
+      writeSessionFile('app', sessionId, spawnedAt);
+      writeValidRegistryWithProjectBClaimingFallback();
+
+      const captured = await GeminiSessionHistoryParser.captureSessionIdFromFilesystem({
+        spawnedAt,
+        cwd: projectA,
+        maxAttempts: 1,
+      });
+
+      expect(captured).toBeNull();
+    });
+
+    it('fails closed during locate when an unmatched cwd basename is claimed by another registry project', async () => {
+      const sessionId = '00002222-aaaa-bbbb-cccc-dddddddddddd';
+      writeSessionFile('app', sessionId, new Date());
+      writeValidRegistryWithProjectBClaimingFallback();
+
+      await expect(GeminiSessionHistoryParser.locate({ agentSessionId: sessionId, cwd: projectA })).resolves.toBeNull();
+    });
+
+    it('does not return a cached app transcript to an unmatched sibling cwd when project B owns the slug', async () => {
+      const sessionId = '00003333-aaaa-bbbb-cccc-dddddddddddd';
+      const spawnedAt = new Date();
+      writeSessionFile('app', sessionId, spawnedAt);
+      writeValidRegistryWithProjectBClaimingFallback();
+
+      const captured = await GeminiSessionHistoryParser.captureSessionIdFromFilesystem({
+        spawnedAt,
+        cwd: projectB,
+        maxAttempts: 1,
+      });
+
+      expect(captured).toBe(sessionId);
+      await expect(GeminiSessionHistoryParser.locate({ agentSessionId: sessionId, cwd: projectA })).resolves.toBeNull();
     });
 
     it('captures from project B registry directory when sibling projects share a basename', async () => {
