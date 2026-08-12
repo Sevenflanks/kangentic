@@ -265,7 +265,7 @@ The trap is that the obvious measurement gives the wrong answer. A trivial promp
 Two further rules the harness enforces, both learned the hard way here:
 
 - **Measure the file the VERIFIER reads.** Qwen's probe text reaches `~/.qwen/tmp/<hash>/logs.json` in ~130ms but its `chats/<sessionId>.jsonl` in ~500ms. Reporting the first number would have credited the verifier with a latency belonging to a file it never opens.
-- **An offline run can never establish a pass.** With credentials stripped there is no turn to flush at turn-end, so a fast append proves nothing. Offline yields only "absent" or "needs live confirmation".
+- **An offline run can never establish a pass.** `--offline` is `best-effort-env`: it removes inherited provider/cloud credential variables, strips every inherited case variant of `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY`, forces uppercase and lowercase HTTP(S) proxy variables to `http://127.0.0.1:9`, and clears uppercase and lowercase `ALL_PROXY` / `NO_PROXY`. It preserves process essentials such as `PATH`, home, system-root, temp, and locale variables. It is not an OS network sandbox and cannot guarantee that a CLI will not load credentials or network configuration from its own config files. The JSON report makes this boundary machine-readable with `networkIsolation: "best-effort-env"` and `livePassEligible: false`; offline never establishes PASS, even if a user turn appears in history. With no authenticated turn to flush at turn-end, a fast append proves nothing. Offline yields only "absent" or "needs live confirmation".
 
 ## Measured flush latency
 

@@ -32,10 +32,11 @@
  * at turn-end and FAILS the gate.
  *
  * OFFLINE MODE
- * `--offline` runs with credentials stripped. If the CLI appends the user turn
- * before calling the API, the probe costs no quota. But an unauthenticated run
- * has no turn to flush at turn-end, so a fast append there proves nothing:
- * offline can only ever yield "absent" (a negative) or "needs live
+ * `--offline` is best-effort environment hardening: it strips inherited
+ * credential variables and forces conventional proxies to a dead loopback
+ * endpoint. It is not an OS network sandbox and cannot prevent a CLI from
+ * reading credentials from its config files. A fast append there proves
+ * nothing: offline can only ever yield "absent" (a negative) or "needs live
  * confirmation". Offline NEVER yields a PASS. The report enforces this.
  *
  * Usage:
@@ -47,7 +48,7 @@
  * Flags:
  *   --agent <name|all>  agent to probe (required unless --list)
  *   --trials <n>        trials per case, default 3. Report uses the MAX.
- *   --offline           strip credentials; never produces a PASS
+ *   --offline           best-effort environment hardening; never produces a PASS
  *   --case <name>       run only one case: short | long | slash
  *   --keep              keep the temp workspace for inspection
  *   --timeout <ms>      per-probe appearance timeout, default 60000
@@ -60,6 +61,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
+import { buildMeasurementEnv } from './lib/measure-injection-flush-env.mjs';
 
 const require = createRequire(import.meta.url);
 const nodePty = require('node-pty');
@@ -359,27 +361,11 @@ function stripAnsi(text) {
 }
 
 /**
- * Strip this session's own agent identity markers so the child CLI persists
- * its own transcript. Mirrors buildSpawnEnv (src/main/pty/spawn/pty-spawn.ts).
- * In offline mode also strip credentials so no API call is made.
+ * Builds the child environment without this session's agent identity markers.
+ * Offline mode is intentionally only best-effort environment hardening.
  */
 function buildEnv({ offline }) {
-  const env = {};
-  const credentialPattern = /(API_KEY|AUTH_TOKEN|_TOKEN|OPENAI_|ANTHROPIC_|GEMINI_|GOOGLE_|MOONSHOT_|DASHSCOPE_)/i;
-  for (const [key, value] of Object.entries(process.env)) {
-    if (value === undefined) continue;
-    if (key === 'CLAUDECODE' || key.startsWith('CLAUDE_CODE_')) continue;
-    if (offline && credentialPattern.test(key)) continue;
-    env[key] = value;
-  }
-  if (offline) {
-    // Point the CLIs at a dead endpoint so an authenticated config file cannot
-    // silently rescue the run and turn an offline probe into a real turn.
-    env.HTTP_PROXY = 'http://127.0.0.1:9';
-    env.HTTPS_PROXY = 'http://127.0.0.1:9';
-    env.NO_PROXY = '';
-  }
-  return env;
+  return buildMeasurementEnv(process.env, { offline });
 }
 
 function spawnAgent(agent, workspace, env) {
@@ -895,7 +881,14 @@ async function measureAgent(agentName) {
   console.log(`  -> ${verdict.verdict.toUpperCase()}: ${verdict.reason}`);
   if (verdict.slashNote) console.log(`     ${verdict.slashNote}`);
 
-  return { agent: agentName, offline: offlineMode, results, ...verdict };
+  return {
+    agent: agentName,
+    offline: offlineMode,
+    networkIsolation: offlineMode ? 'best-effort-env' : 'none',
+    livePassEligible: !offlineMode,
+    results,
+    ...verdict,
+  };
 }
 
 async function main() {
@@ -919,6 +912,8 @@ async function main() {
     measuredAt: new Date().toISOString(),
     platform: process.platform,
     offline: offlineMode,
+    networkIsolation: offlineMode ? 'best-effort-env' : 'none',
+    livePassEligible: !offlineMode,
     trials: trialCount,
     passThresholdMs: PASS_THRESHOLD_MS,
     agents: [],
@@ -933,6 +928,9 @@ async function main() {
       console.error(`  ${name}: ${error.message}`);
       report.agents.push({
         agent: name,
+        offline: offlineMode,
+        networkIsolation: offlineMode ? 'best-effort-env' : 'none',
+        livePassEligible: !offlineMode,
         verdict: 'unmeasurable-here',
         reason: error.message,
         results: [],
