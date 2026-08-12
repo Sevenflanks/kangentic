@@ -382,6 +382,14 @@ export class TerminalSubmit {
 
           confirmed = await this.pollForConfirmation(verifier, command, sentAt, signal);
           if (confirmed) break;
+          if (this.sessionManager.getActivityCache()[sessionId] === 'permission') {
+            return {
+              outcome: 'unconfirmed',
+              unconfirmedCommands,
+              discardedDraft: shouldClear ? pendingDraft : null,
+              interruptedTurn: false,
+            };
+          }
         }
 
         if (canVerify) {

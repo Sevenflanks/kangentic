@@ -172,7 +172,7 @@ Three details are load-bearing:
 
 ### Retry, and what happens on exhaustion
 
-For a verifiable command, each attempt polls the verifier for 400ms; up to 5 attempts. **Retries re-press Enter alone.** Esc is sent at most once, on the first attempt only, because it is not a picker-scoped key: Claude Code documents it as "stop Claude while it is generating output", and on a non-empty prompt with no picker the first press prints "Esc again to clear", so a second press would delete the very command being submitted.
+For a verifiable command, each attempt polls the verifier for 400ms; up to 5 attempts. **Retries re-press Enter alone.** Esc is sent at most once, on the first attempt only, because it is not a picker-scoped key: Claude Code documents it as "stop Claude while it is generating output", and on a non-empty prompt with no picker the first press prints "Esc again to clear", so a second press would delete the very command being submitted. If a verification miss observes activity transition to `permission`, delivery stops before another Enter: that first Enter may have opened the prompt, and a retry could answer it. The stopped burst returns the existing `unconfirmed` outcome, so it cannot authorize escalation.
 
 On exhaustion the code does **not** write `Ctrl+C`. If the command actually did submit and verification merely lagged, that Ctrl+C would kill the turn it just started, and it was the only path that could produce two consecutive Ctrl+C presses and exit the CLI. Exhaustion reports a failure, and the scheduler escalates.
 
