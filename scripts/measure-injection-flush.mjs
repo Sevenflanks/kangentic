@@ -62,6 +62,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { buildMeasurementEnv } from './lib/measure-injection-flush-env.mjs';
+import { runWithProbeCeiling } from './lib/measure-injection-flush-timeout.mjs';
 
 const require = createRequire(import.meta.url);
 const nodePty = require('node-pty');
@@ -351,7 +352,23 @@ function findNonce(roots, pattern, baseline, nonce) {
 // PTY helpers (patterns lifted from scripts/validate-clear-fork.mjs)
 // ---------------------------------------------------------------------------
 
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+/**
+ * @param {number} ms
+ * @param {AbortSignal | undefined} signal
+ * @returns {Promise<void>}
+ */
+function sleep(ms, signal) {
+  if (signal?.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(done, ms);
+    function done() {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', done);
+      resolve();
+    }
+    signal?.addEventListener('abort', done, { once: true });
+  });
+}
 
 function stripAnsi(text) {
   return text
@@ -389,9 +406,9 @@ function spawnAgent(agent, workspace, env) {
  * is the Enter write, never the spawn, so this only needs to be "ready enough
  * to accept typing".
  */
-async function waitForReady(state, { minBytes = 200, quietMs = 1500, timeoutMs = 90_000 }) {
+async function waitForReady(state, { minBytes = 200, quietMs = 1500, timeoutMs = 90_000, signal }) {
   const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
+  while (Date.now() < deadline && !signal?.aborted) {
     // Exit is checked BEFORE the quiet heuristic and short-circuits. A crashing
     // CLI prints its stack trace and then goes quiet, which otherwise satisfies
     // "settled" and reports a dead process as a ready TUI - manufacturing a
@@ -400,7 +417,7 @@ async function waitForReady(state, { minBytes = 200, quietMs = 1500, timeoutMs =
     maybeAnswerPrompt(state);
     const quietFor = Date.now() - state.lastDataAt;
     if (state.totalBytes >= minBytes && quietFor >= quietMs) return true;
-    await sleep(100);
+    await sleep(100, signal);
   }
   return false;
 }
@@ -472,10 +489,11 @@ function detectAuthGate(scrollback) {
   return match ? match.source : null;
 }
 
-async function typeSlowly(pty, text, perCharMs = 12) {
+async function typeSlowly(pty, text, perCharMs = 12, signal) {
   for (const char of text) {
+    if (signal?.aborted) return;
     pty.write(char);
-    if (perCharMs > 0) await sleep(perCharMs);
+    if (perCharMs > 0) await sleep(perCharMs, signal);
   }
 }
 
@@ -483,7 +501,7 @@ async function typeSlowly(pty, text, perCharMs = 12) {
 // One probe
 // ---------------------------------------------------------------------------
 
-async function runProbe({ agentName, agent, probeCase, trialIndex }) {
+async function runProbe({ agentName, agent, probeCase, trialIndex, signal }) {
   const workspace = fs.mkdtempSync(path.join(os.tmpdir(), `kng-flush-${agentName}-`));
   fs.writeFileSync(path.join(workspace, 'README.md'), 'Measurement workspace.\n');
 
@@ -538,6 +556,11 @@ async function runProbe({ agentName, agent, probeCase, trialIndex }) {
     state.lastDataAt = Date.now();
   });
   pty.onExit(() => { state.exited = true; });
+  const killPty = () => {
+    try { pty.kill(); } catch { /* already gone */ }
+  };
+  signal?.addEventListener('abort', killPty, { once: true });
+  if (signal?.aborted) killPty();
 
   const result = {
     agent: agentName,
@@ -556,7 +579,7 @@ async function runProbe({ agentName, agent, probeCase, trialIndex }) {
   };
 
   try {
-    result.ready = await waitForReady(state, {});
+    result.ready = await waitForReady(state, { signal });
     if (!result.ready) {
       result.exitedDuringProbe = state.exited;
       result.scrollbackTail = stripAnsi(state.scrollback.slice(-1200)).trim() || null;
@@ -587,12 +610,14 @@ async function runProbe({ agentName, agent, probeCase, trialIndex }) {
     // characters after it had gone quiet. Production does not hit this because
     // `submitKeystrokes` runs its own Ctrl+U handshake and settle first; this
     // pause is the harness's stand-in for that.
-    await sleep(1500);
+    await sleep(1500, signal);
+    if (signal?.aborted) return result;
 
     // Type the probe, then start the clock on the Enter, exactly as
     // TerminalSubmit does (text, settle, then \r).
-    await typeSlowly(pty, probeCase.text);
-    await sleep(probeCase.isSlash ? 600 : 250);
+    await typeSlowly(pty, probeCase.text, 12, signal);
+    await sleep(probeCase.isSlash ? 600 : 250, signal);
+    if (signal?.aborted) return result;
 
     const sentAt = Date.now();
     pty.write('\r');
@@ -600,13 +625,13 @@ async function runProbe({ agentName, agent, probeCase, trialIndex }) {
     // Poll at the same cadence a real verifier uses (VERIFY_POLL_MS = 25).
     let found = null;
     const deadline = sentAt + appearTimeoutMs;
-    while (Date.now() < deadline) {
+    while (Date.now() < deadline && !signal?.aborted) {
       found = agent.findNonce
         ? agent.findNonce(probeCase.nonce)
         : findNonce(roots, filePattern, baseline, probeCase.nonce);
       if (found) break;
       if (state.exited) break;
-      await sleep(25);
+      await sleep(25, signal);
     }
 
     if (found) {
@@ -638,17 +663,18 @@ async function runProbe({ agentName, agent, probeCase, trialIndex }) {
     // needed there.
     if (!offlineMode) {
       const turnDeadline = Date.now() + 90_000;
-      while (Date.now() < turnDeadline && !state.exited) {
+      while (Date.now() < turnDeadline && !state.exited && !signal?.aborted) {
         if (Date.now() - state.lastDataAt > 4000) break;
-        await sleep(200);
+        await sleep(200, signal);
       }
       result.turnDurationMs = state.lastDataAt - sentAt;
     }
   } catch (error) {
     result.error = String(error && error.message ? error.message : error);
   } finally {
-    try { pty.kill(); } catch { /* already gone */ }
-    await sleep(300);
+    signal?.removeEventListener('abort', killPty);
+    killPty();
+    await sleep(300, signal);
     if (!keepWorkspace) {
       try { fs.rmSync(workspace, { recursive: true, force: true }); } catch { /* ignore */ }
     } else {
@@ -846,9 +872,10 @@ async function measureAgent(agentName) {
       // from a slow one while it is happening. Capping it turns "the sweep
       // silently stopped" into a recorded `unmeasurable-here`.
       const probeCeilingMs = 4 * 60_000;
-      const result = await Promise.race([
-        runProbe({ agentName, agent, probeCase, trialIndex }),
-        sleep(probeCeilingMs).then(() => ({
+      const result = await runWithProbeCeiling({
+        ceilingMs: probeCeilingMs,
+        runProbe: (signal) => runProbe({ agentName, agent, probeCase, trialIndex, signal }),
+        createTimeoutResult: () => ({
           agent: agentName,
           case: caseName,
           trial: trialIndex + 1,
@@ -862,8 +889,8 @@ async function measureAgent(agentName) {
           exitedDuringProbe: false,
           scrollbackTail: null,
           error: `probe exceeded the ${Math.round(probeCeilingMs / 1000)}s ceiling`,
-        })),
-      ]);
+        }),
+      });
       results.push(result);
 
       if (result.error) {
