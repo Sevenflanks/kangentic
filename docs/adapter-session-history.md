@@ -92,7 +92,7 @@ If a Codex release breaks any of these, the parser will silently return null/emp
 
 ## Gemini
 
-**File path**: `~/.gemini/tmp/<projectDirName>/chats/session-<timestamp><shortId>.jsonl` on current
+**File path**: `~/.gemini/tmp/<projectSlug>/chats/session-<timestamp><shortId>.jsonl` on current
 builds, `.json` on older ones. **Both generations are live and both must be matched.**
 
 `<shortId>` is only the FIRST 8 CHARACTERS of the session UUID, so
@@ -107,7 +107,7 @@ for every Gemini session after the cutover `locate()` found nothing and
 capture and all Gemini live telemetry. Both now test `/^session-.*\.jsonl?$/`. Pinned by
 `tests/unit/gemini-session-file-format.test.ts`; do not re-anchor either pattern.
 
-The `<projectDirName>` is the **lowercased basename** of the cwd, NOT a hash - despite the misleading `projectHash` field inside the JSON body (which appears to be a SHA-256 of something else, possibly the absolute path, but is not what Gemini uses to name the directory). Verified empirically against live Gemini directory listings:
+The `<projectSlug>` comes from the authoritative `~/.gemini/projects.json` cwd-to-slug mapping. Kangentic resolves both paths with `path.resolve`, compares case-insensitively only on Windows, and uses the registry slug even when its chat directory is empty. When the registry is missing, malformed, or has no cwd entry, it falls back to the **lowercased basename** of the cwd. The fallback was verified empirically against live Gemini directory listings:
 
 | cwd | Directory name |
 |---|---|
@@ -115,7 +115,7 @@ The `<projectDirName>` is the **lowercased basename** of the cwd, NOT a hash - d
 | `C:/Users/dev/Parent/MyProject` | `myproject` |
 | `<parent>/worktree-mixed-case-123` | `worktree-mixed-case-123` |
 
-**Collision risk**: two projects sharing the same basename (e.g. two `app/` directories in different parent paths) will share this Gemini directory. That's Gemini's design choice, not ours. Worktrees created by tools like Kangentic typically have unique hash-suffixed names, so collisions are rare in practice.
+The basename fallback can collide for two projects sharing a basename (e.g. two `app/` directories in different parent paths). A matching registry entry prevents that cross-project binding.
 
 **Format**: two generations. `isFullRewrite: true` either way - the parser receives the whole file
 content on each change, and `collectGeminiMessages()` normalizes both into one `messages[]` array.

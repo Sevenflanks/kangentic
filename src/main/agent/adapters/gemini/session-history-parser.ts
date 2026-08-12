@@ -10,15 +10,11 @@ import {
 /**
  * Parser for Gemini CLI's native session chat JSON file.
  *
- * Path: `~/.gemini/tmp/<projectDirName>/chats/session-<sessionId>.json`
+ * Path: `~/.gemini/tmp/<projectSlug>/chats/session-<sessionId>.json`
  *
- * The `<projectDirName>` is the lowercased basename of the cwd (NOT a
- * hash despite the `projectHash` field inside the JSON body). Verified
- * empirically from live directory listings - Gemini uses the last path
- * segment of cwd, lowercased, as the directory name.
- *
- * Note: Gemini's dirname scheme has a collision risk if two projects
- * share the same basename. That's a Gemini design choice, not ours.
+ * Gemini records the authoritative cwd-to-slug mapping in
+ * `~/.gemini/projects.json`. Older or incomplete installations fall back
+ * to the lowercased cwd basename.
  *
  * File format: a single JSON object, rewritten on every message. The
  * parser always receives the full file content (isFullRewrite = true).
@@ -49,7 +45,7 @@ import {
  */
 export class GeminiSessionHistoryParser {
   /**
-   * Scan `~/.gemini/tmp/<basename(cwd)>/chats/` for a session file whose
+   * Scan `~/.gemini/tmp/<projectSlug>/chats/` for a session file whose
    * `startTime` says it was created by our spawn, and return its
    * `sessionId`. The primary capture path for Gemini - hooks are
    * unreliable (`session_id` may be missing from SessionStart stdin)
@@ -75,7 +71,7 @@ export class GeminiSessionHistoryParser {
     const startTimeFloorMs = spawnedAtMs - 30_000;
     const startTimeCeilMs = spawnedAtMs + 30_000;
 
-    const projectDirName = computeGeminiProjectDirName(options.cwd);
+    const projectDirName = resolveGeminiProjectDirName(options.cwd);
     const directory = path.join(os.homedir(), '.gemini', 'tmp', projectDirName, 'chats');
     // `.jsonl?` matches BOTH generations. Gemini 0.37 wrote one JSON object per
     // `.json` file; current builds write append-only `.jsonl`. An anchored
@@ -126,7 +122,7 @@ export class GeminiSessionHistoryParser {
   }): Promise<string | null> {
     const { agentSessionId, cwd } = options;
 
-    const projectDirName = computeGeminiProjectDirName(cwd);
+    const projectDirName = resolveGeminiProjectDirName(cwd);
     const directory = path.join(os.homedir(), '.gemini', 'tmp', projectDirName, 'chats');
 
     // Gemini 0.37 embeds only the FIRST 8 CHARS of the session UUID
@@ -144,7 +140,9 @@ export class GeminiSessionHistoryParser {
     const cached = discoveredSessionPaths.get(agentSessionId);
     if (cached) {
       discoveredSessionPaths.delete(agentSessionId);
-      if (fs.existsSync(cached)) return cached;
+      if (normalizeGeminiProjectPath(path.dirname(cached)) === normalizeGeminiProjectPath(directory) && fs.existsSync(cached)) {
+        return cached;
+      }
     }
 
     const maxAttempts = 10;
@@ -272,6 +270,40 @@ function toNumber(value: unknown): number | undefined {
 export function computeGeminiProjectDirName(cwd: string): string {
   const basename = path.basename(path.normalize(cwd));
   return basename.toLowerCase();
+}
+
+/**
+ * Resolve the Gemini project slug for a cwd. The registry distinguishes
+ * projects with identical basenames, so a matching entry remains authoritative
+ * even while its chats directory is empty.
+ */
+function resolveGeminiProjectDirName(cwd: string): string {
+  const registry = readGeminiProjectsRegistry();
+  const resolvedCwd = normalizeGeminiProjectPath(cwd);
+  for (const [projectPath, slug] of Object.entries(registry)) {
+    if (normalizeGeminiProjectPath(projectPath) === resolvedCwd) return slug;
+  }
+  return computeGeminiProjectDirName(cwd);
+}
+
+function readGeminiProjectsRegistry(): Record<string, string> {
+  try {
+    const parsed: unknown = JSON.parse(fs.readFileSync(path.join(os.homedir(), '.gemini', 'projects.json'), 'utf-8'));
+    if (!isRecord(parsed) || !isRecord(parsed.projects)) return {};
+
+    const registry: Record<string, string> = {};
+    for (const [projectPath, slug] of Object.entries(parsed.projects)) {
+      if (typeof slug === 'string') registry[projectPath] = slug;
+    }
+    return registry;
+  } catch {
+    return {};
+  }
+}
+
+function normalizeGeminiProjectPath(projectPath: string): string {
+  const resolved = path.resolve(projectPath);
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
 }
 
 /**
