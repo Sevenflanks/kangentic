@@ -185,6 +185,23 @@ screenshot or short clip in the PR makes that review much faster and is always a
 
 不需要執行任何內部 maintainer workflow。Maintainer 會審查 PR、確認 CI 全數通過，並依一般 GitHub 流程合併。Upstream contribution 必須從乾淨的 `main` checkout 建立。Fork 專用的同步與 release 規則見 [docs/fork-governance.md](docs/fork-governance.md)。
 
+### Agent-specific contributions
+
+Kangentic supports twelve agent CLIs, and we do not hold a subscription to all of them. Anything
+that needs a live, authenticated CLI is measured where we can and recorded honestly where we
+cannot, so the gaps are written down rather than hidden. If you use one of these agents daily, you
+are better placed than we are to close them.
+
+The clearest example is auto_command delivery. Kangentic confirms that an injected command actually
+became a user turn, and an agent only earns the last-resort recovery (restarting the session) once
+two things have been proven for it. The per-agent status, what each one is still missing, and a
+step-by-step recipe are in
+[docs/command-injection.md](docs/command-injection.md#per-adapter-support-matrix). Partial results
+are welcome: measuring an agent and reporting the numbers is a useful PR on its own.
+
+Bug reports for this area are most useful with the agent name, the task's `auto_command_state`, and
+whether the session was local or remote.
+
 ## Finding Work
 
 Look for issues labeled **good first issue** for approachable tasks. If you want to take on something larger, open an issue first to discuss the approach.

@@ -1317,9 +1317,16 @@ export class TerminalSubmitScheduler {
     // of the message. A settings change also has its own restart path, and
     // `--resume` preserves what was already applied, so a failed `/effort`
     // alone is not a reason to respawn a session.
+    //
+    // `escalatable !== false` is the CONFIRM-ONLY gate. An adapter that has not
+    // proven its verifier end to end still gets one, because retry-on-Enter is
+    // pure upside, but a false negative there would be a guess - and acting on
+    // a guess here restarts a session and destroys live work. Those adapters
+    // confirm and retry; they never authorize the restart.
     const escalatable = burst.commands
       .filter((command, commandIndex) => (
         commandVerifyMode(command, commandIndex, burst.opts, burst.commands.length) === 'submitted'
+        && (typeof command === 'string' || command.escalatable !== false)
         && report.unconfirmedCommands.includes(commandText(command))
       ))
       .map(commandText);

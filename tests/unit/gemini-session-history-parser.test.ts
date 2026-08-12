@@ -341,4 +341,189 @@ describe('GeminiSessionHistoryParser', () => {
       expect(result).toBeNull();
     });
   });
+
+  describe('projects.json directory resolution', () => {
+    let homeDir: string;
+    let workspaceDir: string;
+    let projectA: string;
+    let projectB: string;
+
+    function writeSessionFile(slug: string, sessionId: string, startTime: Date): string {
+      const chatsDir = path.join(homeDir, '.gemini', 'tmp', slug, 'chats');
+      fs.mkdirSync(chatsDir, { recursive: true });
+      const filename = `session-${startTime.toISOString().replace(/[:.]/g, '-').replace('Z', '')}${sessionId.slice(0, 8)}.json`;
+      const filePath = path.join(chatsDir, filename);
+      fs.writeFileSync(filePath, JSON.stringify({ sessionId, startTime: startTime.toISOString(), messages: [] }));
+      return filePath;
+    }
+
+    beforeEach(() => {
+      homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gemini-home-'));
+      workspaceDir = path.join(homeDir, 'workspace');
+      projectA = path.join(workspaceDir, 'parent-a', 'app');
+      projectB = path.join(workspaceDir, 'parent-b', 'app');
+      fs.mkdirSync(projectA, { recursive: true });
+      fs.mkdirSync(projectB, { recursive: true });
+      fs.mkdirSync(path.join(homeDir, '.gemini'), { recursive: true });
+      fs.writeFileSync(
+        path.join(homeDir, '.gemini', 'projects.json'),
+        JSON.stringify({
+          projects: {
+            [path.resolve(projectA)]: 'project-a',
+            [path.resolve(projectB)]: 'project-b',
+          },
+        }),
+      );
+      vi.spyOn(os, 'homedir').mockReturnValue(homeDir);
+      clearDiscoveredSessionPaths();
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+      vi.restoreAllMocks();
+      fs.rmSync(homeDir, { recursive: true, force: true });
+    });
+
+    async function expectBasenameFallback(registryContent: string): Promise<void> {
+      const sessionId = '99999999-aaaa-bbbb-cccc-dddddddddddd';
+      const expected = writeSessionFile('app', sessionId, new Date());
+      fs.writeFileSync(path.join(homeDir, '.gemini', 'projects.json'), registryContent);
+
+      const located = await GeminiSessionHistoryParser.locate({ agentSessionId: sessionId, cwd: projectB });
+
+      expect(located).toBe(expected);
+    }
+
+    function writeValidRegistryWithProjectBClaimingFallback(): void {
+      fs.writeFileSync(
+        path.join(homeDir, '.gemini', 'projects.json'),
+        JSON.stringify({ projects: { [path.resolve(projectB)]: 'app' } }),
+      );
+    }
+
+    it('falls back to the basename directory when the registry is malformed', async () => {
+      await expectBasenameFallback('{ not json ');
+    });
+
+    it('falls back to the basename directory when the registry is missing', async () => {
+      const sessionId = '88888888-aaaa-bbbb-cccc-dddddddddddd';
+      const expected = writeSessionFile('app', sessionId, new Date());
+      fs.rmSync(path.join(homeDir, '.gemini', 'projects.json'));
+
+      const located = await GeminiSessionHistoryParser.locate({ agentSessionId: sessionId, cwd: projectB });
+
+      expect(located).toBe(expected);
+    });
+
+    it('falls back to the basename directory when the registry has no cwd match', async () => {
+      await expectBasenameFallback(JSON.stringify({ projects: { [path.resolve(projectA)]: 'project-a' } }));
+    });
+
+    it('fails closed during capture when an unmatched cwd basename is claimed by another registry project', async () => {
+      const sessionId = '00001111-aaaa-bbbb-cccc-dddddddddddd';
+      const spawnedAt = new Date();
+      writeSessionFile('app', sessionId, spawnedAt);
+      writeValidRegistryWithProjectBClaimingFallback();
+
+      const captured = await GeminiSessionHistoryParser.captureSessionIdFromFilesystem({
+        spawnedAt,
+        cwd: projectA,
+        maxAttempts: 1,
+      });
+
+      expect(captured).toBeNull();
+    });
+
+    it('fails closed during locate when an unmatched cwd basename is claimed by another registry project', async () => {
+      const sessionId = '00002222-aaaa-bbbb-cccc-dddddddddddd';
+      writeSessionFile('app', sessionId, new Date());
+      writeValidRegistryWithProjectBClaimingFallback();
+
+      await expect(GeminiSessionHistoryParser.locate({ agentSessionId: sessionId, cwd: projectA })).resolves.toBeNull();
+    });
+
+    it('does not return a cached app transcript to an unmatched sibling cwd when project B owns the slug', async () => {
+      const sessionId = '00003333-aaaa-bbbb-cccc-dddddddddddd';
+      const spawnedAt = new Date();
+      writeSessionFile('app', sessionId, spawnedAt);
+      writeValidRegistryWithProjectBClaimingFallback();
+
+      const captured = await GeminiSessionHistoryParser.captureSessionIdFromFilesystem({
+        spawnedAt,
+        cwd: projectB,
+        maxAttempts: 1,
+      });
+
+      expect(captured).toBe(sessionId);
+      await expect(GeminiSessionHistoryParser.locate({ agentSessionId: sessionId, cwd: projectA })).resolves.toBeNull();
+    });
+
+    it('captures from project B registry directory when sibling projects share a basename', async () => {
+      const sessionId = 'eeee5555-aaaa-bbbb-cccc-dddddddddddd';
+      const spawnedAt = new Date();
+      writeSessionFile('project-b', sessionId, spawnedAt);
+
+      const captured = await GeminiSessionHistoryParser.captureSessionIdFromFilesystem({
+        spawnedAt,
+        cwd: projectB,
+        maxAttempts: 1,
+      });
+
+      expect(captured).toBe(sessionId);
+    });
+
+    it('does not capture project B fallback transcript for project A when its mapped directory is empty', async () => {
+      const sessionId = 'ffff6666-aaaa-bbbb-cccc-dddddddddddd';
+      const spawnedAt = new Date();
+      writeSessionFile('app', sessionId, spawnedAt);
+
+      const captured = await GeminiSessionHistoryParser.captureSessionIdFromFilesystem({
+        spawnedAt,
+        cwd: projectA,
+        maxAttempts: 1,
+      });
+
+      expect(captured).toBeNull();
+    });
+
+    it('locates from project B registry directory when sibling projects share a basename', async () => {
+      const sessionId = '11117777-aaaa-bbbb-cccc-dddddddddddd';
+      const expected = writeSessionFile('project-b', sessionId, new Date());
+
+      const located = await GeminiSessionHistoryParser.locate({ agentSessionId: sessionId, cwd: projectB });
+
+      expect(located).toBe(expected);
+    });
+
+    it('does not locate project B fallback transcript for project A when its mapped directory is empty', async () => {
+      const sessionId = '22228888-aaaa-bbbb-cccc-dddddddddddd';
+      const projectBTranscript = writeSessionFile('app', sessionId, new Date());
+
+      vi.useFakeTimers();
+      const locatePromise = GeminiSessionHistoryParser.locate({ agentSessionId: sessionId, cwd: projectA });
+      await vi.advanceTimersByTimeAsync(5_000);
+      const located = await locatePromise;
+
+      expect(located).not.toBe(projectBTranscript);
+      expect(located).toBeNull();
+    });
+
+    it('does not return a project B cached transcript for project A', async () => {
+      const sessionId = '33339999-aaaa-bbbb-cccc-dddddddddddd';
+      const spawnedAt = new Date();
+      writeSessionFile('project-b', sessionId, spawnedAt);
+
+      await GeminiSessionHistoryParser.captureSessionIdFromFilesystem({
+        spawnedAt,
+        cwd: projectB,
+        maxAttempts: 1,
+      });
+
+      vi.useFakeTimers();
+      const locatePromise = GeminiSessionHistoryParser.locate({ agentSessionId: sessionId, cwd: projectA });
+      await vi.advanceTimersByTimeAsync(5_000);
+
+      await expect(locatePromise).resolves.toBeNull();
+    });
+  });
 });

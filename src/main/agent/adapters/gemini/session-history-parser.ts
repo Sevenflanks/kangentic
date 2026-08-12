@@ -10,15 +10,11 @@ import {
 /**
  * Parser for Gemini CLI's native session chat JSON file.
  *
- * Path: `~/.gemini/tmp/<projectDirName>/chats/session-<sessionId>.json`
+ * Path: `~/.gemini/tmp/<projectSlug>/chats/session-<sessionId>.json`
  *
- * The `<projectDirName>` is the lowercased basename of the cwd (NOT a
- * hash despite the `projectHash` field inside the JSON body). Verified
- * empirically from live directory listings - Gemini uses the last path
- * segment of cwd, lowercased, as the directory name.
- *
- * Note: Gemini's dirname scheme has a collision risk if two projects
- * share the same basename. That's a Gemini design choice, not ours.
+ * Gemini records the authoritative cwd-to-slug mapping in
+ * `~/.gemini/projects.json`. Older or incomplete installations fall back
+ * to the lowercased cwd basename.
  *
  * File format: a single JSON object, rewritten on every message. The
  * parser always receives the full file content (isFullRewrite = true).
@@ -49,7 +45,7 @@ import {
  */
 export class GeminiSessionHistoryParser {
   /**
-   * Scan `~/.gemini/tmp/<basename(cwd)>/chats/` for a session file whose
+   * Scan `~/.gemini/tmp/<projectSlug>/chats/` for a session file whose
    * `startTime` says it was created by our spawn, and return its
    * `sessionId`. The primary capture path for Gemini - hooks are
    * unreliable (`session_id` may be missing from SessionStart stdin)
@@ -75,9 +71,14 @@ export class GeminiSessionHistoryParser {
     const startTimeFloorMs = spawnedAtMs - 30_000;
     const startTimeCeilMs = spawnedAtMs + 30_000;
 
-    const projectDirName = computeGeminiProjectDirName(options.cwd);
+    const projectDirName = resolveGeminiProjectDirName(options.cwd);
+    if (!projectDirName) return null;
     const directory = path.join(os.homedir(), '.gemini', 'tmp', projectDirName, 'chats');
-    const pattern = /^session-.*\.json$/;
+    // `.jsonl?` matches BOTH generations. Gemini 0.37 wrote one JSON object per
+    // `.json` file; current builds write append-only `.jsonl`. An anchored
+    // `\.json$` silently matched nothing on every recent install, which broke
+    // session-id capture and therefore live telemetry for Gemini entirely.
+    const pattern = /^session-.*\.jsonl?$/;
 
     const maxAttempts = options.maxAttempts ?? 60;
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
@@ -122,7 +123,8 @@ export class GeminiSessionHistoryParser {
   }): Promise<string | null> {
     const { agentSessionId, cwd } = options;
 
-    const projectDirName = computeGeminiProjectDirName(cwd);
+    const projectDirName = resolveGeminiProjectDirName(cwd);
+    if (!projectDirName) return null;
     const directory = path.join(os.homedir(), '.gemini', 'tmp', projectDirName, 'chats');
 
     // Gemini 0.37 embeds only the FIRST 8 CHARS of the session UUID
@@ -131,24 +133,30 @@ export class GeminiSessionHistoryParser {
     // real on-disk files. The historical regex matched the full
     // UUID and never fired.
     const shortId = agentSessionId.slice(0, 8).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const pattern = new RegExp(`^session-.*${shortId}\\.json$`, 'i');
+    // `.jsonl?` so both on-disk generations match - see the note in
+    // `captureSessionIdFromFilesystem`.
+    const pattern = new RegExp(`^session-.*${shortId}\\.jsonl?$`, 'i');
 
     // Fast path: captureSessionIdFromFilesystem already found this file.
     // Return the cached path immediately instead of re-scanning.
     const cached = discoveredSessionPaths.get(agentSessionId);
     if (cached) {
       discoveredSessionPaths.delete(agentSessionId);
-      if (fs.existsSync(cached)) return cached;
+      if (normalizeGeminiProjectPath(path.dirname(cached)) === normalizeGeminiProjectPath(directory) && fs.existsSync(cached)) {
+        return cached;
+      }
     }
 
     const maxAttempts = 10;
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       const found = findMatchingFile(directory, pattern);
       if (found) return found;
-      // Also check for a filename that is exactly `session-<id>.json`
+      // Also check for a filename that is exactly `session-<id>.json(l)`
       // in case Gemini doesn't include a prefix.
-      const plain = path.join(directory, `session-${agentSessionId}.json`);
-      if (fs.existsSync(plain)) return plain;
+      for (const extension of ['.jsonl', '.json']) {
+        const plain = path.join(directory, `session-${agentSessionId}${extension}`);
+        if (fs.existsSync(plain)) return plain;
+      }
       await sleep(500);
     }
     return null;
@@ -161,19 +169,9 @@ export class GeminiSessionHistoryParser {
    * its model + token totals.
    */
   static parse(content: string, _mode: 'full' | 'append'): SessionHistoryParseResult {
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(content);
-    } catch {
-      // Partial write mid-flush or corruption - return empty result.
-      return { usage: null, events: [], activity: null };
-    }
-    if (!isRecord(parsed)) {
-      return { usage: null, events: [], activity: null };
-    }
-
-    const messages = parsed.messages;
-    if (!Array.isArray(messages)) {
+    const messages = collectGeminiMessages(content);
+    if (!messages) {
+      // Partial write mid-flush, corruption, or a shape we do not recognise.
       return { usage: null, events: [], activity: null };
     }
 
@@ -277,6 +275,45 @@ export function computeGeminiProjectDirName(cwd: string): string {
 }
 
 /**
+ * Resolve the Gemini project slug for a cwd. The registry distinguishes
+ * projects with identical basenames, so a matching entry remains authoritative
+ * even while its chats directory is empty. When an unmatched cwd's legacy
+ * basename is already claimed by another registry entry, do not scan it.
+ */
+function resolveGeminiProjectDirName(cwd: string): string | null {
+  const registry = readGeminiProjectsRegistry();
+  if (!registry) return computeGeminiProjectDirName(cwd);
+
+  const resolvedCwd = normalizeGeminiProjectPath(cwd);
+  for (const [projectPath, slug] of Object.entries(registry)) {
+    if (normalizeGeminiProjectPath(projectPath) === resolvedCwd) return slug;
+  }
+
+  const fallbackSlug = computeGeminiProjectDirName(cwd);
+  return Object.values(registry).includes(fallbackSlug) ? null : fallbackSlug;
+}
+
+function readGeminiProjectsRegistry(): Record<string, string> | null {
+  try {
+    const parsed: unknown = JSON.parse(fs.readFileSync(path.join(os.homedir(), '.gemini', 'projects.json'), 'utf-8'));
+    if (!isRecord(parsed) || !isRecord(parsed.projects)) return null;
+
+    const registry: Record<string, string> = {};
+    for (const [projectPath, slug] of Object.entries(parsed.projects)) {
+      if (typeof slug === 'string') registry[projectPath] = slug;
+    }
+    return registry;
+  } catch {
+    return null;
+  }
+}
+
+function normalizeGeminiProjectPath(projectPath: string): string {
+  const resolved = path.resolve(projectPath);
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+}
+
+/**
  * Set of model names we've already warned about, so the WARN log
  * fires at most once per unique unknown model per process lifetime.
  * Prevents log spam when a session continually updates.
@@ -367,19 +404,104 @@ function safeReaddirWithStats(directory: string): Array<{ name: string; mtimeMs:
  * Returns null on any I/O or parse failure. Only called on mtime-fresh
  * files, which are small enough to read whole.
  */
-function readGeminiSessionMeta(filePath: string): { sessionId: string; startTimeMs: number } | null {
+/**
+ * Normalise either on-disk generation into a flat `messages[]` array.
+ *
+ * Legacy (`.json`): the whole file is one object carrying `messages[]`.
+ *
+ * Current (`.jsonl`): a header line, then a mix of `$set` patch lines (whose
+ * payload may seed `messages[]` wholesale) and standalone message lines. Gemini
+ * re-emits the SAME `id` while a response streams, so identity is by `id` and
+ * the last write wins - otherwise a streaming reply is counted several times
+ * and the token totals read high.
+ *
+ * Returns null only when nothing parseable was found, which the caller reports
+ * as an empty result rather than an error.
+ */
+function collectGeminiMessages(content: string): unknown[] | null {
   try {
-    const content = fs.readFileSync(filePath, 'utf-8');
     const parsed: unknown = JSON.parse(content);
-    if (!isRecord(parsed)) return null;
-    const { sessionId, startTime } = parsed;
-    if (typeof sessionId !== 'string' || typeof startTime !== 'string') return null;
-    const startTimeMs = Date.parse(startTime);
-    if (!Number.isFinite(startTimeMs)) return null;
-    return { sessionId, startTimeMs };
+    if (isRecord(parsed) && Array.isArray(parsed.messages)) return parsed.messages;
+  } catch {
+    // Not a single JSON object - fall through to the JSONL reader.
+  }
+
+  const ordered: unknown[] = [];
+  const indexById = new Map<string, number>();
+  let sawAny = false;
+
+  const append = (message: unknown): void => {
+    if (!isRecord(message)) return;
+    sawAny = true;
+    const id = typeof message.id === 'string' ? message.id : null;
+    if (id === null) {
+      ordered.push(message);
+      return;
+    }
+    const existing = indexById.get(id);
+    if (existing === undefined) {
+      indexById.set(id, ordered.length);
+      ordered.push(message);
+    } else {
+      ordered[existing] = message;
+    }
+  };
+
+  for (const line of content.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let entry: unknown;
+    try {
+      entry = JSON.parse(trimmed);
+    } catch {
+      // A torn final line from a write in flight - skip it, keep the rest.
+      continue;
+    }
+    if (!isRecord(entry)) continue;
+
+    const patch = entry.$set;
+    if (isRecord(patch) && Array.isArray(patch.messages)) {
+      for (const message of patch.messages) append(message);
+      continue;
+    }
+    // A standalone message line. The header line has no `type`, so it is
+    // skipped by the same check.
+    if (typeof entry.type === 'string') append(entry);
+  }
+
+  return sawAny ? ordered : null;
+}
+
+function readGeminiSessionMeta(filePath: string): { sessionId: string; startTimeMs: number } | null {
+  let content: string;
+  try {
+    content = fs.readFileSync(filePath, 'utf-8');
   } catch {
     return null;
   }
+
+  // Two on-disk generations carry the same header fields in different places:
+  // a legacy `.json` file IS the object, while a current `.jsonl` file has it
+  // on line 1. Parsing the whole file first keeps legacy behaviour byte for
+  // byte; the first-line fallback is what makes current Gemini resolve at all
+  // (JSON.parse over a multi-line JSONL throws, so this used to return null for
+  // every recent session).
+  const firstLine = content.split(/\r?\n/, 1)[0] ?? '';
+  for (const candidate of [content, firstLine]) {
+    if (!candidate.trim()) continue;
+    try {
+      const parsed: unknown = JSON.parse(candidate);
+      if (!isRecord(parsed)) continue;
+      const { sessionId, startTime } = parsed;
+      if (typeof sessionId !== 'string' || typeof startTime !== 'string') continue;
+      const startTimeMs = Date.parse(startTime);
+      if (!Number.isFinite(startTimeMs)) continue;
+      return { sessionId, startTimeMs };
+    } catch {
+      // Try the next candidate shape.
+    }
+  }
+  return null;
 }
 
 /**

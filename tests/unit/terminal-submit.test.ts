@@ -28,6 +28,7 @@ import {
 } from '../../src/main/pty/terminal-submit';
 import type { PasteEngine, PasteOptions } from '../../src/main/pty/paste-engine';
 import type { SessionManager } from '../../src/main/pty/session-manager';
+import type { ActivityState } from '../../src/shared/types';
 import {
   SimulatedSessionManager,
   DEFAULT_TUI_OPTIONS,
@@ -53,6 +54,9 @@ function makeSubmit(tuiOptions: Partial<FakeTuiOptions> = {}): {
   const sessionManager = new SimulatedSessionManager(SESSION_ID, {
     ...DEFAULT_TUI_OPTIONS,
     ...tuiOptions,
+  });
+  Object.assign(sessionManager, {
+    getActivityCache: (): Record<string, ActivityState> => ({}),
   });
   const submit = new TerminalSubmit(
     sessionManager as unknown as SessionManager,
@@ -517,6 +521,31 @@ describe('TerminalSubmit', () => {
       expect(sessionManager.tui.escClearedBuffer).toBe(false);
       sessionManager.dispose();
     });
+
+    it('stops retrying Enter when verification discovers a permission prompt', async () => {
+      // The initial Enter may have caused the permission prompt. Retrying Enter
+      // would answer that prompt, so the byte layer must stop before attempt 2.
+      const { submit, sessionManager } = makeSubmit();
+      let activity: ActivityState = 'thinking';
+      Object.assign(sessionManager, {
+        getActivityCache: (): Record<string, ActivityState> => ({ [SESSION_ID]: activity }),
+      });
+      const verifier: CommandVerifier = async () => {
+        activity = 'permission';
+        return false;
+      };
+
+      const result = await submit.submitKeystrokes(
+        SESSION_ID,
+        [{ text: '/code-review', verify: 'submitted' }],
+        { verifier },
+      );
+
+      expect(sessionManager.writes.filter((data) => data === '\r')).toHaveLength(1);
+      expect(result.outcome).toBe('unconfirmed');
+      expect(result.unconfirmedCommands).toEqual([]);
+      sessionManager.dispose();
+    }, 20_000);
 
     it('reports failed, and never writes Ctrl+C, when retries are exhausted', async () => {
       // On exhaustion the old code fired Ctrl+C into the live session. If the
